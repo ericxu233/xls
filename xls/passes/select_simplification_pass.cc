@@ -930,6 +930,66 @@ absl::StatusOr<bool> SimplifyNode(Node* node, const QueryEngine& query_engine,
     }
   }
 
+  // Reduce bit-width of PrioritySelect if the cases form a same value subtrings.
+  if (NarrowingEnabled(opt_level) && node->Is<PrioritySelect>()) {
+    PrioritySelect* sel = node->As<PrioritySelect>();
+    int num_or_reduces = 0;
+    int cases_size = sel->cases().size();
+    std::vector<std::pair<Node*, int>> consecutive_cases;
+    for (int64_t i = 0; i < cases_size; ++i) {
+      if (i == 0) {
+        consecutive_cases.push_back({sel->get_case(i), 1});
+        num_or_reduces++;
+        continue;
+      }
+      Node* curr_case = sel->get_case(i);
+      Node* prev_case = sel->get_case(i - 1);
+      if (curr_case != prev_case) {
+        consecutive_cases.push_back({curr_case, 1});
+        num_or_reduces++;
+      } else {
+        consecutive_cases.back().second++;
+      }
+    }
+
+    // The if clause is a heuristic to avoid the optimization being too costly
+    if (cases_size / num_or_reduces >= 2 && cases_size / consecutive_cases.size() >= 2) {
+      int bit_pos = 0;
+      std::vector<Node*> or_reduces;
+      std::vector<Node*> case_nodes;
+      for (auto [case_node, count] : consecutive_cases) {
+        XLS_ASSIGN_OR_RETURN(
+            Node* case_slice,
+            node->function_base()->MakeNode<BitSlice>(
+                node->loc(), node->operand(0),
+                /*start=*/bit_pos,
+                /*width=*/
+                count));
+        XLS_ASSIGN_OR_RETURN(
+            Node* case_reduce,
+            node->function_base()->
+            MakeNode<BitwiseReductionOp>(node->loc(),
+                                         case_slice,
+                                         Op::kOrReduce));
+        or_reduces.push_back(case_reduce);
+        case_nodes.push_back(case_node);
+        bit_pos += count;
+      }
+      std::reverse(or_reduces.begin(), or_reduces.end());
+
+      XLS_ASSIGN_OR_RETURN(
+          Node* cancat_or_reduces,
+          node->function_base()->
+          MakeNode<Concat>(node->loc(),
+                           or_reduces));
+      XLS_RETURN_IF_ERROR(
+          node->ReplaceUsesWithNew<PrioritySelect>(
+              node->loc(),
+              cancat_or_reduces,
+              case_nodes).status());
+    }
+  }
+
   return false;
 }
 
