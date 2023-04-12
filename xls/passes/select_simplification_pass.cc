@@ -986,6 +986,8 @@ absl::StatusOr<bool> SimplifyNode(Node* node, const QueryEngine& query_engine,
           node->ReplaceUsesWithNew<PrioritySelect>(
               cancat_or_reduces,
               case_nodes).status());
+
+      return true;
     }
   }
 
