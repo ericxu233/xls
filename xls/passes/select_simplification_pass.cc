@@ -984,7 +984,6 @@ absl::StatusOr<bool> SimplifyNode(Node* node, const QueryEngine& query_engine,
                            or_reduces));
       XLS_RETURN_IF_ERROR(
           node->ReplaceUsesWithNew<PrioritySelect>(
-              node->loc(),
               cancat_or_reduces,
               case_nodes).status());
     }
