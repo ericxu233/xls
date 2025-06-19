@@ -15,25 +15,27 @@
 #include "xls/simulation/verilog_simulator.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include "absl/flags/flag.h"
+#include "absl/base/no_destructor.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
-#include "xls/common/file/filesystem.h"
-#include "xls/common/file/temp_directory.h"
-#include "xls/common/file/temp_file.h"
-#include "xls/common/logging/log_lines.h"
+#include "absl/types/span.h"
+#include "xls/codegen/name_to_bit_count.h"
+#include "xls/codegen/vast/vast.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/common/subprocess.h"
+#include "xls/ir/bits.h"
 #include "re2/re2.h"
 
 namespace xls {
@@ -94,12 +96,25 @@ absl::StatusOr<std::vector<Observation>> StdoutToObservations(
 
 absl::StatusOr<std::pair<std::string, std::string>> VerilogSimulator::Run(
     std::string_view text, FileType file_type) const {
-  return Run(text, file_type, /*includes=*/{});
+  return Run(text, file_type, /*macro_definitions=*/{}, /*includes=*/{});
+}
+
+absl::StatusOr<std::pair<std::string, std::string>> VerilogSimulator::Run(
+    std::string_view text, FileType file_type,
+    absl::Span<const MacroDefinition> macro_definitions) const {
+  return Run(text, file_type, macro_definitions, /*includes=*/{});
 }
 
 absl::Status VerilogSimulator::RunSyntaxChecking(std::string_view text,
                                                  FileType file_type) const {
-  return RunSyntaxChecking(text, file_type, /*includes=*/{});
+  return RunSyntaxChecking(text, file_type, /*macro_definitions=*/{},
+                           /*includes=*/{});
+}
+
+absl::Status VerilogSimulator::RunSyntaxChecking(
+    std::string_view text, FileType file_type,
+    absl::Span<const MacroDefinition> macro_definitions) const {
+  return RunSyntaxChecking(text, file_type, macro_definitions, /*includes=*/{});
 }
 
 absl::StatusOr<std::vector<Observation>>
@@ -112,13 +127,13 @@ VerilogSimulator::SimulateCombinational(
 }
 
 VerilogSimulatorManager& GetVerilogSimulatorManagerSingleton() {
-  static VerilogSimulatorManager* manager = new VerilogSimulatorManager;
+  static absl::NoDestructor<VerilogSimulatorManager> manager;
   return *manager;
 }
 
-absl::StatusOr<VerilogSimulator*> VerilogSimulatorManager::GetVerilogSimulator(
-    std::string_view name) const {
-  if (!simulators_.contains(name)) {
+absl::StatusOr<std::unique_ptr<VerilogSimulator>>
+VerilogSimulatorManager::GetVerilogSimulator(std::string_view name) const {
+  if (!simulator_generators_.contains(name)) {
     if (simulator_names_.empty()) {
       return absl::NotFoundError(
           absl::StrFormat("No simulator found named \"%s\". No "
@@ -129,16 +144,17 @@ absl::StatusOr<VerilogSimulator*> VerilogSimulatorManager::GetVerilogSimulator(
         "No simulator found named \"%s\". Available simulators: %s", name,
         absl::StrJoin(simulator_names_, ", ")));
   }
-  return simulators_.at(name).get();
+  return simulator_generators_.at(name)();
 }
 
 absl::Status VerilogSimulatorManager::RegisterVerilogSimulator(
-    std::string_view name, std::unique_ptr<VerilogSimulator> simulator) {
-  if (simulators_.contains(name)) {
+    std::string_view name,
+    VerilogSimulatorManager::SimulatorGenerator simulator_generator) {
+  if (simulator_generators_.contains(name)) {
     return absl::InternalError(
         absl::StrFormat("Simulator named %s already exists", name));
   }
-  simulators_[name] = std::move(simulator);
+  simulator_generators_[name] = std::move(simulator_generator);
   simulator_names_.push_back(std::string(name));
   std::sort(simulator_names_.begin(), simulator_names_.end());
 

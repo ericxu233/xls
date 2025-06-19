@@ -18,29 +18,34 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_format.h"
+#include "xls/codegen/codegen_result.h"
 #include "xls/codegen/module_signature.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/dev_tools/tool_timeout.h"
 #include "xls/ir/function_base.h"
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/verifier.h"
-#include "xls/scheduling/pipeline_schedule.pb.h"
+#include "xls/scheduling/scheduling_options.h"
+#include "xls/scheduling/scheduling_result.h"
 #include "xls/tools/codegen.h"
 #include "xls/tools/codegen_flags.h"
 #include "xls/tools/codegen_flags.pb.h"
 #include "xls/tools/scheduling_options_flags.h"
 #include "xls/tools/scheduling_options_flags.pb.h"
 
-const char kUsage[] = R"(
+static constexpr std::string_view kUsage = R"(
 Generates Verilog RTL from a given IR file. Writes a Verilog file and a module
 signature describing the module interface to a specified location. Example
 invocations:
@@ -59,6 +64,7 @@ namespace xls {
 namespace {
 
 absl::Status RealMain(std::string_view ir_path) {
+  auto timeout = StartTimeoutTimer();
   if (ir_path == "-") {
     ir_path = "/dev/stdin";
   }
@@ -82,12 +88,12 @@ absl::Status RealMain(std::string_view ir_path) {
   XLS_ASSIGN_OR_RETURN(
       bool delay_model_flag_passed,
       IsDelayModelSpecifiedViaFlag(scheduling_options_flags_proto));
+  std::pair<SchedulingResult, verilog::CodegenResult> result;
   XLS_ASSIGN_OR_RETURN(
-      CodegenResult r,
-      ScheduleAndCodegen(p.get(), scheduling_options_flags_proto,
-                         codegen_flags_proto, delay_model_flag_passed));
-  verilog::ModuleGeneratorResult result = r.module_generator_result;
-  std::optional<PipelineScheduleProto> schedule = r.pipeline_schedule_proto;
+      result, ScheduleAndCodegen(p.get(), scheduling_options_flags_proto,
+                                 codegen_flags_proto, delay_model_flag_passed));
+  const SchedulingResult& scheduling_result = result.first;
+  verilog::CodegenResult& codegen_result = result.second;
 
   if (!absl::GetFlag(FLAGS_output_schedule_ir_path).empty()) {
     XLS_RETURN_IF_ERROR(
@@ -96,47 +102,63 @@ absl::Status RealMain(std::string_view ir_path) {
   }
 
   if (!absl::GetFlag(FLAGS_output_schedule_path).empty()) {
-    if (schedule.has_value()) {
-      XLS_RETURN_IF_ERROR(SetTextProtoFile(
-          absl::GetFlag(FLAGS_output_schedule_path), schedule.value()));
-    } else {
-      XLS_RETURN_IF_ERROR(
-          SetFileContents(absl::GetFlag(FLAGS_output_schedule_path), ""));
-    }
+    XLS_RETURN_IF_ERROR(
+        SetTextProtoFile(absl::GetFlag(FLAGS_output_schedule_path),
+                         scheduling_result.schedules));
   }
 
   if (!absl::GetFlag(FLAGS_output_block_ir_path).empty()) {
-    XLS_QCHECK_EQ(p->blocks().size(), 1)
-        << "There should be exactly one block in the package after generating "
+    QCHECK_GE(p->blocks().size(), 1)
+        << "There should be at least one block in the package after generating "
            "module text.";
     XLS_RETURN_IF_ERROR(SetFileContents(
         absl::GetFlag(FLAGS_output_block_ir_path), p->DumpIr()));
   }
 
   if (!absl::GetFlag(FLAGS_output_signature_path).empty()) {
+    XLS_RETURN_IF_ERROR(
+        SetTextProtoFile(absl::GetFlag(FLAGS_output_signature_path),
+                         codegen_result.signature.proto()));
+  }
+
+  if (!absl::GetFlag(FLAGS_output_scheduling_pass_metrics_path).empty()) {
     XLS_RETURN_IF_ERROR(SetTextProtoFile(
-        absl::GetFlag(FLAGS_output_signature_path), result.signature.proto()));
+        absl::GetFlag(FLAGS_output_scheduling_pass_metrics_path),
+        scheduling_result.pass_pipeline_metrics));
+  }
+
+  if (!absl::GetFlag(FLAGS_output_codegen_pass_metrics_path).empty()) {
+    XLS_RETURN_IF_ERROR(
+        SetTextProtoFile(absl::GetFlag(FLAGS_output_codegen_pass_metrics_path),
+                         codegen_result.pass_pipeline_metrics));
+  }
+
+  if (!absl::GetFlag(FLAGS_block_metrics_path).empty()) {
+    XLS_RETURN_IF_ERROR(SetTextProtoFile(
+        absl::GetFlag(FLAGS_block_metrics_path), codegen_result.block_metrics));
   }
 
   const std::string& verilog_path = absl::GetFlag(FLAGS_output_verilog_path);
   if (!verilog_path.empty()) {
-    std::filesystem::path absolute = std::filesystem::absolute(verilog_path);
-    for (int64_t i = 0; i < result.verilog_line_map.mapping_size(); ++i) {
-      result.verilog_line_map.mutable_mapping(i)->set_verilog_file(absolute);
+    for (int64_t i = 0; i < codegen_result.verilog_line_map.mapping_size();
+         ++i) {
+      codegen_result.verilog_line_map.mutable_mapping(i)->set_verilog_file(
+          verilog_path);
     }
   }
 
   const std::string& verilog_line_map_path =
       absl::GetFlag(FLAGS_output_verilog_line_map_path);
   if (!verilog_line_map_path.empty()) {
-    XLS_RETURN_IF_ERROR(
-        SetTextProtoFile(verilog_line_map_path, result.verilog_line_map));
+    XLS_RETURN_IF_ERROR(SetTextProtoFile(verilog_line_map_path,
+                                         codegen_result.verilog_line_map));
   }
 
   if (verilog_path.empty()) {
-    std::cout << result.verilog_text;
+    std::cout << codegen_result.verilog_text;
   } else {
-    XLS_RETURN_IF_ERROR(SetFileContents(verilog_path, result.verilog_text));
+    XLS_RETURN_IF_ERROR(
+        SetFileContents(verilog_path, codegen_result.verilog_text));
   }
   return absl::OkStatus();
 }
@@ -149,8 +171,8 @@ int main(int argc, char** argv) {
       xls::InitXls(kUsage, argc, argv);
 
   if (positional_arguments.size() != 1) {
-    XLS_LOG(QFATAL) << absl::StreamFormat("Expected invocation: %s IR_FILE",
-                                          argv[0]);
+    LOG(QFATAL) << absl::StreamFormat("Expected invocation: %s IR_FILE",
+                                      argv[0]);
   }
   std::string_view ir_path = positional_arguments[0];
   return xls::ExitStatus(xls::RealMain(ir_path));

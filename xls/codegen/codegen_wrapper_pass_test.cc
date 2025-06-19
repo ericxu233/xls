@@ -18,27 +18,33 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/statusor.h"
 #include "xls/codegen/codegen_pass.h"
 #include "xls/common/status/matchers.h"
+#include "xls/ir/block.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_test_base.h"
 #include "xls/passes/dce_pass.h"
+#include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace m = ::xls::op_matchers;
 
 namespace xls::verilog {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 
 class CodegenWrapperPassTest : public IrTestBase {
  protected:
   absl::StatusOr<bool> Run(Block* block) {
     PassResults results;
-    CodegenPassUnit unit(block->package(), block);
-    return CodegenWrapperPass(std::make_unique<DeadCodeEliminationPass>())
-        .Run(&unit, CodegenPassOptions(), &results);
+    CodegenContext context(block);
+    OptimizationContext optimization_context;
+    return CodegenWrapperPass(std::make_unique<DeadCodeEliminationPass>(),
+                              optimization_context)
+        .Run(block->package(), CodegenPassOptions(), &results, context);
   }
 };
 

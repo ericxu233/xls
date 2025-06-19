@@ -15,13 +15,14 @@
 #ifndef XLS_INTERPRETER_FUNCTION_INTERPRETER_H_
 #define XLS_INTERPRETER_FUNCTION_INTERPRETER_H_
 
+#include <optional>
 #include <string>
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "xls/interpreter/ir_interpreter.h"
+#include "xls/interpreter/observer.h"
+#include "xls/ir/events.h"
 #include "xls/ir/function.h"
 #include "xls/ir/value.h"
 
@@ -31,12 +32,14 @@ namespace xls {
 // indexed by parameter name. Returns both the value and any events that
 // happened while running.
 absl::StatusOr<InterpreterResult<Value>> InterpretFunction(
-    Function* function, absl::Span<const Value> args);
+    Function* function, absl::Span<const Value> args,
+    std::optional<EvaluationObserver*> observer = std::nullopt);
 
 // Runs the interpreter on the function where the arguments are given by name.
 // Returns both the result alue and any events that happened while running.
 absl::StatusOr<InterpreterResult<Value>> InterpretFunctionKwargs(
-    Function* function, const absl::flat_hash_map<std::string, Value>& args);
+    Function* function, const absl::flat_hash_map<std::string, Value>& args,
+    std::optional<EvaluationObserver*> observer = std::nullopt);
 
 }  // namespace xls
 

@@ -14,25 +14,31 @@
 
 #include "xls/passes/sparsify_select_pass.h"
 
+#include <cstdint>
+#include <string_view>
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/statusor.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_test_base.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/ir/value.h"
 #include "xls/passes/dce_pass.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
+#include "xls/solvers/z3_ir_equivalence_testutils.h"
 
 namespace m = ::xls::op_matchers;
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 
 class SparsifySelectPassTest : public IrTestBase {
  protected:
@@ -40,16 +46,43 @@ class SparsifySelectPassTest : public IrTestBase {
 
   absl::StatusOr<bool> Run(FunctionBase* f) {
     PassResults results;
+    OptimizationContext context;
     XLS_ASSIGN_OR_RETURN(bool changed,
                          SparsifySelectPass().RunOnFunctionBase(
-                             f, OptimizationPassOptions(), &results));
+                             f, OptimizationPassOptions(), &results, context));
     XLS_RETURN_IF_ERROR(
         DeadCodeEliminationPass()
-            .RunOnFunctionBase(f, OptimizationPassOptions(), &results)
+            .RunOnFunctionBase(f, OptimizationPassOptions(), &results, context)
             .status());
     return changed;
   }
 };
+
+TEST_F(SparsifySelectPassTest, CompoundType) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  auto x = fb.Param("x", p->GetBitsType(1));
+  auto x_big = fb.ZeroExtend(x, 3);
+  auto complex_vs = [&](uint64_t v) {
+    return fb.Literal(Value::Tuple({Value(UBits(v, 4)), Value(UBits(v, 5)),
+                                    Value(UBits(v, 6)), Value(UBits(v, 5)),
+                                    Value(UBits(v, 4))}));
+  };
+  auto complex_vs_match = [&](uint64_t v) {
+    return m::Literal(Value::Tuple({Value(UBits(v, 4)), Value(UBits(v, 5)),
+                                    Value(UBits(v, 6)), Value(UBits(v, 5)),
+                                    Value(UBits(v, 4))}));
+  };
+  fb.Select(x_big,
+            {complex_vs(1), complex_vs(2), complex_vs(3), complex_vs(4),
+             complex_vs(5), complex_vs(6), complex_vs(7), complex_vs(8)});
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  EXPECT_THAT(Run(f), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              m::Select(m::Sub(x_big.node(), m::Literal(UBits(0, 3))),
+                        {complex_vs_match(1), complex_vs_match(2)},
+                        complex_vs_match(0)));
+}
 
 TEST_F(SparsifySelectPassTest, Simple) {
   auto p = CreatePackage();
@@ -94,7 +127,7 @@ TEST_F(SparsifySelectPassTest, Simple) {
                             m::Literal("bits[4]:10"),
                             m::Literal("bits[4]:11"),
                         },
-                        /*default=*/m::Literal("bits[4]:0")));
+                        /*default_value=*/m::Literal("bits[4]:0")));
 }
 
 TEST_F(SparsifySelectPassTest, TwoIntervals) {
@@ -138,26 +171,27 @@ TEST_F(SparsifySelectPassTest, TwoIntervals) {
                  m::Add(m::ZeroExt(m::Param("x")), m::Literal("bits[4]:2"))});
   EXPECT_THAT(
       f->return_value(),
-      m::Select(m::And(m::UGe(selector, m::Literal("bits[4]:9")),
-                       m::ULe(selector, m::Literal("bits[4]:12"))),
-                /*cases=*/{m::Select(m::Sub(selector, m::Literal("bits[4]:2")),
-                                     /*cases=*/
-                                     {
-                                         m::Literal("bits[4]:2"),
-                                         m::Literal("bits[4]:3"),
-                                         m::Literal("bits[4]:4"),
-                                         m::Literal("bits[4]:5"),
-                                     },
-                                     /*default=*/m::Literal("bits[4]:0")),
-                           m::Select(m::Sub(selector, m::Literal("bits[4]:9")),
-                                     /*cases=*/
-                                     {
-                                         m::Literal("bits[4]:9"),
-                                         m::Literal("bits[4]:10"),
-                                         m::Literal("bits[4]:11"),
-                                         m::Literal("bits[4]:12"),
-                                     },
-                                     /*default=*/m::Literal("bits[4]:0"))}));
+      m::Select(
+          m::And(m::UGe(selector, m::Literal("bits[4]:9")),
+                 m::ULe(selector, m::Literal("bits[4]:12"))),
+          /*cases=*/{m::Select(m::Sub(selector, m::Literal("bits[4]:2")),
+                               /*cases=*/
+                               {
+                                   m::Literal("bits[4]:2"),
+                                   m::Literal("bits[4]:3"),
+                                   m::Literal("bits[4]:4"),
+                                   m::Literal("bits[4]:5"),
+                               },
+                               /*default_value=*/m::Literal("bits[4]:0")),
+                     m::Select(m::Sub(selector, m::Literal("bits[4]:9")),
+                               /*cases=*/
+                               {
+                                   m::Literal("bits[4]:9"),
+                                   m::Literal("bits[4]:10"),
+                                   m::Literal("bits[4]:11"),
+                                   m::Literal("bits[4]:12"),
+                               },
+                               /*default_value=*/m::Literal("bits[4]:0"))}));
 }
 
 TEST_F(SparsifySelectPassTest, FourIntervals) {
@@ -214,18 +248,18 @@ TEST_F(SparsifySelectPassTest, FourIntervals) {
                        /*cases=*/
                        {m::Select(m::Sub(selector, m::Literal("bits[4]:5")),
                                   /*cases=*/{m::Literal("bits[4]:5")},
-                                  /*default=*/m::Literal("bits[4]:0")),
+                                  /*default_value=*/m::Literal("bits[4]:0")),
                         m::Select(m::Sub(selector, m::Literal("bits[4]:8")),
                                   /*cases=*/
                                   {m::Literal("bits[4]:8")},
-                                  /*default=*/
+                                  /*default_value=*/
                                   m::Literal("bits[4]:0"))}),
                    m::Select(m::Sub(selector, m::Literal("bits[4]:11")),
                              /*cases=*/{m::Literal("bits[4]:11")},
-                             /*default=*/m::Literal("bits[4]:0"))}),
+                             /*default_value=*/m::Literal("bits[4]:0"))}),
               m::Select(m::Sub(selector, m::Literal("bits[4]:14")),
                         /*cases=*/{m::Literal("bits[4]:14")},
-                        /*default=*/m::Literal("bits[4]:0"))}));
+                        /*default_value=*/m::Literal("bits[4]:0"))}));
 }
 
 TEST_F(SparsifySelectPassTest, WideSelector) {
@@ -281,7 +315,7 @@ TEST_F(SparsifySelectPassTest, WideSelector) {
                                    m::Literal("bits[4]:4"),
                                    m::Literal("bits[4]:5"),
                                },
-                               /*default=*/m::Literal("bits[4]:0")),
+                               /*default_value=*/m::Literal("bits[4]:0")),
                      m::Select(m::Sub(selector, m::Literal("bits[100]:9")),
                                /*cases=*/
                                {
@@ -290,7 +324,7 @@ TEST_F(SparsifySelectPassTest, WideSelector) {
                                    m::Literal("bits[4]:11"),
                                    m::Literal("bits[4]:12"),
                                },
-                               /*default=*/m::Literal("bits[4]:0"))}));
+                               /*default_value=*/m::Literal("bits[4]:0"))}));
 }
 
 TEST_F(SparsifySelectPassTest, DefaultValue) {
@@ -334,26 +368,70 @@ TEST_F(SparsifySelectPassTest, DefaultValue) {
                  m::Add(m::ZeroExt(m::Param("x")), m::Literal("bits[4]:2"))});
   EXPECT_THAT(
       f->return_value(),
-      m::Select(m::And(m::UGe(selector, m::Literal("bits[4]:9")),
-                       m::ULe(selector, m::Literal("bits[4]:12"))),
-                /*cases=*/{m::Select(m::Sub(selector, m::Literal("bits[4]:2")),
-                                     /*cases=*/
-                                     {
-                                         m::Literal("bits[4]:2"),
-                                         m::Literal("bits[4]:3"),
-                                         m::Literal("bits[4]:4"),
-                                         m::Literal("bits[4]:5"),
-                                     },
-                                     /*default=*/m::Literal("bits[4]:0")),
-                           m::Select(m::Sub(selector, m::Literal("bits[4]:9")),
-                                     /*cases=*/
-                                     {
-                                         m::Literal("bits[4]:9"),
-                                         m::Literal("bits[4]:10"),
-                                         m::Literal("bits[4]:11"),
-                                         m::Literal("bits[4]:12"),
-                                     },
-                                     /*default=*/m::Literal("bits[4]:0"))}));
+      m::Select(
+          m::And(m::UGe(selector, m::Literal("bits[4]:9")),
+                 m::ULe(selector, m::Literal("bits[4]:12"))),
+          /*cases=*/{m::Select(m::Sub(selector, m::Literal("bits[4]:2")),
+                               /*cases=*/
+                               {
+                                   m::Literal("bits[4]:2"),
+                                   m::Literal("bits[4]:3"),
+                                   m::Literal("bits[4]:4"),
+                                   m::Literal("bits[4]:5"),
+                               },
+                               /*default_value=*/m::Literal("bits[4]:0")),
+                     m::Select(m::Sub(selector, m::Literal("bits[4]:9")),
+                               /*cases=*/
+                               {
+                                   m::Literal("bits[4]:9"),
+                                   m::Literal("bits[4]:10"),
+                                   m::Literal("bits[4]:11"),
+                                   m::Literal("bits[4]:12"),
+                               },
+                               /*default_value=*/m::Literal("bits[4]:0"))}));
+}
+
+TEST_F(SparsifySelectPassTest, LargeSelector) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn func(x1: bits[2], x2: bits[2]) -> bits[2] {
+       literal.1: bits[2042] = literal(value=0x20_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000, id=1)
+       literal.2: bits[2042] = literal(value=0x0, id=2)
+       s: bits[2042] = one_hot_sel(x1, cases=[literal.1, literal.2], id=3)
+       literal.4: bits[2] = literal(value=0, id=4)
+       ret sel.5: bits[2] = sel(s, cases=[x2, literal.4, literal.4, literal.4, literal.4, literal.4, literal.4, literal.4, literal.4, literal.4, literal.4, literal.4, literal.4, literal.4], default=literal.4, id=5)
+     }
+  )",
+                                                       p.get()));
+
+  solvers::z3::ScopedVerifyEquivalence sve(f);
+  EXPECT_THAT(Run(f), IsOkAndHolds(true));
+  testing::Matcher<const Node*> selector =
+      m::OneHotSelect(m::Param("x1"),
+                      /*cases=*/{m::Literal(), m::Literal()});
+  constexpr std::string_view kLargeLiteral =
+      "bits[2042]:0x20_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_"
+      "0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_"
+      "0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_"
+      "0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_"
+      "0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000";
+  EXPECT_THAT(
+      f->return_value(),
+      m::Select(
+          m::And(m::UGe(selector, m::Literal(kLargeLiteral)),
+                 m::ULe(selector, m::Literal(kLargeLiteral))),
+          /*cases=*/{m::Select(m::Sub(selector, m::Literal("bits[2042]:0x0")),
+                               /*cases=*/
+                               {
+                                   m::Param("x2"),
+                               },
+                               /*default_value=*/m::Literal("bits[2]:0x0")),
+                     m::Select(m::Sub(selector, m::Literal(kLargeLiteral)),
+                               /*cases=*/
+                               {
+                                   m::Literal("bits[2]:0x0"),
+                               },
+                               /*default_value=*/m::Literal("bits[2]:0x0"))}));
 }
 
 }  // namespace

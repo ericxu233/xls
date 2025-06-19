@@ -19,7 +19,11 @@
 #include <queue>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/noc/simulation/common.h"
 #include "xls/noc/simulation/flit.h"
 #include "xls/noc/simulation/global_routing_table.h"

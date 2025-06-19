@@ -14,24 +14,30 @@
 
 #include "xls/common/file/named_pipe.h"
 
+#include <cstdint>
 #include <filesystem>  // NOLINT
+#include <optional>
 #include <utility>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/str_format.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/temp_directory.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/thread.h"
 
 namespace xls {
 namespace {
 
-using status_testing::IsOk;
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
+using ::absl_testing::IsOk;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::Not;
 using ::testing::Optional;
 
@@ -44,7 +50,7 @@ TEST(NamedPipeTest, SingleReadAndWrite) {
   // pipe has been opened.
   Thread write_thread([&pipe]() {
     FileLineWriter fw = pipe.OpenForWriting().value();
-    XLS_CHECK_OK(fw.WriteLine("Hello world!"));
+    CHECK_OK(fw.WriteLine("Hello world!"));
   });
   XLS_ASSERT_OK_AND_ASSIGN(FileLineReader fr, pipe.OpenForReading());
   write_thread.Join();
@@ -60,7 +66,7 @@ TEST(NamedPipeTest, MultipleReadAndWrite) {
   Thread write_thread([&pipe]() {
     FileLineWriter fw = pipe.OpenForWriting().value();
     for (int64_t i = 0; i < 10; ++i) {
-      XLS_CHECK_OK(fw.WriteLine(absl::StrFormat("Line #%d", i)));
+      CHECK_OK(fw.WriteLine(absl::StrFormat("Line #%d", i)));
     }
   });
   XLS_ASSERT_OK_AND_ASSIGN(FileLineReader fr, pipe.OpenForReading());
@@ -72,6 +78,44 @@ TEST(NamedPipeTest, MultipleReadAndWrite) {
   }
 }
 
+TEST(NamedPipeTest, PipeImmediatelyClosedOnWriteEnd) {
+  XLS_ASSERT_OK_AND_ASSIGN(TempDirectory temp_dir, TempDirectory::Create());
+  std::filesystem::path path = temp_dir.path() / "the_pipe";
+  XLS_ASSERT_OK_AND_ASSIGN(NamedPipe pipe, NamedPipe::Create(path));
+
+  Thread write_thread(
+      [&pipe]() { FileLineWriter fw = pipe.OpenForWriting().value(); });
+  XLS_ASSERT_OK_AND_ASSIGN(FileLineReader fr, pipe.OpenForReading());
+
+  EXPECT_THAT(fr.ReadLine(), IsOkAndHolds(std::nullopt));
+  write_thread.Join();
+}
+
+TEST(NamedPipeTest, FullBuffer) {
+  XLS_ASSERT_OK_AND_ASSIGN(TempDirectory temp_dir, TempDirectory::Create());
+  std::filesystem::path path = temp_dir.path() / "the_pipe";
+  XLS_ASSERT_OK_AND_ASSIGN(NamedPipe pipe, NamedPipe::Create(path));
+  // Write a sufficiently large number of values to fill the pipe buffer.
+  constexpr int64_t kCount = 1'000'000;
+
+  Thread write_thread([&pipe]() {
+    FileLineWriter fw = pipe.OpenForWriting().value();
+    for (int64_t i = 0; i < kCount; ++i) {
+      CHECK_OK(fw.WriteLine(absl::StrFormat("Line #%d", i)));
+    }
+  });
+
+  // Wait for some amount of time for the pipe buffer to fill.
+  absl::SleepFor(absl::Seconds(5));
+
+  XLS_ASSERT_OK_AND_ASSIGN(FileLineReader fr, pipe.OpenForReading());
+  for (int64_t i = 0; i < kCount; ++i) {
+    EXPECT_THAT(fr.ReadLine(),
+                IsOkAndHolds(Optional(absl::StrFormat("Line #%d", i))));
+  }
+  write_thread.Join();
+}
+
 TEST(NamedPipeTest, EmptyLines) {
   XLS_ASSERT_OK_AND_ASSIGN(TempDirectory temp_dir, TempDirectory::Create());
   std::filesystem::path path = temp_dir.path() / "the_pipe";
@@ -79,9 +123,9 @@ TEST(NamedPipeTest, EmptyLines) {
 
   Thread write_thread([&pipe]() {
     FileLineWriter fw = pipe.OpenForWriting().value();
-    XLS_CHECK_OK(fw.WriteLine(""));
-    XLS_CHECK_OK(fw.WriteLine(""));
-    XLS_CHECK_OK(fw.WriteLine(""));
+    CHECK_OK(fw.WriteLine(""));
+    CHECK_OK(fw.WriteLine(""));
+    CHECK_OK(fw.WriteLine(""));
   });
   XLS_ASSERT_OK_AND_ASSIGN(FileLineReader fr, pipe.OpenForReading());
   write_thread.Join();

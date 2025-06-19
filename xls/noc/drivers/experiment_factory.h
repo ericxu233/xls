@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_NOC_EXPERIMENT_FACTORY_H_
-#define XLS_NOC_EXPERIMENT_FACTORY_H_
+#ifndef XLS_NOC_DRIVERS_EXPERIMENT_FACTORY_H_
+#define XLS_NOC_DRIVERS_EXPERIMENT_FACTORY_H_
 
 #include <memory>
 #include <string>
@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "absl/container/btree_map.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "xls/common/casts.h"
@@ -77,4 +78,4 @@ class ExperimentFactory {
 
 }  // namespace xls::noc
 
-#endif  // XLS_NOC_EXPERIMENT_FACTORY_H_
+#endif  // XLS_NOC_DRIVERS_EXPERIMENT_FACTORY_H_

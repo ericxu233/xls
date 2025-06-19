@@ -30,17 +30,21 @@
 #include "xls/codegen/codegen_options.h"
 #include "xls/codegen/module_signature.pb.h"
 #include "xls/codegen/node_representation.h"
-#include "xls/codegen/vast.h"
+#include "xls/codegen/vast/vast.h"
+#include "xls/ir/name_uniquer.h"
 #include "xls/ir/node.h"
 #include "xls/ir/nodes.h"
 #include "xls/ir/package.h"
-#include "xls/ir/source_location.h"
 #include "xls/ir/type.h"
 #include "xls/ir/value.h"
 #include "xls/passes/bdd_query_engine.h"
 
 namespace xls {
 namespace verilog {
+// Properties for selectors that are relevant for codegen.
+struct SelectorProperties {
+  bool never_zero;
+};
 
 // An abstraction wrapping a VAST module which assists with lowering of XLS IR
 // into Verilog. Key functionality:
@@ -59,20 +63,26 @@ class ModuleBuilder {
   Module* module() { return module_; }
 
   // Add an input port of the given XLS type to the module.
-  absl::StatusOr<LogicRef*> AddInputPort(std::string_view name, Type* type);
+  absl::StatusOr<LogicRef*> AddInputPort(
+      std::string_view name, Type* type,
+      std::optional<std::string_view> sv_type = std::nullopt);
 
   // Add an input port of the given width.
-  LogicRef* AddInputPort(std::string_view name, int64_t bit_count);
+  absl::StatusOr<LogicRef*> AddInputPort(
+      std::string_view name, int64_t bit_count,
+      std::optional<std::string_view> sv_type = std::nullopt);
 
   // Add an output port of the given XLS type to the module. The output is
   // assigned the given value.
-  absl::Status AddOutputPort(std::string_view name, Type* type,
-                             Expression* value);
+  absl::Status AddOutputPort(
+      std::string_view name, Type* type, Expression* value,
+      std::optional<std::string_view> sv_type = std::nullopt);
 
   // Add an output port of the given width to the module. The output is assigned
   // the given value.
-  absl::Status AddOutputPort(std::string_view name, int64_t bit_count,
-                             Expression* value);
+  absl::Status AddOutputPort(
+      std::string_view name, int64_t bit_count, Expression* value,
+      std::optional<std::string_view> sv_type = std::nullopt);
 
   // Returns whether the given node can be emitted as an inline expression in
   // Verilog (the alternative is to assign the expression of node to a temporary
@@ -85,9 +95,7 @@ class ModuleBuilder {
   // are the users 'node' in the emitted Verilog to consider when determining
   // whether node can be emitted inline. If not specified all users of node are
   // considered.
-  bool CanEmitAsInlineExpression(Node* node,
-                                 std::optional<absl::Span<Node* const>>
-                                     users_of_expression = std::nullopt);
+  bool CanEmitAsInlineExpression(Node* node);
 
   // Returns the given node as a Verilog expression. 'inputs' contains the
   // operand expressions for the node.
@@ -122,11 +130,12 @@ class ModuleBuilder {
 
   // Declares a variable with the given name and XLS type. Returns a reference
   // to the variable.
-  LogicRef* DeclareVariable(std::string_view name, Type* type);
+  absl::StatusOr<LogicRef*> DeclareVariable(std::string_view name, Type* type);
 
   // Declares a flat variable with the given name and number of bits. Returns a
   // reference to the variable.
-  LogicRef* DeclareVariable(std::string_view name, int64_t bit_count);
+  absl::StatusOr<LogicRef*> DeclareVariable(std::string_view name,
+                                            int64_t bit_count);
 
   // Assigns the rhs to the lhs using continuous assignment where both sides
   // have the given XLS type. The emitted verilog may require multiple
@@ -183,6 +192,8 @@ class ModuleBuilder {
   // For organization (not functionality) the module is divided into several
   // sections. The emitted module has the following structure:
   //
+  //   { includes_section }
+  //
   //   module foo(
   //     ...
   //   );
@@ -213,6 +224,7 @@ class ModuleBuilder {
   // current declaration and assignment sections.
   void NewDeclarationAndAssignmentSections();
 
+  ModuleSection* include_section() const { return includes_section_; }
   // Methods to returns one of the various sections in the module.
   ModuleSection* declaration_section() const {
     return declaration_subsections_.back();
@@ -226,7 +238,11 @@ class ModuleBuilder {
   ModuleSection* instantiation_section() const {
     return instantiation_section_;
   }
-  ModuleSection* assert_section() const { return assert_section_; }
+
+  // Assert section accessor is complex (and assert_section_ is mutable) because
+  // it lazily constructs `ifdef guards (if needed).
+  ModuleSection* assert_section() const;
+
   ModuleSection* cover_section() const { return cover_section_; }
   ModuleSection* output_section() const { return output_section_; }
   ModuleSection* trace_section() const { return trace_section_; }
@@ -285,6 +301,15 @@ class ModuleBuilder {
                                       absl::Span<const IndexType> indices,
                                       IndexMatch index_match, Type* xls_type);
 
+  // Emits a copy-and-update of an array using a generate loop, which avoids
+  // unnecessary bloat in the output code size.
+  absl::Status EmitArrayCopyAndUpdateViaGenerate1D(std::string_view op_name,
+                                                   IndexableExpression* lhs,
+                                                   IndexableExpression* rhs,
+                                                   Expression* update_value,
+                                                   IndexType index_type,
+                                                   Type* xls_type);
+
   // Assigns the arbitrarily-typed Value 'value' to 'lhs'. Depending upon the
   // type this may require multiple assignment statements. The function
   // add_assignment should add a single assignment statement.
@@ -308,15 +333,21 @@ class ModuleBuilder {
   // etc) because a function definition may be reused to implement multiple
   // identical nodes (for example, two different 32-bit multiplies may map to
   // the same function).
-  std::string VerilogFunctionName(Node* node);
+  absl::StatusOr<std::string> VerilogFunctionName(Node* node);
 
   // Defines a function which implements the given node. If a function already
   // exists which implements this node then the existing function is returned.
   absl::StatusOr<VerilogFunction*> DefineFunction(Node* node);
 
-  // Get a BddQueryEngine for a given node, constructing it if it hasn't already
-  // been constructed for another node with the same FunctionBase.
-  absl::StatusOr<BddQueryEngine* const> GetBddForNode(Node* const node);
+  // Uses query_engine_ to compute selector properties. If query_engine_ is not
+  // populated, it will populate first.
+  absl::StatusOr<SelectorProperties> GetSelectorProperties(Node* selector);
+
+  // Returns true if the module builder is configured to emit asserts.
+  bool CanEmitAsserts() const;
+
+  // Sanitize and uniquify the given name for use as a Verilog identifier.
+  std::string SanitizeAndUniquifyName(std::string_view name);
 
   std::string module_name_;
   VerilogFile* file_;
@@ -330,6 +361,7 @@ class ModuleBuilder {
   std::optional<Reset> rst_;
 
   Module* module_;
+  ModuleSection* includes_section_;
   ModuleSection* functions_section_;
   ModuleSection* constants_section_;
   ModuleSection* input_section_;
@@ -337,7 +369,10 @@ class ModuleBuilder {
   std::vector<ModuleSection*> declaration_subsections_;
   std::vector<ModuleSection*> assignment_subsections_;
   ModuleSection* instantiation_section_;
-  ModuleSection* assert_section_;
+  // Mutable because we lazily construct the assert section.
+  // We don't want to make all the ifdef guards if the section ends up being
+  // empty.
+  mutable std::optional<ModuleSection*> assert_section_;
   ModuleSection* cover_section_;
   ModuleSection* trace_section_;
   ModuleSection* output_section_;
@@ -346,7 +381,11 @@ class ModuleBuilder {
   // name.
   absl::flat_hash_map<std::string, VerilogFunction*> node_functions_;
 
-  std::optional<BddQueryEngine> query_engine_;
+  BddQueryEngine query_engine_;
+
+  // Uniquer used to ensure wires, regs, and other RTL constructs have unique
+  // names.
+  NameUniquer name_uniquer_;
 };
 
 }  // namespace verilog

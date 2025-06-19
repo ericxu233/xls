@@ -15,17 +15,19 @@
 #ifndef XLS_NOC_SIMULATION_PACKETIZER_H_
 #define XLS_NOC_SIMULATION_PACKETIZER_H_
 
-#include <queue>
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 #include "xls/ir/bits.h"
-#include "xls/ir/bits_ops.h"
-#include "xls/noc/simulation/common.h"
-#include "xls/noc/simulation/sim_objects.h"
+#include "xls/noc/simulation/flit.h"
 
 // This file contains classes used to represent and build a packet, along
 // with auxilary functions to convert packets to flits (depacketize) and
@@ -164,7 +166,7 @@ class DePacketizer {
     int64_t max_bits_to_send = flit_payload_bit_count_ - reserved_bits;
     int64_t bits_already_sent = packet_.data.bit_count() - bits_left_to_send_;
 
-    XLS_VLOG(1) << absl::StreamFormat(
+    VLOG(1) << absl::StreamFormat(
         "... packetizer reserved %d max_bits_to_send %d already_sent %d left "
         "%d",
         reserved_bits, max_bits_to_send, bits_already_sent, bits_left_to_send_);

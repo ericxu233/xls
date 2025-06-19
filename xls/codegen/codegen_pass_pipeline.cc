@@ -20,28 +20,41 @@
 #include <memory>
 
 #include "absl/status/statusor.h"
-#include "xls/codegen/block_metrics_generation_pass.h"
+#include "xls/codegen/block_stitching_pass.h"
 #include "xls/codegen/codegen_checker.h"
 #include "xls/codegen/codegen_pass.h"
 #include "xls/codegen/codegen_wrapper_pass.h"
 #include "xls/codegen/ffi_instantiation_pass.h"
+#include "xls/codegen/maybe_materialize_fifos_pass.h"
 #include "xls/codegen/mulp_combining_pass.h"
+#include "xls/codegen/name_legalization_pass.h"
 #include "xls/codegen/port_legalization_pass.h"
+#include "xls/codegen/priority_select_reduction_pass.h"
 #include "xls/codegen/ram_rewrite_pass.h"
+#include "xls/codegen/register_combining_pass.h"
 #include "xls/codegen/register_legalization_pass.h"
 #include "xls/codegen/side_effect_condition_pass.h"
 #include "xls/codegen/signature_generation_pass.h"
+#include "xls/codegen/trace_verbosity_pass.h"
 #include "xls/ir/block.h"
+#include "xls/passes/basic_simplification_pass.h"
+#include "xls/passes/cse_pass.h"
 #include "xls/passes/dce_pass.h"
 #include "xls/passes/identity_removal_pass.h"
+#include "xls/passes/optimization_pass.h"
 #include "xls/passes/pass_base.h"
 
 namespace xls::verilog {
 
-std::unique_ptr<CodegenCompoundPass> CreateCodegenPassPipeline() {
+std::unique_ptr<CodegenCompoundPass> CreateCodegenPassPipeline(
+    OptimizationContext& context) {
   auto top = std::make_unique<CodegenCompoundPass>(
       "codegen", "Top level codegen pass pipeline");
   top->AddInvariantChecker<CodegenChecker>();
+
+  // Stitch multi-block designs together in a top-level block that instantiates
+  // and stitches the others.
+  top->Add<BlockStitchingPass>();
 
   // Generate the signature from the initial proc and options prior to any
   // transformations. If necessary the signature can be mutated later if the
@@ -73,28 +86,52 @@ std::unique_ptr<CodegenCompoundPass> CreateCodegenPassPipeline() {
   // Create instantiations from ffi invocations.
   top->Add<FfiInstantiationPass>();
 
+  // Filter out traces filtered by verbosity config.
+  top->Add<TraceVerbosityPass>();
+
+  // Replace provably-unneeded priority-select operations with simpler selects.
+  top->Add<PrioritySelectReductionPass>();
+
   // Update assert conditions to be guarded by pipeline_valid signals.
   top->Add<SideEffectConditionPass>();
 
+  // Deduplicate registers across mutually exclusive stages.
+  top->Add<RegisterCombiningPass>();
+
   // Remove any identity ops which might have been added earlier in the
   // pipeline.
-  top->Add<CodegenWrapperPass>(std::make_unique<IdentityRemovalPass>());
+  top->Add<CodegenWrapperPass>(std::make_unique<IdentityRemovalPass>(),
+                               context);
+
+  // Do some trivial simplifications to any flow control logic added during code
+  // generation.
+  top->Add<CodegenWrapperPass>(
+      std::make_unique<CsePass>(/*common_literals=*/false), context);
+  top->Add<CodegenWrapperPass>(std::make_unique<BasicSimplificationPass>(),
+                               context);
+
+  // Swap out fifo instantiations with materialized fifos where required by
+  // codegen options.
+  top->Add<MaybeMaterializeFifosPass>();
 
   // Final dead-code elimination pass to remove cruft left from earlier passes.
-  top->Add<CodegenWrapperPass>(std::make_unique<DeadCodeEliminationPass>());
+  top->Add<CodegenWrapperPass>(std::make_unique<DeadCodeEliminationPass>(),
+                               context);
 
-  // Final metrics collection for the final block.
-  top->Add<BlockMetricsGenerationPass>();
+  // Legalize names.
+  top->Add<NameLegalizationPass>();
 
   return top;
 }
 
 absl::StatusOr<bool> RunCodegenPassPipeline(const CodegenPassOptions& options,
-                                            Block* block) {
-  std::unique_ptr<CodegenCompoundPass> pipeline = CreateCodegenPassPipeline();
-  CodegenPassUnit unit(block->package(), block);
+                                            Block* block,
+                                            OptimizationContext& opt_context) {
+  std::unique_ptr<CodegenCompoundPass> pipeline =
+      CreateCodegenPassPipeline(opt_context);
+  CodegenContext codegen_context(block);
   PassResults results;
-  return pipeline->Run(&unit, options, &results);
+  return pipeline->Run(block->package(), options, &results, codegen_context);
 }
 
 }  // namespace xls::verilog

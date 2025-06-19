@@ -15,16 +15,18 @@
 #include "xls/ir/format_preference.h"
 
 #include <string>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "xls/common/status/matchers.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
 
 TEST(FormatPreferenceTest, ToString) {
@@ -33,7 +35,7 @@ TEST(FormatPreferenceTest, ToString) {
     std::string stringified;
     bool valid;
   };
-  for (auto [value, expected, valid] : std::vector<TestCase>{
+  for (const auto& [value, expected, valid] : std::vector<TestCase>{
            {FormatPreference::kDefault, "default", true},
            {FormatPreference::kBinary, "binary", true},
            {FormatPreference::kUnsignedDecimal, "unsigned-decimal", true},

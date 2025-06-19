@@ -19,14 +19,16 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <tuple>
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/blocking_counter.h"
+#include "absl/types/span.h"
 #include "clang/include/clang/AST/Decl.h"
+#include "clang/include/clang/AST/DeclBase.h"
+#include "clang/include/clang/AST/Expr.h"
+#include "clang/include/clang/Basic/SourceLocation.h"
 #include "xls/common/thread.h"
 #include "xls/contrib/xlscc/metadata_output.pb.h"
 #include "xls/ir/package.h"
@@ -34,39 +36,11 @@
 
 namespace xlscc {
 
-enum PragmaType {
-  Pragma_Null = 0,
-  Pragma_NoTuples,
-  Pragma_Unroll,
-  Pragma_Top,
-  Pragma_InitInterval,
-  Pragma_Label,
-  Pragma_ArrayAllowDefaultPad,
-  Pragma_SyntheticInt,
-  Pragma_Block,
-};
-
-class Pragma {
- private:
-  PragmaType type_;
-  int64_t int_argument_ = -1;
-  std::string str_argument_ = "";
-
- public:
-  Pragma(PragmaType type, int64_t argument);
-  Pragma(PragmaType type, std::string argument);
-  explicit Pragma(PragmaType type);
-  Pragma();
-
-  PragmaType type() const;
-  int64_t int_argument() const;
-  std::string_view str_argument() const;
-};
-
 class CCParser;
 class LibToolVisitor;
 class DiagnosticInterceptor;
 class LibToolFrontendAction;
+class LibToolPPCallback;
 
 // Needs to be here because std::unique uses sizeof()
 class LibToolThread {
@@ -94,6 +68,12 @@ class CCParser {
   friend class LibToolVisitor;
   friend class DiagnosticInterceptor;
   friend class LibToolFrontendAction;
+  friend class LibToolPPCallback;
+  friend class HlsDesignPragmaHandler;
+  friend class HlsPipelineInitIntervalPragmaHandler;
+  friend class HlsUnrollPragmaHandler;
+  friend class HlsChannelStrictnessPragmaHandler;
+  friend class HlsNoParamPragmaHandler;
 
  public:
   // Deletes the AST
@@ -134,10 +114,6 @@ class CCParser {
 
   void AddSourceInfoToMetadata(xlscc_metadata::MetadataOutput& output);
   void AddSourceInfoToPackage(xls::Package& package);
-  absl::StatusOr<Pragma> FindPragmaForLoc(const clang::SourceLocation& loc,
-                                          bool ignore_label);
-  absl::StatusOr<Pragma> FindPragmaForLoc(const clang::PresumedLoc& ploc,
-                                          bool ignore_label);
 
   xls::SourceInfo GetLoc(const clang::Stmt& stmt);
   clang::PresumedLoc GetPresumedLoc(const clang::Stmt& stmt);
@@ -161,11 +137,9 @@ class CCParser {
   // Scans for top-level function candidates
   absl::Status VisitFunction(const clang::FunctionDecl* funcdecl);
   absl::Status VisitVarDecl(const clang::VarDecl* funcdecl);
-  absl::Status ScanFileForPragmas(std::string_view filename);
 
-  using PragmaLoc = std::tuple<std::string, int>;
-  absl::flat_hash_map<PragmaLoc, Pragma> hls_pragmas_;
-  absl::flat_hash_set<std::string> files_scanned_for_pragmas_;
+  absl::flat_hash_map<const clang::Stmt*, const clang::CallExpr*>
+      intrinsic_calls_by_stmt_;
 
   const clang::FunctionDecl* top_function_ = nullptr;
   std::string_view top_function_name_ = "";

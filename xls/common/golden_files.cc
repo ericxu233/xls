@@ -14,14 +14,18 @@
 
 #include "xls/common/golden_files.h"
 
+#include <filesystem>  // NOLINT
 #include <string>
 #include <string_view>
 
+#include "gtest/gtest.h"
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/strings/strip.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/get_runfile_path.h"
-#include "xls/common/logging/logging.h"
+#include "xls/common/source_location.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/update_golden_files_flag.inc"
 
@@ -32,11 +36,10 @@ ABSL_FLAG(std::string, xls_source_dir, "",
 namespace xls {
 
 void ExpectEqualToGoldenFile(const std::filesystem::path& golden_file_path,
-                             std::string_view text,
-                             xabsl::SourceLocation loc) {
-  XLS_VLOG(1) << "Reading golden Verilog from: " << golden_file_path;
+                             std::string_view text, xabsl::SourceLocation loc) {
+  VLOG(1) << "Reading golden Verilog from: " << golden_file_path;
   if (absl::GetFlag(FLAGS_test_update_golden_files)) {
-    XLS_CHECK(!absl::GetFlag(FLAGS_xls_source_dir).empty())
+    CHECK(!absl::GetFlag(FLAGS_xls_source_dir).empty())
         << "Must specify --xls_source_dir with --test_update_golden_files.";
     // Strip the xls off the end of the xls_source_dir as the golden file path
     // already includes xls.
@@ -46,9 +49,9 @@ void ExpectEqualToGoldenFile(const std::filesystem::path& golden_file_path,
         std::filesystem::path(xls_source_dir).remove_filename();
     std::filesystem::path abs_path = xls_source_pardir / golden_file_path;
 
-    XLS_LOG(INFO) << "Updating golden file; abs_path: " << abs_path;
-    XLS_CHECK_OK(SetFileContents(abs_path, text));
-    XLS_LOG(INFO) << "Updated golden file: " << golden_file_path;
+    LOG(INFO) << "Updating golden file; abs_path: " << abs_path;
+    CHECK_OK(SetFileContents(abs_path, text));
+    LOG(INFO) << "Updated golden file: " << golden_file_path;
   } else {
     XLS_ASSERT_OK_AND_ASSIGN(std::filesystem::path abs_path,
                              GetXlsRunfilePath(golden_file_path));

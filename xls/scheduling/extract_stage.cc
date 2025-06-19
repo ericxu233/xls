@@ -21,14 +21,13 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/match.h"
 #include "absl/strings/str_format.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
 #include "xls/ir/nodes.h"
-#include "xls/ir/type.h"
-#include "xls/ir/value_helpers.h"
+#include "xls/ir/source_location.h"
+#include "xls/ir/topo_sort.h"
+#include "xls/scheduling/pipeline_schedule.h"
 
 namespace xls {
 
@@ -50,25 +49,31 @@ absl::StatusOr<Function*> ExtractStage(FunctionBase* src,
           new_operands.push_back(node_map.at(operand));
         } else {
           Node* new_param = new_f->AddNode(
-              std::make_unique<Param>(operand->loc(), operand->GetName(),
-                                      operand->GetType(), new_f.get()));
+              std::make_unique<Param>(operand->loc(), operand->GetType(),
+                                      operand->GetName(), new_f.get()));
           node_map[operand] = new_param;
           new_operands.push_back(new_param);
         }
       }
       // hack to support viewing procs as functions
       Node* new_node;
-      if (node->Is<Send>() || node->Is<Receive>()) {
+      if (node->Is<StateRead>() || node->Is<Next>() || node->Is<Send>() ||
+          node->Is<Receive>()) {
+        // NB The fact that data-dependencies is dropped is fine since prior to
+        // this anything used by the Send or Next node is marked for return
+        // below.
         new_node = new_f->AddNode(std::make_unique<xls::Param>(
-            node->loc(), node->GetName(), node->GetType(), new_f.get()));
+            node->loc(), node->GetType(), node->GetName(), new_f.get()));
       } else {
         XLS_ASSIGN_OR_RETURN(
             new_node, node->CloneInNewFunction(new_operands, new_f.get()));
       }
       node_map[node] = new_node;
+      // NB This checks whether the value is *USED* by a send or next and
+      // returns it.
       if (std::any_of(node->users().begin(), node->users().end(), [&](Node* u) {
             return schedule.cycle(u) > stage || u->Is<Send>() ||
-                   new_f->HasImplicitUse(node);
+                   u->Is<Next>() || new_f->HasImplicitUse(node);
           })) {
         live_out.push_back(new_node);
       }
@@ -79,11 +84,10 @@ absl::StatusOr<Function*> ExtractStage(FunctionBase* src,
   // which gathers all nodes scheduled in the stage that are live out.
   // The tuple will be the return value of the new function.
   // Otherwise, just use the mapped function output.
-
-  auto src_function = static_cast<Function*>(src);
-  if (node_map.contains(src_function->return_value())) {
-    XLS_RETURN_IF_ERROR(
-        new_f->set_return_value(node_map[src_function->return_value()]));
+  if (src->IsFunction() &&
+      node_map.contains(src->AsFunctionOrDie()->return_value())) {
+    XLS_RETURN_IF_ERROR(new_f->set_return_value(
+        node_map.at(src->AsFunctionOrDie()->return_value())));
   } else {
     if (live_out.size() == 1) {
       XLS_RETURN_IF_ERROR(new_f->set_return_value(live_out.front()));

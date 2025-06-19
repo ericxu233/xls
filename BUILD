@@ -41,13 +41,16 @@ license(
     package_name = "xls",
 )
 
-exports_files(["LICENSE", "mkdocs.yml"])
+exports_files([
+    "LICENSE",
+    "mkdocs.yml",
+])
 
 genrule(
     name = "fuzztest_generated_bazelrc",
     outs = ["fuzztest.generated.bazelrc"],
+    cmd = "$(location @com_google_fuzztest//bazel:setup_configs) \"@com_google_fuzztest\" | sed '$$ { /^$$/d }' > $@",
     tools = ["@com_google_fuzztest//bazel:setup_configs"],
-    cmd = "$(location @com_google_fuzztest//bazel:setup_configs) \"@com_google_fuzztest\" > $@",
 )
 
 diff_test(

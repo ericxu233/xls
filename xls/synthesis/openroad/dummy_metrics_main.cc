@@ -16,16 +16,16 @@
 #include <string>
 #include <string_view>
 
+#include "absl/flags/flag.h"
+#include "absl/status/status.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "libs/json11/json11.hpp"
 #include "xls/common/exit_status.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
-#include "xls/common/status/status_macros.h"
 
-const char kUsage[] = R"(
+static constexpr std::string_view kUsage = R"(
 A dummy JSON metrics script meant to mimic the behavior of an OpenROAD metrics
 script wrapped using bazel_rules_hdl modular hardware flows.
 

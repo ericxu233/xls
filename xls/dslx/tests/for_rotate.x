@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import std
+import std;
 
 // Rotates the nibbles in the u8.
 fn main(x: u8) -> u8 {
     for (_, x): (u4, u8) in u4:0..u4:4 {
-        std::rrot(x, u8:1)
+        std::rotr(x, u8:1)
     }(x)
 }
 

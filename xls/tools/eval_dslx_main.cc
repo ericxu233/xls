@@ -13,32 +13,38 @@
 // limitations under the License.
 
 // Tool to evaluate DSLX + args and report the result.
-#include <filesystem>
+#include <filesystem>  // NOLINT
 #include <iostream>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
+#include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/dslx/bytecode/bytecode.h"
 #include "xls/dslx/bytecode/bytecode_emitter.h"
 #include "xls/dslx/bytecode/bytecode_interpreter.h"
 #include "xls/dslx/create_import_data.h"
 #include "xls/dslx/default_dslx_stdlib_path.h"
+#include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/import_data.h"
 #include "xls/dslx/interp_value.h"
-#include "xls/dslx/interp_value_helpers.h"
+#include "xls/dslx/interp_value_utils.h"
 #include "xls/dslx/parse_and_typecheck.h"
+#include "xls/dslx/virtualizable_file_system.h"
 #include "xls/dslx/warning_kind.h"
 
-const char kUsage[] = R"(
+static constexpr std::string_view kUsage = R"(
 Evaluates a DSLX file with user-specified or random inputs using the DSLX
 interpreter. Example invocations:
 
@@ -61,7 +67,8 @@ static absl::Status RealMain(
     const std::vector<std::filesystem::path>& additional_search_paths,
     std::string_view entry_fn_name, std::string_view args_text) {
   dslx::ImportData import_data(dslx::CreateImportData(
-      kDefaultDslxStdlibPath, additional_search_paths, dslx::kAllWarningsSet));
+      kDefaultDslxStdlibPath, additional_search_paths,
+      dslx::kDefaultWarningsSet, std::make_unique<dslx::RealFilesystem>()));
 
   XLS_ASSIGN_OR_RETURN(std::vector<dslx::InterpValue> args,
                        dslx::ParseArgs(args_text));
@@ -74,6 +81,7 @@ static absl::Status RealMain(
   XLS_ASSIGN_OR_RETURN(
       dslx::Function * f,
       tm.module->GetMemberOrError<dslx::Function>(entry_fn_name));
+  XLS_RET_CHECK(f != nullptr);
   if (f->params().size() != args.size()) {
     return absl::InvalidArgumentError(
         absl::StrFormat("Incorrect number of arguments: wanted %d, got %d.",
@@ -82,7 +90,7 @@ static absl::Status RealMain(
 
   XLS_ASSIGN_OR_RETURN(std::unique_ptr<dslx::BytecodeFunction> bf,
                        dslx::BytecodeEmitter::Emit(&import_data, tm.type_info,
-                                                   f, std::nullopt));
+                                                   *f, std::nullopt));
   XLS_ASSIGN_OR_RETURN(
       dslx::InterpValue result,
       dslx::BytecodeInterpreter::Interpret(&import_data, bf.get(), args));
@@ -96,14 +104,14 @@ static absl::Status RealMain(
 int main(int argc, char* argv[]) {
   std::vector<std::string_view> positional_arguments =
       xls::InitXls(kUsage, argc, argv);
-  XLS_QCHECK_EQ(positional_arguments.size(), 1) << absl::StreamFormat(
+  QCHECK_EQ(positional_arguments.size(), 1) << absl::StreamFormat(
       "Expected invocation: %s <DSLX path> --input", argv[0]);
 
   std::string inputs = absl::GetFlag(FLAGS_input);
-  XLS_QCHECK(!inputs.empty());
+  QCHECK(!inputs.empty());
 
   std::string entry_fn_name = absl::GetFlag(FLAGS_entry);
-  XLS_QCHECK(!entry_fn_name.empty()) << "--entry must be specified.";
+  QCHECK(!entry_fn_name.empty()) << "--entry must be specified.";
 
   std::vector<std::string> pieces =
       absl::StrSplit(absl::GetFlag(FLAGS_dslx_paths), ',');

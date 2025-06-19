@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "absl/flags/flag.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
@@ -28,12 +29,12 @@
 #include "xls/common/exit_status.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/thread.h"
 #include "xls/fuzzer/ast_generator.h"
 #include "xls/fuzzer/run_fuzz_multiprocess.h"
 #include "xls/fuzzer/sample.h"
+#include "xls/fuzzer/sample.pb.h"
 
 ABSL_FLAG(absl::Duration, duration, absl::InfiniteDuration(),
           "Duration to run the sample generator for.");
@@ -82,6 +83,8 @@ ABSL_FLAG(
 ABSL_FLAG(std::optional<int64_t>, worker_count, std::nullopt,
           "Number of workers to use for execution; defaults to number of "
           "physical cores detected.");
+ABSL_FLAG(bool, with_valid_holdoff, false,
+          "If true, emit valid random holdoffs on proc input channels.");
 
 namespace xls {
 namespace {
@@ -107,6 +110,7 @@ struct Options {
   bool use_llvm_jit;
   bool use_system_verilog;
   std::optional<int64_t> worker_count;
+  bool with_valid_holdoff;
 };
 
 absl::Status CheckOrCreateWritableDirectory(const std::filesystem::path& path) {
@@ -167,6 +171,7 @@ absl::Status RealMain(const Options& options) {
   }
   sample_options.set_use_jit(options.use_llvm_jit);
   sample_options.set_use_system_verilog(options.use_system_verilog);
+  sample_options.set_with_valid_holdoff(options.with_valid_holdoff);
 
   return ParallelGenerateAndRunSamples(
       worker_count, ast_generator_options, sample_options, options.seed,
@@ -186,11 +191,11 @@ int main(int argc, char** argv) {
       argc, argv);
 
   if (!positional_arguments.empty()) {
-    XLS_LOG(QFATAL) << "Unexpected positional arguments: "
-                    << absl::StrJoin(positional_arguments, ", ");
+    LOG(QFATAL) << "Unexpected positional arguments: "
+                << absl::StrJoin(positional_arguments, ", ");
   }
   if (absl::GetFlag(FLAGS_simulate) && !absl::GetFlag(FLAGS_codegen)) {
-    XLS_LOG(QFATAL) << "Must specify --codegen when --simulate is given.";
+    LOG(QFATAL) << "Must specify --codegen when --simulate is given.";
   }
 
   return xls::ExitStatus(xls::RealMain({
@@ -215,5 +220,6 @@ int main(int argc, char** argv) {
       .use_llvm_jit = absl::GetFlag(FLAGS_use_llvm_jit),
       .use_system_verilog = absl::GetFlag(FLAGS_use_system_verilog),
       .worker_count = absl::GetFlag(FLAGS_worker_count),
+      .with_valid_holdoff = absl::GetFlag(FLAGS_with_valid_holdoff),
   }));
 }

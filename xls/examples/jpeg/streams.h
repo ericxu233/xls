@@ -42,6 +42,7 @@
 #ifndef XLS_EXAMPLES_JPEG_STREAMS_H_
 #define XLS_EXAMPLES_JPEG_STREAMS_H_
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -50,7 +51,9 @@
 #include <utility>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "xls/common/status/status_macros.h"
 
 namespace xls::jpeg {

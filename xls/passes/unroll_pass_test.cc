@@ -14,22 +14,25 @@
 
 #include "xls/passes/unroll_pass.h"
 
+#include <memory>
 #include <string>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "xls/common/status/matchers.h"
+#include "xls/ir/function.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_parser.h"
-#include "xls/passes/dce_pass.h"
+#include "xls/ir/package.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace m = ::xls::op_matchers;
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 
 TEST(UnrollPassTest, UnrollsCountedForWithInvariantArgsAndStride) {
   const std::string program = R"(
@@ -51,9 +54,11 @@ fn unrollable() -> bits[32] {
                            Parser::ParsePackage(program));
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, p->GetFunction("unrollable"));
   PassResults results;
+  OptimizationContext context;
   UnrollPass pass;
-  EXPECT_THAT(pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results),
-              IsOkAndHolds(true));
+  EXPECT_THAT(
+      pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results, context),
+      IsOkAndHolds(true));
   EXPECT_THAT(f->return_value(),
               m::Invoke(m::Literal(2),
                         m::Invoke(m::Literal(0), m::Literal(0), m::Literal(0)),

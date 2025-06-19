@@ -14,19 +14,28 @@
 
 #include "xls/common/status/status_builder.h"
 
-#include <cstdio>
+#include <cstdint>
+#include <memory>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include "absl/base/log_severity.h"
+#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
+#include "absl/log/log_entry.h"
+#include "absl/log/log_sink.h"
 #include "absl/status/status.h"
+#include "absl/strings/cord.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
-#include "xls/common/logging/logging.h"
+#include "absl/time/time.h"
+#include "xls/common/source_location.h"
 #include "xls/common/symbolized_stacktrace.h"
 
 namespace xabsl {
@@ -75,16 +84,22 @@ void StatusBuilder::ConditionallyLog(const absl::Status& status) const {
       // and one for the mutex).
       struct LogSites {
         absl::Mutex mutex;
-        std::unordered_map<const void*, xls::VLogSite> sites_by_file
-            ABSL_GUARDED_BY(mutex);
+        // NOLINTNEXTLINE(abseil-no-internal-dependencies)
+        std::unordered_map<const void*, absl::log_internal::VLogSite>
+            sites_by_file ABSL_GUARDED_BY(mutex);
       };
       static auto* vlog_sites = new LogSites();
 
       vlog_sites->mutex.Lock();
-      auto& site = vlog_sites->sites_by_file[loc_.file_name()];
+      // This assumes that loc_.file_name() is a compile time constant in order
+      // to satisfy the lifetime constraints imposed by VLogSite. The
+      // constructors of SourceLocation guarantee that for us.
+      auto [iter, unused] = vlog_sites->sites_by_file.try_emplace(
+          loc_.file_name(), loc_.file_name());
+      auto& site = iter->second;
       vlog_sites->mutex.Unlock();
 
-      if (!site.IsEnabled(rep_->verbose_level, loc_.file_name())) {
+      if (!site.IsEnabled(rep_->verbose_level)) {
         return;
       }
 
@@ -94,13 +109,13 @@ void StatusBuilder::ConditionallyLog(const absl::Status& status) const {
     case Rep::LoggingMode::kLogEveryN: {
       struct LogSites {
         absl::Mutex mutex;
-        absl::flat_hash_map<std::pair<const void*, uint>, uint>
+        absl::flat_hash_map<std::pair<const void*, uint32_t>, uint32_t>
             counts_by_file_and_line ABSL_GUARDED_BY(mutex);
       };
       static auto* log_every_n_sites = new LogSites();
 
       log_every_n_sites->mutex.Lock();
-      const uint count =
+      const uint32_t count =
           log_every_n_sites
               ->counts_by_file_and_line[{loc_.file_name(), loc_.line()}]++;
       log_every_n_sites->mutex.Unlock();
@@ -113,7 +128,7 @@ void StatusBuilder::ConditionallyLog(const absl::Status& status) const {
     case Rep::LoggingMode::kLogEveryPeriod: {
       struct LogSites {
         absl::Mutex mutex;
-        absl::flat_hash_map<std::pair<const void*, uint>, absl::Time>
+        absl::flat_hash_map<std::pair<const void*, uint32_t>, absl::Time>
             next_log_by_file_and_line ABSL_GUARDED_BY(mutex);
       };
       static auto* log_every_sites = new LogSites();
@@ -131,7 +146,7 @@ void StatusBuilder::ConditionallyLog(const absl::Status& status) const {
     }
   }
 
-  xls::LogSink* const sink = rep_->sink;
+  absl::LogSink* const sink = rep_->sink;
   const std::string maybe_stack_trace =
       rep_->should_log_stack_trace
           ? absl::StrCat("\n", xls::GetSymbolizedStackTraceAsString(
@@ -139,12 +154,21 @@ void StatusBuilder::ConditionallyLog(const absl::Status& status) const {
           : "";
   const int verbose_level = rep_->logging_mode == Rep::LoggingMode::kVLog
                                 ? rep_->verbose_level
-                                : xls::LogEntry::kNoVerboseLevel;
-  XLS_LOG(LEVEL(severity))
-          .AtLocation(loc_)
-          .ToSinkAlso(sink)
-          .WithVerbosity(verbose_level)
-      << status << maybe_stack_trace;
+                                : absl::LogEntry::kNoVerboseLevel;
+  if (sink) {
+    LOG(LEVEL(severity))
+            .AtLocation(loc_.file_name(), loc_.line())
+            .ToSinkAlso(sink)
+            .WithVerbosity(verbose_level)
+        << status << maybe_stack_trace;
+  } else {
+    // sink == nullptr indicates not to call ToSinkAlso(), which dies if sink is
+    // nullptr. Unfortunately, this means we reproduce the above macro call.
+    LOG(LEVEL(severity))
+            .AtLocation(loc_.file_name(), loc_.line())
+            .WithVerbosity(verbose_level)
+        << status << maybe_stack_trace;
+  }
 }
 
 void StatusBuilder::SetStatusCode(absl::StatusCode canonical_code,
@@ -160,13 +184,32 @@ void StatusBuilder::SetStatusCode(absl::StatusCode canonical_code,
 
 void StatusBuilder::CopyPayloads(const absl::Status& src, absl::Status* dst) {
   src.ForEachPayload([&](std::string_view type_url, absl::Cord payload) {
-    dst->SetPayload(type_url, payload);
+    dst->SetPayload(type_url, std::move(payload));
   });
 }
 
 absl::Status StatusBuilder::WithMessage(const absl::Status& status,
                                         std::string_view msg) {
+  // Unfortunately since we can't easily strip the source-location off of this
+  // new status the backtrace can end up with a lot of copies of this line at
+  // the beginning. We manually try to trim them out but we can't actually
+  // remove the first one.
   auto ret = absl::Status(status.code(), msg);
+  std::optional<SourceLocation> first =
+      StatusBuilder::GetSourceLocations(ret).empty()
+          ? std::nullopt
+          : std::make_optional<SourceLocation>(
+                StatusBuilder::GetSourceLocations(ret).front());
+  bool first_non_duplicate = false;
+  for (const SourceLocation& sl : StatusBuilder::GetSourceLocations(status)) {
+    if (!first_non_duplicate && first && first->line() == sl.line() &&
+        std::string_view(first->file_name()) ==
+            std::string_view(sl.file_name())) {
+      continue;
+    }
+    first_non_duplicate = true;
+    StatusBuilder::AddSourceLocation(ret, sl);
+  }
   CopyPayloads(status, &ret);
   return ret;
 }
@@ -192,6 +235,7 @@ absl::Status StatusBuilder::CreateStatusAndConditionallyLog() && {
   absl::Status result = JoinMessageToStatus(
       std::move(status_), rep_->stream.str(), rep_->message_join_style);
   ConditionallyLog(result);
+  StatusBuilder::AddSourceLocation(result, loc_);
 
   // We consumed the status above, we set it to some error just to prevent
   // people relying on it become OK or something.

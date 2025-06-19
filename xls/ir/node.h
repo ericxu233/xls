@@ -15,26 +15,27 @@
 #ifndef XLS_IR_NODE_H_
 #define XLS_IR_NODE_H_
 
+#include <compare>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <ostream>
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
-#include "absl/container/btree_set.h"
+#include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xls/common/casts.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/change_listener.h"
 #include "xls/ir/op.h"
 #include "xls/ir/source_location.h"
 #include "xls/ir/type.h"
-#include "xls/ir/value.h"
 
 namespace xls {
 
@@ -42,8 +43,40 @@ class Package;
 class Node;
 class FunctionBase;
 
-// Forward decaration to avoid circular dependency.
+absl::Span<ChangeListener* const> GetChangeListeners(
+    FunctionBase* function_base);
+
+// Forward declaration to avoid circular dependency.
 class DfsVisitor;
+
+// A (non-owning) reference to a node; contains both the node's ID and the
+// pointer to the node, enabling efficient access & safe comparison.
+class NodeRef {
+ public:
+  explicit NodeRef(Node* node);
+
+  int64_t id() const { return id_; }
+  Node* node() const { return node_; }
+
+  // On dereference, behaves exactly like the underlying node.
+  Node& operator*() const { return *node_; }
+  Node* operator->() const { return node_; }
+
+  friend bool operator==(const NodeRef& a, const NodeRef& b) {
+    DCHECK(a.id() != b.id() || a.node() == b.node())
+        << "False node match due to reused ID";
+    return a.id() == b.id();
+  }
+
+  template <typename H>
+  friend H AbslHashValue(H h, const NodeRef& node) {
+    return h.combine(std::move(h), node.id());
+  }
+
+ private:
+  int64_t id_;
+  Node* node_;
+};
 
 // Abstract type for a node (representing an expression) in the high level IR.
 //
@@ -53,14 +86,6 @@ class Node {
   virtual ~Node() = default;
 
   // Accepts the visitor, instructing it to visit this node.
-  //
-  // The visitor is instructed to visit this node with:
-  //
-  // * This node with kPre
-  // * Each operand of this node with kIn and the operand number
-  //   * After calling kIn with an operand number returns, that operand is
-  //     visited.
-  // * This node with kPost
   absl::Status Accept(DfsVisitor* visitor);
 
   // Visits this node with the given visitor. Visits only this node and does not
@@ -69,6 +94,12 @@ class Node {
 
   Type* GetType() const { return type_; }
 
+  // Precondition: this node's result type must be known to be a `BitsType`.
+  //
+  // Convenience helper for getting the bit count of the result type. Many
+  // operations produce bits-typed outputs, so this is a useful helper even
+  // though it is not properly polymorphic. It must only be called on nodes that
+  // we are sure are producing bits-typed results.
   int64_t BitCountOrDie() const {
     return GetType()->AsBitsOrDie()->bit_count();
   }
@@ -94,10 +125,30 @@ class Node {
   absl::Status ReplaceOperandNumber(int64_t operand_no, Node* new_operand,
                                     bool type_must_match = true);
 
-  // Replace all uses of this node with 'replacement'. If this node is the
-  // return value of the function, then 'replacement' is made the return
-  // value. This node is not deleted and remains in the graph.
-  absl::Status ReplaceUsesWith(Node* replacement);
+  // Replace all uses of this node with 'replacement', except within those users
+  // where 'filter' returns false. If replace_implicit_uses is false implicit
+  // uses (such as return-values/next line uses) will not be replaced.
+  //
+  // TODO(allight): The remove_implicit_uses should be removed once next-node is
+  // complete since its only there because in functions using next-node there is
+  // an implicit 'param' on the next value line internally which if it is
+  // removed it messes up the verifier.
+  absl::Status ReplaceUsesWith(Node* replacement,
+                               const std::function<bool(Node*)>& filter,
+                               bool replace_implicit_uses = true);
+  // Replace all uses of this node with 'replacement'. If replace_implicit_uses
+  // is false implicit uses (such as return-values/next line uses) will not be
+  // replaced.
+  //
+  // TODO(allight): The remove_implicit_uses should be removed once next-node is
+  // complete since its only there because in functions using next-node there is
+  // an implicit 'param' on the next value line internally which if it is
+  // removed it messes up the verifier.
+  absl::Status ReplaceUsesWith(Node* replacement,
+                               bool replace_implicit_uses = true) {
+    return ReplaceUsesWith(
+        replacement, [](Node*) { return true; }, replace_implicit_uses);
+  }
 
   // Constructs a new node and replaces all uses of 'this' with the newly
   // constructed node. NodeT is the node subclass (e.g., 'Param') and the
@@ -121,10 +172,7 @@ class Node {
   absl::StatusOr<bool> ReplaceImplicitUsesWith(Node* replacement);
 
   // Swaps the operands at indices 'a' and 'b' in the operands sequence.
-  void SwapOperands(int64_t a, int64_t b) {
-    // Operand/user chains already set up properly.
-    std::swap(operands_[a], operands_[b]);
-  }
+  void SwapOperands(int64_t a, int64_t b);
 
   // Returns true if analysis indicates that this node always produces the
   // same value as 'other' when run with the same operands. The analysis is
@@ -138,31 +186,39 @@ class Node {
     return IsOpClass<OpT>(op());
   }
 
-  // Returns a down_cast pointer of the given template argument type. XLS_CHECK
+  // Returns a down_cast pointer of the given template argument type. CHECK
   // fails if the object is not of the given type. For example: As<Param>().
   template <typename OpT>
   const OpT* As() const {
-    XLS_CHECK(Is<OpT>());
+    CHECK(Is<OpT>());
     return down_cast<const OpT*>(this);
   }
   template <typename OpT>
   OpT* As() {
-    XLS_CHECK(Is<OpT>());
+    CHECK(Is<OpT>());
     return down_cast<OpT*>(this);
   }
 
   // Returns whether this node was assigned a name at construction. Nodes
   // without assigned names will have names generated from the opcode and unique
   // id.
-  bool HasAssignedName() const { return !name_.empty(); }
+  bool HasAssignedName() const { return name_ != nullptr; }
 
-  // Returns name of this node. If not assigned at construction time, the name
-  // is generated from the opcode and unique id (e.g. "add.2");
+  // Returns the name of this node. If not assigned at construction time, the
+  // name is generated from the opcode and unique id (e.g. "add.2");
   std::string GetName() const;
+
+  // Returns the name of this node, if assigned. Will be empty iff
+  // HasAssignedName returns false.
+  std::string_view GetNameView() const;
 
   // Sets the name of this node. After this method is called. HasAssignedName
   // will return true.
   void SetName(std::string_view name);
+
+  // Sets the name of this node. Makes no attempt to unique-ify the name so care
+  // must be taken that there are no collisions.
+  void SetNameDirectly(std::string_view name);
 
   // Clears the name of this node. The node will have a generate name based on
   // the opcode and ID. After this method is called. HasAssignedName will return
@@ -198,10 +254,18 @@ class Node {
       }
       return a->id() < b->id();
     }
+
+    std::strong_ordering Compare(const Node* a, const Node* b) const {
+      if (std::strong_ordering id_cmp = a->id() <=> b->id();
+          id_cmp != std::strong_ordering::equal) {
+        return id_cmp;
+      }
+      return a <=> b;
+    }
   };
 
   // Returns the unique set of users of this node sorted by id.
-  const absl::btree_set<Node*, NodeIdLessThan>& users() const { return users_; }
+  absl::Span<Node* const> users() const { return users_; }
 
   // Helper for querying whether "target" is a user of this node.
   bool HasUser(const Node* target) const;
@@ -214,7 +278,7 @@ class Node {
   bool OpIn(absl::Span<const Op> choices) const;
 
   Node* operand(int64_t i) const {
-    XLS_CHECK_LT(i, operands_.size());
+    CHECK_LT(i, operands_.size());
     return operands_[i];
   }
   int64_t operand_count() const { return operands_.size(); }
@@ -277,26 +341,37 @@ class Node {
   // links as with AddOperand.
   void AddOptionalOperand(std::optional<Node*> operand);
 
+  // Removes the optional operand at position 'operand_no'. Notes that this node
+  // is no longer a user of the operand if this is its last use.
+  absl::Status RemoveOptionalOperand(int64_t operand_no);
+
   // Adds the given node to this node's function and replaces this node's uses
   // with the node.
   absl::Status AddNodeToFunctionAndReplace(std::unique_ptr<Node> replacement);
 
- protected:
   void AddUser(Node* user);
   void RemoveUser(Node* user);
+
+  // The number of users that we consider small enough to perform linear-time
+  // algorithms on.
+  static constexpr int64_t kSmallUserCount = 8;
 
   FunctionBase* function_base_;
   int64_t id_;
   Op op_;
   Type* type_;
   SourceInfo loc_;
-  std::string name_;
+  std::unique_ptr<std::string> name_;  // Non-null if name has been assigned.
 
-  std::vector<Node*> operands_;
+  // Most nodes have <= 2 operands, so we keep those locally if we can.
+  absl::InlinedVector<Node*, 2> operands_;
 
   // Set of users sorted by node_id for stability.
-  absl::btree_set<Node*, NodeIdLessThan> users_;
+  absl::InlinedVector<Node*, 2> users_;
 };
+
+inline NodeRef::NodeRef(Node* node)
+    : id_(node == nullptr ? -1 : node->id()), node_(node) {}
 
 inline std::ostream& operator<<(std::ostream& os, const Node& node) {
   os << node.ToString();
@@ -306,10 +381,20 @@ inline std::ostream& operator<<(std::ostream& os, const Node* node) {
   os << (node == nullptr ? std::string("<nullptr Node*>") : node->ToString());
   return os;
 }
-
-inline void NodeAppend(std::string* out, const Node* n) {
-  absl::StrAppend(out, n->ToString());
+inline std::ostream& operator<<(std::ostream& os, const NodeRef& node) {
+  os << node->ToString();
+  return os;
 }
+
+inline bool operator==(const NodeRef& a, Node* b) {
+  if (b == nullptr) {
+    return a.node() == nullptr;
+  }
+  DCHECK(a.id() != b->id() || a.node() == b)
+      << "False node match due to reused ID";
+  return a.id() == b->id();
+}
+inline bool operator==(Node* a, const NodeRef& b) { return b == a; }
 
 }  // namespace xls
 

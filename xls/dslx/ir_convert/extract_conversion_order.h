@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_DSLX_IR_CONVERT_CPP_EXTRACT_CONVERSION_ORDER_H_
-#define XLS_DSLX_IR_CONVERT_CPP_EXTRACT_CONVERSION_ORDER_H_
+#ifndef XLS_DSLX_IR_CONVERT_EXTRACT_CONVERSION_ORDER_H_
+#define XLS_DSLX_IR_CONVERT_EXTRACT_CONVERSION_ORDER_H_
 
 #include <optional>
 #include <string>
@@ -21,56 +21,16 @@
 #include <variant>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
-#include "absl/strings/str_join.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/proc.h"
+#include "xls/dslx/frontend/proc_id.h"
 #include "xls/dslx/type_system/parametric_env.h"
 #include "xls/dslx/type_system/type_info.h"
 
 namespace xls::dslx {
-
-// ProcId is used to represent a unique instantiation of a Proc, that is, to
-// differentiate the instance of Proc Foo spawned from Proc Bar from the one
-// spawned from Proc Baz. Each instance can have different member data:
-// different constants or channels, so we need to be able to identify each
-// separately.
-struct ProcId {
-  // Contains the "spawn chain": the series of Procs through which this Proc was
-  // spawned, with the oldest/"root" proc as element 0.  Contains the current
-  // proc, as well.
-  std::vector<Proc*> proc_stack;
-
-  // The index of this Proc in the proc stack. If a Proc is spawned > 1 inside
-  // the same Proc config function, this index differentiates the spawnees.
-  // Each unique proc stack will have its count start at 0 - in other words,
-  // the sequence:
-  // spawn foo()(c0)
-  // spawn bar()(c1)
-  // spawn foo()(c2)
-  // Would result in IDs of:
-  // foo:0, bar:0, and foo:1, respectively.
-  int instance;
-
-  std::string ToString() const {
-    return absl::StrCat(absl::StrJoin(proc_stack, "->",
-                                      [](std::string* out, const Proc* p) {
-                                        out->append(p->identifier());
-                                      }),
-                        ":", instance);
-    return "";
-  }
-
-  bool operator==(const ProcId& other) const {
-    return proc_stack == other.proc_stack && instance == other.instance;
-  }
-
-  template <typename H>
-  friend H AbslHashValue(H h, const ProcId& pid) {
-    return H::combine(std::move(h), pid.proc_stack, pid.instance);
-  }
-};
 
 // Describes a callee function in the conversion order (see
 // ConversionRecord::callees).
@@ -159,7 +119,7 @@ class ConversionRecord {
         type_info_(type_info),
         parametric_env_(std::move(parametric_env)),
         callees_(std::move(callees)),
-        proc_id_(proc_id),
+        proc_id_(std::move(proc_id)),
         is_top_(is_top) {}
 
   Function* f_;
@@ -181,8 +141,9 @@ class ConversionRecord {
 // Args:
 //  module: Module to convert the (non-parametric) functions for.
 //  type_info: Mapping from node to type.
+//  include_tests: should test-functions be included.
 absl::StatusOr<std::vector<ConversionRecord>> GetOrder(
-    Module* module, TypeInfo* type_info);
+    Module* module, TypeInfo* type_info, bool include_tests = false);
 
 // Returns a reverse topological order for functions to be converted to IR given
 // "f" as the entry function.
@@ -196,6 +157,21 @@ absl::StatusOr<std::vector<ConversionRecord>> GetOrder(
 absl::StatusOr<std::vector<ConversionRecord>> GetOrderForEntry(
     std::variant<Function*, Proc*> entry, TypeInfo* type_info);
 
+// Top level procs are procs where their config or next function is not invoked
+// within the module.
+//
+// Note that parametric procs must be instantiated, and thus are never
+// top-level.
+//
+// For example, for a given module with four procs: ProcA, ProcB, ProcC and
+// ProcD. The procs have the following invocation scheme:
+// * ProcA invokes ProcC and ProcD, and
+// * ProcB does not invoke any procs.
+// Given that there is no invocation of ProcA and ProcB, they (ProcA and ProcB)
+// are the top level procs.
+absl::StatusOr<std::vector<Proc*>> GetTopLevelProcs(Module* module,
+                                                    TypeInfo* type_info);
+
 }  // namespace xls::dslx
 
-#endif  // XLS_DSLX_IR_CONVERT_CPP_EXTRACT_CONVERSION_ORDER_H_
+#endif  // XLS_DSLX_IR_CONVERT_EXTRACT_CONVERSION_ORDER_H_

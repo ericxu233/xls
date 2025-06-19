@@ -14,17 +14,25 @@
 
 #include "xls/data_structures/inline_bitmap.h"
 
+#include <cstdint>
 #include <ios>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "xls/common/fuzzing/fuzztest.h"
+#include "absl/types/span.h"
+#include "cppitertools/chain.hpp"
+#include "cppitertools/enumerate.hpp"
+#include "xls/ir/bits.h"
+#include "xls/ir/bits_ops.h"  // IWYU pragma: keep AbslStringify.
 
 namespace xls {
 namespace {
 
-using testing::ElementsAre;
+using ::testing::ElementsAre;
 
 TEST(InlineBitmapTest, FromWord) {
   {
@@ -500,6 +508,56 @@ TEST(InlineBitmapTest, Intersect) {
   }
 }
 
+TEST(InlineBitmapTest, WithSize) {
+  {
+    InlineBitmap b1(80);
+    b1.SetByte(0, 0xab);
+    b1.SetByte(1, 0xcd);
+    b1.SetByte(2, 0xa5);
+    b1.SetByte(9, 0x84);
+
+    InlineBitmap b2 = b1.WithSize(90, /*new_data=*/true);
+    EXPECT_EQ(b1.GetByte(0), 0xab);
+    EXPECT_EQ(b1.GetByte(1), 0xcd);
+    EXPECT_EQ(b1.GetByte(2), 0xa5);
+    EXPECT_EQ(b1.GetByte(3), 0);
+    EXPECT_EQ(b1.GetByte(4), 0);
+    EXPECT_EQ(b1.GetByte(5), 0);
+    EXPECT_EQ(b1.GetByte(6), 0);
+    EXPECT_EQ(b1.GetByte(7), 0);
+    EXPECT_EQ(b1.GetByte(8), 0);
+    EXPECT_EQ(b1.GetByte(9), 0x84);
+    for (int64_t i = 0; i < 80; ++i) {
+      EXPECT_EQ(b1.Get(i), b2.Get(i));
+    }
+    for (int64_t i = 80; i < 90; ++i) {
+      EXPECT_EQ(b2.Get(i), true);
+    }
+  }
+  {
+    InlineBitmap b1(80);
+    b1.SetByte(0, 0xab);
+    b1.SetByte(1, 0xcd);
+    b1.SetByte(2, 0xa5);
+    b1.SetByte(9, 0x84);
+
+    InlineBitmap b2 = b1.WithSize(40);
+    EXPECT_EQ(b1.GetByte(0), 0xab);
+    EXPECT_EQ(b1.GetByte(1), 0xcd);
+    EXPECT_EQ(b1.GetByte(2), 0xa5);
+    EXPECT_EQ(b1.GetByte(3), 0);
+    EXPECT_EQ(b1.GetByte(4), 0);
+    EXPECT_EQ(b1.GetByte(5), 0);
+    EXPECT_EQ(b1.GetByte(6), 0);
+    EXPECT_EQ(b1.GetByte(7), 0);
+    EXPECT_EQ(b1.GetByte(8), 0);
+    EXPECT_EQ(b1.GetByte(9), 0x84);
+    for (int64_t i = 0; i < 40; ++i) {
+      EXPECT_EQ(b1.Get(i), b2.Get(i));
+    }
+  }
+}
+
 }  // namespace
 
 // Note: tests below this point are friended, so cannot live in the anonymous
@@ -539,4 +597,98 @@ TEST(InlineBitmapTest, MaskForWord) {
   }
 }
 
+uint64_t GetWordBitsAtForTest(const InlineBitmap& ib, int64_t bit_offset) {
+  return ib.GetWordBitsAt(bit_offset);
+}
+
+void GetWordBitsAtFuzz(std::vector<bool> pre, uint64_t target,
+                       std::vector<bool> post) {
+  InlineBitmap bm(pre.size() + 64 + post.size());
+  for (auto [idx, v] : iter::enumerate(pre)) {
+    bm.Set(idx, v);
+  }
+  for (int64_t i = 0; i < 64; ++i) {
+    bm.Set(i + pre.size(), (target >> i) & 0x1);
+  }
+  for (auto [idx, v] : iter::enumerate(post)) {
+    bm.Set(idx + pre.size() + 64, v);
+  }
+
+  EXPECT_EQ(GetWordBitsAtForTest(bm, pre.size()), target);
+}
+
+FUZZ_TEST(InlineBitmapTest, GetWordBitsAtFuzz)
+    .WithDomains(
+        fuzztest::VectorOf(fuzztest::Arbitrary<bool>()).WithMaxSize(500),
+        fuzztest::Arbitrary<uint64_t>(),
+        fuzztest::VectorOf(fuzztest::Arbitrary<bool>()).WithMaxSize(500));
+
+void GetWordBitsAtEndFuzz(std::vector<bool> pre, std::vector<bool> target) {
+  InlineBitmap bm(pre.size() + target.size());
+  for (auto&& [idx, v] : iter::enumerate(iter::chain(pre, target))) {
+    bm.Set(idx, v);
+  }
+  InlineBitmap exp(64);
+  for (auto&& [idx, v] : iter::enumerate(target)) {
+    exp.Set(idx, v);
+  }
+
+  EXPECT_EQ(GetWordBitsAtForTest(bm, pre.size()), exp.GetWord(0));
+}
+FUZZ_TEST(InlineBitmapTest, GetWordBitsAtEndFuzz)
+    .WithDomains(
+        fuzztest::VectorOf(fuzztest::Arbitrary<bool>()).WithMaxSize(500),
+        fuzztest::VectorOf(fuzztest::Arbitrary<bool>())
+            .WithMaxSize(64)
+            .WithMinSize(1));
+
+using SrcSink = std::pair<bool, bool>;
+// Overwrites 'target' part of out with target part of src
+void OverwriteFuzz(std::vector<bool> pre_src, std::vector<bool> post_src,
+                   std::vector<bool> pre_out, std::vector<bool> post_out,
+                   std::vector<SrcSink> target) {
+  InlineBitmap src(pre_src.size() + post_src.size() + target.size());
+  InlineBitmap out(pre_out.size() + post_out.size() + target.size());
+  InlineBitmap exp(pre_out.size() + post_out.size() + target.size());
+  for (auto&& [idx, v] : iter::enumerate(pre_src)) {
+    src.Set(idx, v);
+  }
+  for (auto&& [idx, v] : iter::enumerate(pre_out)) {
+    out.Set(idx, v);
+    exp.Set(idx, v);
+  }
+  for (auto&& [idx, tgt] : iter::enumerate(target)) {
+    const auto& [src_bit, out_bit] = tgt;
+    src.Set(idx + pre_src.size(), src_bit);
+    out.Set(idx + pre_out.size(), out_bit);
+    exp.Set(idx + pre_out.size(), src_bit);
+  }
+  for (auto&& [idx, v] : iter::enumerate(post_src)) {
+    src.Set(idx + pre_src.size() + target.size(), v);
+  }
+  for (auto&& [idx, v] : iter::enumerate(post_out)) {
+    out.Set(idx + pre_out.size() + target.size(), v);
+    exp.Set(idx + pre_out.size() + target.size(), v);
+  }
+
+  testing::Test::RecordProperty("out", Bits::FromBitmap(out).ToDebugString());
+  testing::Test::RecordProperty("src", Bits::FromBitmap(src).ToDebugString());
+  testing::Test::RecordProperty("exp", Bits::FromBitmap(exp).ToDebugString());
+  testing::Test::RecordProperty("cnt", target.size());
+  testing::Test::RecordProperty("w_off", pre_out.size());
+  testing::Test::RecordProperty("r_off", pre_src.size());
+  out.Overwrite(src, target.size(), pre_out.size(), pre_src.size());
+  EXPECT_THAT(Bits::FromBitmap(std::move(out)),
+              Bits::FromBitmap(std::move(exp)));
+}
+
+FUZZ_TEST(InlineBitmapTest, OverwriteFuzz)
+    .WithDomains(
+        fuzztest::VectorOf(fuzztest::Arbitrary<bool>()).WithMaxSize(500),
+        fuzztest::VectorOf(fuzztest::Arbitrary<bool>()).WithMaxSize(500),
+        fuzztest::VectorOf(fuzztest::Arbitrary<bool>()).WithMaxSize(500),
+        fuzztest::VectorOf(fuzztest::Arbitrary<bool>()).WithMaxSize(500),
+        fuzztest::VectorOf(fuzztest::Arbitrary<SrcSink>())
+            .WithMaxSize(500)
+            .WithMinSize(1));
 }  // namespace xls

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_DSLX_FRONTEND_CPP_SCANNER_H_
-#define XLS_DSLX_FRONTEND_CPP_SCANNER_H_
+#ifndef XLS_DSLX_FRONTEND_SCANNER_H_
+#define XLS_DSLX_FRONTEND_SCANNER_H_
 
 #include <cstdint>
 #include <functional>
@@ -24,11 +24,12 @@
 #include <vector>
 
 #include "absl/base/attributes.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/common/test_macros.h"
 #include "xls/dslx/frontend/comment_data.h"
 #include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/frontend/token.h"
@@ -44,15 +45,17 @@ namespace xls::dslx {
 // TODO(leary): 2023-08-21 We can now use the payloads present in absl::Status
 // (we no longer have our own project-specific Status) -- we should not need to
 // encode conditional data in the string and parse it out.
-absl::Status ScanErrorStatus(const Span& span, std::string_view message);
+absl::Status ScanErrorStatus(const Span& span, std::string_view message,
+                             const FileTable& file_table);
 
 // Converts the conceptual character stream in a string of text into a stream of
 // tokens according to the DSLX syntax.
 class Scanner {
  public:
-  Scanner(std::string filename, std::string text,
+  Scanner(FileTable& file_table, Fileno fileno, std::string text,
           bool include_whitespace_and_comments = false)
-      : filename_(std::move(filename)),
+      : file_table_(file_table),
+        fileno_(fileno),
         text_(std::move(text)),
         include_whitespace_and_comments_(include_whitespace_and_comments) {}
 
@@ -62,9 +65,7 @@ class Scanner {
   //
   // TODO(leary): 2020-09-08 Attempt to privatize this, ideally consumers would
   // only care about the positions of tokens, not of the scanner itself.
-  Pos GetPos() const {
-    return Pos(filename_, lineno_, colno_);
-  }
+  Pos GetPos() const { return Pos(fileno_, lineno_, colno_); }
 
   // Pops a token from the current position in the character stream, or returns
   // a status error if no token can be scanned out.
@@ -89,20 +90,15 @@ class Scanner {
   //
   // Note: if there is trailing whitespace in the file, AtEof() will return
   // false until you try to Pop(), at which point you'll see an EOF-kind token.
-  bool AtEof() const {
-    return AtCharEof();
-  }
-
-  // Proceeds through the stream until an unescaped double quote is encountered.
-  //
-  // Note: since there are special character escapes in strings, they are
-  // specially handled by this routine when an open quote is encountered.
-  absl::StatusOr<std::string> ScanUntilDoubleQuote();
+  bool AtEof() const { return AtCharEof(); }
 
   void EnableDoubleCAngle() { double_c_angle_enabled_ = true; }
   void DisableDoubleCAngle() { double_c_angle_enabled_ = false; }
 
-  std::string_view filename() const { return filename_; }
+  FileTable& file_table() const { return file_table_; }
+
+  Fileno fileno() const { return fileno_; }
+  std::string_view filename() const { return file_table().Get(fileno_); }
 
   absl::Span<const CommentData> comments() const { return comments_; }
 
@@ -114,10 +110,25 @@ class Scanner {
   }
 
  private:
+  // These tests generally use the private ScanUntilDoubleQuote() helper.
+  XLS_FRIEND_TEST(ScannerTest, RecognizesEscapes);
+  XLS_FRIEND_TEST(ScannerTest, StringCharUnicodeBadStartChar);
+  XLS_FRIEND_TEST(ScannerTest, StringCharUnicodeBadTerminator);
+  XLS_FRIEND_TEST(ScannerTest, StringCharUnicodeEscapeEmpty);
+  XLS_FRIEND_TEST(ScannerTest, StringCharUnicodeEscapeNonHexDigit);
+  XLS_FRIEND_TEST(ScannerTest, StringCharUnicodeInvalidSequence);
+  XLS_FRIEND_TEST(ScannerTest, StringCharUnicodeMoreThanSixDigits);
+
   // Determines whether string "s" matches a keyword -- if so, returns the
   // keyword enum that it corresponds to. Otherwise, typically the caller will
   // assume s is an identifier.
   static std::optional<Keyword> GetKeyword(std::string_view s);
+
+  // Proceeds through the stream until an unescaped double quote is encountered.
+  //
+  // Note: since there are special character escapes in strings, they are
+  // specially handled by this routine when an open quote is encountered.
+  absl::StatusOr<std::string> ScanUntilDoubleQuote();
 
   // Scans a number token out of the character stream. Note the number may have
   // a base determined by a radix-noting prefix; e.g. "0x" or "0b".
@@ -125,6 +136,10 @@ class Scanner {
   // Precondition: The character stream must be positioned over either a digit
   // or a minus sign.
   absl::StatusOr<Token> ScanNumber(char startc, const Pos& start_pos);
+
+  // Scans a string token out of the character stream -- character cursor should
+  // be over the opening quote character.
+  absl::StatusOr<Token> ScanString(const Pos& start_pos);
 
   // Scans a character literal from the character stream as a character token.
   //
@@ -159,10 +174,6 @@ class Scanner {
   absl::StatusOr<Token> ScanIdentifierOrKeyword(char startc,
                                                 const Pos& start_pos);
 
-  // Drops comments/whitespace from the current scan position in the character
-  // stream.
-  void DropCommentsAndLeadingWhitespace();
-
   // Drops leading whitespace from the current scan position in the character
   // stream.
   void DropLeadingWhitespace();
@@ -173,7 +184,7 @@ class Scanner {
 
   // Returns whether the input character stream has been exhausted.
   bool AtCharEof() const {
-    XLS_CHECK_LE(index_, text_.size());
+    CHECK_LE(index_, text_.size());
     return index_ == text_.size();
   }
 
@@ -182,7 +193,7 @@ class Scanner {
   // Precondition: have not hit the end of the character stream (i.e.
   // `!AtCharEof()`).
   char PeekChar() const {
-    XLS_CHECK_LT(index_, text_.size());
+    CHECK_LT(index_, text_.size());
     return text_[index_];
   }
 
@@ -218,8 +229,9 @@ class Scanner {
 
   // Pops all the characters from the current character cursor to the end of
   // line (or end of file) and returns that. (This is useful presuming a leading
-  // EOL-comment-delimiter was observed.)
-  Token PopComment(const Pos& start_pos);
+  // EOL-comment-delimiter was observed.) If `allow_multiline`, will look for a
+  // continuing comment on the next line.
+  Token PopComment(const Pos& start_pos, bool allow_multiline);
 
   // Pops all the whitespace characters and returns them as a token. This is
   // useful e.g. in syntax-highlighting mode where we want whitespace and
@@ -230,7 +242,7 @@ class Scanner {
   absl::StatusOr<Token> PopWhitespace(const Pos& start_pos);
 
   // Attempts to pop a comment and, if successful, returns the comment data.
-  std::optional<CommentData> TryPopComment();
+  std::optional<CommentData> TryPopComment(bool allow_multiline);
 
   // Attempts to pop either whitespace (as a token) or a comment (as a token) at
   // the current character stream position. If the character stream is
@@ -247,7 +259,13 @@ class Scanner {
   // are valid constituents of a string.
   absl::StatusOr<std::string> ProcessNextStringChar();
 
-  std::string filename_;
+  absl::Status ScanErrorStatus(const Span& span,
+                               std::string_view message) const {
+    return xls::dslx::ScanErrorStatus(span, message, file_table_);
+  }
+
+  FileTable& file_table_;
+  Fileno fileno_;
   std::string text_;
   bool include_whitespace_and_comments_;
   int64_t index_ = 0;
@@ -259,4 +277,4 @@ class Scanner {
 
 }  // namespace xls::dslx
 
-#endif  // XLS_DSLX_FRONTEND_CPP_SCANNER_H_
+#endif  // XLS_DSLX_FRONTEND_SCANNER_H_

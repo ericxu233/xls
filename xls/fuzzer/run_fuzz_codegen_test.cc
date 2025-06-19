@@ -22,13 +22,15 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/temp_directory.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/fuzzer/ast_generator.h"
 #include "xls/fuzzer/run_fuzz.h"
 #include "xls/fuzzer/sample.h"
@@ -43,7 +45,7 @@ constexpr int64_t kCallsPerSample = 8;
 constexpr int64_t kSampleCount = 20;
 constexpr int64_t kProcTicks = 100;
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 using ::testing::IsSupersetOf;
 
 // Returns the directory in which to write crashers.
@@ -92,7 +94,7 @@ class RunFuzzCodegenTest : public ::testing::Test {
     if (test_info == nullptr) {
       return;
     }
-    XLS_CHECK(test_info->name() != nullptr);
+    CHECK(test_info->name() != nullptr);
 
     std::filesystem::path test_outputs_path =
         undeclared_outputs_dir / test_info->name();
@@ -102,7 +104,7 @@ class RunFuzzCodegenTest : public ::testing::Test {
     if (test_info->value_param() != nullptr) {
       test_outputs_path /= test_info->value_param();
     }
-    XLS_CHECK(std::filesystem::create_directories(test_outputs_path));
+    CHECK(std::filesystem::create_directories(test_outputs_path));
     std::filesystem::copy(temp_dir.path(), test_outputs_path,
                           std::filesystem::copy_options::recursive);
   }
@@ -132,14 +134,16 @@ class RunFuzzCodegenTest : public ::testing::Test {
     return options;
   }
 
-  absl::StatusOr<Sample> RunFuzz(int64_t seed) {
+  absl::Status RunFuzz(int64_t seed) {
     std::mt19937_64 rng(seed);
-    return GenerateSampleAndRun(rng, GetAstGeneratorOptions(),
+    return GenerateSampleAndRun(file_table_, rng, GetAstGeneratorOptions(),
                                 GetSampleOptions(), /*run_dir=*/GetTempPath(),
-                                crasher_dir_);
+                                crasher_dir_)
+        .status();
   }
 
  private:
+  dslx::FileTable file_table_;
   std::optional<std::filesystem::path> crasher_dir_;
   std::optional<TempDirectory> temp_dir_;
 };

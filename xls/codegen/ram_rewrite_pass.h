@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_CODEGEN_RAM_CHANNEL_REWRITE_PASS_H_
-#define XLS_CODEGEN_RAM_CHANNEL_REWRITE_PASS_H_
-
-#include <functional>
+#ifndef XLS_CODEGEN_RAM_REWRITE_PASS_H_
+#define XLS_CODEGEN_RAM_REWRITE_PASS_H_
 
 #include "absl/status/statusor.h"
 #include "xls/codegen/codegen_pass.h"
+#include "xls/ir/package.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls::verilog {
 
@@ -39,16 +39,12 @@ class RamRewritePass : public CodegenPass {
       : CodegenPass("ram_channel_rewrite", "Rewrite channels to RAMs") {}
   ~RamRewritePass() override = default;
 
-  absl::StatusOr<bool> RunInternal(CodegenPassUnit* unit,
+  absl::StatusOr<bool> RunInternal(Package* package,
                                    const CodegenPassOptions& options,
-                                   PassResults* results) const override;
+                                   PassResults* results,
+                                   CodegenContext& context) const final;
 };
-
-// Alias for function that rewrites the block in the CodegenPassUnit for the
-// given RamConfiguration.
-using ram_rewrite_function_t = std::function<absl::StatusOr<bool>(
-    CodegenPassUnit*, const CodegenPassOptions&, const RamConfiguration&)>;
 
 }  // namespace xls::verilog
 
-#endif  // XLS_CODEGEN_RAM_CHANNEL_REWRITE_PASS_H_
+#endif  // XLS_CODEGEN_RAM_REWRITE_PASS_H_

@@ -15,6 +15,11 @@
 # Tests that consume the publicly-exposed API.
 
 package(
+    default_applicable_licenses = ["//:license"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -22,9 +27,10 @@ cc_test(
     name = "function_builder_test",
     srcs = ["function_builder_test.cc"],
     deps = [
-        "//xls/common:xls_gunit",
         "//xls/public:function_builder",
+        "//xls/public:ir",
         "//xls/public:status_matchers",
         "//xls/public:xls_gunit_main",
+        "@googletest//:gtest",
     ],
 )

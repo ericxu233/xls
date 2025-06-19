@@ -16,6 +16,8 @@
 
 load(
     "//xls/build_rules:xls_build_defs.bzl",
+    "PROC_WRAPPER_TYPE",
+    "cc_xls_ir_jit_wrapper",
     "xls_benchmark_ir",
     "xls_dslx_ir",
     "xls_dslx_library",
@@ -29,6 +31,10 @@ load(
 package(
     default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_users"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],
 )
 
@@ -63,30 +69,38 @@ xls_dslx_ir(
     library = ":aes_ctr_dslx",
 )
 
+cc_xls_ir_jit_wrapper(
+    name = "aes_ctr_wrapper",
+    src = ":aes_ctr.ir",
+    jit_wrapper_args = {
+        "class_name": "AesCtr",
+        "namespace": "xls::aes::wrapped",
+    },
+    wrapper_type = PROC_WRAPPER_TYPE,
+)
+
 cc_test(
     name = "aes_ctr_test",
     srcs = ["aes_ctr_test.cc"],
-    data = [
-        ":aes_ctr.ir",
-    ],
     deps = [
+        ":aes_ctr_wrapper",
         ":aes_test_common",
         "//xls/common:exit_status",
         "//xls/common:init_xls",
-        "//xls/common/file:filesystem",
-        "//xls/common/file:get_runfile_path",
-        "//xls/common/logging",
         "//xls/common/status:status_macros",
+        "//xls/interpreter:proc_runtime",
+        "//xls/ir",
+        "//xls/ir:channel",
         "//xls/ir:events",
-        "//xls/ir:ir_parser",
         "//xls/jit:jit_channel_queue",
-        "//xls/jit:jit_proc_runtime",
         "@boringssl//:crypto",
         "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/random",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
     ],
 )
@@ -101,7 +115,6 @@ xls_ir_cc_library_macro(
     name = "aes_decrypt_cc",
     src = ":aes_decrypt.ir",
     namespaces = "xls,aes",
-    top = "aes_decrypt",
 )
 
 xls_dslx_library(
@@ -123,7 +136,6 @@ xls_ir_cc_library_macro(
     name = "aes_encrypt_cc",
     src = ":aes_encrypt.ir",
     namespaces = "xls,aes",
-    top = "aes_encrypt",
 )
 
 xls_dslx_library(
@@ -152,31 +164,40 @@ xls_dslx_ir(
     library = ":aes_gcm_dslx",
 )
 
+cc_xls_ir_jit_wrapper(
+    name = "aes_gcm_wrapper",
+    src = ":aes_gcm.ir",
+    jit_wrapper_args = {
+        "class_name": "AesGcm",
+        "namespace": "xls::aes::wrapped",
+    },
+    wrapper_type = PROC_WRAPPER_TYPE,
+)
+
 cc_test(
     name = "aes_gcm_test",
     srcs = ["aes_gcm_test.cc"],
-    data = [
-        ":aes_gcm.ir",
-    ],
     tags = ["optonly"],
     deps = [
+        ":aes_gcm_wrapper",
         ":aes_test_common",
         "//xls/common:exit_status",
         "//xls/common:init_xls",
-        "//xls/common/file:filesystem",
-        "//xls/common/file:get_runfile_path",
-        "//xls/common/logging",
-        "//xls/common/logging:vlog_is_on",
         "//xls/common/status:status_macros",
-        "//xls/interpreter:serial_proc_runtime",
-        "//xls/ir:ir_parser",
-        "//xls/jit:jit_proc_runtime",
+        "//xls/interpreter:proc_runtime",
+        "//xls/ir",
+        "//xls/ir:bits",
+        "//xls/ir:channel",
+        "//xls/ir:value",
         "@boringssl//:crypto",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:vlog_is_on",
         "@com_google_absl//absl/random",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
     ],
 )
 
@@ -219,14 +240,17 @@ cc_test(
         ":aes_test_common",
         "//xls/common:exit_status",
         "//xls/common:init_xls",
-        "//xls/common/logging",
         "//xls/common/status:status_macros",
+        "//xls/ir:bits",
         "//xls/ir:value",
         "@boringssl//:crypto",
         "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/random",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/time",
     ],
@@ -238,7 +262,6 @@ cc_library(
     hdrs = ["aes_test_common.h"],
     deps = [
         "//xls/common/status:status_macros",
-        "//xls/ir",
         "//xls/ir:bits",
         "//xls/ir:bits_ops",
         "//xls/ir:value",
@@ -251,6 +274,8 @@ cc_library(
 xls_benchmark_ir(
     name = "aes_ctr_benchmark_ir",
     src = ":aes_ctr.ir",
+    # TODO: Hits OOM issues during synthesis; should get this fixed.
+    synthesize = False,
 )
 
 xls_benchmark_ir(
@@ -270,6 +295,7 @@ cc_binary(
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/random",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
     ],

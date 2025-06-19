@@ -15,7 +15,9 @@
 #ifndef XLS_IR_UNWRAPPING_ITERATOR_H_
 #define XLS_IR_UNWRAPPING_ITERATOR_H_
 
+#include <cstddef>
 #include <iterator>
+#include <type_traits>
 #include <utility>
 
 namespace xls {
@@ -58,6 +60,7 @@ namespace xls {
 // For simplicity, UnwrappingIterator is currently unconditionally an
 // input_iterator -- it doesn't inherit any superpowers NestedIterator may have.
 template <typename NestedIter>
+  requires(std::input_iterator<NestedIter>)
 class UnwrappingIterator {
  public:
   using iterator_category = std::input_iterator_tag;
@@ -68,8 +71,12 @@ class UnwrappingIterator {
 
   explicit UnwrappingIterator(NestedIter iter) : iter_(std::move(iter)) {}
 
-  auto operator*() -> value_type { return iter_->get(); }
-  auto operator->() -> value_type { return iter_->get(); }
+  UnwrappingIterator()
+    requires(std::is_default_constructible_v<NestedIter>)
+      : iter_() {}
+
+  auto operator*() const -> value_type { return iter_->get(); }
+  auto operator->() const -> value_type { return iter_->get(); }
   UnwrappingIterator& operator++() {
     ++iter_;
     return *this;

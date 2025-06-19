@@ -14,6 +14,9 @@
 
 #include "xls/ir/bit_push_buffer.h"
 
+#include <cstdint>
+#include <vector>
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -27,7 +30,9 @@ TEST(BitPushBufferTest, IsEmptyAfterConstruction) {
 
   EXPECT_TRUE(buffer.empty());
   EXPECT_EQ(buffer.size_in_bytes(), 0);
-  EXPECT_THAT(buffer.GetUint8Data(), IsEmpty());
+  EXPECT_EQ(buffer.size_in_bits(), 0);
+  EXPECT_THAT(buffer.GetUint8DataWithMsbPadding(), IsEmpty());
+  EXPECT_THAT(buffer.GetUint8DataWithLsbPadding(), IsEmpty());
 }
 
 TEST(BitPushBufferTest, HasSingle0AfterPushingFalse) {
@@ -37,7 +42,9 @@ TEST(BitPushBufferTest, HasSingle0AfterPushingFalse) {
 
   EXPECT_FALSE(buffer.empty());
   EXPECT_EQ(buffer.size_in_bytes(), 1);
-  EXPECT_EQ(buffer.GetUint8Data(), std::vector<uint8_t>{0});
+  EXPECT_EQ(buffer.GetUint8DataWithMsbPadding(), std::vector<uint8_t>{0});
+  EXPECT_EQ(buffer.GetUint8DataWithLsbPadding(), std::vector<uint8_t>{0});
+  EXPECT_EQ(buffer.size_in_bits(), 1);
 }
 
 TEST(BitPushBufferTest, HasSingle1InMsbAfterPushingTrue) {
@@ -47,7 +54,9 @@ TEST(BitPushBufferTest, HasSingle1InMsbAfterPushingTrue) {
 
   EXPECT_FALSE(buffer.empty());
   EXPECT_EQ(buffer.size_in_bytes(), 1);
-  EXPECT_EQ(buffer.GetUint8Data(), std::vector<uint8_t>{1 << 7});
+  EXPECT_EQ(buffer.GetUint8DataWithLsbPadding(), std::vector<uint8_t>{1 << 7});
+  EXPECT_EQ(buffer.GetUint8DataWithMsbPadding(), std::vector<uint8_t>{1});
+  EXPECT_EQ(buffer.size_in_bits(), 1);
 }
 
 TEST(BitPushBufferTest, Has1InSecondMsbAfterPushingFalseTrue) {
@@ -58,7 +67,10 @@ TEST(BitPushBufferTest, Has1InSecondMsbAfterPushingFalseTrue) {
 
   EXPECT_FALSE(buffer.empty());
   EXPECT_EQ(buffer.size_in_bytes(), 1);
-  EXPECT_EQ(buffer.GetUint8Data(), std::vector<uint8_t>{1 << 6});
+  EXPECT_EQ(buffer.GetUint8DataWithLsbPadding(),
+            std::vector<uint8_t>{0b01 << 6});
+  EXPECT_EQ(buffer.GetUint8DataWithMsbPadding(), std::vector<uint8_t>{0b01});
+  EXPECT_EQ(buffer.size_in_bits(), 2);
 }
 
 TEST(BitPushBufferTest, IsOneByteAfterPushing8Values) {
@@ -70,6 +82,7 @@ TEST(BitPushBufferTest, IsOneByteAfterPushing8Values) {
 
   EXPECT_FALSE(buffer.empty());
   EXPECT_EQ(buffer.size_in_bytes(), 1);
+  EXPECT_EQ(buffer.size_in_bits(), 8);
 }
 
 TEST(BitPushBufferTest, Has1SecondBytesMsbAfterPushing8False1True) {
@@ -82,7 +95,17 @@ TEST(BitPushBufferTest, Has1SecondBytesMsbAfterPushing8False1True) {
 
   EXPECT_FALSE(buffer.empty());
   EXPECT_EQ(buffer.size_in_bytes(), 2);
-  EXPECT_EQ(buffer.GetUint8Data(), std::vector<uint8_t>({0, 1 << 7}));
+  EXPECT_EQ(buffer.GetUint8DataWithLsbPadding(),
+            std::vector<uint8_t>({0, 1 << 7}));
+  EXPECT_EQ(buffer.GetUint8DataWithMsbPadding(), std::vector<uint8_t>({0, 1}));
+  EXPECT_EQ(buffer.size_in_bits(), 9);
+}
+
+TEST(BitPushBufferTest, ToString) {
+  BitPushBuffer buffer;
+  buffer.PushBit(true);
+  buffer.PushBit(false);
+  EXPECT_EQ(buffer.ToString(), "0b10");
 }
 
 }  // namespace

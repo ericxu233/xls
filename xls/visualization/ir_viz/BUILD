@@ -12,17 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@xls_pip_deps//:requirements.bzl", "requirement")
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
 
 # pytype binary and test
 load("@io_bazel_rules_closure//closure:defs.bzl", "closure_js_binary", "closure_js_library")
-load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@rules_python//python:proto.bzl", "py_proto_library")
+load("@xls_pip_deps//:requirements.bzl", "requirement")
+
+# Load proto_library
 load("//xls/examples:list_filegroup_files.bzl", "list_filegroup_files")
 # js_binary used in this file
 # cc_proto_library is used in this file
 
 package(
-    default_visibility = ["//xls:xls_internal"],
+    default_applicable_licenses = ["//:license"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -53,8 +60,6 @@ py_binary(
         ":js_compiled",
         "//xls/tools:opt_main",
     ],
-    python_version = "PY3",
-    srcs_version = "PY3",
     deps = [
         requirement("Flask"),
         requirement("Jinja2"),
@@ -63,8 +68,8 @@ py_binary(
         requirement("MarkupSafe"),
         requirement("Werkzeug"),
         "//xls/common:runfiles",
-        "@com_google_absl_py//absl:app",
-        "@com_google_absl_py//absl/flags",
+        "@abseil-py//absl:app",
+        "@abseil-py//absl/flags",
     ],
 )
 
@@ -75,14 +80,138 @@ build_test(
     targets = [":app"],
 )
 
+py_proto_library(
+    name = "visualization_proto_py_pb2",
+    visibility = ["//xls:xls_internal"],
+    deps = [":visualization_proto"],
+)
+
 cc_proto_library(
     name = "visualization_cc_proto",
+    visibility = ["//xls:xls_internal"],
     deps = [":visualization_proto"],
 )
 
 proto_library(
     name = "visualization_proto",
     srcs = ["visualization.proto"],
+    visibility = ["//xls:xls_internal"],
+)
+
+cc_library(
+    name = "node_attribute_visitor",
+    srcs = ["node_attribute_visitor.cc"],
+    hdrs = ["node_attribute_visitor.h"],
+    visibility = ["//xls:xls_internal"],
+    deps = [
+        ":visualization_cc_proto",
+        "//xls/ir",
+        "//xls/ir:format_preference",
+        "//xls/ir:format_strings",
+        "@com_google_absl//absl/status",
+    ],
+)
+
+cc_library(
+    name = "ir_to_proto",
+    srcs = ["ir_to_proto.cc"],
+    hdrs = ["ir_to_proto.h"],
+    visibility = ["//xls:xls_internal"],
+    deps = [
+        ":node_attribute_visitor",
+        ":visualization_cc_proto",
+        "//xls/common/status:ret_check",
+        "//xls/common/status:status_macros",
+        "//xls/estimators/area_model:area_estimator",
+        "//xls/estimators/delay_model:analyze_critical_path",
+        "//xls/estimators/delay_model:delay_estimator",
+        "//xls/ir",
+        "//xls/ir:op",
+        "//xls/passes:bdd_query_engine",
+        "//xls/passes:partial_info_query_engine",
+        "//xls/passes:proc_state_range_query_engine",
+        "//xls/passes:query_engine",
+        "//xls/passes:token_provenance_analysis",
+        "//xls/passes:union_query_engine",
+        "//xls/scheduling:pipeline_schedule",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:span",
+        "@re2",
+    ],
+)
+
+py_binary(
+    name = "ir_to_cytoscape",
+    srcs = ["ir_to_cytoscape.py"],
+    data = [":ir_to_proto_main"],
+    deps = [
+        ":visualization_proto_py_pb2",
+        requirement("networkx"),
+        "//xls/common:runfiles",
+        "@abseil-py//absl:app",
+        "@abseil-py//absl/flags",
+    ],
+)
+
+cc_test(
+    name = "ir_to_proto_test",
+    srcs = ["ir_to_proto_test.cc"],
+    data = glob([
+        "testdata/ir_to_html_test_*",
+    ]),
+    deps = [
+        ":ir_to_proto",
+        ":visualization_cc_proto",
+        "//xls/common:golden_files",
+        "//xls/common:xls_gunit_main",
+        "//xls/common/status:matchers",
+        "//xls/estimators/delay_model:delay_estimator",
+        "//xls/estimators/delay_model:delay_estimators",
+        "//xls/ir",
+        "//xls/ir:function_builder",
+        "//xls/ir:ir_test_base",
+        "//xls/scheduling:pipeline_schedule",
+        "//xls/scheduling:scheduling_options",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings:str_format",
+        "@googletest//:gtest",
+    ],
+)
+
+cc_binary(
+    name = "ir_to_proto_main",
+    srcs = ["ir_to_proto_main.cc"],
+    deps = [
+        ":ir_to_proto",
+        ":visualization_cc_proto",
+        "//xls/common:exit_status",
+        "//xls/common:init_xls",
+        "//xls/common/file:filesystem",
+        "//xls/common/status:ret_check",
+        "//xls/common/status:status_macros",
+        "//xls/estimators/area_model:area_estimator",
+        "//xls/estimators/area_model:area_estimators",
+        "//xls/estimators/delay_model:delay_estimator",
+        "//xls/estimators/delay_model:delay_estimators",
+        "//xls/ir",
+        "//xls/ir:ir_parser",
+        "//xls/scheduling:pipeline_schedule",
+        "//xls/scheduling:run_pipeline_schedule",
+        "//xls/scheduling:scheduling_options",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_protobuf//:protobuf",
+        "@com_google_protobuf//src/google/protobuf/io",
+    ],
 )
 
 cc_library(
@@ -90,20 +219,15 @@ cc_library(
     srcs = ["ir_to_json.cc"],
     hdrs = ["ir_to_json.h"],
     deps = [
+        ":ir_to_proto",
         ":visualization_cc_proto",
-        "//xls/common/logging",
         "//xls/common/status:status_macros",
-        "//xls/delay_model:analyze_critical_path",
-        "//xls/delay_model:delay_estimator",
+        "//xls/estimators/delay_model:delay_estimator",
         "//xls/ir",
-        "//xls/ir:op",
-        "//xls/passes:bdd_query_engine",
         "//xls/scheduling:pipeline_schedule",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_protobuf//:protobuf",
-        "@com_googlesource_code_re2//:re2",
+        "@com_google_protobuf//:json_util",
     ],
 )
 
@@ -111,21 +235,21 @@ cc_test(
     name = "ir_to_json_test",
     srcs = ["ir_to_json_test.cc"],
     data = glob([
-        "testdata/ir_to_json_test_*",
+        "testdata/ir_to_html_test_*",
     ]),
     deps = [
         ":ir_to_json",
-        "//xls/common:golden_files",
-        "//xls/common:xls_gunit",
         "//xls/common:xls_gunit_main",
-        "//xls/common/logging",
         "//xls/common/status:matchers",
-        "//xls/delay_model:delay_estimator",
-        "//xls/delay_model:delay_estimators",
+        "//xls/estimators/delay_model:delay_estimator",
+        "//xls/estimators/delay_model:delay_estimators",
         "//xls/ir",
         "//xls/ir:function_builder",
         "//xls/ir:ir_test_base",
-        "@com_google_absl//absl/memory",
+        "//xls/scheduling:pipeline_schedule",
+        "//xls/scheduling:scheduling_options",
+        "@com_google_absl//absl/log",
+        "@googletest//:gtest",
     ],
 )
 
@@ -137,20 +261,54 @@ cc_binary(
         "//xls/common:exit_status",
         "//xls/common:init_xls",
         "//xls/common/file:filesystem",
-        "//xls/common/logging",
         "//xls/common/status:ret_check",
         "//xls/common/status:status_macros",
-        "//xls/delay_model:delay_estimator",
-        "//xls/delay_model:delay_estimators",
+        "//xls/estimators/delay_model:delay_estimator",
+        "//xls/estimators/delay_model:delay_estimators",
         "//xls/ir",
         "//xls/ir:ir_parser",
         "//xls/scheduling:pipeline_schedule",
         "//xls/scheduling:run_pipeline_schedule",
         "//xls/scheduling:scheduling_options",
         "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+cc_binary(
+    name = "ir_to_csvs_main",
+    srcs = ["ir_to_csvs_main.cc"],
+    deps = [
+        ":ir_to_proto",
+        ":visualization_cc_proto",
+        "//xls/common:exit_status",
+        "//xls/common:init_xls",
+        "//xls/common/file:filesystem",
+        "//xls/common/status:ret_check",
+        "//xls/common/status:status_macros",
+        "//xls/estimators/area_model:area_estimator",
+        "//xls/estimators/area_model:area_estimators",
+        "//xls/estimators/delay_model:delay_estimator",
+        "//xls/estimators/delay_model:delay_estimators",
+        "//xls/ir",
+        "//xls/ir:ir_parser",
+        "//xls/scheduling:pipeline_schedule",
+        "//xls/scheduling:run_pipeline_schedule",
+        "//xls/scheduling:scheduling_options",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@riegeli//riegeli/bytes:fd_writer",
+        "@riegeli//riegeli/csv:csv_record",
+        "@riegeli//riegeli/csv:csv_writer",
     ],
 )
 

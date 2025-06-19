@@ -32,7 +32,7 @@ load(
     "enable_generated_file_wrapper",
 )
 load(
-    "//xls/build_rules:xls_type_check_helpers.bzl",
+    "//xls/build_rules:xls_type_check_utils.bzl",
     "bool_type_check",
     "dictionary_type_check",
     "string_type_check",
@@ -193,4 +193,5 @@ def xls_ir_verilog_build_and_test(
     build_test(
         name = "__" + name,
         targets = [":" + name],
+        tags = kwargs["tags"] if "tags" in kwargs else [],
     )

@@ -18,8 +18,16 @@
 #include <memory>
 #include <string>
 
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_format.h"
+#include "xls/common/casts.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/interp_value.h"
+#include "xls/dslx/type_system/parametric_expression.h"
+#include "xls/dslx/type_system/type.h"
 
 namespace xls::dslx {
 namespace {
@@ -29,17 +37,16 @@ absl::Status ParametricBindDims(const T& param_type, const T& arg_type,
                                 ParametricBindContext& ctx) {
   // Create bindings for symbolic parameter dimensions based on argument values
   // passed.
-  const ConcreteTypeDim& param_dim = param_type.size();
-  const ConcreteTypeDim& arg_dim = arg_type.size();
-  return ParametricBindConcreteTypeDim(param_type, param_dim, arg_type, arg_dim,
-                                       ctx);
+  const TypeDim& param_dim = param_type.size();
+  const TypeDim& arg_dim = arg_type.size();
+  return ParametricBindTypeDim(param_type, param_dim, arg_type, arg_dim, ctx);
 }
 
 absl::Status ParametricBindBits(const BitsType& param_bits,
                                 const BitsType& arg_bits,
                                 ParametricBindContext& ctx) {
-  return ParametricBindConcreteTypeDim(param_bits, param_bits.size(), arg_bits,
-                                       arg_bits.size(), ctx);
+  return ParametricBindTypeDim(param_bits, param_bits.size(), arg_bits,
+                               arg_bits.size(), ctx);
 }
 
 absl::Status ParametricBindTuple(const TupleType& param_type,
@@ -47,8 +54,8 @@ absl::Status ParametricBindTuple(const TupleType& param_type,
                                  ParametricBindContext& ctx) {
   XLS_RET_CHECK_EQ(param_type.size(), arg_type.size());
   for (int64_t i = 0; i < param_type.size(); ++i) {
-    const ConcreteType& param_member = param_type.GetMemberType(i);
-    const ConcreteType& arg_member = arg_type.GetMemberType(i);
+    const Type& param_member = param_type.GetMemberType(i);
+    const Type& arg_member = arg_type.GetMemberType(i);
     XLS_RETURN_IF_ERROR(ParametricBind(param_member, arg_member, ctx));
   }
   return absl::OkStatus();
@@ -59,8 +66,8 @@ absl::Status ParametricBindStruct(const StructType& param_type,
                                   ParametricBindContext& ctx) {
   XLS_RET_CHECK_EQ(param_type.size(), arg_type.size());
   for (int64_t i = 0; i < param_type.size(); ++i) {
-    const ConcreteType& param_member = param_type.GetMemberType(i);
-    const ConcreteType& arg_member = arg_type.GetMemberType(i);
+    const Type& param_member = param_type.GetMemberType(i);
+    const Type& arg_member = arg_type.GetMemberType(i);
     XLS_RETURN_IF_ERROR(ParametricBind(param_member, arg_member, ctx));
   }
   return absl::OkStatus();
@@ -74,87 +81,181 @@ absl::Status ParametricBindArray(const ArrayType& param_type,
   return ParametricBindDims(param_type, arg_type, ctx);
 }
 
+absl::Status ParametricBindBitsToConstructor(const ArrayType& param_type,
+                                             const BitsType& arg_type,
+                                             ParametricBindContext& ctx) {
+  const BitsConstructorType* bits_constructor =
+      down_cast<const BitsConstructorType*>(&param_type.element_type());
+
+  // First we bind the signedness.
+  XLS_RETURN_IF_ERROR(ParametricBindTypeDim(
+      *bits_constructor, bits_constructor->is_signed(), arg_type,
+      TypeDim::CreateBool(arg_type.is_signed()), ctx));
+
+  // Then we bind the number of bits to the array size.
+  XLS_RETURN_IF_ERROR(ParametricBindTypeDim(param_type, param_type.size(),
+                                            arg_type, arg_type.size(), ctx));
+
+  return absl::OkStatus();
+}
+
+absl::Status ParametricBindConstructorToBits(const BitsType& param_type,
+                                             const ArrayType& arg_type,
+                                             ParametricBindContext& ctx) {
+  // Extract the bits constructor (element type) that's being turned into a
+  // bits-like type with the array wrapper.
+  const BitsConstructorType* arg_bits_constructor =
+      down_cast<const BitsConstructorType*>(&arg_type.element_type());
+
+  // First bind the signedness.
+  bool param_signedness = param_type.is_signed();
+  XLS_RETURN_IF_ERROR(
+      ParametricBindTypeDim(param_type, TypeDim::CreateBool(param_signedness),
+                            arg_type, arg_bits_constructor->is_signed(), ctx));
+
+  // Then bind the size.
+  return ParametricBindTypeDim(param_type, param_type.size(), arg_type,
+                               arg_type.size(), ctx);
+}
+
+absl::Status ParametricBindBitsConstructors(
+    const BitsConstructorType& param_type, const BitsConstructorType& arg_type,
+    ParametricBindContext& ctx) {
+  return ParametricBindTypeDim(param_type, param_type.is_signed(), arg_type,
+                               arg_type.is_signed(), ctx);
+}
+
 }  // namespace
 
-absl::Status ParametricBindConcreteTypeDim(const ConcreteType& param_type,
-                                           const ConcreteTypeDim& param_dim,
-                                           const ConcreteType& arg_type,
-                                           const ConcreteTypeDim& arg_dim,
-                                           ParametricBindContext& ctx) {
-  XLS_VLOG(5) << "ParametricBindConcreteTypeDim;"
-              << " param_type: " << param_type << " param_dim: " << param_dim
-              << " arg_type: " << arg_type << " arg_dim: " << arg_dim;
+absl::Status ParametricBindTypeDim(const Type& formal_type,
+                                   const TypeDim& formal_dim,
+                                   const Type& actual_type,
+                                   const TypeDim& actual_dim,
+                                   ParametricBindContext& ctx) {
+  VLOG(5) << "ParametricBindTypeDim;" << " formal_type: " << formal_type
+          << " formal_dim: " << formal_dim << " actual_type: " << actual_type
+          << " actual_dim: " << actual_dim;
 
-  XLS_RET_CHECK(!arg_dim.IsParametric()) << arg_dim.ToString();
+  XLS_RET_CHECK(!actual_dim.IsParametric()) << actual_dim.ToString();
 
   // See if there's a parametric symbol in the formal argument we need to bind
   // vs the actual argument.
-  const ParametricSymbol* symbol = TryGetParametricSymbol(param_dim);
+  const ParametricSymbol* symbol = TryGetParametricSymbol(formal_dim);
   if (symbol == nullptr) {
-    return absl::OkStatus();  // Nothing to bind in the formal argument type.
-  }
-
-  XLS_ASSIGN_OR_RETURN(int64_t arg_dim_i64, arg_dim.GetAsInt64());
-
-  // See if this is the first time we're binding this parametric symbol.
-  const std::string& pdim_name = symbol->identifier();
-  if (!ctx.parametric_env.contains(pdim_name)) {
-    XLS_RET_CHECK(ctx.parametric_binding_types.contains(pdim_name))
-        << "Cannot bind " << pdim_name << " : it has no associated type.";
-    XLS_VLOG(5) << "Binding " << pdim_name << " to " << arg_dim_i64;
-    const ConcreteType& type = *ctx.parametric_binding_types.at(pdim_name);
-    XLS_ASSIGN_OR_RETURN(ConcreteTypeDim bit_count, type.GetTotalBitCount());
-    XLS_ASSIGN_OR_RETURN(int64_t width, bit_count.GetAsInt64());
-    ctx.parametric_env.emplace(
-        pdim_name,
-        InterpValue::MakeUBits(/*bit_count=*/width, /*value=*/arg_dim_i64));
+    VLOG(5) << "No parametric symbol in formal_dim: " << formal_dim;
+    // Nothing to bind in the formal argument type.
     return absl::OkStatus();
   }
 
-  const InterpValue& seen = ctx.parametric_env.at(pdim_name);
+  XLS_ASSIGN_OR_RETURN(int64_t actual_dim_i64, actual_dim.GetAsInt64());
+
+  // See if this is the first time we're binding this parametric symbol.
+  const std::string& formal_name = symbol->identifier();
+  if (!ctx.parametric_env.contains(formal_name)) {
+    XLS_RET_CHECK(ctx.parametric_binding_types.contains(formal_name))
+        << "Cannot bind " << formal_name << " : it has no associated type.";
+    VLOG(5) << "Binding " << formal_name << " to " << actual_dim_i64;
+    const Type& type = *ctx.parametric_binding_types.at(formal_name);
+    XLS_ASSIGN_OR_RETURN(TypeDim bit_count, type.GetTotalBitCount());
+    XLS_ASSIGN_OR_RETURN(int64_t width, bit_count.GetAsInt64());
+    ctx.parametric_env.emplace(
+        formal_name,
+        InterpValue::MakeUBits(/*bit_count=*/width, /*value=*/actual_dim_i64));
+    return absl::OkStatus();
+  }
+
+  const InterpValue& seen = ctx.parametric_env.at(formal_name);
   XLS_ASSIGN_OR_RETURN(int64_t seen_value, seen.GetBitValueViaSign());
-  if (seen_value == arg_dim_i64) {
+  if (seen_value == actual_dim_i64) {
     return absl::OkStatus();  // No contradiction.
   }
 
   // We see a conflict between something we previously observed and something
   // we are now observing -- make an appropriate error.
-  if (auto it = ctx.parametric_default_exprs.find(pdim_name);
+  if (auto it = ctx.parametric_default_exprs.find(formal_name);
       it != ctx.parametric_default_exprs.end() && it->second != nullptr) {
     const Expr* expr = it->second;
-    // Error is violated constraint.
+    // Error is violated "constraint"; i.e. we see a binding that contradicts a
+    // previous binding for the same key.
     std::string message = absl::StrFormat(
         "Parametric constraint violated, saw %s = %d; then %s = %s = %d",
-        pdim_name, seen_value, pdim_name, expr->ToString(), arg_dim_i64);
+        formal_name, seen_value, formal_name, expr->ToString(), actual_dim_i64);
     auto saw_type =
         std::make_unique<BitsType>(/*signed=*/false, /*size=*/seen_value);
     return ctx.deduce_ctx.TypeMismatchError(ctx.span, expr, *saw_type, nullptr,
-                                            arg_type, message);
+                                            actual_type, message);
   }
 
   // Error is conflicting argument types.
   std::string message = absl::StrFormat(
       "Parametric value %s was bound to different values at different "
       "places in invocation; saw: %d; then: %d",
-      pdim_name, seen_value, arg_dim_i64);
-  return ctx.deduce_ctx.TypeMismatchError(ctx.span, nullptr, param_type,
-                                          nullptr, arg_type, message);
+      formal_name, seen_value, actual_dim_i64);
+  return ctx.deduce_ctx.TypeMismatchError(ctx.span, nullptr, formal_type,
+                                          nullptr, actual_type, message);
 }
 
-absl::Status ParametricBind(const ConcreteType& param_type,
-                            const ConcreteType& arg_type,
+absl::Status ParametricBind(const Type& param_type, const Type& arg_type,
                             ParametricBindContext& ctx) {
+  VLOG(10) << "ParametricBind; param_type: " << param_type
+           << " arg_type: " << arg_type;
+
+  auto wrong_kind = [&]() {
+    std::string message = absl::StrFormat(
+        "expected argument kind '%s' to match parameter kind '%s'",
+        arg_type.GetDebugTypeName(), param_type.GetDebugTypeName());
+    return ctx.deduce_ctx.TypeMismatchError(ctx.span, nullptr, param_type,
+                                            nullptr, arg_type, message);
+  };
+
+  // Handle: param is bits constructor and arg is bits constructor.
+  if (IsBitsConstructor(param_type) && IsBitsConstructor(arg_type)) {
+    const BitsConstructorType* param =
+        down_cast<const BitsConstructorType*>(&param_type);
+    const BitsConstructorType* arg =
+        down_cast<const BitsConstructorType*>(&arg_type);
+    return ParametricBindBitsConstructors(*param, *arg, ctx);
+  }
+
+  // Handle: param is bits constructor and arg is bits type.
+  //
+  // Note that we actually need to handle the distinction between
+  // BitsConstructorType and BitsType here, because array of BitsConstructorType
+  // has another dimension to bind (the signedness).
+  if (auto* arg = dynamic_cast<const BitsType*>(&arg_type);
+      arg != nullptr && IsArrayOfBitsConstructor(param_type)) {
+    auto* param = down_cast<const ArrayType*>(&param_type);
+    return ParametricBindBitsToConstructor(*param, *arg, ctx);
+  }
+
+  // Handle: param is bits and arg is array-of-bits-constructor.
+  if (auto* param_bits = dynamic_cast<const BitsType*>(&param_type);
+      param_bits != nullptr && IsArrayOfBitsConstructor(arg_type)) {
+    auto* arg = down_cast<const ArrayType*>(&arg_type);
+    return ParametricBindConstructorToBits(*param_bits, *arg, ctx);
+  }
+
+  // Handle: param and arg are both bits types.
   if (auto* param_bits = dynamic_cast<const BitsType*>(&param_type)) {
     auto* arg_bits = dynamic_cast<const BitsType*>(&arg_type);
-    XLS_RET_CHECK(arg_bits != nullptr);
+    if (arg_bits == nullptr) {
+      return wrong_kind();
+    }
     return ParametricBindBits(*param_bits, *arg_bits, ctx);
   }
+
   if (auto* param_tuple = dynamic_cast<const TupleType*>(&param_type)) {
     auto* arg_tuple = dynamic_cast<const TupleType*>(&arg_type);
+    if (arg_tuple == nullptr) {
+      return wrong_kind();
+    }
     return ParametricBindTuple(*param_tuple, *arg_tuple, ctx);
   }
   if (auto* param_struct = dynamic_cast<const StructType*>(&param_type)) {
     auto* arg_struct = dynamic_cast<const StructType*>(&arg_type);
+    if (arg_struct == nullptr) {
+      return wrong_kind();
+    }
     const StructDef& param_nominal = param_struct->nominal_type();
     const StructDef& arg_nominal = arg_struct->nominal_type();
     if (&param_nominal != &arg_nominal) {
@@ -168,7 +269,9 @@ absl::Status ParametricBind(const ConcreteType& param_type,
   }
   if (auto* param_array = dynamic_cast<const ArrayType*>(&param_type)) {
     auto* arg_array = dynamic_cast<const ArrayType*>(&arg_type);
-    XLS_RET_CHECK(arg_array != nullptr);
+    if (arg_array == nullptr) {
+      return wrong_kind();
+    }
     return ParametricBindArray(*param_array, *arg_array, ctx);
   }
   if (dynamic_cast<const EnumType*>(&param_type) != nullptr) {
@@ -189,8 +292,9 @@ absl::Status ParametricBind(const ConcreteType& param_type,
   }
 
   return absl::InternalError(
-      absl::StrFormat("Unhandled parameter type for symbolic binding: %s @ %s",
-                      param_type.ToString(), ctx.span.ToString()));
+      absl::StrFormat("Unhandled for symbolic binding; param: %s, arg: %s @ %s",
+                      param_type.ToString(), arg_type.ToString(),
+                      ctx.span.ToString(ctx.deduce_ctx.file_table())));
 }
 
 }  // namespace xls::dslx

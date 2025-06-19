@@ -15,11 +15,13 @@
 #ifndef XLS_IR_CODE_TEMPLATE_H_
 #define XLS_IR_CODE_TEMPLATE_H_
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 

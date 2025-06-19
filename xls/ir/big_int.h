@@ -15,11 +15,14 @@
 #ifndef XLS_IR_BIG_INT_H_
 #define XLS_IR_BIG_INT_H_
 
+#include <cstdint>
 #include <ostream>
+#include <string>
 #include <tuple>
 
 #include "absl/status/statusor.h"
-#include "openssl/bn.h"
+#include "openssl/base.h"
+#include "openssl/bn.h"  // IWYU pragma: keep
 #include "xls/ir/bits.h"
 
 namespace xls {
@@ -119,7 +122,7 @@ class BigInt {
   static BigInt Exp2(int64_t e);
 
  private:
-  BIGNUM bn_;
+  BIGNUM bn_{};
 };
 
 std::ostream& operator<<(std::ostream& os, const BigInt& big_int);

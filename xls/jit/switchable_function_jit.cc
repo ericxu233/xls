@@ -20,10 +20,10 @@
 #include <utility>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/interpreter/ir_interpreter.h"
@@ -51,8 +51,10 @@ constexpr ExecutionType kRealDefaultExecutionType = ExecutionType::kJit;
 absl::StatusOr<std::unique_ptr<SwitchableFunctionJit>>
 SwitchableFunctionJit::CreateJit(Function* xls_function, int64_t opt_level,
                                  JitObserver* observer) {
-  XLS_ASSIGN_OR_RETURN(auto jit,
-                       FunctionJit::Create(xls_function, opt_level, observer));
+  XLS_ASSIGN_OR_RETURN(
+      auto jit,
+      FunctionJit::Create(xls_function, opt_level,
+                          /*include_observer_callbacks=*/false, observer));
   return std::unique_ptr<SwitchableFunctionJit>(new SwitchableFunctionJit(
       xls_function, /*use_jit=*/true, std::move(jit)));
 }
@@ -68,7 +70,7 @@ SwitchableFunctionJit::Create(Function* xls_function, ExecutionType execution,
                               int64_t opt_level, JitObserver* observer) {
   if (execution == ExecutionType::kDefault) {
     execution = kRealDefaultExecutionType;
-    XLS_LOG_IF(WARNING, execution == ExecutionType::kInterpreter)
+    LOG_IF(WARNING, execution == ExecutionType::kInterpreter)
         << "Interpreter is being used in place of JIT.";
   }
   switch (execution) {
@@ -78,7 +80,7 @@ SwitchableFunctionJit::Create(Function* xls_function, ExecutionType execution,
       return SwitchableFunctionJit::CreateJit(xls_function, opt_level,
                                               observer);
     case ExecutionType::kDefault:
-      XLS_LOG(FATAL) << "Unreachable";
+      LOG(FATAL) << "Unreachable";
   }
 }
 

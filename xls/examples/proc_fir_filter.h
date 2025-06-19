@@ -11,15 +11,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_EXAMPLES_PROC_FIR_FILTER_H
-#define XLS_EXAMPLES_PROC_FIR_FILTER_H
+#ifndef XLS_EXAMPLES_PROC_FIR_FILTER_H_
+#define XLS_EXAMPLES_PROC_FIR_FILTER_H_
 
 #include <string_view>
-#include <vector>
 
+#include "absl/status/statusor.h"
 #include "xls/ir/channel.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/package.h"
+#include "xls/ir/value.h"
 
 namespace xls {
 
@@ -33,10 +34,11 @@ namespace xls {
 // graphics is an FIR filter. In the wireless world, FIR filters can be used to
 // model and therefore mitigate channel effects, which is an important step in
 // decoding a received signal in certain cases.
-absl::StatusOr<Proc*> CreateFirFilter(
-      std::string_view name, const Value& kernel,
-      StreamingChannel* input_channel, StreamingChannel* output_channel,
-      Package* package);
+absl::StatusOr<Proc*> CreateFirFilter(std::string_view name,
+                                      const Value& kernel,
+                                      StreamingChannel* input_channel,
+                                      StreamingChannel* output_channel,
+                                      Package* package);
 
 }  // namespace xls
 

@@ -14,24 +14,32 @@
 
 #include "xls/solvers/z3_lec.h"
 
+#include <memory>
 #include <string>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "xls/common/status/matchers.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/ir/function.h"
 #include "xls/ir/ir_parser.h"
+#include "xls/ir/node.h"
+#include "xls/ir/nodes.h"
 #include "xls/netlist/cell_library.h"
 #include "xls/netlist/fake_cell_library.h"
 #include "xls/netlist/netlist.h"
 #include "xls/netlist/netlist_parser.h"
+#include "xls/scheduling/pipeline_schedule.h"
+#include "xls/scheduling/scheduling_options.h"
 
 namespace xls {
 namespace solvers {
 namespace z3 {
 namespace {
 
-using netlist::rtl::Netlist;
+using ::xls::netlist::rtl::Netlist;
 
 absl::StatusOr<bool> Match(const std::string& ir_text,
                            const std::string& netlist_text, bool expect_equal) {
@@ -240,9 +248,9 @@ endmodule
   for (Node* node : entry_function->nodes()) {
     if (node->Is<Param>()) {
       cycle_map[node] = 0;
-    } else if (node->GetName().find("and") != std::string::npos) {
+    } else if (absl::StrContains(node->GetName(), "and")) {
       cycle_map[node] = 0;
-    } else if (node->GetName().find("or") != std::string::npos) {
+    } else if (absl::StrContains(node->GetName(), "or")) {
       cycle_map[node] = 1;
     } else {
       cycle_map[node] = 2;
@@ -255,7 +263,7 @@ endmodule
     XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Lec> lec,
                              Lec::CreateForStage(params, schedule, i));
     ASSERT_TRUE(lec->Run());
-    XLS_LOG(INFO) << "Pass stage " << i;
+    LOG(INFO) << "Pass stage " << i;
   }
 }
 
@@ -329,9 +337,9 @@ endmodule
   for (Node* node : entry_function->nodes()) {
     if (node->Is<Param>()) {
       cycle_map[node] = 0;
-    } else if (node->GetName().find("and") != std::string::npos) {
+    } else if (absl::StrContains(node->GetName(), "and")) {
       cycle_map[node] = 0;
-    } else if (node->GetName().find("or") != std::string::npos) {
+    } else if (absl::StrContains(node->GetName(), "or")) {
       cycle_map[node] = 1;
     } else {
       cycle_map[node] = 2;
@@ -347,7 +355,7 @@ endmodule
     } else {
       ASSERT_TRUE(lec->Run());
     }
-    XLS_LOG(INFO) << "Pass stage " << i;
+    LOG(INFO) << "Pass stage " << i;
   }
 }
 
@@ -482,9 +490,9 @@ endmodule
   for (Node* node : entry_function->nodes()) {
     if (node->Is<Param>()) {
       cycle_map[node] = 0;
-    } else if (node->GetName().find("and") != std::string::npos) {
+    } else if (absl::StrContains(node->GetName(), "and")) {
       cycle_map[node] = 0;
-    } else if (node->GetName().find("or") != std::string::npos) {
+    } else if (absl::StrContains(node->GetName(), "or")) {
       cycle_map[node] = 1;
     } else {
       cycle_map[node] = 2;
@@ -497,10 +505,10 @@ endmodule
                              Lec::CreateForStage(params, schedule, i));
     bool foo = lec->Run();
     if (!foo) {
-      XLS_LOG(INFO) << lec->ResultToString();
+      LOG(INFO) << lec->ResultToString();
     }
     ASSERT_TRUE(foo);
-    XLS_LOG(INFO) << "Pass stage " << i;
+    LOG(INFO) << "Pass stage " << i;
   }
 }
 

@@ -24,26 +24,30 @@
 
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/fdo/delay_manager.h"
 #include "xls/ir/channel.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_base.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
-#include "xls/ir/node_util.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
+#include "xls/ir/package.h"
 #include "xls/ir/proc.h"
+#include "xls/ir/topo_sort.h"
 #include "xls/scheduling/pipeline_schedule.pb.h"
+#include "xls/scheduling/schedule_util.h"
 #include "xls/scheduling/scheduling_options.h"
 
 namespace xls {
@@ -63,12 +67,15 @@ int64_t MaximumCycle(const ScheduleCycleMap& cycle_map) {
 
 PipelineSchedule::PipelineSchedule(FunctionBase* function_base,
                                    ScheduleCycleMap cycle_map,
-                                   std::optional<int64_t> length)
-    : function_base_(function_base), cycle_map_(std::move(cycle_map)) {
+                                   std::optional<int64_t> length,
+                                   std::optional<int64_t> min_clock_period_ps)
+    : function_base_(function_base),
+      cycle_map_(std::move(cycle_map)),
+      min_clock_period_ps_(min_clock_period_ps) {
   // Build the mapping from cycle to the vector of nodes in that cycle.
   int64_t max_cycle = MaximumCycle(cycle_map_);
   if (length.has_value()) {
-    XLS_CHECK_GT(*length, max_cycle);
+    CHECK_GT(*length, max_cycle);
     max_cycle = *length - 1;
   }
   // max_cycle is the latest cycle in which any node is scheduled so add one to
@@ -96,7 +103,7 @@ PipelineSchedule::PipelineSchedule(FunctionBase* function_base,
 }
 
 void PipelineSchedule::RemoveNode(Node* node) {
-  XLS_CHECK(cycle_map_.contains(node))
+  CHECK(cycle_map_.contains(node))
       << "Tried to remove a node from a schedule that it doesn't contain";
   int64_t old_cycle = cycle_map_.at(node);
   std::vector<Node*>& ref = cycle_to_nodes_.at(old_cycle);
@@ -105,17 +112,42 @@ void PipelineSchedule::RemoveNode(Node* node) {
 }
 
 absl::StatusOr<PipelineSchedule> PipelineSchedule::FromProto(
-    FunctionBase* function, const PipelineScheduleProto& proto) {
+    FunctionBase* function,
+    const PackagePipelineSchedulesProto& package_schedules_proto) {
+  const auto schedule_it =
+      package_schedules_proto.schedules().find(function->name());
+  if (schedule_it == package_schedules_proto.schedules().end()) {
+    return absl::InvalidArgumentError("Function does not have a schedule.");
+  }
+  // Getting a node by name is slow (linear in number of nodes in the function)
+  // so build up a map for fast lookup.
+  absl::flat_hash_map<std::string, Node*> nodes_by_name;
+  nodes_by_name.reserve(function->node_count());
+  for (Node* node : function->nodes()) {
+    auto [_, inserted] = nodes_by_name.insert({node->GetName(), node});
+    XLS_RET_CHECK(inserted) << "Duplicate node name: " << node->GetName();
+  }
   ScheduleCycleMap cycle_map;
-  for (const auto& stage : proto.stages()) {
+  cycle_map.reserve(function->node_count());
+  for (const auto& stage : schedule_it->second.stages()) {
     for (const auto& timed_node : stage.timed_nodes()) {
       // NOTE: we handle timing with our estimator, so ignore timings from proto
       // but it might be useful in the future to e.g. detect regressions.
-      XLS_ASSIGN_OR_RETURN(Node * node, function->GetNode(timed_node.node()));
-      cycle_map[node] = stage.stage();
+      auto it = nodes_by_name.find(timed_node.node());
+      if (it == nodes_by_name.end()) {
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "Node `%s` found in schedule does not exist in function `%s`",
+            timed_node.node(), function->name()));
+      }
+      cycle_map[it->second] = stage.stage();
     }
   }
-  return PipelineSchedule(function, cycle_map);
+  std::optional<int64_t> min_clock_period_ps;
+  if (schedule_it->second.has_min_clock_period_ps()) {
+    min_clock_period_ps = schedule_it->second.min_clock_period_ps();
+  }
+  return PipelineSchedule(function, std::move(cycle_map),
+                          schedule_it->second.length(), min_clock_period_ps);
 }
 
 absl::StatusOr<PipelineSchedule> PipelineSchedule::SingleStage(
@@ -136,7 +168,6 @@ absl::Span<Node* const> PipelineSchedule::nodes_in_cycle(int64_t cycle) const {
 
 bool PipelineSchedule::IsLiveOutOfCycle(Node* node, int64_t c) const {
   Function* as_func = dynamic_cast<Function*>(function_base_);
-  Proc* as_proc = dynamic_cast<Proc*>(function_base_);
 
   if (cycle(node) > c) {
     return false;
@@ -151,17 +182,21 @@ bool PipelineSchedule::IsLiveOutOfCycle(Node* node, int64_t c) const {
   }
 
   for (Node* user : node->users()) {
-    if (cycle(user) > c) {
-      return true;
+    if (cycle(user) <= c) {
+      continue;
     }
-  }
-
-  if (as_proc != nullptr) {
-    for (int64_t index : as_proc->GetNextStateIndices(node)) {
-      if (cycle(as_proc->GetStateParam(index)) > c) {
-        return true;
+    if (user->Is<Next>()) {
+      Next* user_next = user->As<Next>();
+      if (user_next->predicate() != node && user_next->value() != node) {
+        CHECK_EQ(user_next->state_read(), node);
+        // This Next node only uses this StateRead node to target the state
+        // register it needs to write to; it doesn't actually need the value
+        // read out of the Param node, so we don't need to keep the value in
+        // pipeline registers for its sake.
+        continue;
       }
     }
+    return true;
   }
 
   return false;
@@ -221,14 +256,17 @@ absl::Status PipelineSchedule::Verify() const {
   }
   if (function_base()->IsProc()) {
     Proc* proc = function_base()->AsProcOrDie();
-    for (int64_t index = 0; index < proc->GetStateElementCount(); ++index) {
-      Node* param = proc->GetStateParam(index);
-      Node* next_state = proc->GetNextStateElement(index);
-      // Verify that we determine the new state within II cycles of accessing
-      // the current param.
-      XLS_RET_CHECK_LT(
-          cycle(next_state),
-          cycle(param) + proc->GetInitiationInterval().value_or(1));
+    int64_t worst_case_throughput = proc->GetInitiationInterval().value_or(1);
+    if (worst_case_throughput >= 1) {
+      for (Next* next : proc->next_values()) {
+        Node* state_read = next->state_read();
+        // Verify that no write happens before the corresponding read.
+        XLS_RET_CHECK_LE(cycle(state_read), cycle(next));
+        // Verify that we determine the new state within II cycles of accessing
+        // the current param.
+        XLS_RET_CHECK_LT(cycle(next),
+                         cycle(state_read) + worst_case_throughput);
+      }
     }
   }
   // Verify initial nodes in cycle 0. Final nodes in final cycle.
@@ -237,9 +275,14 @@ absl::Status PipelineSchedule::Verify() const {
 
 absl::Status PipelineSchedule::VerifyTiming(
     int64_t clock_period_ps, const DelayEstimator& delay_estimator) const {
+  // The set of nodes that cannot affect anything that will be synthesized.
+  const absl::flat_hash_set<Node*> dead_after_synthesis =
+      GetDeadAfterSynthesisNodes(function_base_);
+
   // Critical path from start of the cycle that a node is scheduled through the
   // node itself. If the schedule meets timing, then this value should be less
-  // than or equal to clock_period_ps for every node.
+  // than or equal to clock_period_ps for every node (except those that cannot
+  // affect anything that will be synthesized).
   absl::flat_hash_map<Node*, int64_t> node_cp;
   // The predecessor (operand) of the node through which the critical-path from
   // the start of the cycle extends.
@@ -253,6 +296,9 @@ absl::Status PipelineSchedule::VerifyTiming(
     int64_t cp_to_node_start = 0;
     cp_pred[node] = nullptr;
     for (Node* operand : node->operands()) {
+      if (dead_after_synthesis.contains(operand)) {
+        continue;
+      }
       if (cycle(operand) == cycle(node)) {
         if (cp_to_node_start < node_cp.at(operand)) {
           cp_to_node_start = node_cp.at(operand);
@@ -260,8 +306,11 @@ absl::Status PipelineSchedule::VerifyTiming(
         }
       }
     }
-    XLS_ASSIGN_OR_RETURN(int64_t node_delay,
-                         delay_estimator.GetOperationDelayInPs(node));
+    int64_t node_delay = 0;
+    if (!dead_after_synthesis.contains(node)) {
+      XLS_ASSIGN_OR_RETURN(node_delay,
+                           delay_estimator.GetOperationDelayInPs(node));
+    }
     node_cp[node] = cp_to_node_start + node_delay;
     if (max_cp_node == nullptr || node_cp[node] > node_cp[max_cp_node]) {
       max_cp_node = node;
@@ -291,10 +340,16 @@ absl::Status PipelineSchedule::VerifyTiming(
 
 absl::Status PipelineSchedule::VerifyTiming(
     int64_t clock_period_ps, const DelayManager& delay_manager) const {
+  const absl::flat_hash_set<Node*> dead_after_synthesis =
+      GetDeadAfterSynthesisNodes(function_base_);
+
   PathExtractOptions options;
   options.cycle_map = &cycle_map_;
   XLS_ASSIGN_OR_RETURN(PathInfo critical_path,
-                       delay_manager.GetLongestPath(options));
+                       delay_manager.GetLongestPath(
+                           options, /*except=*/[&](Node* source, Node* target) {
+                             return dead_after_synthesis.contains(target);
+                           }));
 
   auto [delay, source, target] = critical_path;
   if (delay > clock_period_ps) {
@@ -317,15 +372,21 @@ absl::Status PipelineSchedule::VerifyConstraints(
     std::optional<int64_t> worst_case_throughput) const {
   absl::flat_hash_map<std::string, std::vector<Node*>> channel_to_nodes;
   absl::flat_hash_map<Node*, absl::btree_set<Node*>> send_predecessors;
+  absl::flat_hash_map<Node*, absl::btree_set<Node*>> io_predecessors;
   int64_t last_cycle = 0;
   for (Node* node : TopoSort(function_base_)) {
     if (node->Is<Receive>() || node->Is<Send>()) {
-      XLS_ASSIGN_OR_RETURN(Channel * channel, GetChannelUsedByNode(node));
-      channel_to_nodes[channel->name()].push_back(node);
+      channel_to_nodes[node->As<ChannelNode>()->channel_name()].push_back(node);
     }
     last_cycle = std::max(last_cycle, cycle_map_.at(node));
 
     for (Node* operand : node->operands()) {
+      if (operand->Is<ChannelNode>()) {
+        io_predecessors[node].insert(operand);
+      }
+      io_predecessors[node].insert(io_predecessors[operand].begin(),
+                                   io_predecessors[operand].end());
+
       if (operand->Is<Send>()) {
         send_predecessors[node].insert(operand);
       }
@@ -437,21 +498,23 @@ absl::Status PipelineSchedule::VerifyConstraints(
         continue;
       }
       const int64_t max_backedge = worst_case_throughput.value_or(1) - 1;
+      if (max_backedge < 0) {
+        // Worst-case throughput constraint is disabled.
+        continue;
+      }
       Proc* proc = function_base_->AsProcOrDie();
-      for (int64_t index = 0; index < proc->GetStateElementCount(); ++index) {
-        Param* param = proc->GetStateParam(index);
-        Node* next_state = proc->GetNextStateElement(index);
+      for (Next* next : proc->next_values()) {
+        StateRead* state_read = next->state_read()->As<StateRead>();
         int64_t backedge_length =
-            cycle_map_.at(next_state) - cycle_map_.at(param);
+            cycle_map_.at(next) - cycle_map_.at(state_read);
         if (backedge_length > max_backedge) {
           return absl::ResourceExhaustedError(absl::StrFormat(
-              "Scheduling constraint violated: param %s was scheduled for "
-              "access %d cycle%s before node %s, its next value, which "
-              "violates the constraint that we can achieve a worst-case "
-              "throughput of one iteration per %d cycle%s without external "
-              "stalls.",
-              param->name(), backedge_length, plural_s(backedge_length),
-              next_state->ToString(), worst_case_throughput.value_or(1),
+              "Scheduling constraint violated: state read %s was scheduled %d "
+              "cycle%s before node %s, its next value, which violates the "
+              "constraint that we can achieve a worst-case throughput of one "
+              "iteration per %d cycle%s without external stalls.",
+              state_read->GetName(), backedge_length, plural_s(backedge_length),
+              next->ToString(), worst_case_throughput.value_or(1),
               plural_s(worst_case_throughput.value_or(1))));
         }
       }
@@ -478,6 +541,46 @@ absl::Status PipelineSchedule::VerifyConstraints(
           }
         }
       }
+    } else if (std::holds_alternative<SameChannelConstraint>(constraint)) {
+      const SameChannelConstraint same_channel_const =
+          std::get<SameChannelConstraint>(constraint);
+      for (Node* node : function_base_->nodes()) {
+        if (!node->Is<ChannelNode>()) {
+          continue;
+        }
+        XLS_ASSIGN_OR_RETURN(ChannelRef channel,
+                             node->As<ChannelNode>()->GetChannelRef());
+        for (Node* predecessor : io_predecessors.at(node)) {
+          CHECK(predecessor->Is<ChannelNode>());
+          XLS_ASSIGN_OR_RETURN(ChannelRef predecessor_channel,
+                               predecessor->As<ChannelNode>()->GetChannelRef());
+          if (predecessor_channel != channel) {
+            continue;
+          }
+          // Check that the node and predecessor are the correct kind of
+          // channel operations. If this is a "loopback" channel, a mixture of
+          // sends and receives might be in channel_to_nodes and you only want
+          // to perform the check in the correct direction.
+          if (node->op() != predecessor->op()) {
+            continue;
+          }
+
+          int64_t same_channel_latency =
+              cycle_map_.at(node) - cycle_map_.at(predecessor);
+          if (same_channel_latency < same_channel_const.MinimumLatency()) {
+            return absl::ResourceExhaustedError(absl::StrFormat(
+                "Scheduling constraint violated: node %s was scheduled for %d "
+                "cycle%s before node %s, which violates the constraint that "
+                "all I/O operations must be scheduled at least %d cycle%s "
+                "after all other operations on the same channel on which they "
+                "depend.",
+                predecessor->ToString(), same_channel_latency,
+                plural_s(same_channel_latency), node->ToString(),
+                same_channel_const.MinimumLatency(),
+                plural_s(same_channel_const.MinimumLatency())));
+          }
+        }
+      }
     }
   }
   return absl::OkStatus();
@@ -488,13 +591,14 @@ PipelineScheduleProto PipelineSchedule::ToProto(
   // Compute nodes and paths delays.
   absl::flat_hash_map<Node*, int64_t> node_delays;
   absl::flat_hash_map<Node*, int64_t> node_path_delays;
+  node_delays.reserve(function_base_->node_count());
+  node_path_delays.reserve(function_base_->node_count());
   for (Node* node : TopoSort(function_base_)) {
     int64_t delay_to_node_start = 0;
     for (Node* operand : node->operands()) {
       if (cycle(operand) == cycle(node)) {
-        if (delay_to_node_start < node_path_delays.at(operand)) {
-          delay_to_node_start = node_path_delays.at(operand);
-        }
+        delay_to_node_start =
+            std::max(delay_to_node_start, node_path_delays.at(operand));
       }
     }
     int64_t node_delay = delay_estimator.GetOperationDelayInPs(node).value();
@@ -505,9 +609,11 @@ PipelineScheduleProto PipelineSchedule::ToProto(
 
   PipelineScheduleProto proto;
   proto.set_function(function_base_->name());
+  proto.mutable_stages()->Reserve(cycle_to_nodes_.size());
   for (int i = 0; i < cycle_to_nodes_.size(); i++) {
     StageProto* stage = proto.add_stages();
     stage->set_stage(i);
+    stage->mutable_timed_nodes()->Reserve(cycle_to_nodes_[i].size());
     for (Node* node : cycle_to_nodes_[i]) {
       TimedNodeProto* timed_node = stage->add_timed_nodes();
       timed_node->set_node(node->GetName());
@@ -515,6 +621,11 @@ PipelineScheduleProto PipelineSchedule::ToProto(
       timed_node->set_path_delay_ps(node_path_delays[node]);
     }
   }
+
+  if (min_clock_period_ps_.has_value()) {
+    proto.set_min_clock_period_ps(*min_clock_period_ps_);
+  }
+  proto.set_length(length());
   return proto;
 }
 
@@ -534,6 +645,32 @@ int64_t PipelineSchedule::CountFinalInteriorPipelineRegisters() const {
   }
 
   return reg_count;
+}
+
+/* static */ absl::StatusOr<PackagePipelineSchedules>
+PackagePipelineSchedulesFromProto(Package* p,
+                                  const PackagePipelineSchedulesProto& proto) {
+  PackagePipelineSchedules schedules;
+  for (const auto& [fb_name, _] : proto.schedules()) {
+    VLOG(3) << absl::StreamFormat(
+        "Converting proto for Functionbase with name %s", fb_name);
+    XLS_ASSIGN_OR_RETURN(FunctionBase * fb, p->GetFunctionBaseByName(fb_name));
+    XLS_ASSIGN_OR_RETURN(PipelineSchedule schedule,
+                         PipelineSchedule::FromProto(fb, proto));
+    schedules.insert({fb, std::move(schedule)});
+  }
+  return schedules;
+}
+
+PackagePipelineSchedulesProto PackagePipelineSchedulesToProto(
+    const PackagePipelineSchedules& schedules,
+    const DelayEstimator& delay_estimator) {
+  PackagePipelineSchedulesProto proto;
+  for (const auto& [fb, schedule] : schedules) {
+    proto.mutable_schedules()->insert(
+        {fb->name(), schedule.ToProto(delay_estimator)});
+  }
+  return proto;
 }
 
 }  // namespace xls

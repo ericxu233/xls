@@ -7,15 +7,16 @@
 #include <cmath>
 #include <tuple>
 
+#include "absl/flags/flag.h"
+#include "absl/log/check.h"
 #include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "xls/common/file/get_runfile_path.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/ir/value_helpers.h"
-#include "xls/ir/value_view_helpers.h"
-#include "xls/tools/testbench_builder.h"
+#include "xls/ir/value_utils.h"
+#include "xls/ir/value_view_utils.h"
+#include "xls/tests/testbench_builder.h"
 #include "third_party/xls_go_math/fp_sincos_32_jit_wrapper.h"
 
 ABSL_FLAG(int, num_threads, 4,
@@ -78,7 +79,7 @@ ResultT ComputeActual(fp::FpSincos32* jit_wrapper, float input) {
   PackedFloat32 packed_input(reinterpret_cast<uint8_t*>(&input), 0);
   ResultT result;
   PackedFloat2x32 packed_result(reinterpret_cast<uint8_t*>(&result), 0);
-  XLS_CHECK_OK(jit_wrapper->Run(packed_input, packed_result));
+  CHECK_OK(jit_wrapper->Run(packed_input, packed_result));
   return result;
 }
 
@@ -120,7 +121,7 @@ absl::Status RealMain(uint32_t num_samples, int num_threads) {
 
 int main(int argc, char** argv) {
   xls::InitXls(argv[0], argc, argv);
-  XLS_QCHECK_OK(xls::RealMain(absl::GetFlag(FLAGS_num_samples),
-                              absl::GetFlag(FLAGS_num_threads)));
+  QCHECK_OK(xls::RealMain(absl::GetFlag(FLAGS_num_samples),
+                          absl::GetFlag(FLAGS_num_threads)));
   return 0;
 }

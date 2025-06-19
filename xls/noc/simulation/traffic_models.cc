@@ -15,9 +15,16 @@
 #include "xls/noc/simulation/traffic_models.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <iterator>
 #include <memory>
 #include <vector>
+
+#include "absl/log/check.h"
+#include "absl/types/span.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/noc/simulation/packetizer.h"
+#include "xls/noc/simulation/random_number_interface.h"
 
 namespace xls::noc {
 
@@ -37,7 +44,7 @@ std::vector<DataPacket> GeneralizedGeometricTrafficModel::GetNewCyclePackets(
     // Except for the initial packet.
     // We expect GetNewCyclePackets to be called without skipping
     // a cycle in which a packet would be sent.
-    XLS_CHECK_EQ(cycle, next_packet_cycle_);
+    CHECK_EQ(cycle, next_packet_cycle_);
     packets.push_back(next_packet_);
   }
 
@@ -55,7 +62,7 @@ std::vector<DataPacket> GeneralizedGeometricTrafficModel::GetNewCyclePackets(
             .SourceIndex(source_index_)
             .DestinationIndex(destination_index_)
             .Build();
-    XLS_CHECK(burst_packet.ok());
+    CHECK(burst_packet.ok());
     packets.push_back(burst_packet.value());
 
     next_packet_delta =
@@ -70,7 +77,7 @@ std::vector<DataPacket> GeneralizedGeometricTrafficModel::GetNewCyclePackets(
           .SourceIndex(source_index_)
           .DestinationIndex(destination_index_)
           .Build();
-  XLS_CHECK(future_packet.ok());
+  CHECK(future_packet.ok());
   next_packet_ = future_packet.value();
   next_packet_cycle_ += next_packet_delta;
 
@@ -130,7 +137,7 @@ std::vector<DataPacket> ReplayTrafficModel::GetNewCyclePackets(int64_t cycle) {
 
   std::vector<DataPacket> packets;
 
-  XLS_CHECK_EQ(cycle, *clock_cycle_iter_);
+  CHECK_EQ(cycle, *clock_cycle_iter_);
 
   absl::StatusOr<DataPacket> packet = DataPacketBuilder()
                                           .Valid(true)
@@ -139,7 +146,7 @@ std::vector<DataPacket> ReplayTrafficModel::GetNewCyclePackets(int64_t cycle) {
                                           .SourceIndex(source_index_)
                                           .DestinationIndex(destination_index_)
                                           .Build();
-  XLS_CHECK(packet.ok());
+  CHECK(packet.ok());
   packets.push_back(packet.value());
   clock_cycle_iter_++;
   return packets;

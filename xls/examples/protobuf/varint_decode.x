@@ -1,3 +1,5 @@
+#![feature(type_inference_v2)]
+
 // Copyright 2023 The XLS Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,8 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import std
-import xls.examples.protobuf.varint_encode
+import std;
+import xls.examples.protobuf.varint_encode;
 
 // Performs a decoding of a variable-length varint value.
 //

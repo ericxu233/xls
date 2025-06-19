@@ -23,10 +23,6 @@ load(
     "xls_ir_verilog_impl",
 )
 load(
-    "//xls/build_rules:xls_toolchains.bzl",
-    "xls_toolchain_attrs",
-)
-load(
     "//xls/build_rules:xls_common_rules.bzl",
     "append_default_to_args",
     "args_to_string",
@@ -45,9 +41,17 @@ load(
     "xls_ir_opt_ir_attrs",
     "xls_ir_opt_ir_impl",
 )
-load("//xls/build_rules:xls_providers.bzl", "ConvIRInfo")
 load(
-    "//xls/build_rules:xls_type_check_helpers.bzl",
+    "//xls/build_rules:xls_providers.bzl",
+    "ConvIrInfo",
+    "IrFileInfo",
+)
+load(
+    "//xls/build_rules:xls_toolchains.bzl",
+    "xls_toolchain_attrs",
+)
+load(
+    "//xls/build_rules:xls_type_check_utils.bzl",
     "bool_type_check",
     "dictionary_type_check",
     "list_type_check",
@@ -66,6 +70,7 @@ _IR_FILE_EXTENSION = ".ir"
 _PROTOBIN_FILE_EXTENSION = ".protobin"
 _BINARYPB_FILE_EXTENSION = ".binarypb"
 _PROTOTEXT_FILE_EXTENSION = ".pbtxt"
+_TEXTPROTO_FILE_EXTENSION = ".txtpb"
 _DEFAULT_XLSCC_ARGS = {
     "top": "Run",
 }
@@ -94,6 +99,15 @@ def _get_xls_cc_ir_generated_files(args):
     """
     return [args.get("ir_file")]
 
+def _get_xls_cc_ir_source_files(ctx):
+    files = ([ctx.file.src] +
+             ctx.files._default_cc_header_files +
+             ctx.files._default_synthesis_header_files +
+             ctx.files.src_deps)
+    if ctx.file.block:
+        files.append(ctx.file.block)
+    return files
+
 def _get_runfiles_for_xls_cc_ir(ctx):
     """Returns the runfiles from a 'xls_cc_ir' ctx.
 
@@ -105,12 +119,7 @@ def _get_runfiles_for_xls_cc_ir(ctx):
     """
     transitive_runfiles = []
 
-    files = ([ctx.file.src] +
-             ctx.files._default_cc_header_files +
-             ctx.files._default_synthesis_header_files +
-             ctx.files.src_deps)
-    if ctx.file.block:
-        files.append(ctx.file.block)
+    files = _get_xls_cc_ir_source_files(ctx)
     runfiles = ctx.runfiles(files = files)
     transitive_runfiles.append(ctx.attr
         ._xlscc_tool[DefaultInfo].default_runfiles)
@@ -174,7 +183,8 @@ def _xls_cc_ir_impl(ctx):
 
     Returns:
       A tuple with the following elements in the order presented:
-        1. The ConvIRInfo provider
+        1. The IrFileInfo provider
+        1. The ConvIrInfo provider
         1. The list of built files.
         1. The runfiles.
         1. The XlsccInfo provider (transitive C++ headers)
@@ -183,6 +193,7 @@ def _xls_cc_ir_impl(ctx):
         "module_name",
         "block",
         "block_pb_out",
+        "block_pb_text",
         "top",
         "package",
         "clang_args_file",
@@ -192,6 +203,17 @@ def _xls_cc_ir_impl(ctx):
         "meta_out_text",
         "block_from_class",
         "z3_rlimit",
+        "generate_new_fsm",
+        "merge_states",
+        "split_states_on_channel_ops",
+        "debug_ir_trace_loop_context",
+        "debug_ir_trace_loop_control",
+        "debug_print_fsm_states",
+        "channel_strictness",
+        "default_channel_strictness",
+        "max_unroll_iters",
+        "print_optimization_warnings",
+        "debug_write_function_slice_graph_path",
     )
 
     xlscc_args = append_default_to_args(
@@ -216,7 +238,7 @@ def _xls_cc_ir_impl(ctx):
 
     # Append to user defines.
     xlscc_args["defines"] = (
-        xlscc_args.get("defines", "") + "__SYNTHESIS__," +
+        xlscc_args.get("defines", "") + "__SYNTHESIS__,__xlscc__," +
         "__AC_OVERRIDE_OVF_UPDATE_BODY=,__AC_OVERRIDE_OVF_UPDATE2_BODY="
     )
 
@@ -253,6 +275,13 @@ def _xls_cc_ir_impl(ctx):
     if metadata_out_text:
         meta_out_text_flag = "--meta_out_text"
 
+    function_slice_graph_out_flag = ""
+    debug_write_function_slice_graph_filename = getattr(ctx.attr, "debug_write_function_slice_graph_path")
+    if debug_write_function_slice_graph_filename:
+        function_slice_graph_file = ctx.actions.declare_file(debug_write_function_slice_graph_filename.name)
+        outputs.append(function_slice_graph_file)
+        function_slice_graph_out_flag = "--debug_write_function_slice_graph_path " + function_slice_graph_file.path
+
     # Get runfiles
     runfiles = _get_runfiles_for_xls_cc_ir(ctx)
 
@@ -272,21 +301,28 @@ def _xls_cc_ir_impl(ctx):
         tools = [ctx.executable._xlscc_tool],
         # The files required for converting the C/C++ source file.
         inputs = runfiles.files,
-        command = "{} {} --block_pb {} {} {} {} {} 1>{} 2>{}".format(
+        command = "set -o pipefail; {} {} --block_pb {} {} {} {} {} {} 2>&1 >{} | tee {}".format(
             ctx.executable._xlscc_tool.path,
             ctx.file.src.path,
             block_pb,
             block_from_class_flag,
             meta_out_flag,
             meta_out_text_flag,
+            function_slice_graph_out_flag,
             my_args,
             ir_file.path,
             log_file.path,
         ),
-        mnemonic = "ConvertXLSCC",
-        progress_message = "Converting XLSCC file: %s" % (ctx.file.src.path),
+        mnemonic = "CompileXLSCC",
+        progress_message = "Converting %s" % ir_file.short_path,
     )
-    return [ConvIRInfo(conv_ir_file = ir_file), outputs, runfiles, XlsccInfo(cc_headers = cc_headers)]
+    return [
+        IrFileInfo(ir_file = ir_file),
+        ConvIrInfo(original_input_files = _get_xls_cc_ir_source_files(ctx), ir_interface = None),
+        outputs,
+        runfiles,
+        XlsccInfo(cc_headers = cc_headers),
+    ]
 
 _xls_cc_ir_attrs = {
     "src": attr.label(
@@ -301,6 +337,7 @@ _xls_cc_ir_attrs = {
               "source file must be provided. The file " + "must have a '" +
               _PROTOBIN_FILE_EXTENSION + "' or a '" +
               _PROTOTEXT_FILE_EXTENSION + "' or a '" +
+              _TEXTPROTO_FILE_EXTENSION + "' or a '" +
               _BINARYPB_FILE_EXTENSION + "' extension. To create this " +
               "protobuf automatically from your C++ source file, use " +
               "'block_from_class' instead. Exactly one of 'block' or " +
@@ -310,6 +347,7 @@ _xls_cc_ir_attrs = {
             _PROTOBIN_FILE_EXTENSION,
             _BINARYPB_FILE_EXTENSION,
             _PROTOTEXT_FILE_EXTENSION,
+            _TEXTPROTO_FILE_EXTENSION,
         ],
     ),
     "block_pb_out": attr.output(
@@ -350,6 +388,10 @@ _xls_cc_ir_attrs = {
         default = False,
         mandatory = False,
     ),
+    "debug_write_function_slice_graph_path": attr.output(
+        doc = "Filename of the generated function slice graph",
+        mandatory = False,
+    ),
     "_xlscc_tool": attr.label(
         doc = "The target of the XLSCC executable.",
         default = Label("//xls/contrib/xlscc:xlscc"),
@@ -381,12 +423,14 @@ def _xls_cc_ir_impl_wrapper(ctx):
       ctx: The current rule's context object.
 
     Returns:
-      ConvIRInfo provider
+      IrFileInfo provider
+      ConvIrInfo provider
       DefaultInfo provider
       XlsccInfo provider
     """
-    ir_conv_info, built_files, runfiles, xlscc_info = _xls_cc_ir_impl(ctx)
+    ir_result, ir_conv_info, built_files, runfiles, xlscc_info = _xls_cc_ir_impl(ctx)
     return [
+        ir_result,
         ir_conv_info,
         DefaultInfo(
             files = depset(
@@ -485,7 +529,6 @@ def xls_cc_ir_macro(
     string_type_check("block_pb_out", block, True)
     string_type_check("block_from_class", block_from_class, True)
     list_type_check("src_deps", src_deps)
-    dictionary_type_check("xlscc_args", xlscc_args)
     bool_type_check("enable_generated_file", enable_generated_file)
     bool_type_check("enable_presubmit_generated_file", enable_presubmit_generated_file)
 
@@ -526,19 +569,21 @@ def _xls_cc_verilog_impl(ctx):
     Args:
       ctx: The current rule's context object.
     Returns:
-      ConvIRInfo provider.
-      OptIRInfo provider.
+      ConvIrInfo provider.
+      OptIrArgInfo provider.
       CodegenInfo provider.
       DefaultInfo provider.
     """
-    ir_conv_info, ir_conv_built_files, ir_conv_runfiles, _xlscc_info = _xls_cc_ir_impl(ctx)
-    ir_opt_info, opt_ir_built_files, opt_ir_runfiles = xls_ir_opt_ir_impl(
+    cc_ir_result, ir_conv_info, ir_conv_built_files, ir_conv_runfiles, _xlscc_info = _xls_cc_ir_impl(ctx)
+    opt_ir_result, ir_opt_info, opt_ir_built_files, opt_ir_runfiles = xls_ir_opt_ir_impl(
         ctx,
-        ir_conv_info.conv_ir_file,
+        cc_ir_result,
+        ir_conv_info.original_input_files,
     )
     codegen_info, verilog_built_files, verilog_runfiles = xls_ir_verilog_impl(
         ctx,
-        ir_opt_info.opt_ir_file,
+        opt_ir_result,
+        ir_conv_info,
     )
     runfiles = ir_conv_runfiles.merge_all([opt_ir_runfiles, verilog_runfiles])
     return [

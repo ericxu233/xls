@@ -39,15 +39,17 @@ in the XLS project, with the relevant Google style guides
     statement blocks.
 
 *   Prefer using `XLS_ASSIGN_OR_RETURN` / `XLS_RETURN_IF_ERROR` when
-    appropriate, but when binding a `StatusOr` wrapped value prefer to name it
-    `thing_or` so that it can be referenced without the wrapper as `thing`; e.g.
+    appropriate. When binding a `StatusOr` wrapped value, prefer to name the
+    variable after its underlying value (just as we do with pointers). Avoid
+    names like `maybe_foo` or `foo_or`, which can lead to multiple variables
+    that represent the same value.
 
     ```
-    absl::StatusOr<Thing> thing_or = f();
-    if (!thing_or.ok()) {
-      // ... handling of the status via thing_or.status() and returning ...
+    absl::StatusOr<Thing> thing = f();
+    if (thing.ok()) {
+      MakeUseOf(*thing);
+      thing->DoSomething();
     }
-    const Thing& thing = thing_or.value();
     ```
 
 *   Prefer `CHECK` to `DCHECK`, except that `DCHECK` can be used to verify
@@ -96,6 +98,30 @@ in the XLS project, with the relevant Google style guides
     up looking a lot like RTTI, so `dynamic_cast<>` is common and accepted for
     those parts of the codebase. Elsewhere, especially with IR `Node` types,
     `down_cast<>` should be used instead.
+
+*   Prefer `std::string_view` to `absl::string_view`. `absl::string_view` mainly
+    differs from `std::string_view` in construction from nullptr, which our
+    usage/callers do not depend upon. This decision lets us switch over to the
+    more consistent end-state sooner. Although the style guide recommends we
+    prefer `absl::string_view` for now, the rationale for why does not really
+    apply to us and their target end state is clear.
+
+*   XLS code is often written in a functional (i.e. separating functions from
+    the [ideally immutable] structs they operate on) and layered style, which
+    leads to `_utils.h` style translation units that layer on and compose
+    functionality. Prefer the suffix `_utils.h` for these, vs `_helpers.h` or
+    other alternatives.
+
+*   Static member functions should be used sparingly, generally only for
+    factories that call a private constructor. We prefer to document
+    implementations with a `/* static */` comment as a reminder to readers (and
+    writers that there is no `this` available). Comments are not an ideal way to
+    mark this kind of information, but there should be a small number of these
+    functions and as factories it is unlikely the static qualifier will be
+    dropped in the future to put the comments out of sync.
+
+*   We use C++ standard-library filesystem functions and data structures, in the
+    absence of an accepted open-source alternative other than Boost.
 
 ### Functions
 
@@ -207,14 +233,33 @@ further support the decision.
     straightforward (avoid taking an address of a reference) and helps avoid
     accidental copies (assigning a reference to local, etc.). Non-const pointer
     usage propagates outwards such that the few cases where a const reference
-    could _actually_ be appropriate become odd outliers, so our guidance is that
+    could *actually* be appropriate become odd outliers, so our guidance is that
     IR elements should uniformly be passed as non-const pointers.
+
+*   A corollary to the above is that `nullptr` is generally not a valid input to
+    functions taking IR elements. When an IR element is optional, we recommend
+    explicitly using `std::optional<T*>`. We deviate from the style guide here
+    because for IR elements `T*` sometimes means `const T&`, `T&`, or just `T`
+    in addition to `T*`, but which is not apparent from the signature. However,
+    using `nullptr` for IR element types is OK when the usage is fully
+    encapsulated.
 
 ## Protocol buffers
 
 *   Prefer to use
     [proto3](https://developers.google.com/protocol-buffers/docs/proto3#simple)
     specifications in all new protocol buffer files.
+
+## Tests
+
+*   If possible, avoid exact text comparisons of the output of XLS IR text
+    serialization (i.e., `ToString` or `DumpIR`). Such tests are sensitive to
+    the order and details of IR serialization and make it difficult to change
+    the serialization. If text comparison is needed, then use a separate golden
+    file which can be regenerated with the `--test_update_golden_files` flag
+    using the
+    [golden files](https://github.com/google/xls/tree/main/xls/common/golden_files.h)
+    library.
 
 ## FAQ
 

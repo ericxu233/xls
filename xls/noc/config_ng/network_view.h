@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_NOC_CONFIG_NETWORK_VIEW_H_
-#define XLS_NOC_CONFIG_NETWORK_VIEW_H_
+#ifndef XLS_NOC_CONFIG_NG_NETWORK_VIEW_H_
+#define XLS_NOC_CONFIG_NG_NETWORK_VIEW_H_
 
+#include <cstdint>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
+#include "xls/common/iterator_range.h"
+#include "xls/ir/unwrapping_iterator.h"
 #include "xls/noc/config_ng/network_component.h"
 #include "xls/noc/config_ng/network_connection.h"
 
@@ -101,4 +105,4 @@ class NetworkView {
 
 }  // namespace xls::noc
 
-#endif  // XLS_NOC_CONFIG_NETWORK_COMPONENT_PORT_H_
+#endif  // XLS_NOC_CONFIG_NG_NETWORK_VIEW_H_

@@ -17,50 +17,159 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
-#include "absl/container/btree_map.h"
+#include "absl/algorithm/container.h"
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
-#include "xls/common/logging/vlog_is_on.h"
+#include "xls/common/casts.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/common/stopwatch.h"
 #include "xls/data_structures/graph_coloring.h"
 #include "xls/data_structures/transitive_closure.h"
 #include "xls/ir/bits.h"
-#include "xls/ir/bits_ops.h"
+#include "xls/ir/channel.h"
 #include "xls/ir/function_base.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
 #include "xls/ir/node_util.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/ir/source_location.h"
+#include "xls/ir/topo_sort.h"
 #include "xls/ir/value.h"
-#include "xls/ir/value_helpers.h"
-#include "xls/passes/post_dominator_analysis.h"
+#include "xls/ir/value_utils.h"
+#include "xls/passes/pass_base.h"
 #include "xls/passes/token_provenance_analysis.h"
 #include "xls/scheduling/scheduling_options.h"
 #include "xls/scheduling/scheduling_pass.h"
 #include "xls/solvers/z3_ir_translator.h"
 #include "xls/solvers/z3_utils.h"
-#include "../z3/src/api/z3_api.h"
+#include "z3/src/api/z3_api.h"
 
 namespace xls {
 
 namespace {
+
+// A helper to avoid doing the time-consuming z3 initialization until the solver
+// is actually required. Many designs have no channels that need mutex analysis.
+//
+// TODO(allight): This might be generally useful enough to move it (or something
+// with a similar function) to the solvers namespace.
+class LazyZ3Translator {
+ public:
+  LazyZ3Translator(FunctionBase* f, int64_t z3_rlimit)
+      : f_(f), z3_rlimit_(z3_rlimit) {}
+
+  absl::StatusOr<solvers::z3::IrTranslator*> Translator() const {
+    if (!translator_) {
+      XLS_ASSIGN_OR_RETURN(translator_,
+                           solvers::z3::IrTranslator::CreateAndTranslate(
+                               f_, /*allow_unsupported=*/true));
+    }
+    return translator_.get();
+  }
+  int64_t z3_rlimit() const { return z3_rlimit_; }
+
+ private:
+  FunctionBase* f_;
+  int64_t z3_rlimit_;
+  mutable std::unique_ptr<solvers::z3::IrTranslator> translator_;
+};
+
+// This stores a mapping from nodes in a FunctionBase to 1-bit nodes that are
+// the "predicate" of that node. The idea is that it should always be sound to
+// replace a node `N` that has predicate `P` with `gate(P, N)` (where `gate` is
+// extended from its usual semantics to also gate the effect of side-effectful
+// operations).
+//
+// It also contains a relation on the set of predicate nodes that describes
+// whether any given pair of predicates is known to be mutually exclusive; i.e.:
+// for a pair `(A, B)` whether `A NAND B` is known to be valid. If `A NAND B` is
+// known not to be valid, that information is tracked too.
+class Predicates {
+ public:
+  // Set the predicate of the given node to the given predicate node.
+  void SetPredicate(Node* node, Node* pred);
+
+  // Get the predicate of the given node.
+  std::optional<Node*> GetPredicate(Node* node) const;
+
+  // Get all nodes predicated by a given predicate node.
+  absl::flat_hash_set<Node*> GetNodesPredicatedBy(Node* node) const;
+
+  // Assert that the two given predicates are mutually exclusive.
+  absl::Status MarkMutuallyExclusive(Node* pred_a, Node* pred_b);
+
+  // Assert that the two given predicates are not mutually exclusive.
+  absl::Status MarkNotMutuallyExclusive(Node* pred_a, Node* pred_b);
+
+  // Assert that the two given predicates have had their mutual exclusion tested
+  // but z3 was unable to come to any conclusion.
+  absl::Status MarkUnknownMutuallyExclusive(Node* pred_a, Node* pred_b);
+
+  // Query whether the two given predicates are known to be mutually exclusive
+  // (`true`), known to not be mutually exclusive (`false`), or nothing is known
+  // about them (`std::nullopt`).
+  //
+  // For all `P` and `Q`,
+  // `QueryMutuallyExclusive(P, Q) == QueryMutuallyExclusive(Q, P)`.
+  absl::StatusOr<std::optional<bool>> QueryMutuallyExclusive(
+      const LazyZ3Translator& translator, Node* pred_a, Node* pred_b);
+
+  // Returns all neighbors of the given predicate in the mutual exclusion graph.
+  // The return value of `MutualExclusionNeighbors(P)` should be all `Q` such
+  // that `QueryMutuallyExclusive(P, Q).has_value()`.
+  absl::flat_hash_map<Node*, std::optional<bool>> MutualExclusionNeighbors(
+      Node* pred) const;
+
+  // Update the metadata contained within the `Predicates` to respect the
+  // replacement of a node by another node.
+  void ReplaceNode(Node* original, Node* replacement);
+
+ private:
+  absl::flat_hash_map<Node*, Node*> predicated_by_;
+  absl::flat_hash_map<Node*, absl::flat_hash_set<Node*>> predicate_of_;
+
+  // The `bool` represents knowledge about the mutual exclusion of two nodes;
+  // if it is true then the two nodes are mutually exclusive, if it is false
+  // then they are known to not be mutually exclusive. If it is nullopt then
+  // solver already tried and failed to prove anything.
+  //
+  // Invariant: if mutual_exclusion_.at(a).contains(b) then
+  // mutual_exclusion.at(b).contains(a), i.e.: this is a symmetric relation;
+  // this fact is used to avoid recalculating 'IsMutex(B, A)' if we already have
+  // found 'IsMutex(A, B)'.
+  //
+  // Invariant: all nodes must have Bits type and bitwidth 1
+  absl::flat_hash_map<Node*, absl::flat_hash_map<Node*, std::optional<bool>>>
+      mutual_exclusion_;
+};
+
+// Add a predicate to a node. If the node does not already have a predicate,
+// this will simply set the predicate of the node to the given predicate and
+// then return the given predicate. Otherwise, this will replace the predicate
+// of the node with AND of the given predicate and the existing predicate,
+// returning this new predicate.
+absl::StatusOr<Node*> AddPredicate(Predicates* p, Node* node, Node* pred);
 
 bool FunctionIsOneBit(Node* node) {
   return node->GetType()->IsBits() &&
@@ -91,6 +200,20 @@ bool HasIntersection(const absl::flat_hash_set<T>& lhs,
                      [&bigger](T element) { return bigger.contains(element); });
 }
 
+template <typename T>
+absl::flat_hash_set<T> Intersection(const absl::flat_hash_set<T>& lhs,
+                                    const absl::flat_hash_set<T>& rhs) {
+  absl::flat_hash_set<T> result;
+  const absl::flat_hash_set<T>& smaller = lhs.size() > rhs.size() ? rhs : lhs;
+  const absl::flat_hash_set<T>& bigger = lhs.size() > rhs.size() ? lhs : rhs;
+  for (const T& element : smaller) {
+    if (bigger.contains(element)) {
+      result.insert(element);
+    }
+  }
+  return result;
+}
+
 Z3_lbool RunSolver(Z3_context c, Z3_ast asserted) {
   Z3_solver solver = solvers::z3::CreateSolver(c, 1);
   Z3_solver_assert(c, solver, asserted);
@@ -116,10 +239,28 @@ std::vector<std::pair<Node*, int64_t>> PredicateNodes(Predicates* p,
   return result;
 }
 
-bool IsHeavyOp(Op op) {
-  return op == Op::kUMul || op == Op::kSMul || op == Op::kSend ||
-         op == Op::kReceive;
+bool IsHeavyOp(Op op) { return op == Op::kSend || op == Op::kReceive; }
+
+std::string_view GetChannelName(Node* node) {
+  if (node->Is<Send>()) {
+    return node->As<Send>()->channel_name();
+  }
+  if (node->Is<Receive>()) {
+    return node->As<Receive>()->channel_name();
+  }
+  return "";
 }
+
+std::optional<Node*> GetPredicate(Node* node) {
+  std::optional<Node*> predicate;
+  if (node->Is<Send>()) {
+    predicate = node->As<Send>()->predicate();
+  }
+  if (node->Is<Receive>()) {
+    predicate = node->As<Receive>()->predicate();
+  }
+  return predicate;
+};
 
 using NodeRelation = absl::flat_hash_map<Node*, absl::flat_hash_set<Node*>>;
 
@@ -174,6 +315,24 @@ absl::flat_hash_set<Node*> LargestConnectedSubgraph(
 // 2. Nodes of the same type that are unrelated in the transitive token
 //    dependency relation can be merged.
 absl::StatusOr<NodeRelation> ComputeMergableEffects(FunctionBase* f) {
+  absl::flat_hash_set<std::string> multi_op_channels;
+  absl::flat_hash_set<std::string> channel_names;
+  for (Node* node : f->nodes()) {
+    if (node->Is<Send>() || node->Is<Receive>()) {
+      std::string_view channel_name = GetChannelName(node);
+      if (auto it = channel_names.find(channel_name);
+          it == channel_names.end()) {
+        channel_names.insert(it, std::string(channel_name));
+      } else if (auto it = multi_op_channels.find(channel_name);
+                 it == multi_op_channels.end()) {
+        multi_op_channels.insert(it, std::string(channel_name));
+      }
+    }
+  }
+  if (multi_op_channels.empty()) {
+    return NodeRelation();
+  }
+
   XLS_ASSIGN_OR_RETURN(TokenDAG token_dag, ComputeTokenDAG(f));
   absl::flat_hash_set<Node*> token_nodes;
   for (const auto& [node, children] : token_dag) {
@@ -183,49 +342,31 @@ absl::StatusOr<NodeRelation> ComputeMergableEffects(FunctionBase* f) {
     }
   }
 
-  auto get_channel_id = [](Node* node) -> int64_t {
-    if (node->Is<Receive>()) {
-      return node->As<Receive>()->channel_id();
-    }
-    if (node->Is<Send>()) {
-      return node->As<Send>()->channel_id();
-    }
-    return -1;
-  };
-
-  auto get_predicate = [](Node* node) -> std::optional<Node*> {
-    std::optional<Node*> predicate;
-    if (node->Is<Send>()) {
-      predicate = node->As<Send>()->predicate();
-    }
-    if (node->Is<Receive>()) {
-      predicate = node->As<Receive>()->predicate();
-    }
-    return predicate;
-  };
-
   NodeRelation result;
   NodeRelation transitive_closure = TransitiveClosure<Node*>(token_dag);
   for (Node* node : ReverseTopoSort(f)) {
     if (node->Is<Send>() || node->Is<Receive>()) {
+      std::string_view channel_name = GetChannelName(node);
+      if (!multi_op_channels.contains(channel_name)) {
+        continue;
+      }
       absl::flat_hash_set<Node*> subgraph =
           LargestConnectedSubgraph(node, token_dag, [&](Node* n) -> bool {
-            return n->op() == node->op() &&
-                   get_channel_id(n) == get_channel_id(node);
+            return n->op() == node->op() && GetChannelName(n) == channel_name;
           });
       for (Node* x : subgraph) {
         for (Node* y : subgraph) {
           // Ensure that x and y are not data-dependent on each other (but they
           // can be token-dependent). The only way for two sends or two receives
           // to have a data dependency is through the predicate.
-          if (std::optional<Node*> pred_x = get_predicate(x)) {
+          if (std::optional<Node*> pred_x = GetPredicate(x)) {
             absl::flat_hash_set<Node*> dependencies_of_pred_x =
                 DependenciesOf(pred_x.value());
             if (dependencies_of_pred_x.contains(y)) {
               continue;
             }
           }
-          if (std::optional<Node*> pred_y = get_predicate(y)) {
+          if (std::optional<Node*> pred_y = GetPredicate(y)) {
             absl::flat_hash_set<Node*> dependencies_of_pred_y =
                 DependenciesOf(pred_y.value());
             if (dependencies_of_pred_y.contains(x)) {
@@ -257,7 +398,14 @@ absl::StatusOr<NodeRelation> ComputeMergableEffects(FunctionBase* f) {
 // size 1 including only themselves.
 // A merge class is a set of nodes that are all jointly mutually exclusive.
 absl::StatusOr<std::vector<absl::flat_hash_set<Node*>>> ComputeMergeClasses(
-    Predicates* p, FunctionBase* f, const ScheduleCycleMap& scm) {
+    Predicates* p, LazyZ3Translator& lazy_solver, FunctionBase* f,
+    const ScheduleCycleMap& scm) {
+  XLS_ASSIGN_OR_RETURN(NodeRelation mergable_effects,
+                       ComputeMergableEffects(f));
+  if (mergable_effects.empty()) {
+    return std::vector<absl::flat_hash_set<Node*>>();
+  }
+
   absl::flat_hash_set<Node*> nodes;
   std::vector<Node*> ordered_nodes;
   absl::flat_hash_map<Node*, absl::flat_hash_set<Node*>> neighborhoods;
@@ -270,8 +418,6 @@ absl::StatusOr<std::vector<absl::flat_hash_set<Node*>>> ComputeMergeClasses(
     }
   }
 
-  XLS_ASSIGN_OR_RETURN(NodeRelation mergable_effects,
-                       ComputeMergableEffects(f));
   auto is_mergable = [&](Node* x, Node* y) -> bool {
     return mergable_effects.contains(x) && mergable_effects.at(x).contains(y) &&
            scm.at(x) == scm.at(y);
@@ -292,15 +438,17 @@ absl::StatusOr<std::vector<absl::flat_hash_set<Node*>>> ComputeMergeClasses(
       }
       if ((x->op() == Op::kSend) &&
           (!is_mergable(x, y) ||
-           (x->As<Send>()->channel_id() != y->As<Send>()->channel_id()))) {
+           (x->As<Send>()->channel_name() != y->As<Send>()->channel_name()))) {
         continue;
       }
       if ((x->op() == Op::kReceive) &&
-          (!is_mergable(x, y) || (x->As<Receive>()->channel_id() !=
-                                  y->As<Receive>()->channel_id()))) {
+          (!is_mergable(x, y) || (x->As<Receive>()->channel_name() !=
+                                  y->As<Receive>()->channel_name()))) {
         continue;
       }
-      if (p->QueryMutuallyExclusive(px, py) == std::make_optional(true)) {
+      XLS_ASSIGN_OR_RETURN(std::optional<bool> mutex,
+                           p->QueryMutuallyExclusive(lazy_solver, px, py));
+      if (mutex == std::make_optional(true)) {
         neighborhoods[x].insert(y);
         neighborhoods[y].insert(x);
       }
@@ -347,10 +495,10 @@ absl::StatusOr<std::vector<absl::flat_hash_set<Node*>>> ComputeMergeClasses(
   }
 
   for (const absl::flat_hash_set<Node*>& color_class : coloring) {
-    XLS_CHECK(!color_class.empty());
+    CHECK(!color_class.empty());
     Op op = (*(color_class.cbegin()))->op();
     for (Node* node : color_class) {
-      XLS_CHECK_EQ(node->op(), op);
+      CHECK_EQ(node->op(), op);
     }
   }
 
@@ -424,42 +572,144 @@ absl::StatusOr<std::vector<Node*>> ComputeTokenInputs(
   return SetToSortedVector(token_inputs_unsorted);
 }
 
+// Returns whether there is a path from any of the nodes in `sources` to any of
+// the nodes in `sinks`.
+bool HasPath(const absl::flat_hash_set<Node*>& sources,
+             const absl::flat_hash_set<Node*>& sinks) {
+  if (HasIntersection(sources, sinks)) {
+    return true;
+  }
+
+  std::vector<Node*> to_visit(sources.begin(), sources.end());
+  absl::flat_hash_set<Node*> visited;
+  while (!to_visit.empty()) {
+    Node* node = to_visit.back();
+    to_visit.pop_back();
+    auto [_, inserted] = visited.insert(node);
+    if (!inserted) {
+      continue;
+    }
+    if (sinks.contains(node)) {
+      return true;
+    }
+    absl::c_copy_if(node->users(), std::back_inserter(to_visit),
+                    [&](Node* user) { return !visited.contains(user); });
+  }
+
+  return false;
+}
+
+bool IsProvenMutuallyExclusiveChannel(ChannelRef channel_ref) {
+  if (std::holds_alternative<Channel*>(channel_ref)) {
+    Channel* channel = std::get<Channel*>(channel_ref);
+    return channel->kind() == ChannelKind::kStreaming &&
+           down_cast<StreamingChannel*>(channel)->GetStrictness() ==
+               ChannelStrictness::kProvenMutuallyExclusive;
+  }
+
+  CHECK(std::holds_alternative<ChannelInterface*>(channel_ref));
+  ChannelInterface* channel_reference =
+      std::get<ChannelInterface*>(channel_ref);
+  return channel_reference->kind() == ChannelKind::kStreaming &&
+         channel_reference->strictness() ==
+             ChannelStrictness::kProvenMutuallyExclusive;
+}
+
+std::string_view GetChannelName(ChannelRef channel_ref) {
+  if (std::holds_alternative<Channel*>(channel_ref)) {
+    return std::get<Channel*>(channel_ref)->name();
+  }
+
+  CHECK(std::holds_alternative<ChannelInterface*>(channel_ref));
+  return std::get<ChannelInterface*>(channel_ref)->name();
+}
+
 absl::StatusOr<bool> MergeSends(Predicates* p, FunctionBase* f,
                                 absl::Span<Node* const> to_merge) {
-  int64_t channel_id = to_merge.front()->As<Send>()->channel_id();
-  for (Node* send : to_merge) {
-    XLS_CHECK_EQ(channel_id, send->As<Send>()->channel_id());
+  if (to_merge.size() <= 1) {
+    return false;
   }
+  XLS_ASSIGN_OR_RETURN(ChannelRef channel_ref,
+                       to_merge.front()->As<Send>()->GetChannelRef());
 
   XLS_ASSIGN_OR_RETURN(std::vector<Node*> token_inputs,
                        ComputeTokenInputs(f, to_merge));
 
-  XLS_ASSIGN_OR_RETURN(Node * token,
-                       f->MakeNode<AfterAll>(SourceInfo(), token_inputs));
+  // Collect all inputs to & users of the merged send, so we can check whether
+  // we can do this merge without creating a cycle.
+  absl::flat_hash_set<Node*> inputs;
+  absl::flat_hash_set<Node*> users;
+  inputs.reserve(token_inputs.size() + 2 * to_merge.size());
+  inputs.insert(token_inputs.begin(), token_inputs.end());
+  for (Node* node : to_merge) {
+    if (std::optional<Node*> predicate = p->GetPredicate(node);
+        predicate.has_value()) {
+      inputs.insert(*predicate);
+    }
+    inputs.insert(node->As<Send>()->data());
+  }
+  users.reserve(to_merge.size());
+  for (Node* node : to_merge) {
+    absl::c_copy(node->users(), std::inserter(users, users.end()));
+  }
+
+  if (HasPath(users, inputs)) {
+    // Check if this was a required merge due to channel strictness.
+    if (IsProvenMutuallyExclusiveChannel(channel_ref)) {
+      return absl::FailedPreconditionError(absl::StrFormat(
+          "Unable to merge operations on proven-mutually-exclusive channel "
+          "%s in proc %s without creating a cycle.",
+          GetChannelName(channel_ref), f->name()));
+    }
+
+    // We can't merge these sends without forming a cycle.
+    VLOG(1) << "Unable to merge nodes without creating a cycle: "
+            << absl::StrJoin(to_merge, ", ", [](std::string* out, Node* node) {
+                 absl::StrAppend(out, node->GetName());
+               });
+    return false;
+  }
+
+  absl::btree_set<SourceLocation> source_locations_set;
+  for (Node* send : to_merge) {
+    CHECK(channel_ref == *send->As<Send>()->GetChannelRef())
+        << "Channel mismatch; attempted to merge sends on channels "
+        << GetChannelName(channel_ref) << " and "
+        << GetChannelName(*send->As<Send>()->GetChannelRef());
+    absl::c_copy(
+        send->loc().locations,
+        std::inserter(source_locations_set, source_locations_set.end()));
+  }
+  SourceInfo merged_source_info(std::vector<SourceLocation>(
+      source_locations_set.begin(), source_locations_set.end()));
 
   XLS_ASSIGN_OR_RETURN(std::vector<Node*> predicates,
                        PredicateVectorFromNodes(p, f, to_merge));
-
-  XLS_ASSIGN_OR_RETURN(Node * selector,
-                       f->MakeNode<Concat>(SourceInfo(), predicates));
-
-  XLS_ASSIGN_OR_RETURN(
-      Node * predicate,
-      f->MakeNode<BitwiseReductionOp>(SourceInfo(), selector, Op::kOrReduce));
 
   std::vector<Node*> args;
   args.reserve(to_merge.size());
   for (Node* node : to_merge) {
     args.push_back(node->As<Send>()->data());
   }
-  // OneHotSelect takes the cases in reverse order, confusingly
+  // OneHotSelect takes the cases in reverse order (LSB-to-MSB).
   std::reverse(args.begin(), args.end());
 
-  XLS_ASSIGN_OR_RETURN(Node * data,
-                       f->MakeNode<OneHotSelect>(SourceInfo(), selector, args));
+  XLS_ASSIGN_OR_RETURN(Node * token,
+                       f->MakeNode<AfterAll>(merged_source_info, token_inputs));
 
-  XLS_ASSIGN_OR_RETURN(Node * send, f->MakeNode<Send>(SourceInfo(), token, data,
-                                                      predicate, channel_id));
+  XLS_ASSIGN_OR_RETURN(Node * selector,
+                       f->MakeNode<Concat>(merged_source_info, predicates));
+
+  XLS_ASSIGN_OR_RETURN(Node * predicate,
+                       f->MakeNode<BitwiseReductionOp>(
+                           merged_source_info, selector, Op::kOrReduce));
+
+  XLS_ASSIGN_OR_RETURN(Node * data, f->MakeNode<OneHotSelect>(
+                                        merged_source_info, selector, args));
+
+  XLS_ASSIGN_OR_RETURN(
+      Node * send, f->MakeNode<Send>(merged_source_info, token, data, predicate,
+                                     GetChannelName(channel_ref)));
 
   for (Node* node : to_merge) {
     XLS_RETURN_IF_ERROR(node->ReplaceUsesWith(send));
@@ -471,29 +721,78 @@ absl::StatusOr<bool> MergeSends(Predicates* p, FunctionBase* f,
 
 absl::StatusOr<bool> MergeReceives(Predicates* p, FunctionBase* f,
                                    absl::Span<Node* const> to_merge) {
-  int64_t channel_id = to_merge.front()->As<Receive>()->channel_id();
-  bool is_blocking = to_merge.front()->As<Receive>()->is_blocking();
-
-  for (Node* send : to_merge) {
-    XLS_CHECK_EQ(channel_id, send->As<Receive>()->channel_id());
-    XLS_CHECK_EQ(is_blocking, send->As<Receive>()->is_blocking());
+  if (to_merge.size() <= 1) {
+    return false;
   }
+  XLS_ASSIGN_OR_RETURN(ChannelRef channel_ref,
+                       to_merge.front()->As<Receive>()->GetChannelRef());
+  bool is_blocking = to_merge.front()->As<Receive>()->is_blocking();
 
   XLS_ASSIGN_OR_RETURN(std::vector<Node*> token_inputs,
                        ComputeTokenInputs(f, to_merge));
 
-  XLS_ASSIGN_OR_RETURN(Node * token,
-                       f->MakeNode<AfterAll>(SourceInfo(), token_inputs));
+  // Collect all inputs to & users of the merged send, so we can check whether
+  // we can do this merge without creating a cycle.
+  absl::flat_hash_set<Node*> inputs;
+  absl::flat_hash_set<Node*> users;
+  inputs.reserve(token_inputs.size() + to_merge.size());
+  inputs.insert(token_inputs.begin(), token_inputs.end());
+  for (Node* node : to_merge) {
+    if (std::optional<Node*> predicate = p->GetPredicate(node);
+        predicate.has_value()) {
+      inputs.insert(*predicate);
+    }
+  }
+  users.reserve(to_merge.size());
+  for (Node* node : to_merge) {
+    absl::c_copy(node->users(), std::inserter(users, users.end()));
+  }
+
+  if (HasPath(users, inputs)) {
+    // Check if this was a required merge due to channel strictness.
+    if (IsProvenMutuallyExclusiveChannel(channel_ref)) {
+      return absl::FailedPreconditionError(absl::StrFormat(
+          "Unable to merge operations on proven-mutually-exclusive channel "
+          "%s in proc %s without creating a cycle.",
+          GetChannelName(channel_ref), f->name()));
+    }
+
+    // We can't merge these sends without forming a cycle.
+    VLOG(1) << "Unable to merge nodes without creating a cycle: "
+            << absl::StrJoin(to_merge, ", ", [](std::string* out, Node* node) {
+                 absl::StrAppend(out, node->GetName());
+               });
+    return false;
+  }
+
+  absl::btree_set<SourceLocation> source_locations_set;
+  for (Node* receive : to_merge) {
+    CHECK(channel_ref == *receive->As<Receive>()->GetChannelRef())
+        << "Channel mismatch; attempted to merge receives on channels "
+        << GetChannelName(channel_ref) << " and "
+        << GetChannelName(*receive->As<Receive>()->GetChannelRef());
+    CHECK_EQ(is_blocking, receive->As<Receive>()->is_blocking());
+    absl::c_copy(
+        receive->loc().locations,
+        std::inserter(source_locations_set, source_locations_set.end()));
+  }
+  SourceInfo merged_source_info(std::vector<SourceLocation>(
+      source_locations_set.begin(), source_locations_set.end()));
 
   XLS_ASSIGN_OR_RETURN(std::vector<Node*> predicates,
                        PredicateVectorFromNodes(p, f, to_merge));
 
-  XLS_ASSIGN_OR_RETURN(Node * predicate,
-                       f->MakeNode<NaryOp>(SourceInfo(), predicates, Op::kOr));
+  XLS_ASSIGN_OR_RETURN(Node * token,
+                       f->MakeNode<AfterAll>(merged_source_info, token_inputs));
 
-  XLS_ASSIGN_OR_RETURN(Node * receive,
-                       f->MakeNode<Receive>(SourceInfo(), token, predicate,
-                                            channel_id, is_blocking));
+  XLS_ASSIGN_OR_RETURN(
+      Node * predicate,
+      f->MakeNode<NaryOp>(merged_source_info, predicates, Op::kOr));
+
+  XLS_ASSIGN_OR_RETURN(
+      Node * receive,
+      f->MakeNode<Receive>(merged_source_info, token, predicate,
+                           GetChannelName(channel_ref), is_blocking));
 
   XLS_ASSIGN_OR_RETURN(Node * token_output,
                        f->MakeNode<TupleIndex>(SourceInfo(), receive, 0));
@@ -546,7 +845,36 @@ absl::StatusOr<bool> MergeNodes(Predicates* p, FunctionBase* f,
   return false;
 }
 
-}  // namespace
+// Returns the set of proven_mutually_exclusive channels that have operations
+// predicated by `node`.
+absl::StatusOr<absl::flat_hash_set<Channel*>>
+GetControlledProvenMutuallyExclusiveChannels(Node* node, const Predicates& p) {
+  FunctionBase* f = node->function_base();
+  absl::flat_hash_set<Channel*> controlled_channels;
+  for (Node* predicated_node : p.GetNodesPredicatedBy(node)) {
+    Channel* channel = nullptr;
+    if (predicated_node->Is<Send>()) {
+      XLS_ASSIGN_OR_RETURN(channel,
+                           f->package()->GetChannel(
+                               predicated_node->As<Send>()->channel_name()));
+    } else if (predicated_node->Is<Receive>()) {
+      XLS_ASSIGN_OR_RETURN(channel,
+                           f->package()->GetChannel(
+                               predicated_node->As<Receive>()->channel_name()));
+    } else {
+      continue;
+    }
+
+    if (channel->kind() != ChannelKind::kStreaming) {
+      continue;
+    }
+    if (down_cast<StreamingChannel*>(channel)->GetStrictness() ==
+        ChannelStrictness::kProvenMutuallyExclusive) {
+      controlled_channels.insert(channel);
+    }
+  }
+  return controlled_channels;
+}
 
 void Predicates::SetPredicate(Node* node, Node* pred) {
   if (predicated_by_.contains(node)) {
@@ -589,21 +917,111 @@ absl::Status Predicates::MarkNotMutuallyExclusive(Node* pred_a, Node* pred_b) {
   return absl::OkStatus();
 }
 
-std::optional<bool> Predicates::QueryMutuallyExclusive(Node* pred_a,
-                                                       Node* pred_b) const {
-  if (!mutual_exclusion_.contains(pred_a)) {
-    return std::nullopt;
-  }
-  if (!mutual_exclusion_.at(pred_a).contains(pred_b)) {
-    return std::nullopt;
-  }
-  return mutual_exclusion_.at(pred_a).at(pred_b);
+absl::Status Predicates::MarkUnknownMutuallyExclusive(Node* pred_a,
+                                                      Node* pred_b) {
+  XLS_RET_CHECK_NE(pred_a, pred_b);
+  XLS_RET_CHECK(FunctionIsOneBit(pred_a));
+  XLS_RET_CHECK(FunctionIsOneBit(pred_b));
+  mutual_exclusion_[pred_a][pred_b] = std::nullopt;
+  mutual_exclusion_[pred_b][pred_a] = std::nullopt;
+  return absl::OkStatus();
 }
 
-absl::flat_hash_map<Node*, bool> Predicates::MutualExclusionNeighbors(
-    Node* pred) const {
-  return mutual_exclusion_.contains(pred) ? mutual_exclusion_.at(pred)
-                                          : absl::flat_hash_map<Node*, bool>();
+absl::StatusOr<std::optional<bool>> Predicates::QueryMutuallyExclusive(
+    const LazyZ3Translator& translator, Node* pred_a, Node* pred_b) {
+  if (pred_a == pred_b) {
+    // Never mutex with yourself.
+    return false;
+  }
+  if (mutual_exclusion_.contains(pred_a) &&
+      mutual_exclusion_.at(pred_a).contains(pred_b)) {
+    // Already known.
+    return mutual_exclusion_.at(pred_a).at(pred_b);
+  }
+
+  // Actually do the mutex calculations
+  XLS_ASSIGN_OR_RETURN(solvers::z3::IrTranslator * solver,
+                       translator.Translator());
+  Z3_context ctx = solver->ctx();
+  solvers::z3::ScopedErrorHandler seh(ctx);
+  XLS_ASSIGN_OR_RETURN(
+      absl::flat_hash_set<Channel*> channels_a,
+      GetControlledProvenMutuallyExclusiveChannels(pred_a, *this));
+  XLS_ASSIGN_OR_RETURN(
+      absl::flat_hash_set<Channel*> channels_b,
+      GetControlledProvenMutuallyExclusiveChannels(pred_b, *this));
+  bool required_for_compilation = HasIntersection(channels_a, channels_b);
+
+  // NB We could check if a or b is always false but since we do this lazily
+  // theres no benefit there.
+
+  if (required_for_compilation) {
+    LOG(INFO) << "Removing Z3's rlimit for mutex check on " << pred_a->GetName()
+              << " and " << pred_b->GetName()
+              << " as mutual exclusion is required for compilation.";
+    solver->SetRlimit(0);
+  } else {
+    solver->SetRlimit(translator.z3_rlimit());
+  }
+  std::optional<Stopwatch> timer;
+  if (VLOG_IS_ON(2)) {
+    timer.emplace();
+  }
+  VLOG(2) << "START: Checking mutex between " << pred_a << " and " << pred_b;
+  Z3_ast z3_a = solver->GetTranslation(pred_a);
+  Z3_ast z3_b = solver->GetTranslation(pred_b);
+
+  // We try to find out if `a ∧ b` is satisfiable, which is true iff
+  // `a NAND b` is not valid.
+  Z3_ast a_and_b =
+      solvers::z3::BitVectorToBoolean(ctx, Z3_mk_bvand(ctx, z3_a, z3_b));
+  Z3_lbool satisfiable = RunSolver(ctx, a_and_b);
+  VLOG(2) << "END: Took " << timer->GetElapsedTime() << " to "
+          << (satisfiable == Z3_L_FALSE  ? "prove"
+              : satisfiable == Z3_L_TRUE ? "disprove"
+                                         : "give up proving")
+          << " mutex between " << pred_a << " and " << pred_b;
+  if (satisfiable == Z3_L_FALSE) {
+    XLS_RETURN_IF_ERROR(MarkMutuallyExclusive(pred_a, pred_b));
+    return true;
+  } else if (satisfiable == Z3_L_TRUE) {
+    XLS_RETURN_IF_ERROR(MarkNotMutuallyExclusive(pred_a, pred_b));
+    if (required_for_compilation) {
+      return absl::FailedPreconditionError(absl::StrFormat(
+          "Proved that %s and %s, which control operations on "
+          "proven-mutually-exclusive channels (%s), are not mutually "
+          "exclusive.",
+          pred_a->GetName(), pred_b->GetName(),
+          absl::StrJoin(Intersection(channels_a, channels_b), ", ",
+                        [](std::string* out, Channel* channel) {
+                          absl::StrAppend(out, channel->name());
+                        })));
+    }
+    return false;
+  } else {
+    VLOG(3) << "Z3 ran out of time checking mutual exclusion of "
+            << pred_a->GetName() << " and " << pred_b->GetName();
+    XLS_RETURN_IF_ERROR(MarkUnknownMutuallyExclusive(pred_a, pred_b));
+    if (required_for_compilation) {
+      return absl::FailedPreconditionError(absl::StrFormat(
+          "Z3 failed to prove that %s and %s, which control operations on "
+          "proven-mutually-exclusive channels (%s), are mutually "
+          "exclusive.",
+          pred_a->GetName(), pred_b->GetName(),
+          absl::StrJoin(Intersection(channels_a, channels_b), ", ",
+                        [](std::string* out, Channel* channel) {
+                          absl::StrAppend(out, channel->name());
+                        })));
+    }
+    return std::nullopt;
+  }
+}
+
+absl::flat_hash_map<Node*, std::optional<bool>>
+Predicates::MutualExclusionNeighbors(Node* pred) const {
+  return mutual_exclusion_.contains(pred)
+             ? mutual_exclusion_.at(pred)
+             : absl::flat_hash_map<Node*, std::optional<bool>>();
 }
 
 void Predicates::ReplaceNode(Node* original, Node* replacement) {
@@ -624,7 +1042,8 @@ void Predicates::ReplaceNode(Node* original, Node* replacement) {
     predicate_of_.erase(original);
   }
   if (mutual_exclusion_.contains(original)) {
-    absl::flat_hash_map<Node*, bool> neighbors = mutual_exclusion_.at(original);
+    absl::flat_hash_map<Node*, std::optional<bool>> neighbors =
+        mutual_exclusion_.at(original);
     mutual_exclusion_.erase(original);
     mutual_exclusion_[replacement] = neighbors;
     for (const auto& [neighbor, boolean] : neighbors) {
@@ -635,7 +1054,7 @@ void Predicates::ReplaceNode(Node* original, Node* replacement) {
 }
 
 absl::StatusOr<Node*> AddPredicate(Predicates* p, Node* node, Node* pred) {
-  XLS_CHECK_EQ(node->function_base(), pred->function_base());
+  CHECK_EQ(node->function_base(), pred->function_base());
   FunctionBase* f = node->function_base();
 
   std::optional<Node*> existing_predicate_maybe = p->GetPredicate(node);
@@ -651,7 +1070,7 @@ absl::StatusOr<Node*> AddPredicate(Predicates* p, Node* node, Node* pred) {
 
     for (const auto [neighbor, boolean] :
          p->MutualExclusionNeighbors(existing_predicate)) {
-      if (boolean) {
+      if (boolean.value_or(false)) {
         XLS_RETURN_IF_ERROR(
             p->MarkMutuallyExclusive(pred_and_existing, neighbor));
       }
@@ -664,312 +1083,34 @@ absl::StatusOr<Node*> AddPredicate(Predicates* p, Node* node, Node* pred) {
   return pred;
 }
 
-struct SelectorEquals {
-  Node* selector;
-  Bits value;
-
-  friend bool operator==(const SelectorEquals& lhs, const SelectorEquals& rhs) {
-    return lhs.selector->id() == rhs.selector->id() &&
-           bits_ops::UEqual(lhs.value, rhs.value);
-  }
-
-  friend bool operator<(const SelectorEquals& lhs, const SelectorEquals& rhs) {
-    return lhs.selector->id() < rhs.selector->id() ||
-           (lhs.selector->id() == rhs.selector->id() &&
-            bits_ops::ULessThan(lhs.value, rhs.value));
-  }
-};
-
-struct PredicateSet {
-  absl::btree_set<SelectorEquals> settings;
-
-  friend bool operator==(const PredicateSet& lhs, const PredicateSet& rhs) {
-    return lhs.settings == rhs.settings;
-  }
-
-  friend bool operator<(const PredicateSet& lhs, const PredicateSet& rhs) {
-    return lhs.settings < rhs.settings;
-  }
-};
-
-using NodeSet = absl::btree_set<Node*, Node::NodeIdLessThan>;
-template <typename T>
-using NodeMap = absl::btree_map<Node*, T, Node::NodeIdLessThan>;
-
-absl::Status AddSelectPredicates(Predicates* p, FunctionBase* f) {
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<PostDominatorAnalysis> pda,
-                       PostDominatorAnalysis::Run(f));
-
-  // In general, this function makes a lot of contortions to create something
-  // that does not need to have common subexpression elimination applied to it.
-  // This is because the CSE implementation needs to have a sophisticated
-  // understanding of predicates, and I couldn't get that to work.
-
-  // First, take each select and add to the `PredicateSet` of all nodes
-  // that are postdominated by one of its cases a predicate of the form
-  // `selector == case_number`.
-  NodeMap<PredicateSet> predicate_sets;
-  for (Node* node : TopoSort(f)) {
-    if (node->Is<Select>()) {
-      Select* select = node->As<Select>();
-      int64_t selector_bits =
-          select->selector()->GetType()->AsBitsOrDie()->bit_count();
-
-      int64_t index = 0;
-      for (Node* case_node : select->cases()) {
-        // If a case node has fanout, this analysis will get confused.
-        if (case_node->users().size() > 1) {
-          continue;
-        }
-
-        // The `users()` method returns a deduplicated set of nodes, so we need
-        // to check if this node has fanout by being used more than once under
-        // the same select.
-        if (select->OperandInstanceCount(case_node) != 1) {
-          continue;
-        }
-
-        // Finally, propagate a `selector == case_index` condition to all nodes
-        // dominated by this case node.
-        for (Node* dominated : pda->GetNodesPostDominatedByNode(case_node)) {
-          // TODO(taktoa): code postdominated by the default case should have
-          // the predicate `selector > select->cases().size()` added to it.
-          predicate_sets[dominated].settings.insert(
-              SelectorEquals{select->selector(), UBits(index, selector_bits)});
-        }
-        ++index;
-      }
-    }
-    // TODO(taktoa): handle one-hot and priority select
-  }
-
-  // Second, create a map from predicate set to nodes, which is intended to
-  // exploit the fact that two nodes may (and will often) have the same
-  // predicate set, so we only want to create nodes for that predicate set once.
-  absl::btree_map<PredicateSet, NodeSet> inverse_predicate_sets;
-  for (const auto& [node, predicate_set] : predicate_sets) {
-    inverse_predicate_sets[predicate_set].insert(node);
-  }
-
-  // Third, we want to exploit the fact that many predicate sets will contain
-  // the same predicates, so we create a map from abstract predicates to nodes,
-  // initially populating it with null pointers, and then synthesize each
-  // abstract predicate, replacing the null pointer with a concrete IR
-  // implementation of the abstract predicate.
-  absl::btree_map<SelectorEquals, Node*> settings_map;
-  for (const auto& [predicate_set, nodes] : inverse_predicate_sets) {
-    for (const SelectorEquals& setting : predicate_set.settings) {
-      settings_map[setting] = nullptr;
-    }
-  }
-  for (auto& [setting, predicate] : settings_map) {
-    XLS_ASSIGN_OR_RETURN(
-        Node * literal,
-        f->MakeNode<Literal>(SourceInfo(), Value(setting.value)));
-    XLS_ASSIGN_OR_RETURN(predicate,
-                         f->MakeNode<CompareOp>(SourceInfo(), setting.selector,
-                                                literal, Op::kEq));
-  }
-
-  // Create an ordering on `Bits` so they can be keys in an `absl::btree_map`.
-  struct BitsLT {
-    bool operator()(const Bits& lhs, const Bits& rhs) const {
-      return bits_ops::ULessThan(lhs, rhs);
-    }
-  };
-
-  // Fourth, we create a mapping from selector to the value of the selector
-  // to set of nodes that contain that selector-value pair, which will be used
-  // later in creating mutual exclusion edges.
-  NodeMap<absl::btree_map<Bits, NodeSet, BitsLT>> selector_to_value_to_preds;
-
-  // Fifth, we AND together all the select predicates that apply to a given node
-  // and then AND that with the current predicate of that node via the call to
-  // `AddPredicate`. Along the way, we populate `selector_to_value_to_preds`.
-  for (const auto& [predicate_set, nodes] : inverse_predicate_sets) {
-    std::vector<Node*> preds;
-    for (const SelectorEquals& setting : predicate_set.settings) {
-      preds.push_back(settings_map.at(setting));
-    }
-    XLS_ASSIGN_OR_RETURN(Node * predicates_anded,
-                         f->MakeNode<NaryOp>(SourceInfo(), preds, Op::kAnd));
-    for (Node* node : nodes) {
-      XLS_ASSIGN_OR_RETURN(Node * pred,
-                           AddPredicate(p, node, predicates_anded));
-      for (const SelectorEquals& setting : predicate_set.settings) {
-        selector_to_value_to_preds[setting.selector][setting.value].insert(
-            pred);
-      }
-    }
-  }
-
-  // Finally, we ensure that any pair of predicates that contains two abstract
-  // predicates on the same selector with different values are marked as
-  // mutually exclusive.
-  for (const auto& [selector, value_to_preds] : selector_to_value_to_preds) {
-    for (const auto& [valueA, predsA] : value_to_preds) {
-      for (const auto& [valueB, predsB] : value_to_preds) {
-        if (bits_ops::UEqual(valueA, valueB)) {
-          continue;
-        }
-        for (Node* predA : predsA) {
-          for (Node* predB : predsB) {
-            if (predA == predB) {
-              continue;
-            }
-            XLS_RETURN_IF_ERROR(p->MarkMutuallyExclusive(predA, predB));
-          }
-        }
-      }
-    }
-  }
-
-  return absl::OkStatus();
-}
-
-absl::Status ComputeMutualExclusion(Predicates* p, FunctionBase* f) {
-  if (f->IsBlock()) {
-    return absl::OkStatus();
-  }
-
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<solvers::z3::IrTranslator> translator,
-                       solvers::z3::IrTranslator::CreateAndTranslate(f, true));
-
-  Z3_context ctx = translator->ctx();
-
-  solvers::z3::ScopedErrorHandler seh(ctx);
-
-  std::vector<std::pair<Node*, int64_t>> predicate_nodes = PredicateNodes(p, f);
-
-  // Determine for each predicate whether it is always false using Z3.
-  // Dead nodes are mutually exclusive with all other nodes, so this can reduce
-  // the runtime  by doing only a linear amount of Z3 calls to remove
-  // quadratically many Z3 calls.
-  for (const auto& [node, index] : predicate_nodes) {
-    Z3_ast translated = translator->GetTranslation(node);
-    if (RunSolver(ctx, solvers::z3::BitVectorToBoolean(ctx, translated)) ==
-        Z3_L_FALSE) {
-      XLS_VLOG(3) << "Proved that " << node << " is always false";
-      // A constant false node is mutually exclusive with all other nodes.
-      for (const auto& [other, other_index] : predicate_nodes) {
-        if (index != other_index) {
-          XLS_RETURN_IF_ERROR(p->MarkMutuallyExclusive(node, other));
-        }
-      }
-    }
-  }
-
-  for (const auto& [node, index] : predicate_nodes) {
-    XLS_VLOG(3) << "Predicate: " << node;
-  }
-
-  int64_t known_false = 0;
-  int64_t known_true = 0;
-  int64_t unknown = 0;
-
-  absl::flat_hash_map<Node*, absl::flat_hash_set<Op>> ops_for_pred;
-  for (const auto& [node, index] : predicate_nodes) {
-    for (Node* predicated_by : p->GetNodesPredicatedBy(node)) {
-      ops_for_pred[node].insert(predicated_by->op());
-    }
-  }
-
-  {
-    std::vector<Node*> irrelevant;
-    for (const auto& [pred, ops] : ops_for_pred) {
-      if (!std::any_of(ops.begin(), ops.end(), IsHeavyOp)) {
-        irrelevant.push_back(pred);
-      }
-    }
-    for (Node* pred : irrelevant) {
-      ops_for_pred.erase(pred);
-    }
-  }
-
-  for (const auto& [node_a, index_a] : predicate_nodes) {
-    for (const auto& [node_b, index_b] : predicate_nodes) {
-      // This prevents checking `a NAND b` and then later checking `b NAND a`.
-      if (index_a >= index_b) {
-        continue;
-      }
-
-      // Skip this pair if we already know whether they are mutually exclusive.
-      if (p->QueryMutuallyExclusive(node_a, node_b).has_value()) {
-        continue;
-      }
-
-      if (!ops_for_pred.contains(node_a) || !ops_for_pred.contains(node_b) ||
-          !HasIntersection(ops_for_pred.at(node_a), ops_for_pred.at(node_b))) {
-        continue;
-      }
-
-      Z3_ast z3_a = translator->GetTranslation(node_a);
-      Z3_ast z3_b = translator->GetTranslation(node_b);
-
-      // We try to find out if `a ∧ b` is satisfiable, which is true iff
-      // `a NAND b` is not valid.
-      Z3_ast a_and_b =
-          solvers::z3::BitVectorToBoolean(ctx, Z3_mk_bvand(ctx, z3_a, z3_b));
-
-      Z3_lbool satisfiable = RunSolver(ctx, a_and_b);
-
-      if (satisfiable == Z3_L_FALSE) {
-        known_true += 1;
-        XLS_RETURN_IF_ERROR(p->MarkMutuallyExclusive(node_a, node_b));
-      } else if (satisfiable == Z3_L_TRUE) {
-        known_false += 1;
-        XLS_RETURN_IF_ERROR(p->MarkNotMutuallyExclusive(node_a, node_b));
-      } else {
-        unknown += 1;
-        XLS_VLOG(3) << "Z3 ran out of time checking mutual exclusion of "
-                    << node_a->GetName() << " and " << node_b->GetName();
-      }
-    }
-  }
-
-  XLS_VLOG(3) << "known_false = " << known_false;
-  XLS_VLOG(3) << "known_true  = " << known_true;
-  XLS_VLOG(3) << "unknown     = " << unknown;
-
-  XLS_RETURN_IF_ERROR(seh.status());
-
-  return absl::OkStatus();
-}
+}  // namespace
 
 absl::StatusOr<bool> MutualExclusionPass::RunOnFunctionBaseInternal(
-    SchedulingUnit<FunctionBase*>* unit, const SchedulingPassOptions& options,
-    SchedulingPassResults* results) const {
-  FunctionBase* f = unit->ir;
-
+    FunctionBase* f, const SchedulingPassOptions& options, PassResults* results,
+    SchedulingContext& context) const {
   ScheduleCycleMap scm;
-  if (unit->schedule.has_value()) {
-    if (f != unit->schedule.value().function_base()) {
+  if (context.schedules().contains(f)) {
+    if (f != context.schedules().at(f).function_base()) {
       return false;
     }
-    scm = unit->schedule.value().GetCycleMap();
+    scm = context.schedules().at(f).GetCycleMap();
   } else {
-    for (Node* node : unit->ir->nodes()) {
+    for (Node* node : f->nodes()) {
       scm[node] = 0;
     }
   }
 
   // Sets limit on z3 "solver resources", so that the pass doesn't take too long
   const int64_t z3_rlimit =
-      options.scheduling_options.mutual_exclusion_z3_rlimit().has_value()
-          ? options.scheduling_options.mutual_exclusion_z3_rlimit().value()
-          : 5000;
-
-  const std::string z3_rlimit_str = absl::StrCat(z3_rlimit);
-
-  Z3_global_param_set("rlimit", z3_rlimit_str.c_str());
+      options.scheduling_options.mutual_exclusion_z3_rlimit().value_or(5000);
 
   Predicates p;
   XLS_RETURN_IF_ERROR(AddSendReceivePredicates(&p, f));
-  XLS_RETURN_IF_ERROR(ComputeMutualExclusion(&p, f));
+  LazyZ3Translator solver(f, z3_rlimit);
   XLS_ASSIGN_OR_RETURN(std::vector<absl::flat_hash_set<Node*>> merge_classes,
-                       ComputeMergeClasses(&p, f, scm));
+                       ComputeMergeClasses(&p, solver, f, scm));
 
-  if (XLS_VLOG_IS_ON(3)) {
+  if (VLOG_IS_ON(3)) {
     for (const absl::flat_hash_set<Node*>& merge_class : merge_classes) {
       if (merge_class.size() <= 1) {
         continue;
@@ -977,17 +1118,17 @@ absl::StatusOr<bool> MutualExclusionPass::RunOnFunctionBaseInternal(
       Op op = (*(merge_class.cbegin()))->op();
       std::vector<std::string> name_pred_pairs;
       for (Node* node : merge_class) {
-        XLS_CHECK_EQ(node->op(), op);
+        CHECK_EQ(node->op(), op);
         name_pred_pairs.push_back(
             absl::StrFormat("%s [%s]", node->GetName(),
                             p.GetPredicate(node).value()->GetName()));
       }
-      XLS_VLOG(3) << "Merge class: " << merge_class.size() << ", op = " << op;
-      XLS_VLOG(3) << "    " << absl::StrJoin(name_pred_pairs, ", ");
+      VLOG(3) << "Merge class: " << merge_class.size() << ", op = " << op;
+      VLOG(3) << "    " << absl::StrJoin(name_pred_pairs, ", ");
     }
   }
 
-  XLS_VLOG(3) << "Successfully computed mutual exclusion for " << f->name();
+  VLOG(3) << "Successfully computed mutual exclusion for " << f->name();
 
   bool changed = false;
   for (const absl::flat_hash_set<Node*>& merge_class : merge_classes) {
@@ -995,7 +1136,9 @@ absl::StatusOr<bool> MutualExclusionPass::RunOnFunctionBaseInternal(
     changed = changed || subpass_changed;
   }
 
-  unit->schedule = std::nullopt;
+  if (changed) {
+    context.schedules().clear();
+  }
 
   return changed;
 }

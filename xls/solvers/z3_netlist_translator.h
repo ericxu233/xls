@@ -20,10 +20,13 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "xls/netlist/function_parser.h"
 #include "xls/netlist/netlist.h"
-#include "../z3/src/api/z3.h"
+#include "z3/src/api/z3.h"  // IWYU pragma: keep
+#include "z3/src/api/z3_api.h"
 
 namespace xls {
 namespace solvers {
@@ -88,7 +91,7 @@ class NetlistTranslator {
   absl::Status Translate();
   absl::Status TranslateCell(const netlist::rtl::Cell& cell);
   absl::StatusOr<Z3_ast> TranslateFunction(
-      const netlist::rtl::Cell& cell, const netlist::function::Ast ast,
+      const netlist::rtl::Cell& cell, netlist::function::Ast ast,
       const absl::flat_hash_map<std::string, Z3_ast>& state_table_values);
   absl::StatusOr<absl::flat_hash_map<std::string, Z3_ast>> TranslateStateTable(
       const netlist::rtl::Cell& cell);

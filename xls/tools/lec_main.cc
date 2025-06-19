@@ -14,19 +14,23 @@
 
 // Tool to prove or disprove logical equivalence of XLS IR and a netlist.
 
-#include <csignal>
+#include <signal.h>  // NOLINT (clang-tidy can't find symbols in csignal)
+#include <unistd.h>
+
+#include <cstdint>
+#include <cstring>
+#include <filesystem>  // NOLINT
 #include <iostream>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "absl/base/internal/sysinfo.h"
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_join.h"
-#include "absl/strings/str_split.h"
+#include "absl/synchronization/mutex.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/get_runfile_path.h"
@@ -34,17 +38,22 @@
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/subprocess.h"
+#include "xls/ir/function.h"
 #include "xls/ir/ir_parser.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/op.h"
+#include "xls/ir/package.h"
+#include "xls/ir/type.h"
 #include "xls/netlist/cell_library.h"
 #include "xls/netlist/function_extractor.h"
 #include "xls/netlist/lib_parser.h"
 #include "xls/netlist/netlist.h"
 #include "xls/netlist/netlist.pb.h"
 #include "xls/netlist/netlist_parser.h"
+#include "xls/scheduling/pipeline_schedule.h"
 #include "xls/scheduling/pipeline_schedule.pb.h"
 #include "xls/solvers/z3_lec.h"
-#include "xls/solvers/z3_utils.h"
-#include "../z3/src/api/z3_api.h"
+#include "z3/src/api/z3_api.h"
 
 ABSL_FLAG(std::string, cell_lib_path, "",
           "Path to the cell library. "
@@ -95,7 +104,7 @@ ABSL_FLAG(int32_t, stage, -1,
 namespace xls {
 namespace {
 
-constexpr const char kIrConverterPath[] =
+static constexpr std::string_view kIrConverterPath =
     "xls/dslx/ir_convert/ir_converter_main";
 
 // Loads a cell library, either from a raw Liberty file or a preprocessed
@@ -204,7 +213,7 @@ absl::Status AutoStage(const solvers::z3::LecParams& lec_params,
         std::cout << "PASSED!\n";
       } else {
         std::cout << "FAILED!\n";
-        std::cout << std::endl << "IR/netlist value dump:" << std::endl;
+        std::cout << '\n' << "IR/netlist value dump:" << '\n';
         lec->DumpIrTree();
       }
     }
@@ -212,9 +221,9 @@ absl::Status AutoStage(const solvers::z3::LecParams& lec_params,
     std::cout << "Performing full LEC.\n";
     XLS_ASSIGN_OR_RETURN(auto lec, solvers::z3::Lec::Create(lec_params));
     bool equal = lec->Run();
-    std::cout << lec->ResultToString() << std::endl;
+    std::cout << lec->ResultToString() << '\n';
     if (!equal) {
-      std::cout << std::endl << "IR/netlist value dump:" << std::endl;
+      std::cout << '\n' << "IR/netlist value dump:" << '\n';
       lec->DumpIrTree();
     }
   }
@@ -251,8 +260,8 @@ static absl::Status RealMain(
   std::unique_ptr<solvers::z3::Lec> lec;
   if (!schedule_path.empty()) {
     XLS_ASSIGN_OR_RETURN(
-        PipelineScheduleProto proto,
-        ParseTextProtoFile<PipelineScheduleProto>(schedule_path));
+        PackagePipelineSchedulesProto proto,
+        ParseTextProtoFile<PackagePipelineSchedulesProto>(schedule_path));
     XLS_ASSIGN_OR_RETURN(
         PipelineSchedule schedule,
         PipelineSchedule::FromProto(lec_params.ir_function, proto));
@@ -296,9 +305,9 @@ static absl::Status RealMain(
     return absl::DeadlineExceededError("LEC timed out.");
   }
 
-  std::cout << lec->ResultToString() << std::endl;
+  std::cout << lec->ResultToString() << '\n';
   if (!equal) {
-    std::cout << std::endl << "IR/netlist value dump:" << std::endl;
+    std::cout << '\n' << "IR/netlist value dump:" << '\n';
     lec->DumpIrTree();
   }
 
@@ -311,27 +320,27 @@ int main(int argc, char* argv[]) {
   xls::InitXls(argv[0], argc, argv);
 
   std::string ir_path = absl::GetFlag(FLAGS_ir_path);
-  XLS_QCHECK(!ir_path.empty()) << "--ir_path must be set.";
+  QCHECK(!ir_path.empty()) << "--ir_path must be set.";
 
   std::string netlist_path = absl::GetFlag(FLAGS_netlist_path);
-  XLS_QCHECK(!netlist_path.empty()) << "--netlist_path must be set.";
+  QCHECK(!netlist_path.empty()) << "--netlist_path must be set.";
 
   std::string cell_lib_path = absl::GetFlag(FLAGS_cell_lib_path);
   std::string cell_proto_path = absl::GetFlag(FLAGS_cell_proto_path);
-  XLS_QCHECK(cell_lib_path.empty() ^ cell_proto_path.empty())
+  QCHECK(cell_lib_path.empty() ^ cell_proto_path.empty())
       << "One (and only one) of --cell_lib_path and --cell_proto_path "
          "should be set.";
 
   std::string schedule_path = absl::GetFlag(FLAGS_schedule_path);
   int stage = absl::GetFlag(FLAGS_stage);
-  XLS_QCHECK(stage == -1 || !schedule_path.empty())
+  QCHECK(stage == -1 || !schedule_path.empty())
       << "--schedule_path must be specified with --stage.";
 
   bool auto_stage = absl::GetFlag(FLAGS_auto_stage);
-  XLS_QCHECK(!(auto_stage && stage != -1))
+  QCHECK(!(auto_stage && stage != -1))
       << "Only one of --stage or --auto_stage may be specified.";
 
-  XLS_QCHECK(!(auto_stage && schedule_path.empty()))
+  QCHECK(!(auto_stage && schedule_path.empty()))
       << "--schedule_path must be specified with --auto_stage.";
 
   return xls::ExitStatus(xls::RealMain(

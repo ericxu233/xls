@@ -14,21 +14,25 @@
 
 #include "xls/ir/big_int.h"
 
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status.h"
 #include "xls/common/status/matchers.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
+#include "xls/ir/format_preference.h"
 #include "xls/ir/number_parser.h"
 
 namespace xls {
 namespace {
 
-using status_testing::StatusIs;
+using ::absl_testing::StatusIs;
 
 class BigIntTest : public ::testing::Test {
  protected:
@@ -37,13 +41,12 @@ class BigIntTest : public ::testing::Test {
   }
 
   BigInt MakeBigInt(std::string_view hex_string) {
-    std::pair<bool, Bits> sign_magnitude =
-        GetSignAndMagnitude(hex_string).value();
-    if (sign_magnitude.first) {
+    auto [sign, magnitude] = GetSignAndMagnitude(hex_string).value();
+    if (sign == Sign::kNegative) {
       // Negative number (leading '-').
-      return BigInt::Negate(BigInt::MakeUnsigned(sign_magnitude.second));
+      return BigInt::Negate(BigInt::MakeUnsigned(magnitude));
     }
-    return BigInt::MakeUnsigned(sign_magnitude.second);
+    return BigInt::MakeUnsigned(magnitude);
   }
 };
 

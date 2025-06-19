@@ -14,29 +14,55 @@
 
 #include "xls/passes/arith_simplification_pass.h"
 
+#include <stdint.h>  // NOLINT(modernize-deprecated-headers) needed for UINT64_C
+
+#include <algorithm>
 #include <cstdlib>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "xls/common/fuzzing/fuzztest.h"
+#include "absl/log/log.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
-#include "xls/common/bits_util.h"
+#include "absl/strings/str_format.h"
+#include "absl/time/time.h"
+#include "absl/types/span.h"
+#include "xls/common/math_util.h"
 #include "xls/common/status/matchers.h"
 #include "xls/interpreter/function_interpreter.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/bits_test_utils.h"
+#include "xls/ir/events.h"
 #include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/package.h"
+#include "xls/ir/value.h"
 #include "xls/passes/dce_pass.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
+#include "xls/solvers/z3_ir_equivalence_testutils.h"
 
 namespace m = ::xls::op_matchers;
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+constexpr absl::Duration kProverTimeout = absl::Seconds(10);
+
+using ::absl_testing::IsOk;
+using ::absl_testing::IsOkAndHolds;
+using ::xls::solvers::z3::ScopedVerifyEquivalence;
+
+using ::testing::_;
+using ::testing::AllOf;
 
 class ArithSimplificationPassTest : public IrTestBase {
  protected:
@@ -44,13 +70,17 @@ class ArithSimplificationPassTest : public IrTestBase {
 
   absl::StatusOr<bool> Run(Package* p) {
     PassResults results;
-    return ArithSimplificationPass(kMaxOptLevel)
-        .Run(p, OptimizationPassOptions(), &results);
+    OptimizationContext context;
+    return ArithSimplificationPass().Run(
+        p, OptimizationPassOptions().WithOptLevel(kMaxOptLevel), &results,
+        context);
   }
 
-  void CheckUnsignedDivide(int n, int divisor);
-  void CheckSignedDividePowerOfTwo(int n, int divisor);
-  void CheckSignedDivideNotPowerOfTwo(int n, int divisor);
+  void CheckUnsignedDivideBy(int divisor, int bit_count);
+  void CheckUnsignedDivideOf(int dividend, int bit_count);
+  void CheckSignedDivideByPowerOfTwo(int n, int divisor);
+  void CheckSignedDivideByNotPowerOfTwo(int n, int divisor);
+  void CheckSignedDivideOf(int bit_count, int dividend);
 };
 
 TEST_F(ArithSimplificationPassTest, Arith1) {
@@ -71,30 +101,409 @@ TEST_F(ArithSimplificationPassTest, Arith1) {
                      m::Concat(m::Literal(0), m::BitSlice())));
 }
 
-TEST_F(ArithSimplificationPassTest, DoubleNeg) {
+TEST_F(ArithSimplificationPassTest, CompareEqNegated) {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn simple_neg(x:bits[2]) -> bits[2] {
-        neg1:bits[2] = neg(x)
-        ret result: bits[2] = neg(neg1)
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[1] {
+        neg1:bits[8] = neg(x)
+        neg2:bits[8] = neg(y)
+        ret result: bits[1] = eq(neg1, neg2)
      }
   )",
                                                        p.get()));
+  ASSERT_THAT(f->return_value(), m::Eq(m::Neg(), m::Neg()));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Param());
+  EXPECT_THAT(f->return_value(), m::Eq(m::Param("x"), m::Param("y")));
 }
 
-TEST_F(ArithSimplificationPassTest, MulBy0) {
+TEST_F(ArithSimplificationPassTest, CompareEqNegatedConstant) {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn mul_zero(x:bits[8]) -> bits[8] {
-        zero:bits[8] = literal(value=0)
-        ret result: bits[8] = umul(x, zero)
+     fn compare_neg(x:bits[8]) -> bits[1] {
+        neg_x:bits[8] = neg(x)
+        k:bits[8] = literal(value=3)
+        ret result: bits[1] = eq(neg_x, k)
      }
   )",
                                                        p.get()));
+  EXPECT_THAT(f->return_value(), m::Eq(m::Neg(), m::Literal(3)));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Literal(0));
+  EXPECT_THAT(f->return_value(), m::Eq(m::Param("x"), m::Literal(253)));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareEqNegatedWithOneUsedElsewhere) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[9] {
+        neg1:bits[8] = neg(x)
+        neg2:bits[8] = neg(y)
+        cmp:bits[1] = eq(neg1, neg2)
+        ret result: bits[9] = concat(cmp, neg1)
+     }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(f->return_value(),
+              m::Concat(m::Eq(m::Neg(m::Param("x")), m::Neg(m::Param("y"))),
+                        m::Neg(m::Param("x"))));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Concat(m::Eq(m::Param("x"), m::Param("y")),
+                                           m::Neg(m::Param("x"))));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareEqNegatedWithBothUsedElsewhere) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[17] {
+        neg1:bits[8] = neg(x)
+        neg2:bits[8] = neg(y)
+        cmp:bits[1] = eq(neg1, neg2)
+        ret result: bits[17] = concat(cmp, neg1, neg2)
+     }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(f->return_value(),
+              m::Concat(m::Eq(m::Neg(m::Param("x")), m::Neg(m::Param("y"))),
+                        m::Neg(m::Param("x")), m::Neg(m::Param("y"))));
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(false));
+  ASSERT_THAT(f->return_value(),
+              m::Concat(m::Eq(m::Neg(m::Param("x")), m::Neg(m::Param("y"))),
+                        m::Neg(m::Param("x")), m::Neg(m::Param("y"))));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareEqNegatedConstantWithOtherUse) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8]) -> bits[9] {
+        neg_x:bits[8] = neg(x)
+        k:bits[8] = literal(value=3)
+        cmp:bits[1] = eq(neg_x, k)
+        ret result: bits[9] = concat(cmp, neg_x)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(),
+              m::Concat(m::Eq(m::Neg(m::Param("x")), m::Literal(3)),
+                        m::Neg(m::Param("x"))));
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(false));
+  EXPECT_THAT(f->return_value(),
+              m::Concat(m::Eq(m::Neg(m::Param("x")), m::Literal(3)),
+                        m::Neg(m::Param("x"))));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareNeNegated) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[1] {
+        neg1:bits[8] = neg(x)
+        neg2:bits[8] = neg(y)
+        ret result: bits[1] = ne(neg1, neg2)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(), m::Ne(m::Neg(), m::Neg()));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Ne(m::Param("x"), m::Param("y")));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareNeNegatedConstant) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8]) -> bits[1] {
+        neg_x:bits[8] = neg(x)
+        k:bits[8] = literal(value=3)
+        ret result: bits[1] = ne(neg_x, k)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(), m::Ne(m::Neg(), m::Literal(3)));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Ne(m::Param("x"), m::Literal(253)));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareNeNegatedWithOneUsedElsewhere) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[9] {
+        neg1:bits[8] = neg(x)
+        neg2:bits[8] = neg(y)
+        cmp:bits[1] = ne(neg1, neg2)
+        ret result: bits[9] = concat(cmp, neg1)
+     }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(f->return_value(),
+              m::Concat(m::Ne(m::Neg(m::Param("x")), m::Neg(m::Param("y"))),
+                        m::Neg(m::Param("x"))));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Concat(m::Ne(m::Param("x"), m::Param("y")),
+                                           m::Neg(m::Param("x"))));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareNeNegatedWithBothUsedElsewhere) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[17] {
+        neg1:bits[8] = neg(x)
+        neg2:bits[8] = neg(y)
+        cmp:bits[1] = ne(neg1, neg2)
+        ret result: bits[17] = concat(cmp, neg1, neg2)
+     }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(f->return_value(),
+              m::Concat(m::Ne(m::Neg(m::Param("x")), m::Neg(m::Param("y"))),
+                        m::Neg(m::Param("x")), m::Neg(m::Param("y"))));
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(false));
+  ASSERT_THAT(f->return_value(),
+              m::Concat(m::Ne(m::Neg(m::Param("x")), m::Neg(m::Param("y"))),
+                        m::Neg(m::Param("x")), m::Neg(m::Param("y"))));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareNeNegatedConstantWithOtherUse) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8]) -> bits[9] {
+        neg_x:bits[8] = neg(x)
+        k:bits[8] = literal(value=3)
+        cmp:bits[1] = ne(neg_x, k)
+        ret result: bits[9] = concat(cmp, neg_x)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(),
+              m::Concat(m::Ne(m::Neg(m::Param("x")), m::Literal(3)),
+                        m::Neg(m::Param("x"))));
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(false));
+  EXPECT_THAT(f->return_value(),
+              m::Concat(m::Ne(m::Neg(m::Param("x")), m::Literal(3)),
+                        m::Neg(m::Param("x"))));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareSignedLtNegated) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[1] {
+        neg1:bits[8] = neg(x)
+        neg2:bits[8] = neg(y)
+        ret result: bits[1] = slt(neg1, neg2)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(), m::SLt(m::Neg(), m::Neg()));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Xor(m::SGt(m::Param("x"), m::Param("y")),
+                                        m::Ne(m::Param(), m::Literal(128)),
+                                        m::Ne(m::Param(), m::Literal(128))));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareSignedLtNegatedConstant) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[1] {
+        neg_x:bits[8] = neg(x)
+        k:bits[8] = literal(value=3)
+        ret result: bits[1] = slt(neg_x, k)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(), m::SLt(m::Neg(), m::Literal(3)));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Xor(m::SGt(m::Param("x"), m::Literal(253)),
+                                        m::Eq(m::Param(), m::Literal(128))));
+}
+
+TEST_F(ArithSimplificationPassTest,
+       CompareSignedLtNegatedWithOneUsedElsewhere) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[9] {
+        neg1:bits[8] = neg(x)
+        neg2:bits[8] = neg(y)
+        cmp:bits[1] = slt(neg1, neg2)
+        ret result: bits[9] = concat(cmp, neg1)
+     }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(f->return_value(),
+              m::Concat(m::SLt(m::Neg(m::Param("x")), m::Neg(m::Param("y"))),
+                        m::Neg(m::Param("x"))));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              m::Concat(m::Xor(m::SGt(m::Param("x"), m::Param("y")),
+                               m::Ne(m::Param("x"), m::Literal(128)),
+                               m::Ne(m::Param("y"), m::Literal(128))),
+                        m::Neg(m::Param("x"))));
+}
+
+TEST_F(ArithSimplificationPassTest,
+       CompareSignedLtNegatedWithBothUsedElsewhere) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[17] {
+        neg1:bits[8] = neg(x)
+        neg2:bits[8] = neg(y)
+        cmp:bits[1] = slt(neg1, neg2)
+        ret result: bits[17] = concat(cmp, neg1, neg2)
+     }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(f->return_value(),
+              m::Concat(m::SLt(m::Neg(m::Param("x")), m::Neg(m::Param("y"))),
+                        m::Neg(m::Param("x")), m::Neg(m::Param("y"))));
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(false));
+  ASSERT_THAT(f->return_value(),
+              m::Concat(m::SLt(m::Neg(m::Param("x")), m::Neg(m::Param("y"))),
+                        m::Neg(m::Param("x")), m::Neg(m::Param("y"))));
+}
+
+TEST_F(ArithSimplificationPassTest,
+       CompareSignedLtNegatedConstantWithOtherUse) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8]) -> bits[9] {
+        neg_x:bits[8] = neg(x)
+        k:bits[8] = literal(value=3)
+        cmp:bits[1] = slt(neg_x, k)
+        ret result: bits[9] = concat(cmp, neg_x)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(),
+              m::Concat(m::SLt(m::Neg(m::Param("x")), m::Literal(3)),
+                        m::Neg(m::Param("x"))));
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(false));
+  EXPECT_THAT(f->return_value(),
+              m::Concat(m::SLt(m::Neg(m::Param("x")), m::Literal(3)),
+                        m::Neg(m::Param("x"))));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareSignedGtNegated) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[1] {
+        neg1:bits[8] = neg(x)
+        neg2:bits[8] = neg(y)
+        ret result: bits[1] = sgt(neg1, neg2)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(), m::SGt(m::Neg(), m::Neg()));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Xor(m::SLt(m::Param("x"), m::Param("y")),
+                                        m::Ne(m::Param(), m::Literal(128)),
+                                        m::Ne(m::Param(), m::Literal(128))));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareSignedGtNegatedConstant) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[1] {
+        neg_x:bits[8] = neg(x)
+        k:bits[8] = literal(value=3)
+        ret result: bits[1] = sgt(neg_x, k)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(), m::SGt(m::Neg(), m::Literal(3)));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Xor(m::SLt(m::Param("x"), m::Literal(253)),
+                                        m::Eq(m::Param(), m::Literal(128))));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareSignedLeNegated) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[1] {
+        neg1:bits[8] = neg(x)
+        neg2:bits[8] = neg(y)
+        ret result: bits[1] = sle(neg1, neg2)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(), m::SLe(m::Neg(), m::Neg()));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Xor(m::SGe(m::Param("x"), m::Param("y")),
+                                        m::Ne(m::Param(), m::Literal(128)),
+                                        m::Ne(m::Param(), m::Literal(128))));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareSignedLeNegatedConstant) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8]) -> bits[1] {
+        neg_x:bits[8] = neg(x)
+        k:bits[8] = literal(value=3)
+        ret result: bits[1] = sle(neg_x, k)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(), m::SLe(m::Neg(), m::Literal(3)));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Xor(m::SGe(m::Param("x"), m::Literal(253)),
+                                        m::Eq(m::Param(), m::Literal(128))));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareSignedGeNegated) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8], y:bits[8]) -> bits[1] {
+        neg1:bits[8] = neg(x)
+        neg2:bits[8] = neg(y)
+        ret result: bits[1] = sge(neg1, neg2)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(), m::SGe(m::Neg(), m::Neg()));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Xor(m::SLe(m::Param("x"), m::Param("y")),
+                                        m::Ne(m::Param(), m::Literal(128)),
+                                        m::Ne(m::Param(), m::Literal(128))));
+}
+
+TEST_F(ArithSimplificationPassTest, CompareSignedGeNegatedConstant) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn compare_neg(x:bits[8]) -> bits[1] {
+        neg_x:bits[8] = neg(x)
+        k:bits[8] = literal(value=3)
+        ret result: bits[1] = sge(neg_x, k)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(), m::SGe(m::Neg(), m::Literal(3)));
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Xor(m::SLe(m::Param("x"), m::Literal(253)),
+                                        m::Eq(m::Param(), m::Literal(128))));
 }
 
 TEST_F(ArithSimplificationPassTest, MulBy42) {
@@ -102,6 +511,67 @@ TEST_F(ArithSimplificationPassTest, MulBy42) {
   XLS_ASSERT_OK(ParseFunction(R"(
      fn mul_zero(x:bits[8]) -> bits[8] {
         literal.1: bits[8] = literal(value=42)
+        ret result: bits[8] = umul(x, literal.1)
+     }
+  )",
+                              p.get())
+                    .status());
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(false));
+}
+
+TEST_F(ArithSimplificationPassTest, MulBy5) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn mul_zero(x:bits[8]) -> bits[8] {
+        literal.1: bits[8] = literal(value=5)
+        ret result: bits[8] = umul(x, literal.1)
+     }
+  )",
+                                                       p.get()));
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              m::Add(m::Param("x"),
+                     m::Concat(m::BitSlice(m::Param("x")), m::Literal(0, 2))));
+}
+
+TEST_F(ArithSimplificationPassTest, MulBy6) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn mul_zero(x:bits[8]) -> bits[8] {
+        literal.1: bits[8] = literal(value=6)
+        ret result: bits[8] = umul(x, literal.1)
+     }
+  )",
+                                                       p.get()));
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              m::Add(m::Concat(m::BitSlice(m::Param("x")), m::Literal(0, 1)),
+                     m::Concat(m::BitSlice(m::Param("x")), m::Literal(0, 2))));
+}
+
+TEST_F(ArithSimplificationPassTest, MulBy7) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn mul_zero(x:bits[8]) -> bits[8] {
+        literal.1: bits[8] = literal(value=7)
+        ret result: bits[8] = umul(x, literal.1)
+     }
+  )",
+                                                       p.get()));
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              m::Sub(m::Concat(m::BitSlice(m::Param("x")), m::Literal(0, 3)),
+                     m::Param("x")));
+}
+
+TEST_F(ArithSimplificationPassTest, MulBy11) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK(ParseFunction(R"(
+     fn mul_zero(x:bits[8]) -> bits[8] {
+        literal.1: bits[8] = literal(value=11)
         ret result: bits[8] = umul(x, literal.1)
      }
   )",
@@ -175,8 +645,11 @@ TEST_F(ArithSimplificationPassTest, UModBy4) {
      }
   )",
                                                        p.get()));
+
+  ScopedVerifyEquivalence sve(f);
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::And(m::Param("x"), m::Literal(3)));
+
+  EXPECT_THAT(f->return_value(), m::ZeroExt(m::BitSlice(0, 2)));
 }
 
 TEST_F(ArithSimplificationPassTest, UModBy1) {
@@ -188,7 +661,10 @@ TEST_F(ArithSimplificationPassTest, UModBy1) {
      }
   )",
                                                        p.get()));
+
+  ScopedVerifyEquivalence sve(f);
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+
   EXPECT_THAT(f->return_value(), m::Literal(0));
 }
 
@@ -201,16 +677,48 @@ TEST_F(ArithSimplificationPassTest, UModBy512) {
      }
   )",
                                                        p.get()));
+
+  ScopedVerifyEquivalence sve(f);
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::And(m::Param("x"), m::Literal(0x1ff)));
+
+  EXPECT_THAT(f->return_value(), m::ZeroExt(m::BitSlice(m::Param("x"), 0, 9)));
 }
 
 TEST_F(ArithSimplificationPassTest, UModBy42) {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn umod_power_of_two(x:bits[16]) -> bits[16] {
-        literal.1: bits[16] = literal(value=42)
+     fn umod_non_power_of_two(x:bits[8]) -> bits[8] {
+        literal.1: bits[8] = literal(value=42)
+        ret result: bits[8] = umod(x, literal.1)
+     }
+  )",
+                                                       p.get()));
+
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+
+  EXPECT_THAT(f->return_value(),
+              m::Sub(m::Param("x"), m::UMul(_, m::Literal(42))));
+}
+
+TEST_F(ArithSimplificationPassTest, UModBy0) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn umod_zero(x:bits[16]) -> bits[16] {
+        literal.1: bits[16] = literal(value=0)
         ret result: bits[16] = umod(x, literal.1)
+     }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Literal(0));
+}
+
+TEST_F(ArithSimplificationPassTest, UModByVariable) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn umod(x:bits[16], y:bits[16]) -> bits[16] {
+        ret result: bits[16] = umod(x, y)
      }
   )",
                                                        p.get()));
@@ -218,17 +726,194 @@ TEST_F(ArithSimplificationPassTest, UModBy42) {
   EXPECT_THAT(f->return_value(), m::UMod());
 }
 
-TEST_F(ArithSimplificationPassTest, UModBy0) {
+TEST_F(ArithSimplificationPassTest, UModOf13) {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn umod_power_of_two(x:bits[16]) -> bits[16] {
+     fn umod_of_constant(x:bits[8]) -> bits[8] {
+        literal.1: bits[8] = literal(value=13)
+        ret result: bits[8] = umod(literal.1, x)
+     }
+  )",
+                                                       p.get()));
+
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+
+  EXPECT_THAT(
+      f->return_value(),
+      m::PrioritySelect(m::Eq(m::Param("x"), m::Literal(0)), {m::Literal(0)},
+                        m::Sub(m::Literal(13), m::UMul(_, m::Param("x")))));
+}
+
+TEST_F(ArithSimplificationPassTest, UModOf0) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn umod_of_constant(x:bits[8]) -> bits[8] {
+        literal.1: bits[8] = literal(value=0)
+        ret result: bits[8] = umod(literal.1, x)
+     }
+  )",
+                                                       p.get()));
+
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+
+  EXPECT_THAT(f->return_value(), m::Literal(0));
+}
+
+TEST_F(ArithSimplificationPassTest, SModBy4) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn smod_power_of_two(x:bits[16]) -> bits[16] {
+        literal.1: bits[16] = literal(value=4)
+        ret result: bits[16] = smod(x, literal.1)
+     }
+  )",
+                                                       p.get()));
+
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+
+  auto nonnegative_result = m::ZeroExt(m::BitSlice(0, 2));
+  EXPECT_THAT(f->return_value(),
+              m::Select(m::And(m::Ne(m::BitSlice(0, 2), m::Literal(0)),
+                               m::BitSlice(m::Param(), 15, 1)),
+                        {nonnegative_result,
+                         m::Sub(nonnegative_result, m::Literal(4))}));
+}
+
+TEST_F(ArithSimplificationPassTest, SModBy1) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn smod_power_of_two(x:bits[16]) -> bits[16] {
+        literal.1: bits[16] = literal(value=1)
+        ret result: bits[16] = smod(x, literal.1)
+     }
+  )",
+                                                       p.get()));
+
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+
+  EXPECT_THAT(f->return_value(), m::Literal(0));
+}
+
+TEST_F(ArithSimplificationPassTest, SModBy512) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn smod_power_of_two(x:bits[16]) -> bits[16] {
+        literal.1: bits[16] = literal(value=512)
+        ret result: bits[16] = smod(x, literal.1)
+     }
+  )",
+                                                       p.get()));
+
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+
+  auto nonnegative_result = m::ZeroExt(m::BitSlice(0, 9));
+  EXPECT_THAT(f->return_value(),
+              m::Select(m::And(m::Ne(m::BitSlice(0, 9), m::Literal(0)),
+                               m::BitSlice(m::Param(), 15, 1)),
+                        {nonnegative_result,
+                         m::Sub(nonnegative_result, m::Literal(512))}));
+}
+
+TEST_F(ArithSimplificationPassTest, SModBy42) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn smod_non_power_of_two(x:bits[8]) -> bits[8] {
+        literal.1: bits[8] = literal(value=42)
+        ret result: bits[8] = smod(x, literal.1)
+     }
+  )",
+                                                       p.get()));
+
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+
+  EXPECT_THAT(f->return_value(),
+              m::Sub(m::Param("x"), m::SMul(_, m::Literal(42))));
+}
+
+TEST_F(ArithSimplificationPassTest, SModBy0) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn smod_zero(x:bits[16]) -> bits[16] {
         literal.1: bits[16] = literal(value=0)
-        ret result: bits[16] = umod(x, literal.1)
+        ret result: bits[16] = smod(x, literal.1)
+     }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Literal(0));
+}
+
+TEST_F(ArithSimplificationPassTest, SModByVariable) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn smod(x:bits[16], y:bits[16]) -> bits[16] {
+        ret result: bits[16] = smod(x, y)
      }
   )",
                                                        p.get()));
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(false));
-  EXPECT_THAT(f->return_value(), m::UMod());
+  EXPECT_THAT(f->return_value(), m::SMod());
+}
+
+TEST_F(ArithSimplificationPassTest, SModOf13) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn smod_non_power_of_two(x:bits[8]) -> bits[8] {
+        literal.1: bits[8] = literal(value=13)
+        ret result: bits[8] = smod(literal.1, x)
+     }
+  )",
+                                                       p.get()));
+
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+
+  EXPECT_THAT(
+      f->return_value(),
+      m::PrioritySelect(m::Eq(m::Param("x"), m::Literal(0)), {m::Literal(0)},
+                        m::Sub(m::Literal(13), m::SMul(_, m::Param("x")))));
+}
+
+TEST_F(ArithSimplificationPassTest, SModOfNegative13) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn smod_non_power_of_two(x:bits[8]) -> bits[8] {
+        literal.1: bits[8] = literal(value=-13)
+        ret result: bits[8] = smod(literal.1, x)
+     }
+  )",
+                                                       p.get()));
+
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+
+  EXPECT_THAT(
+      f->return_value(),
+      m::PrioritySelect(
+          m::Eq(m::Param("x"), m::Literal(0)), {m::Literal(0)},
+          m::Sub(m::Literal(SBits(-13, 8)), m::SMul(_, m::Param("x")))));
+}
+
+TEST_F(ArithSimplificationPassTest, SModOf0) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn smod_non_power_of_two(x:bits[8]) -> bits[8] {
+        literal.1: bits[8] = literal(value=0)
+        ret result: bits[8] = smod(literal.1, x)
+     }
+  )",
+                                                       p.get()));
+
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+
+  EXPECT_THAT(f->return_value(), m::Literal(0));
 }
 
 TEST_F(ArithSimplificationPassTest, UDivBy4) {
@@ -305,9 +990,9 @@ TEST_F(ArithSimplificationPassTest, SDivWithLiteralDivisorSweep) {
       } else {
         expected = Value(SBits(dividend / divisor, 3));
       }
-      XLS_VLOG(1) << absl::StreamFormat("%d / %d = %d (%s)", dividend, divisor,
-                                        expected.bits().ToInt64().value(),
-                                        expected.ToString());
+      VLOG(1) << absl::StreamFormat("%d / %d = %d (%s)", dividend, divisor,
+                                    expected.bits().ToInt64().value(),
+                                    expected.ToString());
       XLS_ASSERT_OK_AND_ASSIGN(
           InterpreterResult<Value> before_result,
           InterpretFunction(f, {Value(SBits(dividend, 3))}));
@@ -336,18 +1021,20 @@ bool Contains(const std::string& haystack, const std::string& needle) {
 // Optimizes the IR for an unsigned divide by the given non-power of two. Checks
 // that optimized IR matches expected IR. Numerically validates (via
 // interpretation) the optimized IR, exhaustively up to 2^n.
-void ArithSimplificationPassTest::CheckUnsignedDivide(int n, int divisor) {
+void ArithSimplificationPassTest::CheckUnsignedDivideBy(int divisor,
+                                                        int bit_count) {
   auto p = CreatePackage();
   FunctionBuilder fb("UnsignedDivideBy" + std::to_string(divisor), p.get());
-  fb.UDiv(fb.Param("x", p->GetBitsType(n)),
-          fb.Literal(Value(UBits(divisor, n))));
+  fb.UDiv(fb.Param("x", p->GetBitsType(bit_count)),
+          fb.Literal(Value(UBits(divisor, bit_count))));
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
 
   // Clean up the dumped IR
   PassResults results;
+  OptimizationContext context;
   ASSERT_THAT(DeadCodeEliminationPass().Run(p.get(), OptimizationPassOptions(),
-                                            &results),
+                                            &results, context),
               IsOkAndHolds(true));
 
   std::string optimized_ir = f->DumpIr();
@@ -361,28 +1048,30 @@ void ArithSimplificationPassTest::CheckUnsignedDivide(int n, int divisor) {
   EXPECT_FALSE(Contains(optimized_ir, "sub"));
 
   // compute x/divisor. assert result == expected
-  auto interp_and_check = [n, &f](int x, int expected) {
-    XLS_ASSERT_OK_AND_ASSIGN(InterpreterResult<Value> r,
-                             InterpretFunction(f, {Value(UBits(x, n))}));
-    EXPECT_EQ(r.value, Value(UBits(expected, n)));
+  auto interp_and_check = [bit_count, &f](int x, int expected) {
+    XLS_ASSERT_OK_AND_ASSIGN(
+        InterpreterResult<Value> r,
+        InterpretFunction(f, {Value(UBits(x, bit_count))}));
+    EXPECT_EQ(r.value, Value(UBits(expected, bit_count)));
   };
 
   // compute RoundToZero(i/divisor)
   auto div_rt0 = [=](int i) { return i / divisor; };
 
-  for (int i = 0; i < Exp2<int>(n); ++i) {
+  for (int i = 0; i < Exp2<int>(bit_count); ++i) {
     interp_and_check(i, div_rt0(i));
   }
 }
 
 // Exhaustively test unsigned division. Vary n and divisor (excluding powers of
 // two).
-TEST_F(ArithSimplificationPassTest, UnsignedDivideAllNonPowersOfTwoExhaustive) {
+TEST_F(ArithSimplificationPassTest,
+       UnsignedDivideByAllNonPowersOfTwoExhaustive) {
   constexpr int kTestUpToN = 10;
   for (int divisor = 1; divisor < Exp2<int>(kTestUpToN); ++divisor) {
-    if (!IsPowerOfTwo(static_cast<uint>(divisor))) {
+    if (!IsPowerOfTwo(static_cast<unsigned int>(divisor))) {
       for (int n = Bits::MinBitCountUnsigned(divisor); n <= kTestUpToN; ++n) {
-        CheckUnsignedDivide(n, divisor);
+        CheckUnsignedDivideBy(divisor, n);
       }
     }
   }
@@ -403,8 +1092,9 @@ TEST_F(ArithSimplificationPassTest, UDivWrongIssue736) {
 
   // Clean up the dumped IR
   PassResults results;
+  OptimizationContext context;
   ASSERT_THAT(DeadCodeEliminationPass().Run(p.get(), OptimizationPassOptions(),
-                                            &results),
+                                            &results, context),
               IsOkAndHolds(true));
 
   std::string optimized_ir = f->DumpIr();
@@ -448,8 +1138,9 @@ TEST_F(ArithSimplificationPassTest, SDivWrongIssue736) {
 
   // Clean up the dumped IR
   PassResults results;
+  OptimizationContext context;
   ASSERT_THAT(DeadCodeEliminationPass().Run(p.get(), OptimizationPassOptions(),
-                                            &results),
+                                            &results, context),
               IsOkAndHolds(true));
 
   std::string optimized_ir = f->DumpIr();
@@ -479,11 +1170,133 @@ TEST_F(ArithSimplificationPassTest, SDivWrongIssue736) {
   interp_and_check(x, div_rt0(x));
 }
 
+TEST_F(ArithSimplificationPassTest, UDivOf64) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn udiv_of_64(x: bits[16]) -> bits[16] {
+        literal.1: bits[16] = literal(value=64)
+        ret result: bits[16] = udiv(literal.1, x)
+     }
+  )",
+                                                       p.get()));
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              m::PrioritySelect(m::ULe(m::Param("x"), m::Literal(64)),
+                                {m::ArrayIndex(m::Literal(), {m::Param("x")})},
+                                m::Literal(UBits(0, 16))));
+}
+
+TEST_F(ArithSimplificationPassTest, UDivOf65) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn udiv_of_65(x: bits[16]) -> bits[16] {
+        literal.1: bits[16] = literal(value=65)
+        ret result: bits[16] = udiv(literal.1, x)
+     }
+  )",
+                                                       p.get()));
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              m::PrioritySelect(m::ULe(m::Param("x"), m::Literal(65)),
+                                {m::ArrayIndex(m::Literal(), {m::Param("x")})},
+                                m::Literal(UBits(0, 16))));
+}
+
+TEST_F(ArithSimplificationPassTest, UDivOf128) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn udiv_of_128(x: bits[16]) -> bits[16] {
+        literal.1: bits[16] = literal(value=128)
+        ret result: bits[16] = udiv(literal.1, x)
+     }
+  )",
+                                                       p.get()));
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(
+      f->return_value(),
+      m::PrioritySelect(m::Concat(m::ULe(m::Param("x"), m::Literal(128)),
+                                  m::ULe(m::Param("x"), m::Literal(64))),
+                        {m::ArrayIndex(m::Literal(), {m::Param("x")}),
+                         m::Literal(UBits(1, 16))},
+                        m::Literal(UBits(0, 16))));
+}
+
+// Optimizes the IR for an unsigned divide of the given constant dividend.
+// Checks that optimized IR matches expected IR. Numerically validates (via
+// interpretation) the optimized IR for all possible divisors.
+void ArithSimplificationPassTest::CheckUnsignedDivideOf(int dividend,
+                                                        int bit_count) {
+  auto p = CreatePackage();
+  FunctionBuilder fb("UnsignedDivideOf" + std::to_string(dividend), p.get());
+  fb.UDiv(fb.Literal(Value(UBits(dividend, bit_count))),
+          fb.Param("x", p->GetBitsType(bit_count)));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+
+  // Clean up the dumped IR
+  PassResults results;
+  OptimizationContext context;
+  ASSERT_THAT(DeadCodeEliminationPass().Run(p.get(), OptimizationPassOptions(),
+                                            &results, context),
+              IsOkAndHolds(true));
+
+  std::string optimized_ir = f->DumpIr();
+
+  // A small dividend will be rewritten to a lookup table with comparisons. No
+  // mul, div, add, or sub.
+  EXPECT_FALSE(Contains(optimized_ir, "mul"));
+  EXPECT_FALSE(Contains(optimized_ir, "div"));
+  EXPECT_FALSE(Contains(optimized_ir, "add"));
+  EXPECT_FALSE(Contains(optimized_ir, "sub"));
+
+  // compute dividend/x. assert result == expected
+  auto interp_and_check = [&](int x, int expected) {
+    XLS_ASSERT_OK_AND_ASSIGN(
+        InterpreterResult<Value> r,
+        InterpretFunction(f, {Value(UBits(x, bit_count))}));
+    EXPECT_EQ(r.value, Value(UBits(expected, bit_count)))
+        << "dividend: " << dividend << ", x: " << x
+        << ", bit_count: " << bit_count;
+  };
+
+  // compute RoundToZero(dividend/i)
+  auto div_rt0 = [=](int i) {
+    if (i == 0) {
+      return (1 << bit_count) - 1;
+    }
+    return dividend / i;
+  };
+
+  for (int i = 0; i < Exp2<int>(bit_count); ++i) {
+    interp_and_check(i, div_rt0(i));
+  }
+}
+
+// Exhaustively test unsigned division of a constant dividend, for varying
+// dividends and divisor widths.
+TEST_F(ArithSimplificationPassTest, ExhaustiveUnsignedDivideOfConstant) {
+  constexpr int kTestUpToDividend = 100;
+  constexpr int kTestUpToDivisorWidth = 10;
+  for (int dividend = 0;
+       dividend <=
+       std::min(kTestUpToDividend, Exp2<int>(kTestUpToDivisorWidth) - 1);
+       ++dividend) {
+    for (int divisor_width =
+             std::max(Bits::MinBitCountUnsigned(dividend), int64_t{1});
+         divisor_width <= kTestUpToDivisorWidth; ++divisor_width) {
+      CheckUnsignedDivideOf(dividend, divisor_width);
+    }
+  }
+}
+
 // Optimizes the IR for a divide by a power of two (which may be negative or
 // positive). Checks that optimized IR matches expected IR. Numerically
 // validates (via interpretation) the optimized IR, exhaustively up to 2^N.
-void ArithSimplificationPassTest::CheckSignedDividePowerOfTwo(int n,
-                                                              int divisor) {
+void ArithSimplificationPassTest::CheckSignedDivideByPowerOfTwo(int n,
+                                                                int divisor) {
   auto p = CreatePackage();
   FunctionBuilder fb(TestName(), p.get());
   fb.SDiv(fb.Param("x", p->GetBitsType(n)),
@@ -493,8 +1306,9 @@ void ArithSimplificationPassTest::CheckSignedDividePowerOfTwo(int n,
 
   // Clean up the dumped IR
   PassResults results;
+  OptimizationContext context;
   ASSERT_THAT(DeadCodeEliminationPass().Run(p.get(), OptimizationPassOptions(),
-                                            &results),
+                                            &results, context),
               IsOkAndHolds(true));
 
   std::string optimized_ir = f->DumpIr();
@@ -536,7 +1350,7 @@ void ArithSimplificationPassTest::CheckSignedDividePowerOfTwo(int n,
   };
 
   // N-1 because we create signed values
-  for (int i = 0; i < Exp2<uint>(n - 1); ++i) {
+  for (int i = 0; i < Exp2<unsigned int>(n - 1); ++i) {
     interp_and_check(i, div_rt0(i));
     interp_and_check(-i, div_rt0(-i));
   }
@@ -544,7 +1358,7 @@ void ArithSimplificationPassTest::CheckSignedDividePowerOfTwo(int n,
   // Avoid overflow: -2^(N-1) * -1 = 2^(N-1) which won't fit in a signed N-bit
   // integer.
   if (divisor != -1) {
-    const int last = -Exp2<uint>(n - 1);
+    const int last = -Exp2<unsigned int>(n - 1);
     interp_and_check(last, div_rt0(last));
   }
 }
@@ -556,14 +1370,14 @@ TEST_F(ArithSimplificationPassTest, SignedDivideAllPowersOfTwoExhaustive) {
   for (int exp = 0; exp <= kTestUpToN; ++exp) {
     const int divisor = Exp2<int>(exp);
     for (int n = Bits::MinBitCountSigned(divisor); n <= kTestUpToN; ++n) {
-      CheckSignedDividePowerOfTwo(n, divisor);
-      CheckSignedDividePowerOfTwo(n, -divisor);
+      CheckSignedDivideByPowerOfTwo(n, divisor);
+      CheckSignedDivideByPowerOfTwo(n, -divisor);
     }
   }
 }
 
-void ArithSimplificationPassTest::CheckSignedDivideNotPowerOfTwo(int n,
-                                                                 int divisor) {
+void ArithSimplificationPassTest::CheckSignedDivideByNotPowerOfTwo(
+    int n, int divisor) {
   auto p = CreatePackage();
   FunctionBuilder fb("SignedDivideBy" + std::to_string(divisor), p.get());
   fb.SDiv(fb.Param("x", p->GetBitsType(n)),
@@ -573,8 +1387,9 @@ void ArithSimplificationPassTest::CheckSignedDivideNotPowerOfTwo(int n,
 
   // Clean up the dumped IR
   PassResults results;
+  OptimizationContext context;
   ASSERT_THAT(DeadCodeEliminationPass().Run(p.get(), OptimizationPassOptions(),
-                                            &results),
+                                            &results, context),
               IsOkAndHolds(true));
 
   std::string optimized_ir = f->DumpIr();
@@ -603,24 +1418,102 @@ void ArithSimplificationPassTest::CheckSignedDivideNotPowerOfTwo(int n,
   };
 
   // N-1 because we create signed values
-  for (int i = 0; i < Exp2<uint>(n - 1); ++i) {
+  for (int i = 0; i < Exp2<unsigned int>(n - 1); ++i) {
     interp_and_check(i, div_rt0(i));
     interp_and_check(-i, div_rt0(-i));
   }
-  const int last = -Exp2<uint>(n - 1);
+  const int last = -Exp2<unsigned int>(n - 1);
+  interp_and_check(last, div_rt0(last));
+}
+
+void ArithSimplificationPassTest::CheckSignedDivideOf(int bit_count,
+                                                      int dividend) {
+  auto p = CreatePackage();
+  FunctionBuilder fb("SignedDivideOf" + std::to_string(dividend), p.get());
+  fb.SDiv(fb.Literal(Value(SBits(dividend, bit_count))),
+          fb.Param("x", p->GetBitsType(bit_count)));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+
+  // Clean up the dumped IR
+  PassResults results;
+  OptimizationContext context;
+  ASSERT_THAT(DeadCodeEliminationPass().Run(p.get(), OptimizationPassOptions(),
+                                            &results, context),
+              IsOkAndHolds(true));
+
+  std::string optimized_ir = f->DumpIr();
+
+  // A small dividend will be rewritten to a lookup table with comparisons, plus
+  // handling for negative divisors. No mul, div, add, or sub.
+  EXPECT_TRUE(Contains(optimized_ir, "priority_sel("));
+  EXPECT_TRUE(Contains(optimized_ir, "neg("));
+  EXPECT_FALSE(Contains(optimized_ir, "mul"));
+  EXPECT_FALSE(Contains(optimized_ir, "div"));
+  EXPECT_FALSE(Contains(optimized_ir, "add"));
+  EXPECT_FALSE(Contains(optimized_ir, "sub"));
+
+  // compute dividend/x. assert result == expected
+  auto interp_and_check = [&](int x, int expected) {
+    XLS_ASSERT_OK_AND_ASSIGN(
+        InterpreterResult<Value> r,
+        InterpretFunction(f, {Value(SBits(x, bit_count))}));
+    EXPECT_EQ(r.value, Value(SBits(expected, bit_count)))
+        << "dividend / x: " << dividend << " / " << x
+        << ", expected: " << expected << "\n\nIR:\n"
+        << f->DumpIr();
+  };
+
+  // compute RoundToZero(dividend/i)
+  auto div_rt0 = [=](int i) {
+    if (i == 0) {
+      if (dividend < 0) {
+        return (-1) << (bit_count - 1);
+      } else {
+        return (1 << (bit_count - 1)) - 1;
+      }
+    }
+    const int q = std::abs(dividend) / std::abs(i);
+    const bool exactly_one_negative = ((i < 0) != (dividend < 0));
+    return exactly_one_negative ? -q : q;
+  };
+
+  // N-1 because we create signed values
+  for (int i = 0; i < Exp2<unsigned int>(bit_count - 1); ++i) {
+    interp_and_check(i, div_rt0(i));
+    interp_and_check(-i, div_rt0(-i));
+  }
+  const int last = -Exp2<unsigned int>(bit_count - 1);
   interp_and_check(last, div_rt0(last));
 }
 
 // Exhaustively test signed division. For divisor, test all non-powers of 2, up
 // to...
-TEST_F(ArithSimplificationPassTest, SignedDivideAllNonPowersOfTwoExhaustive) {
+TEST_F(ArithSimplificationPassTest, SignedDivideByAllNonPowersOfTwoExhaustive) {
   constexpr int kTestUpToN = 10;
   for (int divisor = 1; divisor < Exp2<int>(kTestUpToN - 1); ++divisor) {
-    if (!IsPowerOfTwo(static_cast<uint>(divisor))) {
+    if (!IsPowerOfTwo(static_cast<unsigned int>(divisor))) {
       for (int n = Bits::MinBitCountSigned(divisor); n <= kTestUpToN; ++n) {
-        CheckSignedDivideNotPowerOfTwo(n, divisor);
-        CheckSignedDivideNotPowerOfTwo(n, -divisor);
+        CheckSignedDivideByNotPowerOfTwo(n, divisor);
+        CheckSignedDivideByNotPowerOfTwo(n, -divisor);
       }
+    }
+  }
+}
+// For constant dividend, test all values up to a given dividend bound & divisor
+// width.
+TEST_F(ArithSimplificationPassTest, ExhaustiveSignedDivideOfConstant) {
+  constexpr int kTestUpToDividend = 100;
+  constexpr int kTestUpToDivisorWidth = 10;
+  for (int dividend = 0;
+       dividend <=
+       std::min(kTestUpToDividend, Exp2<int>(kTestUpToDivisorWidth) - 1);
+       ++dividend) {
+    for (int divisor_width =
+             std::max(Bits::MinBitCountSigned(dividend), int64_t{1});
+         divisor_width <= kTestUpToDivisorWidth; ++divisor_width) {
+      CheckSignedDivideOf(divisor_width, dividend);
+      CheckSignedDivideOf(divisor_width, -dividend);
     }
   }
 }
@@ -653,6 +1546,26 @@ TEST_F(ArithSimplificationPassTest, UMulByMaxPowerOfTwo) {
               m::Concat(m::BitSlice(m::Param("x")), m::Literal(UBits(0, 7))));
 }
 
+TEST_F(ArithSimplificationPassTest, UMulWithSlicedResult) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn mul_zero(x:bits[16]) -> (bits[8], bits[8]) {
+        literal.1: bits[8] = literal(value=25)
+        umul.2: bits[16] = umul(x, literal.1)
+        lo_bits: bits[8] = bit_slice(umul.2, start=0, width=8)
+        mid_bits: bits[8] = bit_slice(umul.2, start=4, width=8)
+        ret tuple.10: (bits[8], bits[8]) = tuple(lo_bits, mid_bits)
+     }
+  )",
+                                                       p.get()));
+
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              m::Tuple(m::BitSlice(AllOf(m::UMul(), m::Type("bits[12]"))),
+                       m::BitSlice(AllOf(m::UMul(), m::Type("bits[12]")))));
+}
+
 TEST_F(ArithSimplificationPassTest, SMulByMinNegative) {
   // The minimal negative number has only one bit set like powers of two do, but
   // the mul-by-power-of-two optimization should not kick in.
@@ -670,7 +1583,7 @@ TEST_F(ArithSimplificationPassTest, SMulByMinNegative) {
 
 TEST_F(ArithSimplificationPassTest, SMulByMinusOne) {
   // A single-bit value of 1 is a -1 when interpreted as a signed number. The
-  // Mul-by-power-of-two optimization should not kick in in this case.
+  // Mul-by-power-of-two optimization should not kick in this case.
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
      fn mul_zero(x:bits[8]) -> bits[3] {
@@ -681,6 +1594,26 @@ TEST_F(ArithSimplificationPassTest, SMulByMinusOne) {
                                                        p.get()));
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(false));
   EXPECT_THAT(f->return_value(), m::SMul());
+}
+
+TEST_F(ArithSimplificationPassTest, SMulWithSlicedResult) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn mul_zero(x:bits[16]) -> (bits[8], bits[8]) {
+        literal.1: bits[8] = literal(value=25)
+        smul.2: bits[16] = smul(x, literal.1)
+        lo_bits: bits[8] = bit_slice(smul.2, start=0, width=8)
+        mid_bits: bits[8] = bit_slice(smul.2, start=4, width=8)
+        ret tuple.10: (bits[8], bits[8]) = tuple(lo_bits, mid_bits)
+     }
+  )",
+                                                       p.get()));
+
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              m::Tuple(m::BitSlice(AllOf(m::SMul(), m::Type("bits[12]"))),
+                       m::BitSlice(AllOf(m::SMul(), m::Type("bits[12]")))));
 }
 
 TEST_F(ArithSimplificationPassTest, UDivBy1) {
@@ -707,19 +1640,6 @@ TEST_F(ArithSimplificationPassTest, MulBy1) {
                                                        p.get()));
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
   EXPECT_THAT(f->return_value(), m::Param("x"));
-}
-
-TEST_F(ArithSimplificationPassTest, CanonicalizeXorAllOnes) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn f(x:bits[2]) -> bits[2] {
-        literal.1: bits[2] = literal(value=3)
-        ret result: bits[2] = xor(x, literal.1)
-     }
-  )",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Not(m::Param()));
 }
 
 TEST_F(ArithSimplificationPassTest, OverlargeShiftAfterSimp) {
@@ -765,145 +1685,138 @@ TEST_F(ArithSimplificationPassTest, OverlargeShiftRightArithmeticByLiteral) {
               m::SignExt(m::BitSlice(/*start=*/15, /*width=*/1)));
 }
 
-TEST_F(ArithSimplificationPassTest, CompareBoolAgainstOne) {
+TEST_F(ArithSimplificationPassTest, ArithmeticShiftRightOfConstantOne) {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn f(x:bits[1]) -> bits[1] {
+     fn f(x:bits[10]) -> bits[42] {
+        literal.1: bits[42] = literal(value=1)
+        ret result: bits[42] = shra(literal.1, x)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(), m::Shra());
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::ZeroExt(m::Eq(m::Param(), m::Literal(0))));
+}
+
+TEST_F(ArithSimplificationPassTest, LogicalShiftRightOfConstantOne) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn f(x:bits[10]) -> bits[42] {
+        literal.1: bits[42] = literal(value=1)
+        ret result: bits[42] = shrl(literal.1, x)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(), m::Shrl());
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::ZeroExt(m::Eq(m::Param(), m::Literal(0))));
+}
+
+TEST_F(ArithSimplificationPassTest, ArithmeticShiftRightOfOneBitUnknown) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn f(x:bits[10], y:bits[1]) -> bits[1] {
+        ret result: bits[1] = shra(y, x)
+     }
+  )",
+                                                       p.get()));
+  EXPECT_THAT(f->return_value(), m::Shra());
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Param("y"));
+}
+
+TEST_F(ArithSimplificationPassTest, ArithmeticShiftRightOfOneBitOne) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn f(x:bits[10]) -> bits[1] {
         literal.1: bits[1] = literal(value=1)
-        ret result: bits[1] = eq(x, literal.1)
+        ret result: bits[1] = shra(literal.1, x)
      }
   )",
                                                        p.get()));
-  EXPECT_TRUE(f->return_value()->Is<CompareOp>());
+  EXPECT_THAT(f->return_value(), m::Shra());
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_TRUE(f->return_value()->Is<Param>());
+  EXPECT_THAT(f->return_value(), m::Literal(1));
 }
 
-TEST_F(ArithSimplificationPassTest, CompareBoolAgainstZero) {
+TEST_F(ArithSimplificationPassTest, CreateLsbMaskByDecodeAndSub) {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn f(x:bits[1]) -> bits[1] {
-        literal.1: bits[1] = literal(value=0)
-        ret result: bits[1] = eq(x, literal.1)
+     fn f(x: bits[6]) -> bits[16] {
+        literal.1: bits[16] = literal(value=1)
+        decode.2: bits[16] = decode(x, width=16)
+        ret result: bits[16] = sub(decode.2, literal.1)
      }
   )",
                                                        p.get()));
-  EXPECT_TRUE(f->return_value()->Is<CompareOp>());
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Not(m::Param()));
+  EXPECT_THAT(f->return_value(),
+              m::Not(m::Shll(m::Literal(UBits(65535, 16)), m::Param("x"))));
 }
 
-TEST_F(ArithSimplificationPassTest, DoubleNegation) {
+TEST_F(ArithSimplificationPassTest, CreateLsbMaskByDecodeAndAddLeft) {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn f(x: bits[42]) -> bits[42] {
-        not.2: bits[42] = not(x)
-        ret result: bits[42] = not(not.2)
+     fn f(x: bits[6]) -> bits[16] {
+        literal.1: bits[16] = literal(value=-1)
+        decode.2: bits[16] = decode(x, width=16)
+        ret result: bits[16] = add(decode.2, literal.1)
      }
   )",
                                                        p.get()));
-  EXPECT_TRUE(f->return_value()->Is<UnOp>());
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Param("x"));
+  EXPECT_THAT(f->return_value(),
+              m::Not(m::Shll(m::Literal(UBits(65535, 16)), m::Param("x"))));
 }
 
-TEST_F(ArithSimplificationPassTest, NaryOrEliminateSeveralZeros) {
+TEST_F(ArithSimplificationPassTest, CreateLsbMaskByDecodeAndAddRight) {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn f(x: bits[8], y: bits[8]) -> bits[8] {
-        literal.3: bits[8] = literal(value=0)
-        literal.4: bits[8] = literal(value=0)
-        ret result: bits[8] = or(x, literal.3, y, literal.4)
+     fn f(x: bits[6]) -> bits[16] {
+        literal.1: bits[16] = literal(value=-1)
+        decode.2: bits[16] = decode(x, width=16)
+        ret result: bits[16] = add(literal.1, decode.2)
      }
   )",
                                                        p.get()));
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Or(m::Param("x"), m::Param("y")));
+  EXPECT_THAT(f->return_value(),
+              m::Not(m::Shll(m::Literal(UBits(65535, 16)), m::Param("x"))));
 }
 
-TEST_F(ArithSimplificationPassTest, NaryAndEliminateSeveralOnes) {
+TEST_F(ArithSimplificationPassTest, OneBitDecode) {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn f(x: bits[8], y: bits[8]) -> bits[8] {
-        literal.3: bits[8] = literal(value=0xff)
-        literal.4: bits[8] = literal(value=0xff)
-        ret result: bits[8] = and(x, literal.3, y, literal.4)
+     fn f(x:bits[10]) -> bits[1] {
+        ret result: bits[1] = decode(x, width=1)
      }
   )",
                                                        p.get()));
+  EXPECT_THAT(f->return_value(), m::Decode());
+
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::And(m::Param("x"), m::Param("y")));
+  EXPECT_THAT(f->return_value(), m::Eq(m::Param("x"), m::Literal(0)));
 }
 
-TEST_F(ArithSimplificationPassTest, NaryAndEliminateAllOnes) {
+TEST_F(ArithSimplificationPassTest, DecodeOfOneBit) {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn f() -> bits[8] {
-        literal.1: bits[8] = literal(value=0xff)
-        literal.2: bits[8] = literal(value=0xff)
-        ret result: bits[8] = and(literal.1, literal.2)
+     fn f(x:bits[1]) -> bits[2] {
+        ret result: bits[2] = decode(x, width=2)
      }
   )",
                                                        p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Literal(255));
-}
+  EXPECT_THAT(f->return_value(), m::Decode());
 
-TEST_F(ArithSimplificationPassTest, NaryFlattening) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn f(x: bits[8], y: bits[8], z: bits[8]) -> bits[8] {
-        literal.3: bits[8] = literal(value=0x1f)
-        literal.4: bits[8] = literal(value=0x0f)
-        and.5: bits[8] = and(z, literal.3)
-        ret result: bits[8] = and(x, y, literal.4, and.5)
-     }
-  )",
-                                                       p.get()));
+  ScopedVerifyEquivalence stays_equivalent(f, kProverTimeout);
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::And(m::Param("x"), m::Param("y"),
-                                        m::Param("z"), m::Literal(15)));
-}
-
-TEST_F(ArithSimplificationPassTest, NaryLiteralConsolidation) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-fn f(x: bits[8], y: bits[8], z: bits[8]) -> bits[8] {
-  literal.4: bits[8] = literal(value=15)
-  literal.5: bits[8] = literal(value=31)
-  ret result: bits[8] = and(x, y, literal.4, z, literal.5)
-}
-  )",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::And(m::Param("x"), m::Param("y"),
-                                        m::Param("z"), m::Literal(15)));
-}
-
-TEST_F(ArithSimplificationPassTest, XAndNotX) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn f(x: bits[32]) -> bits[32] {
-        not.2: bits[32] = not(x)
-        ret result: bits[32] = and(x, not.2)
-     }
-  )",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Literal(0));
-}
-
-TEST_F(ArithSimplificationPassTest, NotXAndX) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-     fn f(x: bits[32]) -> bits[32] {
-        not.2: bits[32] = not(x)
-        ret result: bits[32] = and(not.2, x)
-     }
-  )",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Literal(0));
+  EXPECT_THAT(f->return_value(),
+              m::Concat(m::Param("x"), m::Not(m::Param("x"))));
 }
 
 TEST_F(ArithSimplificationPassTest, SignExtTwice) {
@@ -917,197 +1830,6 @@ TEST_F(ArithSimplificationPassTest, SignExtTwice) {
                                                        p.get()));
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
   EXPECT_THAT(f->return_value(), m::SignExt(m::Param()));
-}
-
-TEST_F(ArithSimplificationPassTest, CollapseToNaryOr) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
- fn f(w: bits[8], x: bits[8], y: bits[8], z: bits[8]) -> bits[8] {
-    or.5: bits[8] = or(w, x)
-    or.6: bits[8] = or(y, z)
-    ret result: bits[8] = or(or.5, or.6)
- }
-  )",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Or(m::Param("w"), m::Param("x"),
-                                       m::Param("y"), m::Param("z")));
-}
-
-TEST_F(ArithSimplificationPassTest, CollapseToNaryOrWithOtherUses) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
- fn f(w: bits[8], x: bits[8], y: bits[8], z: bits[8]) -> (bits[8], bits[8]) {
-    w_or_x: bits[8] = or(w, x)
-    y_or_z: bits[8] = or(y, z)
-    tmp0: bits[8] = or(w_or_x, y_or_z)
-    ret result: (bits[8], bits[8]) = tuple(w_or_x, tmp0)
- }
-  )",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  // `Or(w, x)` should not be folded because it has more than one use.
-  EXPECT_THAT(f->return_value(),
-              m::Tuple(m::Or(m::Param("w"), m::Param("x")),
-                       m::Or(m::Or(), m::Param("y"), m::Param("z"))));
-}
-
-TEST_F(ArithSimplificationPassTest, CollapseOneSideToNaryOr) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
- fn f(x: bits[8], y: bits[8], z: bits[8]) -> bits[8] {
-    or.4: bits[8] = or(y, z)
-    ret result: bits[8] = or(x, or.4)
- }
-  )",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(),
-              m::Or(m::Param("x"), m::Param("y"), m::Param("z")));
-}
-
-TEST_F(ArithSimplificationPassTest, NorWithLiteralZeroOperands) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
- fn f(x: bits[8], y: bits[8], z: bits[8]) -> bits[8] {
-    literal.1: bits[8] = literal(value=0)
-    literal.2: bits[8] = literal(value=0)
-    ret result: bits[8] = nor(x, literal.1, y, literal.2, z)
- }
-  )",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(),
-              m::Nor(m::Param("x"), m::Param("y"), m::Param("z")));
-}
-
-TEST_F(ArithSimplificationPassTest, NandWithLiteralAllOnesOperands) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
- fn f(x: bits[8], y: bits[8], z: bits[8]) -> bits[8] {
-    literal.1: bits[8] = literal(value=255)
-    ret result: bits[8] = nand(x, literal.1, y, z)
- }
-  )",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(),
-              m::Nand(m::Param("x"), m::Param("y"), m::Param("z")));
-}
-
-TEST_F(ArithSimplificationPassTest, SingleOperandNand) {
-  auto p = CreatePackage();
-  FunctionBuilder fb(TestName(), p.get());
-  fb.AddNaryOp(Op::kNand, {fb.Param("x", p->GetBitsType(32))});
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Not(m::Param("x")));
-}
-
-TEST_F(ArithSimplificationPassTest, SingleOperandOr) {
-  auto p = CreatePackage();
-  FunctionBuilder fb(TestName(), p.get());
-  fb.AddNaryOp(Op::kOr, {fb.Param("x", p->GetBitsType(32))});
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Param("x"));
-}
-
-TEST_F(ArithSimplificationPassTest, AndWithDuplicateOperands) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-    fn id_and(x: bits[32], y: bits[32]) -> bits[32] {
-       ret result: bits[32] = and(x, y, y, x, pos=[(0,1,5)])
-    }
-)",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::And(m::Param("x"), m::Param("y")));
-}
-
-TEST_F(ArithSimplificationPassTest, AndWithSameOperands) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-    fn id_and(x: bits[32], y: bits[32]) -> bits[32] {
-       ret result: bits[32] = and(x, x, pos=[(0,1,5)])
-    }
-)",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Param("x"));
-}
-
-TEST_F(ArithSimplificationPassTest, OrWithSameOperands) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-    fn id_or(x: bits[32], y: bits[32]) -> bits[32] {
-       ret result: bits[32] = or(x, x, pos=[(0,1,5)])
-    }
-)",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Param("x"));
-}
-
-TEST_F(ArithSimplificationPassTest, NandWithDuplicateOperands) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-    fn id_or(x: bits[32], y: bits[32]) -> bits[32] {
-       ret result: bits[32] = nand(x, x, y, y, x, pos=[(0,1,5)])
-    }
-)",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Nand(m::Param("x"), m::Param("y")));
-}
-
-TEST_F(ArithSimplificationPassTest, NandWithSameOperands) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-    fn id_or(x: bits[32], y: bits[32]) -> bits[32] {
-       ret result: bits[32] = nand(x, x, x, pos=[(0,1,5)])
-    }
-)",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Not(m::Param("x")));
-}
-
-TEST_F(ArithSimplificationPassTest, XorWithSameOperandsEven) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-    fn id_or(x: bits[32], y: bits[32]) -> bits[32] {
-       ret result: bits[32] = xor(x, x, pos=[(0,1,5)])
-    }
-)",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Literal(0));
-}
-
-TEST_F(ArithSimplificationPassTest, XorWithSameOperandsOdd) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-    fn id_or(x: bits[32], y: bits[32]) -> bits[32] {
-       ret result: bits[32] = xor(x, x, x, pos=[(0,1,5)])
-    }
-)",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Param("x"));
-}
-
-TEST_F(ArithSimplificationPassTest, AddWithZero) {
-  auto p = CreatePackage();
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
-    fn add_zero(x: bits[32]) -> bits[32] {
-      zero: bits[32] = literal(value=0)
-      ret result: bits[32] = add(x, zero)
-    }
-)",
-                                                       p.get()));
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Param("x"));
 }
 
 TEST_F(ArithSimplificationPassTest, ZeroWidthMulOperand) {
@@ -1180,6 +1902,17 @@ TEST_F(ArithSimplificationPassTest, InvertedComparison) {
   }
 }
 
+TEST_F(ArithSimplificationPassTest, InvertedComparisonWithMultipleUsers) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  BValue lt = fb.ULt(fb.Param("x", u32), fb.Param("y", u32));
+  BValue not_lt = fb.Not(lt);
+  fb.Tuple({lt, not_lt});
+  XLS_ASSERT_OK(fb.Build().status());
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(false));
+}
+
 TEST_F(ArithSimplificationPassTest, ULtMask) {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
@@ -1192,10 +1925,24 @@ TEST_F(ArithSimplificationPassTest, ULtMask) {
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
   EXPECT_THAT(
       f->return_value(),
-      m::Nor(m::Or(m::BitSlice(m::Param("x"), /*start=*/2, /*width=*/1),
-                   m::BitSlice(m::Param("x"), /*start=*/3, /*width=*/1)),
-             m::And(m::BitSlice(m::Param("x"), /*start=*/0, /*width=*/1),
-                    m::BitSlice(m::Param("x"), /*start=*/1, /*width=*/1))));
+      m::Nor(
+          m::OrReduce(m::BitSlice(m::Param("x"), /*start=*/2, /*width=*/2)),
+          m::AndReduce(m::BitSlice(m::Param("x"), /*start=*/0, /*width=*/2))));
+}
+
+TEST_F(ArithSimplificationPassTest, ULeMask) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+    fn f(x: bits[4]) -> bits[1] {
+      literal.1: bits[4] = literal(value=0b0011)
+      ret result: bits[1] = ule(x, literal.1)
+    }
+)",
+                                                       p.get()));
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              m::Not(m::OrReduce(
+                  m::BitSlice(m::Param("x"), /*start=*/2, /*width=*/2))));
 }
 
 TEST_F(ArithSimplificationPassTest, UGtMask) {
@@ -1208,9 +1955,25 @@ TEST_F(ArithSimplificationPassTest, UGtMask) {
 )",
                                                        p.get()));
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(),
-              m::Or(m::BitSlice(m::Param("x"), /*start=*/2, /*width=*/1),
-                    m::BitSlice(m::Param("x"), /*start=*/3, /*width=*/1)));
+  EXPECT_THAT(f->return_value(), m::OrReduce(m::BitSlice(
+                                     m::Param("x"), /*start=*/2, /*width=*/2)));
+}
+
+TEST_F(ArithSimplificationPassTest, UGeMask) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+    fn f(x: bits[4]) -> bits[1] {
+      literal.1: bits[4] = literal(value=0b0011)
+      ret result: bits[1] = uge(x, literal.1)
+    }
+)",
+                                                       p.get()));
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(
+      f->return_value(),
+      m::Or(
+          m::OrReduce(m::BitSlice(m::Param("x"), /*start=*/2, /*width=*/2)),
+          m::AndReduce(m::BitSlice(m::Param("x"), /*start=*/0, /*width=*/2))));
 }
 
 TEST_F(ArithSimplificationPassTest, UGtMaskAllOnes) {
@@ -1250,6 +2013,58 @@ TEST_F(ArithSimplificationPassTest, ShiftByConcatWithZeroValueAndOthers) {
               m::Shll(m::Param("x"), m::Concat(m::Param("y"), m::Param("z"))));
 }
 
+TEST_F(ArithSimplificationPassTest, DecodeTrivialConcat) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  fb.Decode(fb.Concat({fb.Literal(Value(UBits(0, 32)))}),
+            /*width=*/128);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              AllOf(m::Decode(m::Literal(/*value=*/0, /*width=*/32)),
+                    m::Type("bits[128]")));
+}
+
+TEST_F(ArithSimplificationPassTest, DecodeConcatWithZeroValue) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  fb.Decode(fb.Concat({fb.Literal(Value(UBits(0, 24))),
+                       fb.Param("y", p->GetBitsType(8))}),
+            /*width=*/128);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              AllOf(m::Decode(m::Param("y")), m::Type("bits[128]")));
+}
+
+TEST_F(ArithSimplificationPassTest, DecodeConcatWithZeroValueAndOthers) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  fb.Decode(fb.Concat({fb.Literal(Value(UBits(0, 16))),
+                       fb.Param("y", p->GetBitsType(8)),
+                       fb.Param("z", p->GetBitsType(8))}),
+            /*width=*/128);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              AllOf(m::Decode(m::Concat(m::Param("y"), m::Param("z"))),
+                    m::Type("bits[128]")));
+}
+
+TEST_F(ArithSimplificationPassTest, DecodeNarrowedConcatWithZeroValue) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  fb.Decode(fb.Concat({fb.Literal(Value(UBits(0, 24))),
+                       fb.Param("y", p->GetBitsType(8))}),
+            /*width=*/1024);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(
+      f->return_value(),
+      AllOf(m::ZeroExt(AllOf(m::Decode(m::Param("y")), m::Type("bits[256]"))),
+            m::Type("bits[1024]")));
+}
+
 TEST_F(ArithSimplificationPassTest, GuardedShiftOperation) {
   // Test that a shift amount clamped to the shift's width is removed.
   auto p = CreatePackage();
@@ -1274,9 +2089,32 @@ TEST_F(ArithSimplificationPassTest, GuardedShiftOperationWithDefault) {
   BValue amt = fb.Param("amt", p->GetBitsType(32));
   BValue limit = fb.Literal(Value(UBits(100, 32)));
   BValue clamped_amt =
-      fb.Select(fb.UGt(amt, limit), /*cases=*/{limit}, /*default_value=*/amt);
+      fb.Select(fb.UGt(amt, limit), /*cases=*/absl::MakeConstSpan({amt}),
+                /*default_value=*/limit);
   fb.Shll(x, clamped_amt);
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(
+      f->return_value(),
+      m::Shll(m::Param("x"), m::Select(m::UGt(), /*cases=*/{m::Param("amt")},
+                                       /*default_value=*/m::Literal())));
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Shll(m::Param("x"), m::Param("amt")));
+}
+
+TEST_F(ArithSimplificationPassTest, GuardedShiftOperationWithPrioritySelect) {
+  // Test that a shift amount clamped to the shift's width is removed.
+  // Uses a priority select.
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue x = fb.Param("x", p->GetBitsType(100));
+  BValue amt = fb.Param("amt", p->GetBitsType(32));
+  BValue limit = fb.Literal(Value(UBits(100, 32)));
+  BValue clamped_amt = fb.PrioritySelect(fb.UGt(amt, limit), /*cases=*/{limit},
+                                         /*default_value=*/amt);
+  fb.Shll(x, clamped_amt);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ScopedVerifyEquivalence sve(f);
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
   EXPECT_THAT(f->return_value(), m::Shll(m::Param("x"), m::Param("amt")));
 }
@@ -1329,50 +2167,123 @@ TEST_F(ArithSimplificationPassTest, GuardedShiftOperationLowLimit) {
   EXPECT_THAT(f->return_value(), m::Shll(m::Param("x"), m::Select()));
 }
 
-TEST_F(ArithSimplificationPassTest, EqAggregateType) {
+TEST_F(ArithSimplificationPassTest, UMulCompare) {
   auto p = CreatePackage();
   FunctionBuilder fb(TestName(), p.get());
-  Type* u32 = p->GetBitsType(32);
-  BValue x = fb.Param("x", p->GetTupleType({u32, u32}));
-  BValue y = fb.Param("y", p->GetTupleType({u32, u32}));
-  BValue x_eq_x = fb.Eq(x, x);
-  BValue x_eq_y = fb.Eq(x, y);
-  fb.Tuple({x_eq_x, x_eq_y});
+  BValue x = fb.Param("x", p->GetBitsType(32));
+  fb.Eq(fb.Literal(UBits(1000, 50)),
+        fb.UMul(x, fb.Literal(UBits(100, 32)), 50));
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
-
+  ScopedVerifyEquivalence sve(f);
+  ScopedRecordIr sri(p.get());
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
   EXPECT_THAT(f->return_value(),
-              m::Tuple(m::Literal(1), m::Eq(m::Param("x"), m::Param("y"))));
+              m::Eq(m::ZeroExt(x.node()), m::Literal(UBits(10, 50))));
 }
 
-TEST_F(ArithSimplificationPassTest, NeAggregateType) {
+TEST_F(ArithSimplificationPassTest, UMulCompareOverflow) {
   auto p = CreatePackage();
   FunctionBuilder fb(TestName(), p.get());
-  Type* u32 = p->GetBitsType(32);
-  BValue x = fb.Param("x", p->GetTupleType({u32, u32}));
-  BValue y = fb.Param("y", p->GetTupleType({u32, u32}));
-  BValue x_eq_x = fb.Ne(x, x);
-  BValue x_eq_y = fb.Ne(x, y);
-  fb.Tuple({x_eq_x, x_eq_y});
+  BValue x = fb.Param("x", p->GetBitsType(3));
+  // This can overflow which makes getting the inverse more difficult.
+  // TODO(allight): It might be nice to do this when we can.
+  fb.Eq(fb.Literal(UBits(1, 8)), fb.UMul(x, fb.Literal(UBits(170, 8)), 8));
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ScopedVerifyEquivalence sve(f);
+  ScopedRecordIr sri(p.get());
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(false));
+}
 
+TEST_F(ArithSimplificationPassTest, UMulCompareZero) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue x = fb.Param("x", p->GetBitsType(3));
+  // Make sure that x*<foo> == 0 is x == 0
+  fb.Eq(fb.Literal(UBits(0, 6)), fb.UMul(x, fb.Literal(UBits(7, 3)), 6));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ScopedVerifyEquivalence sve(f);
+  ScopedRecordIr sri(p.get());
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Eq(x.node(), m::Literal(UBits(0, 3))))
+      << f->DumpIr();
+}
+
+TEST_F(ArithSimplificationPassTest, UMulMulAndCompareZero) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue x = fb.Param("x", p->GetBitsType(3));
+  fb.Eq(fb.Literal(UBits(0, 3)), fb.UMul(x, fb.Literal(UBits(0, 3)), 3));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  // Just make sure that whatever we create for a vacuously true x*0 == 0 is
+  // consistent.
+  ScopedVerifyEquivalence sve(f);
+  ScopedRecordIr sri(p.get());
+  ASSERT_THAT(Run(p.get()), IsOk());
+}
+
+TEST_F(ArithSimplificationPassTest, UMulCompareImpossible) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue x = fb.Param("x", p->GetBitsType(32));
+  fb.Eq(fb.Literal(UBits(1001, 50)),
+        fb.UMul(x, fb.Literal(UBits(100, 32)), 50));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ScopedVerifyEquivalence sve(f);
+  ScopedRecordIr sri(p.get());
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Literal(Value::Bool(false)));
+}
+
+void UmulFuzz(const Bits& multiplicand, const Bits& result, int64_t var_width,
+              bool const_on_right, bool var_on_right) {
+  VerifiedPackage p("umul_fuzz");
+  FunctionBuilder fb("umul_fuzz", &p);
+  BValue eq_const = fb.Literal(result);
+  BValue mul_const = fb.Literal(multiplicand);
+  BValue var = fb.Param("param_val", p.GetBitsType(var_width));
+  BValue mul;
+  if (var_on_right) {
+    mul = fb.UMul(mul_const, var, result.bit_count());
+  } else {
+    mul = fb.UMul(var, mul_const, result.bit_count());
+  }
+  if (const_on_right) {
+    fb.Eq(mul, eq_const);
+  } else {
+    fb.Eq(eq_const, mul);
+  }
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ScopedVerifyEquivalence sve(f);
+  ScopedRecordIr sri(&p);
+  PassResults results;
+  OptimizationContext context;
+  ASSERT_THAT(ArithSimplificationPass().Run(
+                  &p, OptimizationPassOptions().WithOptLevel(kMaxOptLevel),
+                  &results, context),
+              absl_testing::IsOk());
+}
+
+FUZZ_TEST(ArithSimplificationPassFuzzTest, UmulFuzz)
+    .WithDomains(ArbitraryBits(16), ArbitraryBits(16), fuzztest::InRange(1, 40),
+                 fuzztest::Arbitrary<bool>(), fuzztest::Arbitrary<bool>());
+
+// Test for rewriting add(sign_ext(c: bits[1]), K) to Select(c, [K, K-1]).
+TEST_F(ArithSimplificationPassTest, AddSignExtPlusConstant) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn add_sign_ext(c:bits[1]) -> bits[4] {
+       s:bits[4] = sign_ext(c, new_bit_count=4)
+       k:bits[4] = literal(value=3)
+       ret result: bits[4] = add(s, k)
+     }
+  )",
+                                                       p.get()));
+  ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  // Expect Select(c, [3, 2]) since sign_ext(c) is 0 or -1 (0xF) => 0+3=3,
+  // -1+3=2
   EXPECT_THAT(f->return_value(),
-              m::Tuple(m::Literal(0), m::Ne(m::Param("x"), m::Param("y"))));
-}
-
-TEST_F(ArithSimplificationPassTest, EqNeZeroWidthTypes) {
-  auto p = CreatePackage();
-  FunctionBuilder fb(TestName(), p.get());
-  BValue x = fb.Param("x", p->GetTupleType({}));
-  BValue y = fb.Param("y", p->GetTupleType({}));
-  BValue x_eq_y = fb.Eq(x, y);
-  BValue x_ne_y = fb.Ne(x, y);
-  fb.Tuple({x_eq_y, x_ne_y});
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
-
-  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
-  EXPECT_THAT(f->return_value(), m::Tuple(m::Literal(1), m::Literal(0)));
+              m::Select(m::Param("c"), {m::Literal(3), m::Literal(2)}));
 }
 
 }  // namespace

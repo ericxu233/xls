@@ -17,12 +17,12 @@
 #include <cstdint>
 #include <vector>
 
+#include "absl/log/log.h"
 #include "absl/random/bit_gen_ref.h"
 #include "absl/random/distributions.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/interpreter/function_interpreter.h"
 #include "xls/ir/bits.h"
@@ -38,6 +38,7 @@ Value RandomValue(Type* type, absl::BitGenRef rng) {
   if (type->IsTuple()) {
     TupleType* tuple_type = type->AsTupleOrDie();
     std::vector<Value> elements;
+    elements.reserve(tuple_type->size());
     for (int64_t i = 0; i < tuple_type->size(); ++i) {
       elements.push_back(RandomValue(tuple_type->element_type(i), rng));
     }
@@ -46,6 +47,7 @@ Value RandomValue(Type* type, absl::BitGenRef rng) {
   if (type->IsArray()) {
     ArrayType* array_type = type->AsArrayOrDie();
     std::vector<Value> elements;
+    elements.reserve(array_type->size());
     for (int64_t i = 0; i < array_type->size(); ++i) {
       elements.push_back(RandomValue(array_type->element_type(), rng));
     }
@@ -81,7 +83,7 @@ absl::StatusOr<std::vector<Value>> RandomFunctionArguments(
 
   Type* validator_return = validator->GetType()->return_type();
   if (!validator_return->IsBits() || validator_return->GetFlatBitCount() != 1) {
-    XLS_LOG(INFO) << "VR: " << validator_return->ToString();
+    LOG(INFO) << "VR: " << validator_return->ToString();
     return absl::InvalidArgumentError(
         "Function argument validator must return a single bit value.");
   }

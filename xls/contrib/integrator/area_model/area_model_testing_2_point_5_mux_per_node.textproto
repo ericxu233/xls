@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# proto-file: xls/delay_model/delay_model.proto
-# proto-message: xls.delay_model.DelayModel
+# proto-file: xls/estimators/estimator_model.proto
+# proto-message: xls.estimator_model.EstimatorModel
 
 # Dummy model for testing. All nodes except select have the same
-# fixed cost. 
+# fixed cost.
 # The cost of regular node is 2.5X a mux.
 
 # Free nodes.
@@ -29,6 +29,7 @@ op_models { op: "kConcat" estimator { fixed: 0 } }
 op_models { op: "kIdentity" estimator { fixed: 0 } }
 op_models { op: "kLiteral" estimator { fixed: 0 } }
 op_models { op: "kParam" estimator { fixed: 0 } }
+op_models { op: "kStateRead" estimator { fixed: 0 } }
 op_models { op: "kReverse" estimator { fixed: 0 } }
 op_models { op: "kTuple" estimator { fixed: 0 } }
 op_models { op: "kTupleIndex" estimator { fixed: 0 } }
@@ -75,3 +76,5 @@ op_models { op: "kUMul" estimator { fixed: 5 } }
 op_models { op: "kUMod" estimator { fixed: 5 } }
 op_models { op: "kXor" estimator { fixed: 5 } }
 op_models { op: "kXorReduce" estimator { fixed: 5 } }
+
+metric: DELAY_METRIC

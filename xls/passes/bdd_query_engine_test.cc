@@ -14,18 +14,24 @@
 
 #include "xls/passes/bdd_query_engine.h"
 
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "absl/container/inlined_vector.h"
 #include "xls/common/status/matchers.h"
-#include "xls/data_structures/binary_decision_diagram.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_builder.h"
+#include "xls/ir/interval.h"
+#include "xls/ir/interval_set.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/op.h"
 #include "xls/ir/package.h"
+#include "xls/passes/query_engine.h"
 
 namespace xls {
 namespace {
@@ -256,8 +262,8 @@ TEST_F(BddQueryEngineTest, ForceNodeToBeModeledAsVariable) {
   BValue my_zero = fb.Literal(UBits(0, 1));
 
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
-  BddQueryEngine query_engine(/*path_limit=*/0,
-                              [](const Node* n) { return n->op() != Op::kOr; });
+  BddQueryEngine query_engine(
+      /*path_limit=*/0, [](const Node* n) { return n->op() != Op::kOr; });
   XLS_ASSERT_OK(query_engine.Populate(f).status());
   EXPECT_FALSE(KnownEquals(query_engine, andop.node(), my_one.node()));
   EXPECT_TRUE(KnownEquals(query_engine, andop.node(), my_zero.node()));
@@ -289,6 +295,86 @@ TEST_F(BddQueryEngineTest, BitValuesImplyNodeValuePredicateAlwaysFalse) {
   auto result = query_engine.ImpliedNodeValue(
       {{{a.node(), 0}, true}, {{a_not.node(), 0}, true}}, orop.node());
   EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(BddQueryEngineTest, ImpliedNodeTernaryChecksPathLength) {
+  auto p = CreatePackage();
+  // Function found with fuzzing and would OOM the process when BDD query engine
+  // is called with specific arguments.
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(
+                                             R"(
+fn __sample__main(x0: bits[16], x1: bits[8], x2: bits[10], x3: bits[1]) -> (bits[13], bits[16], bits[16][6], bits[16], bits[16]) {
+  literal.73: bits[6] = literal(value=0, id=73)
+  concat.74: bits[16] = concat(literal.73, x2, id=74)
+  x4: bits[16] = and(concat.74, x0, id=6, pos=[(0,4,32)])
+  bit_slice.97: bits[10] = bit_slice(x4, start=0, width=10, id=97, pos=[(0,20,25)])
+  literal.100: bits[10] = literal(value=2, id=100, pos=[(0,20,25)])
+  x22: bits[16] = neg(x0, id=39, pos=[(0,21,23)])
+  ugt.99: bits[1] = ugt(bit_slice.97, literal.100, id=99, pos=[(0,20,25)])
+  literal.36: bits[16] = literal(value=2, id=36, pos=[(0,20,44)])
+  bit_slice.49: bits[13] = bit_slice(x4, start=0, width=13, id=49)
+  x23: bits[13] = bit_slice(x22, start=3, width=13, id=88, pos=[(0,22,26)])
+  sel.78: bits[16] = sel(ugt.99, cases=[x4, literal.36], id=78, pos=[(0,20,25)])
+  x28: bits[13] = and(bit_slice.49, x23, id=50, pos=[(0,26,33)])
+  x12: bits[16][6] = array(x0, x4, x0, x0, x4, x0, id=92, pos=[(0,11,28)])
+  x17: bits[16] = literal(value=0, id=9, pos=[(0,5,47)])
+  x21: bits[16] = sel(sel.78, cases=[x0, x4], default=x0, id=96, pos=[(0,20,24)])
+  ret tuple.51: (bits[13], bits[16], bits[16][6], bits[16], bits[16]) = tuple(x28, x0, x12, x17, x21, id=51, pos=[(0,27,8)])
+}
+)",
+                                             p.get()));
+  BddQueryEngine query_engine(/*path_limit=*/1024);
+  XLS_ASSERT_OK(query_engine.Populate(f).status());
+  XLS_ASSERT_OK_AND_ASSIGN(Node * sel_node, f->GetNode("sel.78"));
+  // NB The specific target is irrelevant.
+  XLS_ASSERT_OK_AND_ASSIGN(Node * target, f->GetNode("x4"));
+  std::vector<std::pair<TreeBitLocation, bool>> vals;
+  // Set sel-node to 0x1.
+  vals.reserve(sel_node->BitCountOrDie());
+  vals.push_back({TreeBitLocation(sel_node, 0), true});
+  for (int64_t i = 1; i < sel_node->BitCountOrDie(); ++i) {
+    vals.push_back({TreeBitLocation(sel_node, i), false});
+  }
+  // This will blow up the path depth.
+  EXPECT_EQ(query_engine.ImpliedNodeTernary(vals, target), std::nullopt)
+      << "Expected failure to find result due to path-size explosion.";
+}
+TEST_F(BddQueryEngineTest, SpecializeGivenIntervalsHandlesSaturation) {
+  // Found via fuzzing. When told to specialize on an interval set, if one
+  // interval was saturated, it would be omitted from the check - making the
+  // specialization assume more than was requested. In this case, it made a
+  // value appear to be determined when it wasn't.
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(
+                                             R"(
+fn __sample__main(x: bits[60]) -> bits[35] {
+  bit_slice.1: bits[55] = bit_slice(x, start=5, width=55, id=1)
+  literal.2: bits[60] = literal(value=459229419044003026, id=2)
+  or_reduce.3: bits[1] = or_reduce(bit_slice.1, id=3)
+  ult.4: bits[1] = ult(x, literal.2, id=4)
+  literal.5: bits[60] = literal(value=0, id=5)
+  literal.6: bits[60] = literal(value=465194495002459937, id=6)
+  and.7: bits[1] = and(or_reduce.3, ult.4, id=7)
+  eq.8: bits[1] = eq(x, literal.5, id=8)
+  eq.9: bits[1] = eq(x, literal.6, id=9)
+  literal.10: bits[1] = literal(value=0, id=10)
+  or.11: bits[1] = or(and.7, eq.8, id=11)
+  y: bits[3] = concat(eq.9, literal.10, or.11, id=12)
+  ret z: bits[35] = bit_slice(x, start=0, width=35, id=13)
+}
+)",
+                                             p.get()));
+  BddQueryEngine query_engine(1024);
+  XLS_ASSERT_OK(query_engine.Populate(f).status());
+  IntervalSet intervals = IntervalSet::Of(
+      {Interval(UBits(1, 3), UBits(1, 3)), Interval(UBits(5, 3), UBits(5, 3))});
+  XLS_ASSERT_OK_AND_ASSIGN(Node * specialized_node, f->GetNode("y"));
+  std::unique_ptr<QueryEngine> specialized = query_engine.SpecializeGiven(
+      {{specialized_node,
+        ValueKnowledge{.intervals = IntervalSetTree::CreateSingleElementTree(
+                           specialized_node->GetType(), intervals)}}});
+  XLS_ASSERT_OK_AND_ASSIGN(Node * target, f->GetNode("z"));
+  EXPECT_EQ(specialized->KnownValueAsBits(target), std::nullopt);
 }
 
 }  // namespace

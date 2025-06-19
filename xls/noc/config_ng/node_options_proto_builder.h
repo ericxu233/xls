@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_NOC_CONFIG_NODE_OPTIONS_PROTO_BUILDER_H_
-#define XLS_NOC_CONFIG_NODE_OPTIONS_PROTO_BUILDER_H_
+#ifndef XLS_NOC_CONFIG_NG_NODE_OPTIONS_PROTO_BUILDER_H_
+#define XLS_NOC_CONFIG_NG_NODE_OPTIONS_PROTO_BUILDER_H_
 
+#include <cstdint>
 #include <string_view>
 
 #include "xls/noc/config_ng/coordinate_options_proto_builder.h"
@@ -28,16 +29,14 @@ class NodeOptionsProtoBuilder {
   // Constructor storing the proto pointer as a class member.
   // proto_ptr cannot be nullptr. Does not take ownership of the proto_ptr. The
   // proto_ptr must refer to a valid object that outlives this object.
-  explicit NodeOptionsProtoBuilder(
-      NodeOptionsProto* proto_ptr);
+  explicit NodeOptionsProtoBuilder(NodeOptionsProto* proto_ptr);
 
   // Constructor storing the proto pointer as a class member and sets the fields
   // of the proto to default_proto.
   // proto_ptr cannot be nullptr. Does not take ownership of the proto_ptr. The
   // proto_ptr must refer to a valid object that outlives this object.
-  NodeOptionsProtoBuilder(
-      NodeOptionsProto* proto_ptr,
-      const NodeOptionsProto& default_proto);
+  NodeOptionsProtoBuilder(NodeOptionsProto* proto_ptr,
+                          const NodeOptionsProto& default_proto);
 
   // Copy the field values of the proto message object from another builder
   // to the builder.
@@ -63,4 +62,4 @@ class NodeOptionsProtoBuilder {
 
 }  // namespace xls::noc
 
-#endif  // XLS_NOC_CONFIG_NODE_OPTIONS_PROTO_BUILDER_H_
+#endif  // XLS_NOC_CONFIG_NG_NODE_OPTIONS_PROTO_BUILDER_H_

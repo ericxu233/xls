@@ -20,14 +20,20 @@ load(
     "xls_dslx_fmt_test",
     "xls_dslx_library",
     "xls_dslx_opt_ir",
+    "xls_dslx_prove_quickcheck_test",
     "xls_dslx_test",
     "xls_eval_ir_test",
     "xls_ir_cc_library",
+    "xls_ir_equivalence_test",
 )
 
 package(
     default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_users"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -37,47 +43,104 @@ xls_dslx_library(
 )
 
 xls_dslx_fmt_test(
-    name = "std_dslx_autofmt_test",
+    name = "std_dslx_fmt_test",
     src = "std.x",
+    opportunistic_postcondition = True,
 )
 
 xls_dslx_test(
     name = "std_dslx_test",
     srcs = ["std.x"],
+    dslx_test_args = {"compare": "jit"},
+)
+
+xls_dslx_prove_quickcheck_test(
+    name = "std_dslx_prove_quickcheck_test",
+    srcs = ["std.x"],
+)
+
+xls_dslx_library(
+    name = "acm_random_dslx",
+    srcs = ["acm_random.x"],
 )
 
 xls_dslx_test(
     name = "acm_random_dslx_test",
     srcs = ["acm_random.x"],
+    dslx_test_args = {"compare": "jit"},
 )
 
 xls_dslx_fmt_test(
-    name = "acm_random_dslx_fmt",
+    name = "acm_random_dslx_fmt_test",
     src = "acm_random.x",
+    opportunistic_postcondition = True,
+)
+
+xls_dslx_library(
+    name = "abs_diff_dslx",
+    srcs = ["abs_diff.x"],
+)
+
+xls_dslx_fmt_test(
+    name = "abs_diff_dslx_fmt_test",
+    src = "abs_diff.x",
+    opportunistic_postcondition = True,
+)
+
+xls_dslx_test(
+    name = "abs_diff_dslx_test",
+    srcs = ["abs_diff.x"],
+    dslx_test_args = {"compare": "jit"},
+)
+
+xls_dslx_prove_quickcheck_test(
+    name = "abs_diff_dslx_prove_quickcheck_test",
+    srcs = ["abs_diff.x"],
 )
 
 xls_dslx_library(
     name = "apfloat_dslx",
     srcs = ["apfloat.x"],
-    deps = [":std_dslx"],
+    deps = [":abs_diff_dslx"],
 )
 
 xls_dslx_test(
     name = "apfloat_dslx_test",
-    srcs = ["apfloat.x"],
-    deps = [":apfloat_dslx"],
+    dslx_test_args = {"compare": "jit"},
+    library = ":apfloat_dslx",
+)
+
+xls_dslx_prove_quickcheck_test(
+    name = "apfloat_dslx_prove_quickcheck_test",
+    library = ":apfloat_dslx",
+)
+
+xls_dslx_fmt_test(
+    name = "apfloat_dslx_fmt_test",
+    src = "apfloat.x",
+    opportunistic_postcondition = True,
 )
 
 xls_dslx_library(
     name = "bfloat16_dslx",
     srcs = ["bfloat16.x"],
-    deps = [":std_dslx"],
+)
+
+xls_dslx_prove_quickcheck_test(
+    name = "bfloat16_dslx_prove_quickcheck_test",
+    srcs = ["bfloat16.x"],
+)
+
+xls_dslx_fmt_test(
+    name = "bfloat16_dslx_fmt_test",
+    src = "bfloat16.x",
+    opportunistic_postcondition = True,
 )
 
 xls_dslx_test(
     name = "bfloat16_dslx_test",
     srcs = ["bfloat16.x"],
-    deps = [":bfloat16_dslx"],
+    dslx_test_args = {"compare": "jit"},
 )
 
 xls_dslx_opt_ir(
@@ -87,7 +150,15 @@ xls_dslx_opt_ir(
     library = "bfloat16_dslx",
 )
 
-# TODO: 2021-03-08 Takes too long (> 15 minutes). Add xls_ir_equivalence_test.
+# TODO: xls_ir_equivalence_test takes a long time. Tag enormous and manual.
+xls_ir_equivalence_test(
+    name = "bfloat16_add_ir_opt_equivalence_test",
+    size = "enormous",
+    src_0 = ":bfloat16_add.ir",
+    src_1 = ":bfloat16_add.opt.ir",
+    tags = ["manual"],
+)
+
 xls_eval_ir_test(
     name = "bfloat16_add_eval_ir_test",
     src = ":bfloat16_add.ir",
@@ -105,7 +176,15 @@ xls_dslx_opt_ir(
     library = "bfloat16_dslx",
 )
 
-# TODO: 2021-03-08 Takes too long (> 15 minutes). Add xls_ir_equivalence_test.
+# TODO: xls_ir_equivalence_test takes a long time. Tag enormous and manual.
+xls_ir_equivalence_test(
+    name = "bfloat16_sub_ir_opt_equivalence_test",
+    size = "enormous",
+    src_0 = ":bfloat16_sub.ir",
+    src_1 = ":bfloat16_sub.opt.ir",
+    tags = ["manual"],
+)
+
 xls_eval_ir_test(
     name = "bfloat16_sub_eval_ir_test",
     src = ":bfloat16_sub.ir",
@@ -124,15 +203,42 @@ xls_dslx_opt_ir(
 )
 
 xls_dslx_library(
+    name = "hfloat16_dslx",
+    srcs = ["hfloat16.x"],
+)
+
+xls_dslx_prove_quickcheck_test(
+    name = "hfloat16_dslx_prove_quickcheck_test",
+    srcs = ["hfloat16.x"],
+)
+
+xls_dslx_fmt_test(
+    name = "hfloat16_dslx_fmt_test",
+    src = "hfloat16.x",
+    opportunistic_postcondition = True,
+)
+
+xls_dslx_test(
+    name = "hfloat16_dslx_test",
+    srcs = ["hfloat16.x"],
+    dslx_test_args = {"compare": "jit"},
+)
+
+xls_dslx_library(
     name = "float32_dslx",
     srcs = ["float32.x"],
-    deps = [":std_dslx"],
+)
+
+xls_dslx_fmt_test(
+    name = "float32_dslx_fmt_test",
+    src = "float32.x",
+    opportunistic_postcondition = True,
 )
 
 xls_dslx_test(
     name = "float32_dslx_test",
     srcs = ["float32.x"],
-    deps = [":float32_dslx"],
+    dslx_test_args = {"compare": "jit"},
 )
 
 xls_dslx_opt_ir(
@@ -143,15 +249,21 @@ xls_dslx_opt_ir(
     opt_ir_file = "float32_add.opt.ir",
 )
 
-xls_ir_cc_library(
-    name = "float32_add_cc",
-    src = ":float32_add.opt.ir",
-    namespaces = "xls,fp",
-    top = "float32_add",
+# TODO: xls_ir_equivalence_test takes a long time. Tag enormous and manual.
+xls_ir_equivalence_test(
+    name = "float32_add_ir_opt_equivalence_test",
+    size = "enormous",
+    src_0 = ":float32_add.ir",
+    src_1 = ":float32_add.opt.ir",
+    tags = ["manual"],
 )
 
-# TODO(b/152546795): 2021-03-08 Takes too long (~5 minutes). Add
-# xls_ir_equivalence_test.
+xls_ir_cc_library(
+    name = "float32_add_cc",
+    src = ":float32_add",
+    namespaces = "xls,fp",
+)
+
 xls_eval_ir_test(
     name = "float32_add_eval_ir_test",
     src = ":float32_add.ir",
@@ -164,45 +276,11 @@ xls_benchmark_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "float32_add_jit_wrapper",
-    src = ":float32_add.opt.ir",
+    src = ":float32_add",
     jit_wrapper_args = {
-        "class_name": "float32_add",
+        "class_name": "Float32Add",
         "namespace": "xls::fp",
     },
-)
-
-cc_test(
-    name = "float32_add_jit_wrapper_test",
-    srcs = ["float32_add_jit_wrapper_test.cc"],
-    deps = [
-        ":float32_add_jit_wrapper",
-        "//xls/common:xls_gunit",
-        "//xls/common:xls_gunit_main",
-        "//xls/common/status:matchers",
-        "//xls/ir:value",
-        "//xls/ir:value_helpers",
-    ],
-)
-
-cc_test(
-    name = "float32_add_test_cc",
-    srcs = ["float32_add_test.cc"],
-    tags = ["optonly"],
-    deps = [
-        ":float32_add_jit_wrapper",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_absl//absl/random",
-        "@com_google_absl//absl/status",
-        "//xls/common:exit_status",
-        "//xls/common:init_xls",
-        "//xls/common:math_util",
-        "//xls/common/logging",
-        "//xls/common/status:status_macros",
-        "//xls/ir:value_helpers",
-        "//xls/ir:value_view_helpers",
-        "//xls/tools:testbench",
-        "//xls/tools:testbench_builder",
-    ],
 )
 
 xls_dslx_opt_ir(
@@ -213,8 +291,15 @@ xls_dslx_opt_ir(
     opt_ir_file = "float32_sub.opt.ir",
 )
 
-# TODO(b/152546795): 2021-03-08 Takes too long (~5 minutes). Add
-# xls_ir_equivalence_test.
+# TODO: xls_ir_equivalence_test takes a long time. Tag enormous and manual.
+xls_ir_equivalence_test(
+    name = "float32_sub_ir_opt_equivalence_test",
+    size = "enormous",
+    src_0 = ":float32_sub.ir",
+    src_1 = ":float32_sub.opt.ir",
+    tags = ["manual"],
+)
+
 xls_eval_ir_test(
     name = "float32_sub_eval_ir_test",
     src = ":float32_sub.ir",
@@ -246,36 +331,11 @@ xls_benchmark_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "float32_mul_jit_wrapper",
-    src = ":float32_mul.opt.ir",
+    src = ":float32_mul",
     jit_wrapper_args = {
-        "class_name": "float32_mul",
+        "class_name": "Float32Mul",
         "namespace": "xls::fp",
     },
-)
-
-cc_test(
-    name = "float32_mul_test_cc",
-    srcs = ["float32_mul_test.cc"],
-    data = [
-        ":float32_mul.ir",
-        ":float32_mul.opt.ir",
-    ],
-    tags = ["optonly"],
-    deps = [
-        ":float32_mul_jit_wrapper",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_absl//absl/random",
-        "@com_google_absl//absl/status",
-        "//xls/common:exit_status",
-        "//xls/common:init_xls",
-        "//xls/common/file:get_runfile_path",
-        "//xls/common/logging",
-        "//xls/common/status:status_macros",
-        "//xls/ir:value_helpers",
-        "//xls/ir:value_view_helpers",
-        "//xls/tools:testbench",
-        "//xls/tools:testbench_builder",
-    ],
 )
 
 xls_dslx_opt_ir(
@@ -289,7 +349,7 @@ xls_dslx_opt_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "float32_to_int32_wrapper",
-    src = ":float32_to_int32.opt.ir",
+    src = ":float32_to_int32",
     jit_wrapper_args = {
         "class_name": "Float32ToInt32",
         "function": get_mangled_ir_symbol("float32", "to_int32"),
@@ -308,56 +368,12 @@ xls_dslx_opt_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "float32_from_int32_wrapper",
-    src = ":float32_from_int32.opt.ir",
+    src = ":float32_from_int32",
     jit_wrapper_args = {
         "class_name": "Float32FromInt32",
         "function": get_mangled_ir_symbol("float32", "from_int32"),
         "namespace": "xls::dslx",
     },
-)
-
-cc_test(
-    name = "float32_test",
-    srcs = ["float32_test.cc"],
-    tags = ["optonly"],
-    deps = [
-        ":float32_from_int32_wrapper",
-        ":float32_to_int32_wrapper",
-        "@com_google_absl//absl/base",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_absl//absl/random",
-        "@com_google_absl//absl/status:statusor",
-        "//xls/common:xls_gunit",
-        "//xls/common:xls_gunit_main",
-        "//xls/common/status:matchers",
-    ],
-)
-
-# TODO(rspringer): Takes too long to run in normal testing.
-cc_binary(
-    name = "float32_add_bounds",
-    srcs = ["float32_add_bounds.cc"],
-    data = [
-        ":float32_add.ir",
-        ":float32_add.opt.ir",
-    ],
-    deps = [
-        "@com_google_absl//absl/base",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/time",
-        "//xls/common:exit_status",
-        "//xls/common:init_xls",
-        "//xls/common/file:filesystem",
-        "//xls/common/file:get_runfile_path",
-        "//xls/common/status:status_macros",
-        "//xls/ir",
-        "//xls/ir:ir_parser",
-        "//xls/solvers:z3_ir_translator",
-        "//xls/solvers:z3_utils",
-        "@z3//:api",
-    ],
 )
 
 xls_dslx_opt_ir(
@@ -369,13 +385,12 @@ xls_dslx_opt_ir(
 
 xls_ir_cc_library(
     name = "float32_fma_cc",
-    src = ":float32_fma.opt.ir",
+    src = ":float32_fma",
     namespaces = "xls,fp",
-    top = "float32_fma_cc",
 )
 
-# TODO(b/152546795): 2021-03-08 Takes too long (~5 minutes). Add
-# xls_ir_equivalence_test.
+# TODO(b/152546795): xls_ir_equivalence_test won't work because of
+# https://github.com/google/xls/issues/365
 xls_eval_ir_test(
     name = "float32_fma_eval_ir_test",
     src = ":float32_fma.ir",
@@ -388,33 +403,11 @@ xls_benchmark_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "float32_fma_jit_wrapper",
-    src = ":float32_fma.opt.ir",
+    src = ":float32_fma",
     jit_wrapper_args = {
-        "class_name": "float32_fma",
+        "class_name": "Float32Fma",
         "namespace": "xls::fp",
     },
-)
-
-cc_test(
-    name = "float32_fma_test",
-    srcs = ["float32_fma_test.cc"],
-    data = [
-        ":float32_fma.ir",
-        ":float32_fma.opt.ir",
-    ],
-    tags = ["optonly"],
-    deps = [
-        ":float32_fma_jit_wrapper",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_absl//absl/random",
-        "@com_google_absl//absl/status",
-        "//xls/common:exit_status",
-        "//xls/common:init_xls",
-        "//xls/common:math_util",
-        "//xls/common/logging",
-        "//xls/tools:testbench",
-        "//xls/tools:testbench_builder",
-    ],
 )
 
 xls_dslx_opt_ir(
@@ -427,34 +420,11 @@ xls_dslx_opt_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "float32_ldexp_jit_wrapper",
-    src = ":float32_ldexp.opt.ir",
+    src = ":float32_ldexp",
     jit_wrapper_args = {
-        "class_name": "float32_ldexp",
+        "class_name": "Float32Ldexp",
         "namespace": "xls::fp",
     },
-)
-
-cc_test(
-    name = "float32_ldexp_test_cc",
-    srcs = ["float32_ldexp_test.cc"],
-    data = [
-        ":float32_ldexp.ir",
-        ":float32_ldexp.opt.ir",
-    ],
-    tags = ["optonly"],
-    deps = [
-        ":float32_ldexp_jit_wrapper",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_absl//absl/random",
-        "@com_google_absl//absl/status",
-        "//xls/common:exit_status",
-        "//xls/common:init_xls",
-        "//xls/common:math_util",
-        "//xls/common/logging",
-        "//xls/common/status:status_macros",
-        "//xls/tools:testbench",
-        "//xls/tools:testbench_builder",
-    ],
 )
 
 xls_dslx_opt_ir(
@@ -478,48 +448,28 @@ xls_benchmark_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "float32_fast_rsqrt_jit_wrapper",
-    src = ":float32_fast_rsqrt.opt.ir",
+    src = ":float32_fast_rsqrt",
     jit_wrapper_args = {
-        "class_name": "float32_fast_rsqrt",
+        "class_name": "Float32FastRsqrt",
         "namespace": "xls::fp",
     },
-)
-
-cc_test(
-    name = "float32_fast_rsqrt_test_cc",
-    srcs = ["float32_fast_rsqrt_test.cc"],
-    data = [
-        ":float32_fast_rsqrt.ir",
-        ":float32_fast_rsqrt.opt.ir",
-    ],
-    tags = ["optonly"],
-    deps = [
-        ":float32_fast_rsqrt_jit_wrapper",
-        "@com_google_absl//absl/random",
-        "@com_google_absl//absl/status",
-        "//xls/common:exit_status",
-        "//xls/common:init_xls",
-        "//xls/common:math_util",
-        "//xls/common/file:get_runfile_path",
-        "//xls/common/logging",
-        "//xls/common/status:status_macros",
-        "//xls/ir:value_helpers",
-        "//xls/ir:value_view_helpers",
-        "//xls/tools:testbench",
-        "//xls/tools:testbench_builder",
-    ],
 )
 
 xls_dslx_library(
     name = "float64_dslx",
     srcs = ["float64.x"],
-    deps = [":std_dslx"],
+)
+
+xls_dslx_fmt_test(
+    name = "float64_dslx_fmt_test",
+    src = "float64.x",
+    opportunistic_postcondition = True,
 )
 
 xls_dslx_test(
     name = "float64_dslx_test",
     srcs = ["float64.x"],
-    deps = [":float64_dslx"],
+    dslx_test_args = {"compare": "jit"},
 )
 
 xls_dslx_opt_ir(
@@ -543,36 +493,11 @@ xls_benchmark_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "float64_add_jit_wrapper",
-    src = ":float64_add.opt.ir",
+    src = ":float64_add",
     jit_wrapper_args = {
-        "class_name": "float64_add",
+        "class_name": "Float64Add",
         "namespace": "xls::fp",
     },
-)
-
-cc_test(
-    name = "float64_add_test_cc",
-    srcs = ["float64_add_test.cc"],
-    data = [
-        ":float64_add.ir",
-        ":float64_add.opt.ir",
-    ],
-    tags = ["optonly"],
-    deps = [
-        ":float64_add_jit_wrapper",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_absl//absl/random",
-        "@com_google_absl//absl/status",
-        "//xls/common:exit_status",
-        "//xls/common:init_xls",
-        "//xls/common:math_util",
-        "//xls/common/logging",
-        "//xls/common/status:status_macros",
-        "//xls/ir:value_helpers",
-        "//xls/ir:value_view_helpers",
-        "//xls/tools:testbench",
-        "//xls/tools:testbench_builder",
-    ],
 )
 
 xls_dslx_opt_ir(
@@ -616,37 +541,11 @@ xls_benchmark_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "float64_mul_jit_wrapper",
-    src = ":float64_mul.opt.ir",
+    src = ":float64_mul",
     jit_wrapper_args = {
-        "class_name": "float64_mul",
+        "class_name": "Float64Mul",
         "namespace": "xls::fp",
     },
-)
-
-cc_test(
-    name = "float64_mul_test",
-    srcs = ["float64_mul_test.cc"],
-    data = [
-        ":float64_mul.ir",
-        ":float64_mul.opt.ir",
-    ],
-    # Flakes in fastbuild seen on 2021-06-04.
-    tags = ["optonly"],
-    deps = [
-        ":float64_mul_jit_wrapper",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_absl//absl/random",
-        "@com_google_absl//absl/status",
-        "//xls/common:exit_status",
-        "//xls/common:init_xls",
-        "//xls/common/file:get_runfile_path",
-        "//xls/common/logging",
-        "//xls/common/status:status_macros",
-        "//xls/ir:value_helpers",
-        "//xls/ir:value_view_helpers",
-        "//xls/tools:testbench",
-        "//xls/tools:testbench_builder",
-    ],
 )
 
 xls_dslx_opt_ir(
@@ -657,8 +556,8 @@ xls_dslx_opt_ir(
     opt_ir_file = "float64_fma.opt.ir",
 )
 
-# TODO(b/152546795): 2021-03-08 Takes too long (~5 minutes). Add
-# xls_ir_equivalence_test.
+# TODO(b/152546795): xls_ir_equivalence_test won't work because of
+# https://github.com/google/xls/issues/365
 xls_eval_ir_test(
     name = "float64_fma_eval_ir_test",
     src = ":float64_fma.ir",
@@ -671,33 +570,79 @@ xls_benchmark_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "float64_fma_jit_wrapper",
-    src = ":float64_fma.opt.ir",
+    src = ":float64_fma",
     jit_wrapper_args = {
-        "class_name": "float64_fma",
+        "class_name": "Float64Fma",
         "namespace": "xls::fp",
     },
 )
 
-cc_test(
-    name = "float64_fma_test",
-    srcs = ["float64_fma_test.cc"],
-    data = [
-        ":float64_fma.ir",
-        ":float64_fma.opt.ir",
-    ],
-    tags = ["optonly"],
-    deps = [
-        ":float64_fma_jit_wrapper",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_absl//absl/random",
-        "@com_google_absl//absl/status",
-        "//xls/common:exit_status",
-        "//xls/common:init_xls",
-        "//xls/common:math_util",
-        "//xls/common/logging",
-        "//xls/tools:testbench",
-        "//xls/tools:testbench_builder",
-    ],
+xls_dslx_opt_ir(
+    name = "float32_ceil",
+    dslx_top = "ceil_with_denorms",
+    ir_file = "float32_ceil.ir",
+    library = ":float32_dslx",
+    opt_ir_file = "float32_ceil.opt.ir",
+)
+
+cc_xls_ir_jit_wrapper(
+    name = "float32_ceil_jit_wrapper",
+    src = ":float32_ceil.opt.ir",
+    jit_wrapper_args = {
+        "class_name": "F32Ceil",
+        "namespace": "xls::fp",
+    },
+)
+
+xls_dslx_opt_ir(
+    name = "float32_floor",
+    dslx_top = "floor_with_denorms",
+    ir_file = "float32_floor.ir",
+    library = ":float32_dslx",
+    opt_ir_file = "float32_floor.opt.ir",
+)
+
+cc_xls_ir_jit_wrapper(
+    name = "float32_floor_jit_wrapper",
+    src = ":float32_floor.opt.ir",
+    jit_wrapper_args = {
+        "class_name": "F32Floor",
+        "namespace": "xls::fp",
+    },
+)
+
+xls_dslx_opt_ir(
+    name = "float32_trunc",
+    dslx_top = "trunc",
+    ir_file = "float32_trunc.ir",
+    library = ":float32_dslx",
+    opt_ir_file = "float32_trunc.opt.ir",
+)
+
+cc_xls_ir_jit_wrapper(
+    name = "float32_trunc_jit_wrapper",
+    src = ":float32_trunc.opt.ir",
+    jit_wrapper_args = {
+        "class_name": "F32Trunc",
+        "namespace": "xls::fp",
+    },
+)
+
+xls_dslx_library(
+    name = "fixed_point_dslx",
+    srcs = ["fixed_point.x"],
+)
+
+xls_dslx_fmt_test(
+    name = "fixed_point_dslx_fmt_test",
+    src = "fixed_point.x",
+    opportunistic_postcondition = True,
+)
+
+xls_dslx_test(
+    name = "fixed_point_dslx_test",
+    srcs = ["fixed_point.x"],
+    dslx_test_args = {"compare": "jit"},
 )
 
 filegroup(

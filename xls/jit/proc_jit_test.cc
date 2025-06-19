@@ -16,12 +16,12 @@
 
 #include <memory>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "xls/common/status/matchers.h"
+#include "absl/log/check.h"
 #include "xls/interpreter/channel_queue.h"
 #include "xls/interpreter/proc_evaluator.h"
 #include "xls/interpreter/proc_evaluator_test_base.h"
+#include "xls/ir/package.h"
 #include "xls/ir/proc.h"
 #include "xls/jit/jit_channel_queue.h"
 #include "xls/jit/jit_runtime.h"
@@ -31,26 +31,38 @@ namespace xls {
 namespace {
 
 JitRuntime* GetJitRuntime() {
+  static auto orc_jit = OrcJit::Create().value();
   static auto jit_runtime =
-      std::make_unique<JitRuntime>(OrcJit::CreateDataLayout().value());
+      std::make_unique<JitRuntime>(orc_jit->CreateDataLayout().value());
   return jit_runtime.get();
 }
 
+template <bool kWithObserver>
+std::unique_ptr<ProcEvaluator> EvaluatorFromProc(
+    Proc* proc, ChannelQueueManager* queue_manager) {
+  JitChannelQueueManager* jit_queue_manager =
+      dynamic_cast<JitChannelQueueManager*>(queue_manager);
+  CHECK(jit_queue_manager != nullptr);
+  return ProcJit::Create(proc, GetJitRuntime(), jit_queue_manager,
+                         /*include_observer_callbacks=*/kWithObserver)
+      .value();
+}
+
+std::unique_ptr<ChannelQueueManager> QueueManagerForPackage(Package* package) {
+  return JitChannelQueueManager::CreateThreadSafe(
+             package,
+             std::make_unique<JitRuntime>(GetJitRuntime()->data_layout()))
+      .value();
+}
 // Instantiate and run all the tests in proc_evaluator_test_base.cc.
 INSTANTIATE_TEST_SUITE_P(
     ProcJitTest, ProcEvaluatorTestBase,
-    testing::Values(ProcEvaluatorTestParam(
-        [](Proc* proc, ChannelQueueManager* queue_manager)
-            -> std::unique_ptr<ProcEvaluator> {
-          JitChannelQueueManager* jit_queue_manager =
-              dynamic_cast<JitChannelQueueManager*>(queue_manager);
-          XLS_CHECK(jit_queue_manager != nullptr);
-          return ProcJit::Create(proc, GetJitRuntime(), jit_queue_manager)
-              .value();
-        },
-        [](Package* package) -> std::unique_ptr<ChannelQueueManager> {
-          return JitChannelQueueManager::CreateThreadSafe(package).value();
-        })));
+    testing::Values(ProcEvaluatorTestParam(EvaluatorFromProc<false>,
+                                           QueueManagerForPackage,
+                                           /*supports_observers=*/false),
+                    ProcEvaluatorTestParam(EvaluatorFromProc<true>,
+                                           QueueManagerForPackage,
+                                           /*supports_observers=*/true)));
 
 }  // namespace
 }  // namespace xls

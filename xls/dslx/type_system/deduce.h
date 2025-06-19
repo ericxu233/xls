@@ -16,14 +16,12 @@
 #define XLS_DSLX_TYPE_SYSTEM_DEDUCE_H_
 
 #include <memory>
-#include <vector>
 
 #include "absl/status/statusor.h"
-#include "absl/types/span.h"
+#include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/frontend/ast_node.h"
-#include "xls/dslx/type_system/concrete_type.h"
 #include "xls/dslx/type_system/deduce_ctx.h"
-#include "xls/dslx/type_system/parametric_constraint.h"
+#include "xls/dslx/type_system/type.h"
 
 namespace xls::dslx {
 
@@ -35,34 +33,26 @@ namespace xls::dslx {
 // Note: due to transitivity, as a side effect the type_info mapping is filled
 // with all the deductions that were necessary to determine (deduce) the
 // resulting type of `node`.
-absl::StatusOr<std::unique_ptr<ConcreteType>> Deduce(const AstNode* node,
-                                                     DeduceCtx* ctx);
+absl::StatusOr<std::unique_ptr<Type>> Deduce(const AstNode* node,
+                                             DeduceCtx* ctx);
 
-// Resolves "type_" via provided symbolic bindings.
+// Converts an AST expression in "dimension position" (e.g. in an array type
+// annotation's size) and converts it into a `TypeDim` value that can be used
+// in, e.g., an `ArrayType`. The result is either a constexpr-evaluated value or
+// a `ParametricExpression` (for a parametric binding that has not yet been
+// defined).
 //
-// Uses the symbolic bindings of the function we're currently inside of to
-// resolve parametric types.
-//
-// Args:
-//  type: Type to resolve any contained dims for.
-//  ctx: Deduction context to use in resolving the dims.
-//
-// Returns:
-//  "type" with dimensions resolved according to bindings in "ctx".
-absl::StatusOr<std::unique_ptr<ConcreteType>> Resolve(const ConcreteType& type,
-                                                      DeduceCtx* ctx);
+// Note: this is not capable of evaluating more complex ASTs; it assumes
+// something is either fully constexpr-evaluatable, or symbolic.
+absl::StatusOr<TypeDim> DimToConcreteUsize(const Expr* dim_expr,
+                                           DeduceCtx* ctx);
 
-// Helpers that sequences Deduce, then Resolve.
-absl::StatusOr<std::unique_ptr<ConcreteType>> DeduceAndResolve(
-    const AstNode* node, DeduceCtx* ctx);
-
-// Decorates parametric binding AST nodes with their deduced types.
+// Evaluates a dimension expression to a `TypeDim` value of the given `type`.
 //
-// This is used externally in things like parametric instantiation of DSLX
-// builtins like the higher order function "map".
-absl::StatusOr<std::vector<ParametricConstraint>>
-ParametricBindingsToConstraints(absl::Span<ParametricBinding* const> bindings,
-                                DeduceCtx* ctx);
+// Note that right now this is limited to evaluating only `bool` and `u32`
+// values.
+absl::StatusOr<TypeDim> DimToConcrete(const Expr* dim_expr, const Type& type,
+                                      DeduceCtx* ctx);
 
 }  // namespace xls::dslx
 

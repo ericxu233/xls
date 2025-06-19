@@ -27,23 +27,17 @@ jobs:
     timeout-minutes: 600
     steps:
       - uses: actions/checkout@v2
-      - name: Mount Bazel Cache
-        uses: actions/cache@v3
+
+      - name: Restore Nightly Bazel Cache
+        uses: actions/cache/restore@v4
         with:
           path: "~/.cache/bazel"
-          # Create/use a cache called bazel-cache-22_04-<commit hash>
-          # and read the latest cache with prefix bazel-cache-22_04-
-          # if it doesn't already exist.
-          key: bazel-cache-22_04-${{ github.sha }}
-          restore-keys: bazel-cache-22_04-
-      - name: Install bazelisk
-        run: |
-          curl -LO "https://github.com/bazelbuild/bazelisk/releases/download/v1.1.0/bazelisk-linux-amd64"
-          mkdir -p "${GITHUB_WORKSPACE}/bin/"
-          mv bazelisk-linux-amd64 "${GITHUB_WORKSPACE}/bin/bazel"
-          chmod +x "${GITHUB_WORKSPACE}/bin/bazel"
+          key: bazel-cache-nightly-${{ runner.os }}-${{ github.sha }}
+          restore-keys: bazel-cache-nightly-${{ runner.os }}-
+
       - name: Install dependencies via apt
-        run: sudo apt-get install python3-distutils python3-dev python-is-python3 libtinfo5  build-essential liblapack-dev libblas-dev gfortran
+        run: sudo apt-get install python3-dev python-is-python3 libtinfo6 build-essential liblapack-dev libblas-dev gfortran
+
       - name: Bazel Test Target (opt)
         run: |
-          "${GITHUB_WORKSPACE}/bin/bazel" test -c opt --test_output=all --runs_per_test=$BAZEL_RUNS_PER_TEST -- $BAZEL_TARGET
+          bazel test --config=ci -c opt --test_output=all --runs_per_test=$BAZEL_RUNS_PER_TEST -- $BAZEL_TARGET

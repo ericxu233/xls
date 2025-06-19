@@ -18,8 +18,10 @@
 #include <string_view>
 
 #include "absl/status/statusor.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 
-namespace xls {
+namespace xls::integrator {
 
 absl::StatusOr<std::unique_ptr<AreaEstimator>> GetAreaEstimatorByName(
     std::string_view name) {
@@ -29,4 +31,4 @@ absl::StatusOr<std::unique_ptr<AreaEstimator>> GetAreaEstimatorByName(
   return std::make_unique<AreaEstimator>(delay_estimator);
 }
 
-}  // namespace xls
+}  // namespace xls::integrator

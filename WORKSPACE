@@ -12,38 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# TODO: https://github.com/google/xls/issues/931 - Everything here should go away and migrate to MODULE.bazel
+
 workspace(name = "com_google_xls")
-
-# Load and configure a hermetic LLVM based C/C++ toolchain. This is done here
-# and not in load_external.bzl because it requires several sequential steps of
-# declaring archives and using things in them, which is awkward to do in .bzl
-# files because it's not allowed to use `load` inside of a function.
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-
-# Commit on  2023-07-17, current as of 2023-08-05.
-http_archive(
-    name = "com_grail_bazel_toolchain",
-    sha256 = "5fb0a6ae0f5bc72a7d80e6de0edad906c9936729734009f1c01dac4b06f966e0",
-    strip_prefix = "bazel-toolchain-f94335f1f5434256b1793dafbb7dd07773b0e76e",
-    urls = [
-        "https://github.com/grailbio/bazel-toolchain/archive/f94335f1f5434256b1793dafbb7dd07773b0e76e.zip",
-    ],
-)
-
-load("@com_grail_bazel_toolchain//toolchain:deps.bzl", "bazel_toolchain_dependencies")
-
-bazel_toolchain_dependencies()
-
-load("@com_grail_bazel_toolchain//toolchain:rules.bzl", "llvm_toolchain")
-
-llvm_toolchain(
-    name = "llvm_toolchain",
-    llvm_version = "16.0.0",
-)
-
-load("@llvm_toolchain//:toolchains.bzl", "llvm_register_toolchains")
-
-llvm_register_toolchains()
 
 load("//dependency_support:load_external.bzl", "load_external_repositories")
 
@@ -55,37 +26,19 @@ load(
   "python_register_toolchains",
 )
 
+# Must be called before using anything from rules_python.
+# https://github.com/bazelbuild/rules_python/issues/1560#issuecomment-1815118394
 py_repositories()
 
 python_register_toolchains(
-    name = "python39",
-    python_version = "3.9",
-
-    # Required for our containerized CI environments; we do not recommend
-    # building XLS as root normally.
-    ignore_root_user_error = True,
+    name = "project_python",
+    python_version = "3.11",
 )
-
-# gRPC deps should be loaded before initializing other repos. Otherwise, various
-# errors occur during repo loading and initialization.
-load("@com_github_grpc_grpc//bazel:grpc_deps.bzl", "grpc_deps")
-
-grpc_deps()
 
 load("//dependency_support:initialize_external.bzl", "initialize_external_repositories")
 
 initialize_external_repositories()
 
-load("@rules_hdl_pip_deps//:requirements.bzl", rules_hdl_pip_install_deps = "install_deps")
-
-rules_hdl_pip_install_deps()
-
 load("@xls_pip_deps//:requirements.bzl", xls_pip_install_deps = "install_deps")
 
 xls_pip_install_deps()
-
-# Loading the extra deps must be called after initialize_eternal_repositories or
-# the call to pip_parse fails.
-load("@com_github_grpc_grpc//bazel:grpc_extra_deps.bzl", "grpc_extra_deps")
-
-grpc_extra_deps()

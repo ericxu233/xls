@@ -16,8 +16,8 @@
 #define XLS_INTERPRETER_BLOCK_EVALUATOR_H_
 
 #include <cstdint>
+#include <memory>
 #include <optional>
-#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -28,7 +28,9 @@
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xls/codegen/module_signature.pb.h"
+#include "xls/interpreter/observer.h"
 #include "xls/ir/block.h"
+#include "xls/ir/block_elaboration.h"
 #include "xls/ir/events.h"
 #include "xls/ir/value.h"
 
@@ -45,7 +47,7 @@ struct BlockRunResult {
 // For each successive input, new data is driven after a randomized delay.
 class ChannelSource {
  public:
-  enum BehaviorDuringReset {
+  enum class BehaviorDuringReset : uint8_t {
     kIgnoreReady,  // Ignore ready signal during reset
     kAttendReady,  // Send on ready regardless of reset
   };
@@ -58,9 +60,10 @@ class ChannelSource {
   // asserted (if the channel is not otherwise occupied by a in-progress
   // transaction).  Once valid is asserted, it will remain asserted until
   // the transaction completes via ready being asserted.
-  ChannelSource(std::string_view data_name, std::string_view valid_name,
-                std::string_view ready_name, double lambda, Block* block,
-                BehaviorDuringReset reset_behavior = kIgnoreReady)
+  ChannelSource(
+      std::string_view data_name, std::string_view valid_name,
+      std::string_view ready_name, double lambda, Block* block,
+      BehaviorDuringReset reset_behavior = BehaviorDuringReset::kIgnoreReady)
       : data_name_(data_name),
         valid_name_(valid_name),
         ready_name_(ready_name),
@@ -124,7 +127,7 @@ class ChannelSource {
 // Each successive output is received with a fixed probability.
 class ChannelSink {
  public:
-  enum BehaviorDuringReset {
+  enum class BehaviorDuringReset : uint8_t {
     kIgnoreValid,  // Ignore valid signal during reset
     kAttendValid,  // Receive on valid regardless of reset
   };
@@ -134,9 +137,10 @@ class ChannelSink {
   //
   // lambda is the probability that for a given cycle, the sink will assert
   // ready.
-  ChannelSink(std::string_view data_name, std::string_view valid_name,
-              std::string_view ready_name, double lambda, Block* block,
-              BehaviorDuringReset reset_behavior = kAttendValid)
+  ChannelSink(
+      std::string_view data_name, std::string_view valid_name,
+      std::string_view ready_name, double lambda, Block* block,
+      BehaviorDuringReset reset_behavior = BehaviorDuringReset::kAttendValid)
       : data_name_(data_name),
         valid_name_(valid_name),
         ready_name_(ready_name),
@@ -174,6 +178,10 @@ class ChannelSink {
     return data_per_cycle_;
   }
 
+  std::string_view data_name() const { return data_name_; }
+  std::string_view valid_name() const { return valid_name_; }
+  std::string_view ready_name() const { return ready_name_; }
+
  private:
   std::string data_name_;
   std::string valid_name_;
@@ -193,24 +201,62 @@ class ChannelSink {
 struct BlockIOResults {
   std::vector<absl::flat_hash_map<std::string, Value>> inputs;
   std::vector<absl::flat_hash_map<std::string, Value>> outputs;
+  InterpreterEvents interpreter_events;
 };
 
 struct BlockIOResultsAsUint64 {
   std::vector<absl::flat_hash_map<std::string, uint64_t>> inputs;
   std::vector<absl::flat_hash_map<std::string, uint64_t>> outputs;
+  InterpreterEvents interpreter_events;
 };
+
+class BlockContinuation;
 
 class BlockEvaluator {
  public:
+  // What position in a clock cycle should output ports be tapped during. This
+  // can be important for making designs testable since on a link between two
+  // blocks only one side at most needs flopping so often only one side will be
+  // configured to have it. Its often easier to look at the output as though
+  // there was a flop on it even if the block is not configured to include them.
+  // This can be done by examining the output AtLastPosEdgeClock. This can also
+  // be thought of as whether to put a synthetic flop in front of the tap for
+  // output ports.
+  enum class OutputPortSampleTime {
+    // Ports are read at the last instant before the pos-edge of the clock
+    // arrives but after all values have had time to stabilize with the data
+    // coming from the input ports. This can also be thought of as if the ports
+    // that are read had a synthetic, always load-enabled, no-reset flop between
+    // the actual output-port and the simulation tap. This synthetic flop is
+    // written on the clock edge like all other flops.
+    kAtLastPosEdgeClock,
+    // Port values are tapped as they appear after stabilizing after the last
+    // pos-edge of the clock. This means that they use the most recent input
+    // port values and whatever the most recent cycle set registers to as their
+    // value. If a block does not have --flop_outputs set this can have unusual
+    // or unexpected values which look like the value at the start of the next
+    // cycle with the inputs from the last cycle.
+    kAfterLastClock,
+  };
+
   explicit constexpr BlockEvaluator(std::string_view name) : name_(name) {}
   virtual ~BlockEvaluator() = default;
-  // Runs a single cycle of a block with the given register values and input
-  // values. Returns the value sent to the output port and the next register
-  // state.
-  virtual absl::StatusOr<BlockRunResult> EvaluateBlock(
-      const absl::flat_hash_map<std::string, Value>& inputs,
-      const absl::flat_hash_map<std::string, Value>& registers,
-      Block* block) const = 0;
+
+  // Create a new block continuation with all registers initialized to the given
+  // values. This continuation can be used to feed input values in
+  // cycle-by-cycle.
+  absl::StatusOr<std::unique_ptr<BlockContinuation>> NewContinuation(
+      Block* block,
+      const absl::flat_hash_map<std::string, Value>& initial_registers,
+      OutputPortSampleTime sample_time =
+          OutputPortSampleTime::kAtLastPosEdgeClock) const;
+
+  // Create a new block continuation with all registers initialized to zero
+  // values. This continuation can be used to feed input values in
+  // cycle-by-cycle.
+  absl::StatusOr<std::unique_ptr<BlockContinuation>> NewContinuation(
+      Block* block, OutputPortSampleTime sample_time =
+                        OutputPortSampleTime::kAtLastPosEdgeClock) const;
 
   // The name of this evaluator for debug purposes.
   std::string_view name() const { return name_; }
@@ -220,14 +266,16 @@ class BlockEvaluator {
   // for each output port of the block.
   virtual absl::StatusOr<absl::flat_hash_map<std::string, Value>>
   EvaluateCombinationalBlock(
-      Block* block,
-      const absl::flat_hash_map<std::string, Value>& inputs) const;
+      Block* block, const absl::flat_hash_map<std::string, Value>& inputs,
+      OutputPortSampleTime sample_time =
+          OutputPortSampleTime::kAtLastPosEdgeClock) const;
 
   // Overload which accepts and returns uint64_t values instead of xls::Values.
   virtual absl::StatusOr<absl::flat_hash_map<std::string, uint64_t>>
   EvaluateCombinationalBlock(
-      Block* block,
-      const absl::flat_hash_map<std::string, uint64_t>& inputs) const;
+      Block* block, const absl::flat_hash_map<std::string, uint64_t>& inputs,
+      OutputPortSampleTime sample_time =
+          OutputPortSampleTime::kAtLastPosEdgeClock) const;
 
   // Runs the evaluator on a block feeding a sequence of values to input ports
   // and returning the resulting sequence of values from the output
@@ -236,15 +284,18 @@ class BlockEvaluator {
   virtual absl::StatusOr<std::vector<absl::flat_hash_map<std::string, Value>>>
   EvaluateSequentialBlock(
       Block* block,
-      absl::Span<const absl::flat_hash_map<std::string, Value>> inputs) const;
+      absl::Span<const absl::flat_hash_map<std::string, Value>> inputs,
+      OutputPortSampleTime sample_time =
+          OutputPortSampleTime::kAtLastPosEdgeClock) const;
 
   // Overload which accepts and returns uint64_t values instead of xls::Values.
   virtual absl::StatusOr<
       std::vector<absl::flat_hash_map<std::string, uint64_t>>>
   EvaluateSequentialBlock(
       Block* block,
-      absl::Span<const absl::flat_hash_map<std::string, uint64_t>> inputs)
-      const;
+      absl::Span<const absl::flat_hash_map<std::string, uint64_t>> inputs,
+      OutputPortSampleTime sample_time =
+          OutputPortSampleTime::kAtLastPosEdgeClock) const;
 
   // Runs the evaluator on a block.  Each input port in the block
   // should be given a sequence of data values to drive the block.
@@ -344,7 +395,45 @@ class BlockEvaluator {
   }
 
  protected:
+  virtual absl::StatusOr<std::unique_ptr<BlockContinuation>>
+  MakeNewContinuation(
+      BlockElaboration&& elaboration,
+      const absl::flat_hash_map<std::string, Value>& initial_registers,
+      OutputPortSampleTime sample_time) const = 0;
+
   std::string_view name_;
+};
+
+// A sequence of block runs with preserved registers.
+class BlockContinuation {
+ public:
+  virtual ~BlockContinuation() = default;
+
+  // Get the output-ports as they exist at the configured `sample_time`. This is
+  // only valid until the next call to 'RunOneCycle'. The contents are undefined
+  // before the first call to RunOneCycle.
+  virtual const absl::flat_hash_map<std::string, Value>& output_ports() = 0;
+
+  // The position in the clock cycle output ports are sampled.
+  virtual BlockEvaluator::OutputPortSampleTime sample_time() const = 0;
+
+  // Get the registers as they exist on the current cycle. The reference is only
+  // valid until the next call to 'RunOneCycle'.
+  virtual const absl::flat_hash_map<std::string, Value>& registers() = 0;
+  // Get the interpreter events for the last cycle.
+  virtual const InterpreterEvents& events() = 0;
+  // Run a single cycle of the block on the given inputs using the current
+  // register state.
+  virtual absl::Status RunOneCycle(
+      const absl::flat_hash_map<std::string, Value>& inputs) = 0;
+  // Update the registers to the give values.
+  virtual absl::Status SetRegisters(
+      const absl::flat_hash_map<std::string, Value>& regs) = 0;
+
+  // Set an evaluation observer to get reports of the value of each node.
+  virtual absl::Status SetObserver(EvaluationObserver* obs) = 0;
+  // Clear any evaluation observer
+  virtual void ClearObserver() = 0;
 };
 
 }  // namespace xls

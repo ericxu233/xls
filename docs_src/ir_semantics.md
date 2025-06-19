@@ -120,16 +120,14 @@ port is represented with a `input_port` or `output_port` operation.
 #### Register
 
 A register is a representation of a hardware register (flop). Registers can be
-arbitrarily-typed. Each register must have a single `register_write` and a
-single `register_read` operation for writing and reading the register
-respectively.
+arbitrarily-typed. Each register must have a single `register_read` and one or
+more `register_write` operations for reading and writing the register
+respectively. Only a single `register_write` can fire each cycle.
 
-Each register may optionally specify its reset behavior. The reset can be
-specified to occur either synchronously or asynchronously and either on the
-`reset` signal of the associated `register_write` being active-high or
-active-low. If specified the reset value must match the type of the register. If
-no reset behavior is specified then the `reset` argument of `register_write`
-must be unset.
+Each register may optionally specify a reset value. The reset signal and reset
+behavior (e.g., active low) is set as a block attribute. If specified the reset
+value must match the type of the register. If no reset behavior is specified
+then the `reset` argument of `register_write` must be unset.
 
 #### Instantiation
 
@@ -140,6 +138,30 @@ yet supported). The instantiation is integrated into the instantiating block
 with `instantiation_input` and `instantiation_output` operations. There is a
 one-to-one mapping between the instantiation input/output and the ports of the
 instantiated objects.
+
+#### Inner Attributes
+
+##### **`reset`**
+
+Defines the reset port and reset behavior of the block.
+
+**Syntax**
+
+```
+#![reset(port="<port>", asynchronous=<asynchronous>, active_low=<active_low>)]`
+```
+
+**Keyword arguments**
+
+<!-- mdformat off(multiline table cells not supported in mkdocs) -->
+
+| Keyword        | Description                                              |
+| -------------- | -------------------------------------------------------- |
+| `port`         | Name of the reset input port.                            |
+| `asynchronous` | Boolean value (`true` or `false`) indicating whether the reset is asynchronous. |
+| `active_low`   | Boolean value (`true` or `false`) indicating whether the reset signal is active-low. |
+
+<!-- mdformat on -->
 
 ## Operations
 
@@ -191,13 +213,16 @@ Operation  | Opcode          | Semantics
 ### Variadic bitwise operations
 
 Performs a bit-wise operation on one-or-more identically-typed bits operands. If
-only a single argument is provided the operation is a no-op.
+only a single argument is provided, the operations `and`, `or`, and `xor` are a no-op,
+while `nand` and `nor` act as a bit-wise not.
 
 **Syntax**
 
 ```
 result = and(operand_{0}, ..., operand_{N-1})
+result = nand(operand_{0}, ..., operand_{N-1})
 result = or(operand_{0}, ..., operand_{N-1})
+result = nor(operand_{0}, ..., operand_{N-1})
 result = xor(operand_{0}, ..., operand_{N-1})
 ```
 
@@ -210,11 +235,43 @@ Value         | Type
 
 **Operations**
 
-Operation | Opcode     | Semantics
---------- | ---------- | ----------------------------
-`and`     | `Op::kAnd` | `result = lhs & rhs & ...`
-`or`      | `Op::kOr`  | `result = lhs \| rhs \| ...`
-`xor`     | `Op::kXor` | `result = lhs ^ rhs ^ ...`
+Operation | Opcode      | Semantics
+--------- | ----------- | ------------------------------
+`and`     | `Op::kAnd`  | `result = lhs & rhs & ...`
+`nand`    | `Op::kNand` | `result = ~(lhs & rhs & ...)`
+`or`      | `Op::kOr`   | `result = lhs \| rhs \| ...`
+`nor`     | `Op::kNor`  | `result = ~(lhs \| rhs \| ...)`
+`xor`     | `Op::kXor`  | `result = lhs ^ rhs ^ ...`
+
+### Bitwise Reduction Operations
+
+Performs a bit-wise reduction operation on all bits of a single bits-typed
+operand, producing a single bit. For an operand of width 1, they act as no-ops.
+
+
+**Syntax**
+
+```
+result = and_reduce(operand)
+result = or_reduce(operand)
+result = xor_reduce(operand)
+```
+
+**Types**
+
+Value     | Type
+--------- | ---------
+`operand` | `bits[N]`
+`result`  | `bits[1]`
+
+
+**Operations**
+
+Operation    | Opcode           | Semantics
+------------ | ---------------- | ------------------------------------------
+`and_reduce` | `Op::kAndReduce` | `result = operand[0] & operand[1] & ...`
+`or_reduce`  | `Op::kOrReduce`  | `result = operand[0] \| operand[1] \| ...`
+`xor_reduce` | `Op::kXorReduce` | `result = operand[0] ^ operand[1] ^ ...`
 
 ### Arithmetic unary operations
 
@@ -302,17 +359,42 @@ the right operand is zero the result is zero.
 both elements having the same type. The outputs are not fully constrained; the
 operations are free to return any values that sum to the product `lhs * rhs`.
 
-### Comparison operations
+### Equality comparison operations
 
-Performs a comparison on a pair of identically-typed bits operands. Unsigned
-operations are prefixed with a 'u', and signed operations are prefixed with a
-'s'. Produces a result of bits[1] type.
+Performs an equality comparison on a pair of identically-typed operands.
+Produces a result of bits[1] type.
 
 **Syntax**
 
 ```
 result = eq(lhs, rhs)
 result = ne(lhs, rhs)
+```
+
+**Types**
+
+Value    | Type
+-------- | ---------
+`lhs`    | `T`
+`rhs`    | `T`
+`result` | `bits[1]`
+
+**Operations**
+
+Operation | Opcode     | Semantics
+--------- | ---------- | ---------------------
+`eq`      | `Op::kEq`  | `result = lhs == rhs`
+`ne`      | `Op::kNe`  | `result = lhs != rhs`
+
+### Numeric comparison operations
+
+Performs a numeric comparison on a pair of identically-typed bits operands.
+Unsigned operations are prefixed with a 'u', and signed operations are prefixed
+with a 's'. Produces a result of bits[1] type.
+
+**Syntax**
+
+```
 result = sge(lhs, rhs)
 result = sgt(lhs, rhs)
 result = sle(lhs, rhs)
@@ -335,8 +417,6 @@ Value    | Type
 
 Operation | Opcode     | Semantics
 --------- | ---------- | ---------------------
-`eq`      | `Op::kEq`  | `result = lhs == rhs`
-`ne`      | `Op::kNe`  | `result = lhs != rhs`
 `sge`     | `Op::kSGe` | `result = lhs >= rhs`
 `sgt`     | `Op::kSGt` | `result = lhs > rhs`
 `sle`     | `Op::kSLe` | `result = lhs <= rhs`
@@ -513,7 +593,7 @@ Returns a single element from an array.
 **Syntax**
 
 ```
-result = array_index(array, indices=[idx_{0}, ... , idx_{N-1}])
+result = array_index(array, indices=[idx_{0}, ... , idx_{N-1}], assumed_in_bounds=<true|false>)
 ```
 
 **Types**
@@ -523,6 +603,16 @@ Value     | Type
 `array`   | Array of at least `N` dimensions
 `idx_{i}` | Arbitrary bits type
 `result`  | `T`
+
+**Keyword arguments**
+
+<!-- mdformat off(multiline table cells not supported in mkdocs) -->
+
+| Keyword             | Type   | Required | Default | Description   |
+| ------------------- | ------ | -------- | ------- | ------------- |
+| `assumed_in_bounds` | `bool` | no       | False   | Are all indices assumed to be in bounds in all circumstances where the result is observable. |
+
+<!-- mdformat on -->
 
 Returns the element of `array` indexed by the indices `idx_{0} ... idx_{N-1}`.
 The array must have at least as many dimensions as number of index elements `N`.
@@ -549,6 +639,43 @@ assuming input array operand `A`.
 
 <!-- mdformat on -->
 
+`assumed_in_bounds` is an optional parameter to the node which defaults to
+`false` if not present. This has no effect on the behavior of the node but
+informs other passes that the all indices in the node are proven to be
+'in-bounds' in cases where the result is visible. This should only be set by the
+`opt` pipeline passes. This information might be used in later optimization
+passes or during verilog codegen.
+
+#### **`array_slice`**
+
+Returns a slice of an array.
+
+**Syntax**
+
+```
+result = array_slice(array, start, width=<width>)
+```
+
+**Types**
+
+Value    | Type
+-------- | -------------------------------------------------------------
+`array`  | Array
+`start`  | Arbitrary bits type
+`result` | Array with same `element_type` as `array` and size of `width`
+
+**Keyword arguments**
+
+Keyword | Type      | Required | Default | Description
+------- | --------- | -------- | ------- | ----------------------------------
+`width` | `int64_t` | yes      |         | Width to make the resulting array.
+
+Returns a copy of the segment of the input array consisting of the `<width>`
+consecutive elements starting from `start`. If any element in that segment is
+out-of-bounds of the original array the value at the corresponding index is the
+final element in the array. This is consistent behavior with respect to the
+index operation.
+
 #### **`array_update`**
 
 Returns a modified copy of an array.
@@ -556,7 +683,7 @@ Returns a modified copy of an array.
 **Syntax**
 
 ```
-result = array_update(array, value, indices=[idx_{0}, ... , idx_{N-1}])
+result = array_update(array, value, indices=[idx_{0}, ... , idx_{N-1}], assumed_in_bounds=<true|false>)
 ```
 
 **Types**
@@ -568,10 +695,27 @@ Value     | Type
 `idx_{i}` | Arbitrary bits type
 `result`  | Same type as `array`
 
+**Keyword arguments**
+
+<!-- mdformat off(multiline table cells not supported in mkdocs) -->
+
+| Keyword             | Type   | Required | Default | Description             |
+| ------------------- | ------ | -------- | ------- | ----------------------- |
+| `assumed_in_bounds` | `bool` | no       | False   | Are all indices assumed to be in bounds in all cases where the result of this operation is observable. |
+
+<!-- mdformat on -->
+
 Returns a copy of the input array with the element at the given indices replaced
 with the given value. If any index is out of bounds, the result is identical to
 the input `array`. The indexing semantics is identical to `array_index` with the
 exception of out-of-bounds behavior.
+
+`assumed_in_bounds` is an optional parameter to the node which defaults to
+`false` if not present. This has no effect on the behavior of the node but
+informs other passes that the all indices in the node may be assumed to be
+'in-bounds'. This should only be set by the `opt` pipeline passes. This
+information might be used in later optimization passes or during verilog
+codegen.
 
 ### Tuple operations
 
@@ -781,7 +925,7 @@ is zero.
 Implements a binary encoder.
 
 ```
-result = encode(operand, width=<width>)
+result = encode(operand)
 ```
 
 **Types**
@@ -807,6 +951,17 @@ If no bits of the input are set the result is zero.
 
 Produces a bits value with exactly one bit set. The index of the set bit depends
 upon the input value.
+
+This operation can be thought of like a command: "canonicalize/normalize this
+input value to be one-hot", where `lsb_prio` indicates which side of the
+bitvector wins in the case that there are multiple input bits set. Contrast this
+with the [`decode`](#decode) operation which instead converts a binary-encoded
+operand value into a one-hot value.
+
+(Note: once this operation has been applied to a value, the optimizer knows that
+the output has the one-hot property [i.e. exactly one bit is set], which helps
+the optimizer know that one-hot-select operations that use the output value as a
+selector are selecting between distinct values.)
 
 **Syntax**
 
@@ -963,7 +1118,7 @@ Selects between operands based on a selector, choosing the highest-priority case
 if more than one case is selected. Each bit in the selector corresponds to a
 case, with the least significant bit corresponding to the first case and having
 the highest priority. If there are no bits in the selector set, no case is
-selected and the default value of 0 is chosen.
+selected and the `default` value is chosen.
 
 See `one_hot` for an example of the one-hot selector invariant. Note that when
 the selector is not one-hot, this operation is still well defined.
@@ -975,7 +1130,7 @@ unnecessary and subsequently eliminate them.
 **Syntax**
 
 ```
-result = priority_sel(selector, cases=[case_{0}, ... , case_{N-1}])
+result = priority_sel(selector, cases=[case_{0}, ... , case_{N-1}], default=<default>)
 ```
 
 **Types**
@@ -984,6 +1139,7 @@ Value      | Type
 ---------- | ---------
 `selector` | `bits[N]`
 `case_{i}` | `T`
+`default`  | `T`
 `result`   | `T`
 
 The result is the first case `case_{i}` for which the corresponding bit `i` is
@@ -1183,9 +1339,72 @@ Value         | Type
 
 `after_all` can consume an arbitrary number of token operands including zero.
 
+### State-affecting operations
+
+Procs include a concept of local state, represented as a set of elements. Each
+activation can read the state values as they would be left by the previous
+activation, and can set the state values for subsequent activations to see.
+
+#### **`state_read`**
+
+Reads (and consumes) the value in the given state element. Every state element
+must have a corresponding `state_read` operation.
+
+```
+result = state_read(state_element=st)
+```
+
+**Types**
+
+Value    | Type
+-------- | ----
+`result` | `T`
+
+**Keyword arguments**
+
+<!-- mdformat off(multiline table cells not supported in mkdocs) -->
+
+| Keyword         | Type              | Required | Default | Description                       |
+| --------------- | ----------------- | -------- | ------- | --------------------------------- |
+| `state_element` | `string`          | yes      |         | Name of the state element to read |
+
+<!-- mdformat on -->
+
+#### **`next_value`**
+
+If `predicate` is true or absent, sets the value that the next activation will
+see for the given state element. For each state element, at most one
+`next_value` node may fire in a given activation; otherwise, undefined behavior
+can result. For this reason, frontends & optimizations should be exceptionally
+careful when emitting predicated `next_value` nodes; for safety, frontends may
+choose instead to emit a single `next_value` node where `value` uses either a
+`sel` or a `priority_sel`, in which case optimizations may translate the result
+to multiple `next_value` nodes to potentially enable better throughput.
+
+```
+result = next_value(param=read, value=v)
+```
+
+**Types**
+
+Value    | Type
+-------- | ----
+`result` | `()`
+
+**Keyword arguments**
+
+<!-- mdformat off(multiline table cells not supported in mkdocs) -->
+
+| Keyword | Type | Required | Default | Description                                    |
+| ------- | ---- | -------- | ------- | ---------------------------------------------- |
+| `param` | `T`  | yes      |         | The `state_read` for the target state element  |
+| `value` | `T`  | yes      |         | The value to write to the target state element |
+
+<!-- mdformat on -->
+
 ### Other side-effecting operations
 
-Aside from channels operations such as `send` and `receive` several other
+Aside from channel operations such as `send` and `receive`, several other
 operations have side-effects. Care must be taken when adding, removing, or
 transforming these operations, e.g., in the optimizer.
 
@@ -1226,19 +1445,18 @@ Value       | Type
 
 Records the number of times the given condition evaluates to true. Just like
 `assert`, this is a software-only construct and is not emitted in a final
-hardware design. Tokens are used to sequence this operation in the graph.
+hardware design.
 
 ```
-result = cover(tkn, condition, label=<string>)
+result = cover(condition, label=<string>)
 ```
 
 **Types**
 
 Value       | Type
 ----------- | ---------
-`tkn`       | `token`
 `condition` | `bits[1]`
-`result`    | `token`
+`result`    | `()`
 
 **Keyword arguments**
 
@@ -1357,7 +1575,7 @@ The type `T` of the result of the operation is the type of the register.
 
 Writes a value to a register.
 
-The write to the register may be conditioned upon an optional load-enable and/or
+A write to the register may be conditioned upon an optional load-enable and/or
 reset signal. The register is defined on the block.
 
 If `reset` is given the `register` associated with this read **must** have a
@@ -1371,26 +1589,33 @@ the argument evaluates to `1`, remaining unchanged otherwise (i.e. if present it
 is equivalent to `register_write.REG(sel(load_enable, {register_read.REG,
 data}))`).
 
+A register may have multiple writes. If more than one activates (load enable is
+not present or is true) in a single cycle an error is raised at software
+run-time (IR interpreter/JIT).
+
 The `reset` and `load_enable` arguments affect the value written according to
 the following table.
 
-| `Register` reset      | `reset` value | `load_enable` value | new value     | {.sortable}
-: behavior              :               :                     :               :
-| --------------------- | ------------- | ------------------- | ------------- |
-| `active_low == false` | `false` / `0` | not present         | `data`        |
-| `active_low == false` | `true` / `1`  | not present         | `reset_value` |
-| `active_low == true`  | `false` / `0` | not present         | `reset_value` |
-| `active_low == true`  | `true` / `1`  | not present         | `data`        |
-| `active_low == false` | `false` / `0` | `true` / `1`        | `data`        |
-| `active_low == false` | `true` / `1`  | `true` / `1`        | `reset_value` |
-| `active_low == true`  | `false` / `0` | `true` / `1`        | `reset_value` |
-| `active_low == true`  | `true` / `1`  | `true` / `1`        | `data`        |
-| `active_low == false` | `false` / `0` | `false` / `0`       | No change     |
-| `active_low == false` | `true` / `1`  | `false` / `0`       | `reset_value` |
-| `active_low == true`  | `false` / `0` | `false` / `0`       | `reset_value` |
-| `active_low == true`  | `true` / `1`  | `false` / `0`       | No change     |
-| not present           | not present   | `true` / `1`        | `data`        |
-| not present           | not present   | `false` / `0`       | No change     |
+<!-- mdformat off(multiline table cells not supported in mkdocs) -->
+
+| `Register` reset behavior | `reset` value | `load_enable` value | New value     |
+| ------------------------- | ------------- | ------------------- | ------------- |
+| `active_low == false`     | `false` / `0` | Not present         | `data`        |
+| `active_low == false`     | `true` / `1`  | Not present         | `reset_value` |
+| `active_low == true`      | `false` / `0` | Not present         | `reset_value` |
+| `active_low == true`      | `true` / `1`  | Not present         | `data`        |
+| `active_low == false`     | `false` / `0` | `true` / `1`        | `data`        |
+| `active_low == false`     | `true` / `1`  | `true` / `1`        | `reset_value` |
+| `active_low == true`      | `false` / `0` | `true` / `1`        | `reset_value` |
+| `active_low == true`      | `true` / `1`  | `true` / `1`        | `data`        |
+| `active_low == false`     | `false` / `0` | `false` / `0`       | No change     |
+| `active_low == false`     | `true` / `1`  | `false` / `0`       | `reset_value` |
+| `active_low == true`      | `false` / `0` | `false` / `0`       | `reset_value` |
+| `active_low == true`      | `true` / `1`  | `false` / `0`       | No change     |
+| Not present               | Not present   | `true` / `1`        | `data`        |
+| Not present               | Not present   | `false` / `0`       | No change     |
+
+<!-- mdformat on -->
 
 **Syntax**
 
@@ -1409,16 +1634,11 @@ Value         | Type
 
 **Keyword arguments**
 
-<!-- mdformat off(multiline table cells not supported in mkdocs) -->
-
 | Keyword    | Type     | Required | Default | Description                   |
 | ---------- | -------- | -------- | ------- | ----------------------------- |
 | `register` | `string` | yes      |         | Name of the register to write |
 
-<!-- mdformat on -->
-
-The type `T` of the data operand must be the same as the the type of the
-register.
+The type `T` of the data operand must be the same as the type of the register.
 
 #### **`instantiation_input`**
 
@@ -1454,8 +1674,8 @@ Value    | Type
 
 <!-- mdformat on -->
 
-The type `T` of the data operand must be the same as the the type of the
-associated input port of the instantiated object.
+The type `T` of the data operand must be the same as the type of the associated
+input port of the instantiated object.
 
 #### **`instantiation_output`**
 

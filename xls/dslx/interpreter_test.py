@@ -1,4 +1,3 @@
-#
 # Copyright 2020 The XLS Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,10 +21,13 @@ file, etc.
 """
 
 import dataclasses
+import os
 import subprocess as subp
 import sys
+import tempfile
 import textwrap
-from typing import List, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+import xml.etree.ElementTree as ET
 
 from xls.common import runfiles
 from xls.common import test_base
@@ -50,6 +52,8 @@ class InterpreterTest(test_base.TestCase):
       warnings_as_errors: bool = True,
       disable_warnings: Sequence[str] = (),
       extra_flags: Sequence[str] = (),
+      test_filter: Optional[str] = None,
+      extra_env: Optional[Dict[str, str]] = None,
   ) -> str:
     temp_file = self.create_tempfile(content=program)
     cmd = [_INTERP_PATH, temp_file.full_path]
@@ -61,12 +65,32 @@ class InterpreterTest(test_base.TestCase):
     if disable_warnings:
       cmd.append('--disable_warnings=%s' % ','.join(disable_warnings))
     cmd.extend(extra_flags)
-    p = subp.run(cmd, check=False, stderr=subp.PIPE, encoding='utf-8')
+    env = {} if test_filter is None else dict(TESTBRIDGE_TEST_ONLY=test_filter)
+    env.update(extra_env if extra_env else {})
+    p = subp.run(cmd, check=False, stderr=subp.PIPE, encoding='utf-8', env=env)
     if want_error:
       self.assertNotEqual(p.returncode, 0)
     else:
       self.assertEqual(p.returncode, 0, msg=p.stderr)
     return p.stderr
+
+  def test_cause_scan_error(self):
+    """Tests that we flag scan error locations."""
+    program = textwrap.dedent("""\
+    fn main(x: u32) -> u32 {
+        ~x  // note: in DSLX, as in Rust, it's bang (!) not tilde (~)
+    }
+    """)
+    stderr = self._parse_and_test(program, want_error=True)
+    self.assertIn(':2:5-2:5', stderr)
+    self.assertIn(
+        textwrap.dedent("""\
+    0002:     ~x  // note: in DSLX, as in Rust, it's bang (!) not tilde (~)
+    ~~~~~~~~~~^ ScanError: Unrecognized character: '~' (0x7e)
+    0003: }
+    """),
+        stderr,
+    )
 
   def test_two_plus_two_fail_module_test(self):
     """Tests that we flag assertion failure locations with no highlighting."""
@@ -81,7 +105,8 @@ class InterpreterTest(test_base.TestCase):
     """)
     stderr = self._parse_and_test(program, want_error=True)
     self.assertIn(':6:12-6:25', stderr)
-    self.assertIn(textwrap.dedent("""\
+    self.assertIn(
+        textwrap.dedent("""\
     0004:   let y: u32 = x + x;
     0005:   let expected: u32 = u32:5;
     0006:   assert_eq(y, expected)
@@ -90,7 +115,9 @@ class InterpreterTest(test_base.TestCase):
       rhs: u32:5
       were not equal
     0007: }
-    """), stderr)
+    """),
+        stderr,
+    )
 
   def test_conflicting_parametric_bindings(self):
     """Tests a conflict in a deduced parametric value.
@@ -110,8 +137,10 @@ class InterpreterTest(test_base.TestCase):
     """)
     stderr = self._parse_and_test(program, want_error=True)
     self.assertIn(
-        'Parametric value N was bound to different values at different places in invocation; saw: 2; then: 3',
-        stderr)
+        'Parametric value N was bound to different values at different places'
+        ' in invocation; saw: 2; then: 3',
+        stderr,
+    )
 
   def test_fail_incomplete_match(self):
     """Tests that interpreter runtime-fails on incomplete match pattern set."""
@@ -130,8 +159,9 @@ class InterpreterTest(test_base.TestCase):
         program, warnings_as_errors=False, want_error=True
     )
     self.assertIn(
-        'The program being interpreted failed! The value was not matched',
-        stderr)
+        'Match pattern is not exhaustive',
+        stderr,
+    )
 
   def test_failing_test_gives_error_retcode(self):
     """Tests that a failing DSLX test results in an error return code."""
@@ -209,10 +239,12 @@ class InterpreterTest(test_base.TestCase):
     }
     """
     program_file = self.create_tempfile(content=program)
-    # Trace is logged with XLS_LOG(INFO) so log to stderr to capture output.
+    # Trace is logged with LOG(INFO) so log to stderr to capture output.
     cmd = [
-        _INTERP_PATH, '--compare=none', '--alsologtostderr',
-        program_file.full_path
+        _INTERP_PATH,
+        '--compare=none',
+        '--alsologtostderr',
+        program_file.full_path,
     ]
     result = subp.run(cmd, stderr=subp.PIPE, encoding='utf-8', check=True)
     self.assertIn(': 1', result.stderr)
@@ -236,8 +268,8 @@ class InterpreterTest(test_base.TestCase):
         alsologtostderr=True,
         warnings_as_errors=False,
     )
-    self.assertIn('5:21-5:24: 4', stderr)
-    self.assertIn('7:21-7:24: -1', stderr)
+    self.assertIn(':5] trace of x: 4', stderr)
+    self.assertIn(':7] trace of x: -1', stderr)
 
   def test_trace_fmt_hello(self):
     """Tests that basic trace formatting works."""
@@ -287,8 +319,8 @@ class InterpreterTest(test_base.TestCase):
     ]
     result = subp.run(cmd, stderr=subp.PIPE, encoding='utf-8', check=False)
     print(result.stderr)
-    self.assertIn('s as hex: MyStruct {\n  x: 0x2a\n}', result.stderr)
-    self.assertIn('s as bin: MyStruct {\n  x: 0b10_1010\n}', result.stderr)
+    self.assertRegex(result.stderr, r's as hex:\s+MyStruct\s+{\s+x: 0x2a')
+    self.assertRegex(result.stderr, r's as bin:\s+MyStruct\s+{\s+x: 0b10_1010')
 
   def test_trace_fmt_array_of_struct(self):
     """Tests that we can apply trace formatting to an array of structs."""
@@ -319,8 +351,10 @@ class InterpreterTest(test_base.TestCase):
     ]
     result = subp.run(cmd, stderr=subp.PIPE, encoding='utf-8', check=False)
     print(result.stderr)
-    self.assertIn('a as hex: [MyStruct {\n  x: 0x2a\n}]', result.stderr)
-    self.assertIn('a as bin: [MyStruct {\n  x: 0b10_1010\n}]', result.stderr)
+    self.assertRegex(result.stderr, r'a as hex: \[\s+MyStruct\s+{\s+x: 0x2a')
+    self.assertRegex(
+        result.stderr, r'a as bin: \[\s+MyStruct\s+{\s+x: 0b10_1010'
+    )
 
   def test_trace_fmt_array_of_enum(self):
     """Tests we can trace-format an array of enum values."""
@@ -342,7 +376,28 @@ class InterpreterTest(test_base.TestCase):
     stderr = self._parse_and_test(
         program, want_error=False, alsologtostderr=True
     )
-    self.assertIn('a: [MyEnum::ONE, MyEnum::TWO]', stderr)
+    self.assertRegex(stderr, r'MyEnum::ONE\s+// u2:1')
+    self.assertRegex(stderr, r'MyEnum::TWO\s+// u2:2')
+
+  def test_trace_fmt_array_of_ints(self):
+    """Tests we can trace-format an array of u8 values."""
+    program = """
+    fn main() {
+      let a = u8[2]:[u8:1, u8:2];
+      trace_fmt!("a: {:#x}", a);
+    }
+
+    #[test]
+    fn hello_test() {
+      main()
+    }
+    """
+    stderr = self._parse_and_test(
+        program, want_error=False, alsologtostderr=True
+    )
+    self.assertIn(r'a: [', stderr)
+    self.assertIn(r'0x1', stderr)
+    self.assertIn(r'0x2', stderr)
 
   def test_trace_fmt_tuple_of_enum(self):
     """Tests that we can trace format a tuple that includes enum values."""
@@ -364,7 +419,10 @@ class InterpreterTest(test_base.TestCase):
     stderr = self._parse_and_test(
         program, want_error=False, alsologtostderr=True
     )
-    self.assertIn('t: (MyEnum::ONE, MyEnum::TWO, 0x2a)', stderr)
+    self.assertIn('t: (', stderr)
+    self.assertIn('MyEnum::ONE', stderr)
+    self.assertIn('MyEnum::TWO', stderr)
+    self.assertIn('0x2a', stderr)
 
   def test_cast_array_to_wrong_bit_count(self):
     """Tests that casing an array to the wrong bit count causes a failure."""
@@ -376,13 +434,19 @@ class InterpreterTest(test_base.TestCase):
     }
     """)
     stderr = self._parse_and_test(program, want_error=True)
-    self.assertIn(textwrap.dedent("""\
+    self.assertIn(
+        textwrap.dedent("""\
     0002: fn cast_array_to_wrong_bit_count_test() {
     0003:   let x = u2[2]:[2, 3];
     0004:   assert_eq(u3:0, x as u3)
-    ~~~~~~~~~~~~~~~~~~~~~~~~^-----^ XlsTypeError: uN[2][2] vs uN[3]: Cannot cast from expression type uN[2][2] to uN[3].
+    ~~~~~~~~~~~~~~~~~~~~~~~~^-----^ XlsTypeError: Cannot cast from expression type uN[2][2] to uN[3].
+    Type mismatch:
+       uN[2][2]
+    vs uN[3]
     0005: }
-    """), stderr)
+    """),
+        stderr,
+    )
 
   def test_cast_enum_oob_causes_fail(self):
     """Tests casting an out-of-bound value to enum causes a runtime failure."""
@@ -411,7 +475,10 @@ class InterpreterTest(test_base.TestCase):
     }
     """
     stderr = self._parse_and_test(program, want_error=True)
-    self.assertIn('lhs: sN[32][2]:[s32:1, s32:2]\n', stderr)
+    self.assertRegex(stderr, r'<\s+s32:1')
+    self.assertRegex(stderr, r'>\s+s32:3')
+    self.assertRegex(stderr, r'<\s+s32:2')
+    self.assertRegex(stderr, r'>\s+s32:4')
     self.assertIn('first differing index: 0', stderr)
 
   def test_first_failing_test(self):
@@ -458,11 +525,7 @@ class InterpreterTest(test_base.TestCase):
       let x0 = u32:42;
       %s
       // Make a fail label since those should be unique at function scope.
-      if x0 != u32:42 {
-        fail!("impossible", ())
-      } else {
-        ()
-      };
+      assert!(x0 == u32:42, "impossible");
       x%d
     }
     #[test]
@@ -561,6 +624,178 @@ class InterpreterTest(test_base.TestCase):
         ' trailing comma.',
         stderr,
     )
+
+  def test_env_based_test_filter(self):
+    """Tests environment-variable based filtering."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      output_xml = os.path.join(tmpdir, 'test.xml')
+
+      program = """
+      #[test] fn test_one() {}
+      #[test] fn test_two() {}
+      """
+      stderr = self._parse_and_test(
+          program,
+          alsologtostderr=True,
+          test_filter='.*_two',
+          extra_env=dict(XML_OUTPUT_FILE=output_xml),
+      )
+      self.assertIn(
+          '2 test(s) ran; 0 failed; 1 skipped',
+          stderr,
+      )
+
+      with open(output_xml) as f:
+        xml_got = f.read()
+
+      root = ET.fromstring(xml_got)
+      self.assertLen(root.findall(".//testcase[@name='test_one']"), 1)
+      self.assertLen(root.findall(".//testcase[@name='test_two']"), 1)
+      self.assertLen(root.findall('.//failure'), 0)
+
+  def test_env_based_test_filter_one_failing(self):
+    """Tests environment-variable based filtering."""
+    program = """
+    #[test] fn test_failing() { assert_eq(false, true) }
+    #[test] fn test_passing() {}
+    """
+    # First we only run the failing test.
+    with tempfile.TemporaryDirectory() as tmpdir:
+      output_xml = os.path.join(tmpdir, 'test.xml')
+      stderr = self._parse_and_test(
+          program,
+          alsologtostderr=True,
+          want_error=True,
+          test_filter='.*_failing',
+          extra_env=dict(XML_OUTPUT_FILE=output_xml),
+      )
+      self.assertIn(
+          '2 test(s) ran; 1 failed; 1 skipped',
+          stderr,
+      )
+
+      with open(output_xml) as f:
+        xml_got = f.read()
+
+      root = ET.fromstring(xml_got)
+      self.assertLen(
+          root.findall(
+              ".//testcase[@name='test_failing'][@result='completed']"
+          ),
+          1,
+      )
+      self.assertLen(
+          root.findall(".//testcase[@name='test_failing']/failure"), 1
+      )
+      self.assertLen(
+          root.findall(".//testcase[@name='test_passing'][@result='filtered']"),
+          1,
+      )
+      self.assertLen(root.findall('.//failure'), 1)
+
+    # Now filter to the passing one.
+    with tempfile.TemporaryDirectory() as tmpdir:
+      output_xml = os.path.join(tmpdir, 'test.xml')
+      stderr = self._parse_and_test(
+          program,
+          alsologtostderr=True,
+          test_filter='.*_passing',
+          extra_env=dict(XML_OUTPUT_FILE=output_xml),
+      )
+      self.assertIn(
+          '2 test(s) ran; 0 failed; 1 skipped',
+          stderr,
+      )
+
+      with open(output_xml) as f:
+        xml_got = f.read()
+
+      root = ET.fromstring(xml_got)
+      self.assertLen(
+          root.findall(
+              ".//testcase[@name='test_passing'][@result='completed']"
+          ),
+          1,
+      )
+      self.assertLen(
+          root.findall(".//testcase[@name='test_failing'][@result='filtered']"),
+          1,
+      )
+      self.assertLen(
+          root.findall(".//testcase[@name='test_failing']/failure"), 0
+      )
+      self.assertLen(root.findall('.//failure'), 0)
+
+  def test_flag_based_test_filter(self):
+    """Tests environment-variable based filtering."""
+    program = """
+    #[test] fn test_one() {}
+    #[test] fn test_two() {}
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+      output_xml = os.path.join(tmpdir, 'test.xml')
+      stderr = self._parse_and_test(
+          program,
+          alsologtostderr=True,
+          extra_flags=['--test_filter', '.*_two'],
+          extra_env=dict(XML_OUTPUT_FILE=output_xml),
+      )
+      self.assertIn(
+          '2 test(s) ran; 0 failed; 1 skipped',
+          stderr,
+      )
+
+      with open(output_xml) as f:
+        xml_got = f.read()
+
+      print('xml_got:', xml_got)
+      root = ET.fromstring(xml_got)
+      print('root:', root)
+      self.assertLen(
+          root.findall(".//testcase[@name='test_two'][@result='completed']"), 1
+      )
+      self.assertLen(
+          root.findall(".//testcase[@name='test_one'][@result='filtered']"), 1
+      )
+      self.assertLen(root.findall('.//failure'), 0)
+
+  def test_both_test_filters_errors(self):
+    """Tests environment-variable based filtering."""
+    program = """
+    #[test] fn test_one() {}
+    #[test] fn test_two() {}
+    """
+    stderr = self._parse_and_test(
+        program,
+        alsologtostderr=True,
+        want_error=True,
+        test_filter='.*_two',
+        extra_flags=['--test_filter=".*_two"'],
+    )
+    self.assertIn(
+        'only one is allowed',
+        stderr,
+    )
+
+  def test_alternative_stdlib_path(self):
+    with tempfile.TemporaryDirectory(suffix='stdlib') as stdlib_dir:
+      # Make a std.x file in our fake stdlib.
+      with open(os.path.join(stdlib_dir, 'std.x'), 'w') as fake_std:
+        print('pub fn my_stdlib_func(x: u32) -> u32 { x }', file=fake_std)
+
+      # Invoke the function in our fake std.x which should be appropriately
+      # resolved via the dslx_stdlib_path flag.
+      program = """
+      import std;
+
+      #[test]
+      fn test_alternative_stdlib() { assert_eq(std::my_stdlib_func(u32:42), u32:42); }
+      """
+      self._parse_and_test(
+          program,
+          alsologtostderr=True,
+          extra_flags=[f'--dslx_stdlib_path={stdlib_dir}'],
+      )
 
 
 if __name__ == '__main__':

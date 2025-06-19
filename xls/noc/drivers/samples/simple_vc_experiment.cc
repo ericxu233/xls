@@ -14,10 +14,15 @@
 
 #include "xls/noc/drivers/samples/simple_vc_experiment.h"
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/noc/config/network_config.pb.h"
 #include "xls/noc/config/network_config_proto_builder.h"
+#include "xls/noc/drivers/experiment.h"
+#include "xls/noc/drivers/experiment_factory.h"
 #include "xls/noc/simulation/common.h"
+#include "xls/noc/simulation/traffic_description.h"
 
 namespace xls::noc {
 

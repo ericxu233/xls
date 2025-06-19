@@ -22,10 +22,10 @@
 // Note: This module will not give meaningful results for
 // x == infinity or x = NaN.
 
-import apfloat
-import float32
-import float64
-import std
+import apfloat;
+import float32;
+import float64;
+import std;
 
 type F32 = float32::F32;
 type F64 = float64::F64;
@@ -77,7 +77,7 @@ pub fn fp_trig_reduce<EXP_SZ:u32, SFD_SZ:u32, UEXP_SZ:u32 = {EXP_SZ + u32:1}>(x:
   let raw_fraction_bits = prod[61:189];
   let hi = raw_fraction_bits[64:128];
   let lz = clz(hi);
-  let fraction_bexp = apfloat::bias<EXP_SZ, SFD_SZ>(-(sN[EXP_SZ]:1 + (lz as sN[EXP_SZ])));
+  let fraction_bexp = apfloat::bias(-(sN[EXP_SZ]:1 + (lz as sN[EXP_SZ])));
 
   // Clear hidden bit and shift mantissa.
   const SFD_INDEX_START = u32:128 - SFD_SZ;

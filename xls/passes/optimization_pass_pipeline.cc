@@ -17,14 +17,25 @@
 
 #include "xls/passes/optimization_pass_pipeline.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
+#include "absl/algorithm/container.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "xls/common/module_initializer.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/ir/package.h"
 #include "xls/passes/arith_simplification_pass.h"
 #include "xls/passes/array_simplification_pass.h"
+#include "xls/passes/array_untuple_pass.h"
+#include "xls/passes/basic_simplification_pass.h"
 #include "xls/passes/bdd_cse_pass.h"
 #include "xls/passes/bdd_simplification_pass.h"
 #include "xls/passes/bit_slice_simplification_pass.h"
@@ -36,28 +47,39 @@
 #include "xls/passes/conditional_specialization_pass.h"
 #include "xls/passes/constant_folding_pass.h"
 #include "xls/passes/cse_pass.h"
+#include "xls/passes/dataflow_simplification_pass.h"
 #include "xls/passes/dce_pass.h"
 #include "xls/passes/dfe_pass.h"
 #include "xls/passes/identity_removal_pass.h"
 #include "xls/passes/inlining_pass.h"
 #include "xls/passes/label_recovery_pass.h"
-#include "xls/passes/literal_uncommoning_pass.h"
+#include "xls/passes/lut_conversion_pass.h"
 #include "xls/passes/map_inlining_pass.h"
 #include "xls/passes/narrowing_pass.h"
+#include "xls/passes/next_value_optimization_pass.h"
 #include "xls/passes/optimization_pass.h"
-#include "xls/passes/proc_inlining_pass.h"
-#include "xls/passes/proc_state_flattening_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
+#include "xls/passes/pass_base.h"
+#include "xls/passes/pass_pipeline.pb.h"
+#include "xls/passes/proc_state_array_flattening_pass.h"
+#include "xls/passes/proc_state_bits_shattering_pass.h"
+#include "xls/passes/proc_state_narrowing_pass.h"
 #include "xls/passes/proc_state_optimization_pass.h"
+#include "xls/passes/proc_state_provenance_narrowing_pass.h"
+#include "xls/passes/proc_state_tuple_flattening_pass.h"
+#include "xls/passes/query_engine_checker.h"
 #include "xls/passes/ram_rewrite_pass.h"
 #include "xls/passes/reassociation_pass.h"
 #include "xls/passes/receive_default_value_simplification_pass.h"
+#include "xls/passes/resource_sharing_pass.h"
+#include "xls/passes/select_lifting_pass.h"
+#include "xls/passes/select_merging_pass.h"
 #include "xls/passes/select_simplification_pass.h"
 #include "xls/passes/sparsify_select_pass.h"
 #include "xls/passes/strength_reduction_pass.h"
 #include "xls/passes/table_switch_pass.h"
 #include "xls/passes/token_dependency_pass.h"
 #include "xls/passes/token_simplification_pass.h"
-#include "xls/passes/tuple_simplification_pass.h"
 #include "xls/passes/unroll_pass.h"
 #include "xls/passes/useless_assert_removal_pass.h"
 #include "xls/passes/useless_io_removal_pass.h"
@@ -65,141 +87,341 @@
 
 namespace xls {
 
-SimplificationPass::SimplificationPass(int64_t opt_level)
-    : OptimizationFixedPointCompoundPass("simp", "Simplification") {
-  Add<IdentityRemovalPass>();
-  Add<ConstantFoldingPass>();
-  Add<DeadCodeEliminationPass>();
-  Add<CanonicalizationPass>();
-  Add<DeadCodeEliminationPass>();
-  Add<ArithSimplificationPass>(opt_level);
-  Add<DeadCodeEliminationPass>();
-  Add<ComparisonSimplificationPass>();
-  Add<DeadCodeEliminationPass>();
-  Add<TableSwitchPass>();
-  Add<DeadCodeEliminationPass>();
-  Add<ReceiveDefaultValueSimplificationPass>();
-  Add<DeadCodeEliminationPass>();
-  Add<SelectSimplificationPass>(opt_level);
-  Add<DeadCodeEliminationPass>();
-  Add<ConditionalSpecializationPass>(/*use_bdd=*/false);
-  Add<DeadCodeEliminationPass>();
-  Add<ReassociationPass>();
-  Add<DeadCodeEliminationPass>();
-  Add<ConstantFoldingPass>();
-  Add<DeadCodeEliminationPass>();
-  Add<BitSliceSimplificationPass>(opt_level);
-  Add<DeadCodeEliminationPass>();
-  Add<ConcatSimplificationPass>(opt_level);
-  Add<DeadCodeEliminationPass>();
-  Add<TupleSimplificationPass>();
-  Add<DeadCodeEliminationPass>();
-  Add<StrengthReductionPass>(opt_level);
-  Add<DeadCodeEliminationPass>();
-  Add<ArraySimplificationPass>(opt_level);
-  Add<DeadCodeEliminationPass>();
-  Add<NarrowingPass>(/*analysis=*/NarrowingPass::AnalysisType::kBdd, opt_level);
-  Add<DeadCodeEliminationPass>();
-  Add<ArithSimplificationPass>(opt_level);
-  Add<DeadCodeEliminationPass>();
-  Add<BooleanSimplificationPass>();
-  Add<DeadCodeEliminationPass>();
-  Add<TokenSimplificationPass>();
-  Add<DeadCodeEliminationPass>();
-  Add<CsePass>();
+namespace {
+
+void AddSimplificationPasses(OptimizationCompoundPass& pass) {
+  pass.Add<IdentityRemovalPass>();
+  pass.Add<ConstantFoldingPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<CanonicalizationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<BasicSimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<ArithSimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<ComparisonSimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<TableSwitchPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<ReceiveDefaultValueSimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<SelectSimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<DataflowSimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<ConditionalSpecializationPass>(/*use_bdd=*/false);
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<ReassociationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<ConstantFoldingPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<BitSliceSimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<ConcatSimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<ArrayUntuplePass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<DataflowSimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<StrengthReductionPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<ArraySimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<CsePass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<BasicSimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<ArithSimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<NarrowingPass>(/*analysis=*/NarrowingPass::AnalysisType::kTernary);
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<BooleanSimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
+  pass.Add<TokenSimplificationPass>();
+  pass.Add<DeadCodeEliminationPass>();
 }
 
-std::unique_ptr<OptimizationCompoundPass> CreateOptimizationPassPipeline(
-    int64_t opt_level) {
-  auto top = std::make_unique<OptimizationCompoundPass>(
-      "ir", "Top level pass pipeline");
-  top->AddInvariantChecker<VerifierChecker>();
+}  // namespace
 
-  top->Add<DeadFunctionEliminationPass>();
-  top->Add<DeadCodeEliminationPass>();
+SimplificationPass::SimplificationPass()
+    : OptimizationCompoundPass("simp", "Simplification") {
+  AddSimplificationPasses(*this);
+}
+
+FixedPointSimplificationPass::FixedPointSimplificationPass()
+    : OptimizationFixedPointCompoundPass("fixedpoint_simp",
+                                         "Fixed-point Simplification") {
+  AddSimplificationPasses(*this);
+}
+
+PreInliningPassGroup::PreInliningPassGroup()
+    : OptimizationCompoundPass(PreInliningPassGroup::kName,
+                               "pre-inlining passes") {
+  Add<DeadFunctionEliminationPass>();
+  Add<DeadCodeEliminationPass>();
   // At this stage in the pipeline only optimizations up to level 2 should
   // run. 'opt_level' is the maximum level of optimization which should be run
   // in the entire pipeline so set the level of the simplification pass to the
   // minimum of the two values. Same below.
-  top->Add<SimplificationPass>(std::min(int64_t{2}, opt_level));
-  top->Add<UnrollPass>();
-  top->Add<MapInliningPass>();
-  top->Add<InliningPass>();
-  top->Add<DeadFunctionEliminationPass>();
+  using Inner = CapOptLevel<2, SimplificationPass>;
+  Add<IfOptLevelAtLeast<1, Inner>>();
+}
 
-  top->Add<BddSimplificationPass>(std::min(int64_t{2}, opt_level));
-  top->Add<DeadCodeEliminationPass>();
-  top->Add<BddCsePass>();
-  // TODO(https://github.com/google/xls/issues/274): 2022/01/20 Remove this
-  // extra conditional specialization pass when the pipeline has been
-  // reorganized better follow a high level of abstraction down to low level.
-  top->Add<DeadCodeEliminationPass>();
-  top->Add<ConditionalSpecializationPass>(/*use_bdd=*/true);
+UnrollingAndInliningPassGroup::UnrollingAndInliningPassGroup(
+    InliningPass::InlineDepth inline_depth)
+    : OptimizationCompoundPass(UnrollingAndInliningPassGroup::kName,
+                               "full function inlining passes") {
+  Add<UnrollPass>();
+  Add<MapInliningPass>();
+  Add<InliningPass>(inline_depth);
+  Add<DeadFunctionEliminationPass>();
+}
 
-  top->Add<DeadCodeEliminationPass>();
-  top->Add<SimplificationPass>(std::min(int64_t{2}, opt_level));
+ProcStateFlatteningFixedPointPass::ProcStateFlatteningFixedPointPass()
+    : OptimizationFixedPointCompoundPass(
+          ProcStateFlatteningFixedPointPass::kName, "Proc State Flattening") {
+  Add<ProcStateArrayFlatteningPass>();
+  Add<ProcStateTupleFlatteningPass>();
+}
 
-  top->Add<NarrowingPass>(
-      /*analysis=*/NarrowingPass::AnalysisType::kRangeWithOptionalContext,
-      opt_level);
-  top->Add<DeadCodeEliminationPass>();
-  top->Add<ArithSimplificationPass>(opt_level);
-  top->Add<DeadCodeEliminationPass>();
-  top->Add<CsePass>();
-  top->Add<SparsifySelectPass>();
-  top->Add<DeadCodeEliminationPass>();
-  top->Add<UselessAssertRemovalPass>();
-  top->Add<RamRewritePass>();
-  top->Add<UselessIORemovalPass>();
-  top->Add<DeadCodeEliminationPass>();
+namespace {
+class PostInliningOptPassGroup : public OptimizationCompoundPass {
+ public:
+  PostInliningOptPassGroup()
+      : OptimizationCompoundPass("post-inlining optimization passes",
+                                 "post-inlining-opt") {
+    Add<CapOptLevel<2, FixedPointSimplificationPass>>();
 
-  // Run ConditionalSpecializationPass before TokenDependencyPass to remove
-  // false data dependencies
-  top->Add<ConditionalSpecializationPass>(/*use_bdd=*/true);
-  // Legalize multiple channel operations before proc inlining. The legalization
-  // can add an adapter proc that should be inlined.
-  top->Add<ChannelLegalizationPass>();
-  top->Add<TokenDependencyPass>();
-  // Simplify the adapter procs before inlining.
-  top->Add<SimplificationPass>(std::min(int64_t{2}, opt_level));
-  top->Add<ProcInliningPass>();
+    Add<CapOptLevel<2, BddSimplificationPass>>();
+    Add<DeadCodeEliminationPass>();
+    Add<BddCsePass>();
+    // TODO(https://github.com/google/xls/issues/274): 2022/01/20 Remove this
+    // extra conditional specialization pass when the pipeline has been
+    // reorganized better follow a high level of abstraction down to low level.
+    Add<DeadCodeEliminationPass>();
+    Add<ConditionalSpecializationPass>(/*use_bdd=*/true);
 
-  // After proc inlining flatten and optimize the proc state. Run tuple
-  // simplification to simplify tuple structures left over from flattening.
-  // TODO(meheff): Consider running proc state optimization more than once.
-  top->Add<ProcStateFlatteningPass>();
-  top->Add<IdentityRemovalPass>();
-  top->Add<TupleSimplificationPass>();
-  top->Add<ProcStateOptimizationPass>();
-  top->Add<DeadCodeEliminationPass>();
+    Add<DeadCodeEliminationPass>();
+    Add<CapOptLevel<2, FixedPointSimplificationPass>>();
 
-  top->Add<BddSimplificationPass>(std::min(int64_t{3}, opt_level));
-  top->Add<DeadCodeEliminationPass>();
-  top->Add<BddCsePass>();
-  top->Add<DeadCodeEliminationPass>();
+    Add<NarrowingPass>(
+        /*analysis=*/NarrowingPass::AnalysisType::kRangeWithOptionalContext);
+    Add<DeadCodeEliminationPass>();
+    Add<BasicSimplificationPass>();
+    Add<DeadCodeEliminationPass>();
+    Add<ArithSimplificationPass>();
+    Add<DeadCodeEliminationPass>();
+    Add<CsePass>();
+    Add<SparsifySelectPass>();
+    Add<DeadCodeEliminationPass>();
+    Add<UselessAssertRemovalPass>();
+    Add<RamRewritePass>();
+    Add<UselessIORemovalPass>();
+    Add<DeadCodeEliminationPass>();
 
-  top->Add<ConditionalSpecializationPass>(/*use_bdd=*/true);
-  top->Add<DeadCodeEliminationPass>();
+    // Run ConditionalSpecializationPass before TokenDependencyPass to remove
+    // false data dependencies
+    Add<ConditionalSpecializationPass>(/*use_bdd=*/true);
+    // Legalize multiple channel operations before proc inlining. The
+    // legalization can add an adapter proc that should be inlined.
+    Add<ChannelLegalizationPass>();
+    Add<TokenDependencyPass>();
+    // Simplify the adapter procs before inlining.
+    Add<CapOptLevel<2, FixedPointSimplificationPass>>();
 
-  top->Add<SimplificationPass>(std::min(int64_t{3}, opt_level));
+    // After proc inlining flatten and optimize the proc state. Run tuple
+    // simplification to simplify tuple structures left over from flattening.
+    // TODO(meheff): Consider running proc state optimization more than once.
+    Add<ProcStateFlatteningFixedPointPass>();
+    Add<ProcStateBitsShatteringPass>();
+    Add<ProcStateTupleFlatteningPass>();
+    Add<IdentityRemovalPass>();
+    Add<DataflowSimplificationPass>();
+    Add<CapOptLevel<3, NextValueOptimizationPass>>();
 
-  top->Add<UselessAssertRemovalPass>();
-  top->Add<UselessIORemovalPass>();
-  top->Add<ProcStateOptimizationPass>();
-  top->Add<DeadCodeEliminationPass>();
+    Add<ProcStateNarrowingPass>();
+    Add<DeadCodeEliminationPass>();
+    Add<ProcStateOptimizationPass>();
+    Add<DeadCodeEliminationPass>();
 
-  top->Add<LiteralUncommoningPass>();
-  top->Add<DeadFunctionEliminationPass>();
-  top->Add<LabelRecoveryPass>();
+    Add<ProcStateProvenanceNarrowingPass>();
+    Add<DeadCodeEliminationPass>();
+    Add<ProcStateOptimizationPass>();
+    Add<DeadCodeEliminationPass>();
+
+    Add<CapOptLevel<3, BddSimplificationPass>>();
+    Add<DeadCodeEliminationPass>();
+    Add<BddCsePass>();
+    Add<SelectLiftingPass>();
+    Add<DeadCodeEliminationPass>();
+
+    Add<LutConversionPass>();
+    Add<DeadCodeEliminationPass>();
+
+    Add<ConditionalSpecializationPass>(/*use_bdd=*/true);
+    Add<DeadCodeEliminationPass>();
+
+    Add<CapOptLevel<3, FixedPointSimplificationPass>>();
+
+    // Range based select simplification is heavier so we only do it once.
+    Add<SelectRangeSimplificationPass>();
+    Add<DeadCodeEliminationPass>();
+
+    Add<CapOptLevel<3, FixedPointSimplificationPass>>();
+
+    Add<CapOptLevel<3, BddSimplificationPass>>();
+    Add<DeadCodeEliminationPass>();
+    Add<BddCsePass>();
+    Add<DeadCodeEliminationPass>();
+
+    Add<ProcStateBitsShatteringPass>();
+    Add<ProcStateTupleFlatteningPass>();
+    Add<CapOptLevel<3, FixedPointSimplificationPass>>();
+
+    Add<UselessAssertRemovalPass>();
+    Add<UselessIORemovalPass>();
+    Add<CapOptLevel<3, NextValueOptimizationPass>>();
+    // TODO(allight): We might want another proc-narrowing pass here but it's
+    // not clear if it will be likely to find anything and we'd need more
+    // cleanup passes if we did to take advantage of the narrower state.
+    Add<ProcStateOptimizationPass>();
+    Add<DeadCodeEliminationPass>();
+
+    Add<ConditionalSpecializationPass>(/*use_bdd=*/true);
+    Add<DeadCodeEliminationPass>();
+    Add<SelectMergingPass>();
+    Add<DeadCodeEliminationPass>();
+    Add<CapOptLevel<3, FixedPointSimplificationPass>>();
+  }
+};
+}  // namespace
+
+PostInliningPassGroup::PostInliningPassGroup()
+    : OptimizationCompoundPass(PostInliningPassGroup::kName,
+                               "Post-inlining passes") {
+  Add<IfOptLevelAtLeast<1, PostInliningOptPassGroup>>();
+  Add<DeadCodeEliminationPass>();
+  Add<LabelRecoveryPass>();
+  Add<ResourceSharingPass>();
+}
+
+IterativeSimplifyAndUnrollPassGroup::IterativeSimplifyAndUnrollPassGroup()
+    : OptimizationFixedPointCompoundPass(
+          IterativeSimplifyAndUnrollPassGroup::kName,
+          "Iteratively inline and simplify") {
+  Add<PreInliningPassGroup>();
+  Add<UnrollingAndInliningPassGroup>(InliningPass::InlineDepth::kLeafOnly);
+}
+
+std::unique_ptr<OptimizationCompoundPass> CreateOptimizationPassPipeline(
+    bool debug_optimizations) {
+  auto top = std::make_unique<OptimizationCompoundPass>(
+      "ir", "Top level pass pipeline");
+  if (debug_optimizations) {
+    top->AddInvariantChecker<VerifierChecker>();
+    top->AddInvariantChecker<QueryEngineChecker>();
+  } else {
+    top->AddWeakInvariantChecker<VerifierChecker>();
+  }
+
+  top->Add<IterativeSimplifyAndUnrollPassGroup>();
+  top->Add<PostInliningPassGroup>();
+
   return top;
 }
 
 absl::StatusOr<bool> RunOptimizationPassPipeline(Package* package,
-                                                 int64_t opt_level) {
+                                                 int64_t opt_level,
+                                                 bool debug_optimizations) {
   std::unique_ptr<OptimizationCompoundPass> pipeline =
-      CreateOptimizationPassPipeline();
+      CreateOptimizationPassPipeline(debug_optimizations);
   PassResults results;
-  return pipeline->Run(package, OptimizationPassOptions(), &results);
+  OptimizationContext context;
+  return pipeline->Run(package,
+                       OptimizationPassOptions().WithOptLevel(opt_level),
+                       &results, context);
 }
+
+absl::Status OptimizationPassPipelineGenerator::AddPassToPipeline(
+    OptimizationCompoundPass* pass, std::string_view pass_name,
+    const PassPipelineProto::PassOptions& options) const {
+  XLS_ASSIGN_OR_RETURN(auto* generator,
+                       GetOptimizationRegistry().Generator(pass_name));
+  return generator->AddToPipeline(pass, options);
+}
+
+absl::StatusOr<std::unique_ptr<OptimizationPass>>
+OptimizationPassPipelineGenerator::FinalizeWithOptions(
+    std::unique_ptr<OptimizationCompoundPass>&& cur,
+    const PassPipelineProto::PassOptions& options) const {
+  // Make sure both places passes can be configured are updated.
+  // LINT.IfChange(opt_pass_option)
+  std::unique_ptr<OptimizationPass> base = std::move(cur);
+  if (options.has_max_opt_level()) {
+    base = std::make_unique<
+        xls::internal::DynamicCapOptLevel<OptimizationWrapperPass>>(
+        options.max_opt_level(), std::move(base));
+  }
+  if (options.has_min_opt_level()) {
+    base = std::make_unique<
+        xls::internal::DynamicIfOptLevelAtLeast<OptimizationWrapperPass>>(
+        options.min_opt_level(), std::move(base));
+  }
+  if (options.has_requires_resource_sharing() &&
+      options.requires_resource_sharing()) {
+    base = std::make_unique<
+        xls::IfResourceSharingEnabled<OptimizationWrapperPass>>(
+        std::move(base));
+  }
+  // LINT.ThenChange(optimization_pass_registry.h:opt_pass_option)
+  return std::move(base);
+}
+
+std::string OptimizationPassPipelineGenerator::GetAvailablePassesStr() const {
+  std::ostringstream oss;
+  oss << "[";
+  bool first = true;
+  auto all_passes = GetAvailablePasses();
+  absl::c_sort(all_passes);
+  for (auto v : all_passes) {
+    if (!first) {
+      oss << ", ";
+    }
+    first = false;
+    oss << v;
+  }
+  oss << "]";
+  return oss.str();
+}
+
+std::vector<std::string_view>
+OptimizationPassPipelineGenerator::GetAvailablePasses() const {
+  return GetOptimizationRegistry().GetRegisteredNames();
+}
+
+XLS_REGISTER_MODULE_INITIALIZER(simp_pass, {
+  CHECK_OK(RegisterOptimizationPass<FixedPointSimplificationPass>(
+      "fixedpoint_simp"));
+  CHECK_OK(
+      (RegisterOptimizationPass<CapOptLevel<2, FixedPointSimplificationPass>>(
+          "fixedpoint_simp(2)")));
+  CHECK_OK(
+      (RegisterOptimizationPass<CapOptLevel<3, FixedPointSimplificationPass>>(
+          "fixedpoint_simp(3)")));
+  CHECK_OK(RegisterOptimizationPass<SimplificationPass>("simp"));
+  CHECK_OK((
+      RegisterOptimizationPass<CapOptLevel<2, SimplificationPass>>("simp(2)")));
+  CHECK_OK((
+      RegisterOptimizationPass<CapOptLevel<3, SimplificationPass>>("simp(3)")));
+  CHECK_OK((RegisterOptimizationPass<InliningPass>(
+      "iterative-inlining", InliningPass::InlineDepth::kLeafOnly)));
+});
+
+REGISTER_OPT_PASS(PreInliningPassGroup);
+REGISTER_OPT_PASS(UnrollingAndInliningPassGroup,
+                  InliningPass::InlineDepth::kFull);
+REGISTER_OPT_PASS(IterativeSimplifyAndUnrollPassGroup);
+REGISTER_OPT_PASS(ProcStateFlatteningFixedPointPass);
+REGISTER_OPT_PASS(PostInliningPassGroup);
 
 }  // namespace xls

@@ -35,6 +35,7 @@
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_test_base.h"
 #include "xls/ir/package.h"
+#include "xls/ir/value.h"
 
 namespace m = xls::op_matchers;
 
@@ -56,15 +57,15 @@ static absl::Status MakeMultiProcLoop(Package* p, int64_t n) {
     internal_channels.push_back(ch);
   }
   for (int64_t i = 0; i < n; ++i) {
-    ProcBuilder pb(absl::StrFormat("proc%d", i), "tok", p);
+    ProcBuilder pb(absl::StrFormat("proc%d", i), p);
     Channel* recv_chan = internal_channels[i];
     Channel* send_chan =
         internal_channels[((i + 1) >= n) ? (i + 1 - n) : (i + 1)];
-    BValue recv = pb.Receive(recv_chan, pb.GetTokenParam());
+    BValue recv = pb.Receive(recv_chan, pb.Literal(Value::Token()));
     BValue recv_token = pb.TupleIndex(recv, 0);
     BValue recv_data = pb.TupleIndex(recv, 1);
-    BValue send = pb.Send(send_chan, recv_token, recv_data);
-    XLS_RETURN_IF_ERROR(pb.Build(send, {}).status());
+    pb.Send(send_chan, recv_token, recv_data);
+    XLS_RETURN_IF_ERROR(pb.Build().status());
   }
 
   return absl::OkStatus();
@@ -81,8 +82,8 @@ static absl::Status MakeSingleProcLoop(Package* p, int64_t n) {
                              ChannelOps::kSendReceive, p->GetBitsType(32)));
     internal_channels.push_back(ch);
   }
-  ProcBuilder pb("foo", "tok", p);
-  BValue prev_token = pb.GetTokenParam();
+  ProcBuilder pb("foo", p);
+  BValue prev_token = pb.Literal(Value::Token());
   for (int64_t i = 0; i < n; ++i) {
     Channel* recv_chan = internal_channels[i];
     Channel* send_chan =
@@ -93,7 +94,7 @@ static absl::Status MakeSingleProcLoop(Package* p, int64_t n) {
     BValue send = pb.Send(send_chan, recv_token, recv_data);
     prev_token = send;
   }
-  XLS_RETURN_IF_ERROR(pb.Build(prev_token, {}).status());
+  XLS_RETURN_IF_ERROR(pb.Build().status());
   return absl::OkStatus();
 }
 
@@ -115,7 +116,8 @@ static absl::Status MakeFullyConnectedProcNetwork(Package* p, int64_t n) {
     }
   }
   for (int64_t i = 0; i < n; ++i) {
-    ProcBuilder pb(absl::StrFormat("foo%d", i), "tok", p);
+    ProcBuilder pb(absl::StrFormat("foo%d", i), p);
+    BValue initial_token = pb.Literal(Value::Token());
     BValue sum = pb.Literal(UBits(0, 32));
     std::vector<BValue> recv_tokens;
     for (int64_t j = 0; j < n; ++j) {
@@ -123,22 +125,21 @@ static absl::Status MakeFullyConnectedProcNetwork(Package* p, int64_t n) {
         continue;
       }
       Channel* recv_chan = internal_channels[{i, j}];
-      BValue recv = pb.Receive(recv_chan, pb.GetTokenParam());
+      BValue recv = pb.Receive(recv_chan, initial_token);
       BValue recv_token = pb.TupleIndex(recv, 0);
       BValue recv_data = pb.TupleIndex(recv, 1);
       sum = pb.Add(sum, recv_data);
       recv_tokens.push_back(recv_token);
     }
     BValue all_recv_token = pb.AfterAll(recv_tokens);
-    std::vector<BValue> send_tokens;
     for (int64_t j = 0; j < n; ++j) {
       if (i == j) {
         continue;
       }
       Channel* send_chan = internal_channels[{j, i}];
-      send_tokens.push_back(pb.Send(send_chan, all_recv_token, sum));
+      pb.Send(send_chan, all_recv_token, sum);
     }
-    XLS_RETURN_IF_ERROR(pb.Build(pb.AfterAll(send_tokens), {}).status());
+    XLS_RETURN_IF_ERROR(pb.Build().status());
   }
   return absl::OkStatus();
 }
@@ -147,15 +148,16 @@ class MinimalFeedbackArcsTest : public IrTestBase {};
 
 TEST_F(MinimalFeedbackArcsTest, SingleProcWithNoFeedback) {
   constexpr std::string_view ir_text = R"(package test
-chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid, metadata="")
-chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="")
+chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid)
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
 
-top proc foo(tkn: token, st: (), init={()}) {
-  recv: (token, bits[32]) = receive(tkn, channel_id=0)
+top proc foo(st: (), init={()}) {
+  tkn: token = literal(value=token)
+  recv: (token, bits[32]) = receive(tkn, channel=in)
   recv_token: token = tuple_index(recv, index=0)
   recv_data: bits[32] = tuple_index(recv, index=1)
-  send_token: token = send(recv_token, recv_data, channel_id=1)
-  next (send_token, st)
+  send_token: token = send(recv_token, recv_data, channel=out)
+  next (st)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> p, ParsePackage(ir_text));
@@ -166,23 +168,23 @@ top proc foo(tkn: token, st: (), init={()}) {
 
 TEST_F(MinimalFeedbackArcsTest, SingleProcWithLoopbackButNoCycle) {
   constexpr std::string_view ir_text = R"(package test
-chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid, metadata="")
-chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="")
-chan internal(bits[32], id=2, kind=streaming, ops=send_receive, flow_control=ready_valid, metadata="")
+chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid)
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
+chan internal(bits[32], id=2, kind=streaming, ops=send_receive, flow_control=ready_valid)
 
-top proc foo(tkn: token, st: (), init={()}) {
-  recv: (token, bits[32]) = receive(tkn, channel_id=0)
+top proc foo(st: (), init={()}) {
+  tkn: token = literal(value=token)
+  recv: (token, bits[32]) = receive(tkn, channel=in)
   recv_token: token = tuple_index(recv, index=0)
   recv_data: bits[32] = tuple_index(recv, index=1)
-  internal_recv: (token, bits[32]) = receive(tkn, channel_id=2)
+  internal_recv: (token, bits[32]) = receive(tkn, channel=internal)
   internal_recv_token: token = tuple_index(internal_recv, index=0)
   internal_recv_data: bits[32] = tuple_index(internal_recv, index=1)
   sum: bits[32] = add(recv_data, internal_recv_data)
   all_receive_token: token = after_all(recv_token, internal_recv_token)
-  send_token: token = send(all_receive_token, sum, channel_id=1)
-  internal_send_token: token = send(recv_token, recv_data, channel_id=2)
-  all_send_token: token = after_all(send_token, internal_send_token)
-  next (all_send_token, st)
+  send_token: token = send(all_receive_token, sum, channel=out)
+  internal_send_token: token = send(recv_token, recv_data, channel=internal)
+  next (st)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> p, ParsePackage(ir_text));
@@ -193,23 +195,23 @@ top proc foo(tkn: token, st: (), init={()}) {
 
 TEST_F(MinimalFeedbackArcsTest, SingleProcWithLoopbackCycle) {
   constexpr std::string_view ir_text = R"(package test
-chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid, metadata="")
-chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="")
-chan internal(bits[32], id=2, kind=streaming, ops=send_receive, flow_control=ready_valid, metadata="")
+chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid)
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
+chan internal(bits[32], id=2, kind=streaming, ops=send_receive, flow_control=ready_valid)
 
-top proc foo(tkn: token, st: (), init={()}) {
-  recv: (token, bits[32]) = receive(tkn, channel_id=0)
+top proc foo(st: (), init={()}) {
+  tkn: token = literal(value=token)
+  recv: (token, bits[32]) = receive(tkn, channel=in)
   recv_token: token = tuple_index(recv, index=0)
   recv_data: bits[32] = tuple_index(recv, index=1)
-  internal_recv: (token, bits[32]) = receive(tkn, channel_id=2)
+  internal_recv: (token, bits[32]) = receive(tkn, channel=internal)
   internal_recv_token: token = tuple_index(internal_recv, index=0)
   internal_recv_data: bits[32] = tuple_index(internal_recv, index=1)
   sum: bits[32] = add(recv_data, internal_recv_data)
   all_receive_token: token = after_all(recv_token, internal_recv_token)
-  send_token: token = send(all_receive_token, sum, channel_id=1)
-  internal_send_token: token = send(all_receive_token, sum, channel_id=2)
-  all_send_token: token = after_all(send_token, internal_send_token)
-  next (all_send_token, st)
+  send_token: token = send(all_receive_token, sum, channel=out)
+  internal_send_token: token = send(all_receive_token, sum, channel=internal)
+  next (st)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> p, ParsePackage(ir_text));
@@ -228,39 +230,39 @@ TEST_F(MinimalFeedbackArcsTest, TwoProcsWithSplitAndJoin) {
   // │ └─────┘    └─────┘ │
   // └────────────────────┘
   constexpr std::string_view ir_text = R"(package test
-chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid, metadata="")
-chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="")
-chan internal0(bits[32], id=2, kind=streaming, ops=send_receive, flow_control=ready_valid, metadata="")
-chan internal1(bits[32], id=3, kind=streaming, ops=send_receive, flow_control=ready_valid, metadata="")
-chan internal2(bits[32], id=4, kind=streaming, ops=send_receive, flow_control=ready_valid, metadata="")
+chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid)
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
+chan internal0(bits[32], id=2, kind=streaming, ops=send_receive, flow_control=ready_valid)
+chan internal1(bits[32], id=3, kind=streaming, ops=send_receive, flow_control=ready_valid)
+chan internal2(bits[32], id=4, kind=streaming, ops=send_receive, flow_control=ready_valid)
 
-top proc foo(tkn: token, st: (), init={()}) {
-  recv: (token, bits[32]) = receive(tkn, channel_id=0)
+top proc foo(st: (), init={()}) {
+  tkn: token = literal(value=token)
+  recv: (token, bits[32]) = receive(tkn, channel=in)
   recv_token: token = tuple_index(recv, index=0)
   recv_data: bits[32] = tuple_index(recv, index=1)
-  internal_recv0: (token, bits[32]) = receive(tkn, channel_id=2)
+  internal_recv0: (token, bits[32]) = receive(tkn, channel=internal0)
   internal_recv0_token: token = tuple_index(internal_recv0, index=0)
   internal_recv0_data: bits[32] = tuple_index(internal_recv0, index=1)
-  internal_recv1: (token, bits[32]) = receive(tkn, channel_id=3)
+  internal_recv1: (token, bits[32]) = receive(tkn, channel=internal1)
   internal_recv1_token: token = tuple_index(internal_recv1, index=0)
   internal_recv1_data: bits[32] = tuple_index(internal_recv1, index=1)
   partial_sum: bits[32] = add(internal_recv0_data, internal_recv1_data)
   sum: bits[32] = add(recv_data, partial_sum)
   all_receive_token: token = after_all(recv_token, internal_recv0_token, internal_recv1_token)
-  send_token: token = send(all_receive_token, sum, channel_id=1)
-  internal_send_token: token = send(all_receive_token, sum, channel_id=4)
-  all_send_token: token = after_all(send_token, internal_send_token)
-  next (all_send_token, st)
+  send_token: token = send(all_receive_token, sum, channel=out)
+  internal_send_token: token = send(all_receive_token, sum, channel=internal2)
+  next (st)
 }
 
-proc bar(tkn: token, st: (), init={()}) {
-  recv: (token, bits[32]) = receive(tkn, channel_id=4)
+proc bar(st: (), init={()}) {
+  tkn: token = literal(value=token)
+  recv: (token, bits[32]) = receive(tkn, channel=internal2)
   recv_token: token = tuple_index(recv, index=0)
   recv_data: bits[32] = tuple_index(recv, index=1)
-  send0_token: token = send(recv_token, recv_data, channel_id=2)
-  send1_token: token = send(recv_token, recv_data, channel_id=3)
-  all_send_token: token = after_all(send0_token, send1_token)
-  next(all_send_token, st)
+  send0_token: token = send(recv_token, recv_data, channel=internal0)
+  send1_token: token = send(recv_token, recv_data, channel=internal1)
+  next (st)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> p, ParsePackage(ir_text));

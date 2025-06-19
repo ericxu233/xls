@@ -20,8 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
-#include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xls/data_structures/leaf_type_tree.h"
@@ -43,7 +43,7 @@ namespace xls {
 // information must be directly asked for.
 //
 // This works by enumerating all select cases, extracting range information
-// given their selector is at the appropriate value and propogating that down
+// given their selector is at the appropriate value and propagating that down
 // for each single case. This means the engine is only able to provide
 // information for a single case at a time.
 class ContextSensitiveRangeQueryEngine final : public QueryEngine {
@@ -52,21 +52,17 @@ class ContextSensitiveRangeQueryEngine final : public QueryEngine {
 
   absl::StatusOr<ReachedFixpoint> Populate(FunctionBase* f) override;
 
-  LeafTypeTree<IntervalSet> GetIntervals(Node* node) const override {
-    return base_case_ranges_.GetIntervals(node);
-  }
+  LeafTypeTree<IntervalSet> GetIntervals(Node* node) const override;
+  std::optional<SharedLeafTypeTree<TernaryVector>> GetTernary(
+      Node* node) const override;
 
   LeafTypeTree<IntervalSet> GetIntervalsGivenPredicates(
-      Node* node, const absl::flat_hash_set<PredicateState>& state) const {
+      Node* node, const absl::btree_set<PredicateState>& state) const {
     return SpecializeGivenPredicate(state)->GetIntervals(node);
   }
 
   bool IsTracked(Node* node) const override {
     return base_case_ranges_.IsTracked(node);
-  }
-
-  LeafTypeTree<TernaryVector> GetTernary(Node* node) const override {
-    return base_case_ranges_.GetTernary(node);
   }
 
   bool AtMostOneTrue(absl::Span<TreeBitLocation const> bits) const override {
@@ -102,18 +98,31 @@ class ContextSensitiveRangeQueryEngine final : public QueryEngine {
     return base_case_ranges_.ImpliedNodeValue(predicate_bit_values, node);
   }
 
+  // NB This is implemented by BDD engine. The meaning of predicate_bit_values
+  // here is literally just specific bits in various nodes each having a
+  // particular value. The naming collision with PredicateState (ie the select
+  // cases that are active) is unfortunate.
+  std::optional<TernaryVector> ImpliedNodeTernary(
+      absl::Span<const std::pair<TreeBitLocation, bool>> predicate_bit_values,
+      Node* node) const override {
+    return base_case_ranges_.ImpliedNodeTernary(predicate_bit_values, node);
+  }
+
   // Specialize the query engine for the given predicate. For now only a state
   // set with a single element is supported. This is CHECK'd internally to avoid
   // surprising non-deterministic behavior. In the future we might relax this
   // restriction.
   std::unique_ptr<QueryEngine> SpecializeGivenPredicate(
-      const absl::flat_hash_set<PredicateState>& state) const override;
+      const absl::btree_set<PredicateState>& state) const override;
+
+  Bits MaxUnsignedValue(Node* node) const override;
+  Bits MinUnsignedValue(Node* node) const override;
 
  private:
   RangeQueryEngine base_case_ranges_;
   std::vector<std::unique_ptr<const RangeQueryEngine>> arena_;
-  absl::flat_hash_map<PredicateState, const RangeQueryEngine*>
-      one_hot_ranges_;
+  absl::flat_hash_map<PredicateState, const RangeQueryEngine*> one_hot_ranges_;
+  absl::flat_hash_map<Node*, RangeData> select_ranges_;
 };
 
 }  // namespace xls

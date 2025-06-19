@@ -16,25 +16,30 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "xls/codegen/codegen_pass.h"
 #include "xls/common/status/matchers.h"
+#include "xls/ir/block.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/passes/pass_base.h"
 
 namespace m = xls::op_matchers;
 namespace xls::verilog {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using testing::AllOf;
+using ::absl_testing::IsOkAndHolds;
+using ::testing::AllOf;
 
 class MulpCombiningPassTest : public IrTestBase {
  protected:
   absl::StatusOr<bool> Run(Block* block) {
     PassResults results;
-    CodegenPassUnit unit(block->package(), block);
-    return MulpCombiningPass().Run(&unit, CodegenPassOptions(), &results);
+    CodegenContext context(block);
+    return MulpCombiningPass().Run(block->package(), CodegenPassOptions(),
+                                   &results, context);
   }
 };
 
@@ -93,6 +98,21 @@ TEST_F(MulpCombiningPassTest, MulpWithMultipleUsesOfMulp) {
   BValue umulp = bb.UMulp(a, b);
   bb.OutputPort("x", bb.Add(bb.TupleIndex(umulp, 0), bb.TupleIndex(umulp, 1)));
   bb.OutputPort("y", bb.Add(bb.TupleIndex(umulp, 0), bb.TupleIndex(umulp, 1)));
+  XLS_ASSERT_OK_AND_ASSIGN(Block * block, bb.Build());
+
+  EXPECT_THAT(Run(block), IsOkAndHolds(false));
+}
+
+TEST_F(MulpCombiningPassTest, MulpWithOutputUseOfMulp) {
+  auto p = CreatePackage();
+
+  BlockBuilder bb(TestName(), p.get());
+  XLS_ASSERT_OK(bb.block()->AddClockPort("clk"));
+  BValue a = bb.InputPort("a", p->GetBitsType(32));
+  BValue b = bb.InputPort("b", p->GetBitsType(32));
+  BValue umulp = bb.UMulp(a, b);
+  bb.OutputPort("x", bb.Add(bb.TupleIndex(umulp, 0), bb.TupleIndex(umulp, 1)));
+  bb.OutputPort("y", umulp);
   XLS_ASSERT_OK_AND_ASSIGN(Block * block, bb.Build());
 
   EXPECT_THAT(Run(block), IsOkAndHolds(false));

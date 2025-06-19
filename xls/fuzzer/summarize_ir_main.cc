@@ -18,18 +18,24 @@
 #include <vector>
 
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
+#include "google/protobuf/repeated_ptr_field.h"
 #include "google/protobuf/text_format.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/fuzzer/sample_summary.pb.h"
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/op.h"
 #include "xls/ir/package.h"
+#include "xls/ir/type.h"
 
-const char kUsage[] = R"(
+static constexpr std::string_view kUsage = R"(
 
 Appends a summary of a given IR file(s) to the specified Protobuf summary
 file. emitted. The summary information includes information such as op types,
@@ -117,7 +123,7 @@ absl::Status RealMain(std::string_view unoptimized_path,
     SummarizePackage(package.get(), summary_proto->mutable_optimized_nodes());
   }
 
-  XLS_QCHECK(!absl::GetFlag(FLAGS_summary_file).empty())
+  QCHECK(!absl::GetFlag(FLAGS_summary_file).empty())
       << "Must specify --summary_file.";
   // Since SampleSummariesProto contains just a repeated field, appending a new
   // such proto to a file that could potentially contain a SampleSummariesProto
@@ -139,7 +145,7 @@ int main(int argc, char** argv) {
       xls::InitXls(kUsage, argc, argv);
 
   if (!positional_arguments.empty()) {
-    XLS_LOG(QFATAL) << "Usage:\n" << kUsage;
+    LOG(QFATAL) << "Usage:\n" << kUsage;
   }
 
   return xls::ExitStatus(xls::RealMain(absl::GetFlag(FLAGS_unoptimized_ir),

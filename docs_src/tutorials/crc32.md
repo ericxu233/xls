@@ -17,7 +17,7 @@ number of times** within a function.
 A DSLX `for` loop has the following structure:
 
 1.  The loop signature: this consists of three elements:
-    1.  An (index, <accumulator vars>) tuple. The index holds the current
+    1.  An `(index, <accumulator vars>)` tuple. The index holds the current
         iteration number, and the accumulator vars are user-specified data
         carried into the current iteration.
     2.  The type specification for the index/accumulators tuple. Note that the
@@ -25,21 +25,25 @@ A DSLX `for` loop has the following structure:
         but it should be able to hold all possible loop index values).
     3.  An
         [iterable](../dslx_reference.md),
-        either the `range()` or `enumerate()` expressions, either of which
-        dictates the number of iterations of the loop to complete.
+        which can be a range expression `start..limit`, `enumerate()`, or an
+        array object. This dictates the number of iterations of the loop to
+        complete.
 2.  The loop body: this has the same general form as a DSLX function.
     Particularly noteworthy is that the loop body ends by stating the "return"
     value. In a `for` loop, this "return" value is either used as the input to
     the next iteration of the loop (for non-terminal iterations) or as the
     result of the entire expression (for the terminal iteration).
 
-For this specific for loop, the index variable and accumulator are `i` and
-`crc`, both of type `u32`. The iterable range expression specifies that the loop
+For this specific for loop, the index variable is unused, so we assign it to
+`_`. This indicates to the DSLX frontend that "the variable is unused but that's
+ok"; a trailing name after the underscore is also allowed to provide additional
+context. The accumulator consists of a single variable `crc`. Both index and
+accumulator are of type `u32`. The range expression specifies that the loop
 should execute 8 times.
 
 ```dslx-snippet
   // 8 rounds of updates.
-  for (i, crc): (u32, u32) in range(u32:8) {
+  for (_, crc): (u32, u32) in u32:0..u32:8 {
 ```
 
 At the end of the loop, the calculated value is being assigned to the

@@ -14,13 +14,18 @@
 
 #include "xls/common/file/temp_file.h"
 
-#include <iostream>
+#include <stdlib.h>  // NOLINT (needed for mkdtemp())
+#include <unistd.h>
+
+#include <filesystem>  // NOLINT
 #include <string>
 #include <system_error>
 #include <utility>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/match.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/status/matchers.h"
@@ -28,7 +33,7 @@
 namespace xls {
 namespace {
 
-using status_testing::StatusIs;
+using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
 using ::testing::IsEmpty;
 

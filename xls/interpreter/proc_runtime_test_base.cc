@@ -14,6 +14,7 @@
 
 #include "xls/interpreter/proc_runtime_test_base.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -21,21 +22,40 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "xls/common/status/matchers.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/interpreter/channel_queue.h"
+#include "xls/interpreter/evaluator_options.h"
+#include "xls/interpreter/observer.h"
+#include "xls/interpreter/proc_runtime.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/channel.h"
+#include "xls/ir/channel_ops.h"
+#include "xls/ir/events.h"
+#include "xls/ir/format_preference.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/ir_test_base.h"
 #include "xls/ir/package.h"
+#include "xls/ir/proc_elaboration.h"
+#include "xls/ir/value.h"
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
+using ::testing::_;
+using ::testing::ContainsRegex;
+using ::testing::ElementsAre;
 using ::testing::HasSubstr;
 using ::testing::Optional;
+using ::testing::Pair;
+using ::testing::UnorderedElementsAre;
 
 // Creates a proc which has a single send operation using the given channel
 // which sends a sequence of U32 values starting at 'starting_value' and
@@ -43,27 +63,43 @@ using ::testing::Optional;
 absl::StatusOr<Proc*> CreateIotaProc(std::string_view proc_name,
                                      int64_t starting_value, int64_t step,
                                      Channel* channel, Package* package) {
-  ProcBuilder pb(proc_name, /*token_name=*/"tok", package);
+  ProcBuilder pb(proc_name, package);
   BValue st = pb.StateElement("st", Value(UBits(starting_value, 32)));
-  BValue send_token = pb.Send(channel, pb.GetTokenParam(), st);
+  pb.Send(channel, pb.Literal(Value::Token()), st);
 
   BValue new_value = pb.Add(st, pb.Literal(UBits(step, 32)));
-  return pb.Build(send_token, {new_value});
+  return pb.Build({new_value});
 }
 
 // Creates a proc which keeps a running sum of all values read through the input
-// channel. The sum is sent via an output chanel each iteration.
+// channel. The sum is sent via an output channel each iteration.
 absl::StatusOr<Proc*> CreateAccumProc(std::string_view proc_name,
                                       Channel* in_channel, Channel* out_channel,
                                       Package* package) {
-  ProcBuilder pb(proc_name, /*token_name=*/"tok", package);
+  ProcBuilder pb(proc_name, package);
   BValue accum = pb.StateElement("accum", Value(UBits(0, 32)));
-  BValue token_input = pb.Receive(in_channel, pb.GetTokenParam());
+  BValue token_input = pb.Receive(in_channel, pb.Literal(Value::Token()));
   BValue recv_token = pb.TupleIndex(token_input, 0);
   BValue input = pb.TupleIndex(token_input, 1);
   BValue next_accum = pb.Add(accum, input);
-  BValue send_token = pb.Send(out_channel, recv_token, next_accum);
-  return pb.Build(send_token, {next_accum});
+  pb.Send(out_channel, recv_token, next_accum);
+  return pb.Build({next_accum});
+}
+
+absl::StatusOr<Proc*> CreateNewStyleAccumProc(std::string_view proc_name,
+                                              Package* package) {
+  TokenlessProcBuilder pb(NewStyleProc(), proc_name, "tkn", package);
+  BValue accum = pb.StateElement("accum", Value(UBits(0, 32)));
+  XLS_ASSIGN_OR_RETURN(
+      ReceiveChannelInterface * in_channel,
+      pb.AddInputChannel("accum_in", package->GetBitsType(32)));
+  BValue input = pb.Receive(in_channel);
+  BValue next_accum = pb.Add(accum, input);
+  XLS_ASSIGN_OR_RETURN(
+      SendChannelInterface * out_channel,
+      pb.AddOutputChannel("accum_out", package->GetBitsType(32)));
+  pb.Send(out_channel, next_accum);
+  return pb.Build({next_accum});
 }
 
 // Creates a proc which simply passes through a received value to a send.
@@ -71,12 +107,12 @@ absl::StatusOr<Proc*> CreatePassThroughProc(std::string_view proc_name,
                                             Channel* in_channel,
                                             Channel* out_channel,
                                             Package* package) {
-  ProcBuilder pb(proc_name, /*token_name=*/"tok", package);
-  BValue token_input = pb.Receive(in_channel, pb.GetTokenParam());
+  ProcBuilder pb(proc_name, package);
+  BValue token_input = pb.Receive(in_channel, pb.Literal(Value::Token()));
   BValue recv_token = pb.TupleIndex(token_input, 0);
   BValue input = pb.TupleIndex(token_input, 1);
-  BValue send_token = pb.Send(out_channel, recv_token, input);
-  return pb.Build(send_token, {});
+  pb.Send(out_channel, recv_token, input);
+  return pb.Build();
 }
 
 // Create a proc which reads tuples of (count: u32, char: u8) from in_channel,
@@ -88,12 +124,12 @@ absl::StatusOr<Proc*> CreateRunLengthDecoderProc(std::string_view proc_name,
                                                  Package* package) {
   // Proc state is a two-tuple containing: character to write and remaining
   // number of times to write the character.
-  ProcBuilder pb(proc_name, /*token_name=*/"tok", package);
+  ProcBuilder pb(proc_name, package);
+  BValue tok = pb.StateElement("tok", Value::Token());
   BValue last_char = pb.StateElement("last_char", Value(UBits(0, 8)));
   BValue num_remaining = pb.StateElement("num_remaining", Value(UBits(0, 32)));
   BValue receive_next = pb.Eq(num_remaining, pb.Literal(UBits(0, 32)));
-  BValue receive_if =
-      pb.ReceiveIf(in_channel, pb.GetTokenParam(), receive_next);
+  BValue receive_if = pb.ReceiveIf(in_channel, tok, receive_next);
   BValue receive_if_data = pb.TupleIndex(receive_if, 1);
   BValue run_length =
       pb.Select(receive_next,
@@ -108,14 +144,14 @@ absl::StatusOr<Proc*> CreateRunLengthDecoderProc(std::string_view proc_name,
                 /*cases=*/{pb.Literal(UBits(0, 32)),
                            pb.Subtract(run_length, pb.Literal(UBits(1, 32)))});
 
-  return pb.Build(send, {this_char, next_num_remaining});
+  return pb.Build({send, this_char, next_num_remaining});
 }
 
 TEST_P(ProcRuntimeTestBase, EmptyProc) {
   auto package = CreatePackage();
 
-  ProcBuilder pb(TestName(), /*token_name=*/"tok", package.get());
-  XLS_ASSERT_OK(pb.Build(pb.GetTokenParam(), {}));
+  ProcBuilder pb(TestName(), package.get());
+  XLS_ASSERT_OK(pb.Build());
 
   std::unique_ptr<ProcRuntime> runtime =
       GetParam().CreateRuntime(package.get());
@@ -125,11 +161,64 @@ TEST_P(ProcRuntimeTestBase, EmptyProc) {
 
   // Expecting no output should result in zero ticks because the output
   // condition is trivially satisfied.
-  EXPECT_THAT(runtime->TickUntilOutput({}), IsOkAndHolds(0));
+  EXPECT_THAT(
+      runtime->TickUntilOutput(absl::flat_hash_map<Channel*, int64_t>()),
+      IsOkAndHolds(0));
 
   // Ticking until blocked should immediately return because `TickUntilBlocked`
   // only considers procs with IO to determine if the system is blocked.
   XLS_ASSERT_OK(runtime->TickUntilBlocked(/*max_ticks=*/100));
+}
+
+TEST_P(ProcRuntimeTestBase, ObserverTest) {
+  if (!GetParam().supports_observers()) {
+    GTEST_SKIP() << "Observers not supported.";
+  }
+  auto p = CreatePackage();
+  ProcBuilder pb(TestName(), p.get());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * ch_in, p->CreateStreamingChannel("in", ChannelOps::kReceiveOnly,
+                                                 p->GetBitsType(32)));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * ch_out, p->CreateStreamingChannel("out", ChannelOps::kSendOnly,
+                                                  p->GetBitsType(32)));
+  BValue st = pb.StateElement("st", Value(UBits(0, 32)));
+  BValue tok_lit = pb.Literal(Value::Token());
+  BValue res_tup = pb.ReceiveNonBlocking(ch_in, tok_lit);
+  BValue send_tok = pb.Send(ch_out, tok_lit, st);
+  BValue res_tok = pb.TupleIndex(res_tup, 0);
+  BValue res_val = pb.TupleIndex(res_tup, 1);
+  BValue add = pb.Add(res_val, st);
+  BValue nxt = pb.Next(st, add);
+  XLS_ASSERT_OK(pb.Build().status());
+
+  CollectingEvaluationObserver observer;
+  std::unique_ptr<ProcRuntime> runtime = GetParam().CreateRuntime(
+      p.get(), EvaluatorOptions().set_support_observers(true));
+  XLS_ASSERT_OK(runtime->SetObserver(&observer));
+  XLS_ASSERT_OK(
+      runtime->queue_manager().GetQueue(ch_in).Write(Value(UBits(1, 32))));
+  XLS_ASSERT_OK(
+      runtime->queue_manager().GetQueue(ch_in).Write(Value(UBits(2, 32))));
+  for (int64_t i = 0; i < 4; ++i) {
+    XLS_ASSERT_OK(runtime->Tick());
+  }
+  EXPECT_THAT(
+      observer.values(),
+      UnorderedElementsAre(
+          Pair(res_tup.node(), _), Pair(res_tok.node(), _),
+          Pair(send_tok.node(), _), Pair(nxt.node(), _),
+          Pair(tok_lit.node(), ElementsAre(Value::Token(), Value::Token(),
+                                           Value::Token(), Value::Token())),
+          Pair(res_val.node(),
+               ElementsAre(Value(UBits(1, 32)), Value(UBits(2, 32)),
+                           Value(UBits(0, 32)), Value(UBits(0, 32)))),
+          Pair(add.node(),
+               ElementsAre(Value(UBits(1, 32)), Value(UBits(3, 32)),
+                           Value(UBits(3, 32)), Value(UBits(3, 32)))),
+          Pair(st.node(),
+               ElementsAre(Value(UBits(0, 32)), Value(UBits(1, 32)),
+                           Value(UBits(3, 32)), Value(UBits(3, 32))))));
 }
 
 TEST_P(ProcRuntimeTestBase, EmptyProcAndPassThroughProc) {
@@ -146,8 +235,8 @@ TEST_P(ProcRuntimeTestBase, EmptyProcAndPassThroughProc) {
                     .status());
 
   // Create the empty proc in same package.
-  ProcBuilder pb(TestName(), /*token_name=*/"tok", package.get());
-  XLS_ASSERT_OK(pb.Build(pb.GetTokenParam(), {}));
+  ProcBuilder pb(TestName(), package.get());
+  XLS_ASSERT_OK(pb.Build());
 
   std::unique_ptr<ProcRuntime> runtime =
       GetParam().CreateRuntime(package.get());
@@ -278,10 +367,10 @@ TEST_P(ProcRuntimeTestBase, IotaFeedingAccumulator) {
 }
 
 TEST_P(ProcRuntimeTestBase, DegenerateProc) {
-  // Tests interpreting a proc with no send of receive nodes.
+  // Tests interpreting a proc with no send or receive nodes.
   auto package = CreatePackage();
-  ProcBuilder pb(TestName(), /*token_name=*/"tok", package.get());
-  XLS_ASSERT_OK(pb.Build(pb.GetTokenParam(), {}));
+  ProcBuilder pb(TestName(), package.get());
+  XLS_ASSERT_OK(pb.Build({pb.StateElement("tok", Value::Token())}));
 
   std::unique_ptr<ProcRuntime> runtime =
       GetParam().CreateRuntime(package.get());
@@ -313,16 +402,15 @@ TEST_P(ProcRuntimeTestBase, WrappedProc) {
       package->CreateStreamingChannel("out", ChannelOps::kSendOnly,
                                       package->GetBitsType(32)));
 
-  ProcBuilder pb(TestName(), /*token_name=*/"tok", package.get());
-  BValue recv_input = pb.Receive(in_channel, pb.GetTokenParam());
+  ProcBuilder pb(TestName(), package.get());
+  BValue recv_input = pb.Receive(in_channel, pb.Literal(Value::Token()));
   BValue send_to_accum =
       pb.Send(in_accum_channel, /*token=*/pb.TupleIndex(recv_input, 0),
-              /*data_operands=*/{pb.TupleIndex(recv_input, 1)});
+              /*data=*/{pb.TupleIndex(recv_input, 1)});
   BValue recv_from_accum = pb.Receive(out_accum_channel, send_to_accum);
-  BValue send_output =
-      pb.Send(out_channel, /*token=*/pb.TupleIndex(recv_from_accum, 0),
-              /*data_operands=*/{pb.TupleIndex(recv_from_accum, 1)});
-  XLS_ASSERT_OK(pb.Build(send_output, {}));
+  pb.Send(out_channel, /*token=*/pb.TupleIndex(recv_from_accum, 0),
+          /*data=*/{pb.TupleIndex(recv_from_accum, 1)});
+  XLS_ASSERT_OK(pb.Build());
 
   XLS_ASSERT_OK(CreateAccumProc("accum", /*in_channel=*/in_accum_channel,
                                 /*out_channel=*/out_accum_channel,
@@ -367,12 +455,10 @@ TEST_P(ProcRuntimeTestBase, DeadlockedProc) {
   // can actually execute initially (e.g., the parameters). A subsequent call to
   // Tick() will detect the deadlock.
   XLS_ASSERT_OK(runtime->Tick());
-  EXPECT_THAT(
-      runtime->Tick(),
-      StatusIs(
-          absl::StatusCode::kInternal,
-          HasSubstr(
-              "Proc network is deadlocked. Blocked channels: my_channel")));
+  EXPECT_THAT(runtime->Tick(),
+              StatusIs(absl::StatusCode::kInternal,
+                       HasSubstr("Proc network is deadlocked. Blocked channel "
+                                 "instances: my_channel")));
 }
 
 TEST_P(ProcRuntimeTestBase, RunLengthDecoding) {
@@ -438,14 +524,14 @@ TEST_P(ProcRuntimeTestBase, RunLengthDecodingFilter) {
   XLS_ASSERT_OK(CreateRunLengthDecoderProc("decoder", input_channel,
                                            decoded_channel, package.get())
                     .status());
-  ProcBuilder pb("filter", /*token_name=*/"tok", package.get());
-  BValue receive = pb.Receive(decoded_channel, pb.GetTokenParam());
+  ProcBuilder pb("filter", package.get());
+  BValue receive = pb.Receive(decoded_channel, pb.Literal(Value::Token()));
   BValue rx_token = pb.TupleIndex(receive, 0);
   BValue rx_value = pb.TupleIndex(receive, 1);
   BValue rx_value_even =
       pb.Not(pb.BitSlice(rx_value, /*start=*/0, /*width=*/1));
-  BValue send_if = pb.SendIf(output_channel, rx_token, rx_value_even, rx_value);
-  XLS_ASSERT_OK(pb.Build(send_if, {}));
+  pb.SendIf(output_channel, rx_token, rx_value_even, rx_value);
+  XLS_ASSERT_OK(pb.Build());
 
   std::unique_ptr<ProcRuntime> runtime =
       GetParam().CreateRuntime(package.get());
@@ -476,7 +562,7 @@ TEST_P(ProcRuntimeTestBase, IotaWithChannelBackedge) {
   // using the explicit proc state. The state channel has an initial value, just
   // like a proc's state.
   auto package = CreatePackage();
-  ProcBuilder pb(TestName(), /*token_name=*/"tok", package.get());
+  ProcBuilder pb(TestName(), package.get());
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * state_channel,
       package->CreateStreamingChannel(
@@ -487,13 +573,13 @@ TEST_P(ProcRuntimeTestBase, IotaWithChannelBackedge) {
       package->CreateStreamingChannel("out", ChannelOps::kSendOnly,
                                       package->GetBitsType(32)));
 
-  BValue state_receive = pb.Receive(state_channel, pb.GetTokenParam());
+  BValue state_receive = pb.Receive(state_channel, pb.Literal(Value::Token()));
   BValue receive_token = pb.TupleIndex(state_receive, /*idx=*/0);
   BValue state = pb.TupleIndex(state_receive, /*idx=*/1);
   BValue next_state = pb.Add(state, pb.Literal(UBits(1, 32)));
-  BValue out_send = pb.Send(output_channel, pb.GetTokenParam(), state);
-  BValue state_send = pb.Send(state_channel, receive_token, next_state);
-  XLS_ASSERT_OK(pb.Build(pb.AfterAll({out_send, state_send}), {}).status());
+  pb.Send(output_channel, pb.Literal(Value::Token()), state);
+  pb.Send(state_channel, receive_token, next_state);
+  XLS_ASSERT_OK(pb.Build().status());
 
   std::unique_ptr<ProcRuntime> runtime =
       GetParam().CreateRuntime(package.get());
@@ -515,7 +601,7 @@ TEST_P(ProcRuntimeTestBase, IotaWithChannelBackedgeAndTwoInitialValues) {
   // using the explicit proc state. However, the state channel has multiple
   // initial values which results in interleaving of difference sequences of
   // iota values.
-  ProcBuilder pb(TestName(), /*token_name=*/"tok", package.get());
+  ProcBuilder pb(TestName(), package.get());
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * state_channel,
       package->CreateStreamingChannel(
@@ -529,13 +615,13 @@ TEST_P(ProcRuntimeTestBase, IotaWithChannelBackedgeAndTwoInitialValues) {
       package->CreateStreamingChannel("out", ChannelOps::kSendOnly,
                                       package->GetBitsType(32)));
 
-  BValue state_receive = pb.Receive(state_channel, pb.GetTokenParam());
+  BValue state_receive = pb.Receive(state_channel, pb.Literal(Value::Token()));
   BValue receive_token = pb.TupleIndex(state_receive, /*idx=*/0);
   BValue state = pb.TupleIndex(state_receive, /*idx=*/1);
   BValue next_state = pb.Add(state, pb.Literal(UBits(1, 32)));
-  BValue out_send = pb.Send(output_channel, pb.GetTokenParam(), state);
-  BValue state_send = pb.Send(state_channel, receive_token, next_state);
-  XLS_ASSERT_OK(pb.Build(pb.AfterAll({out_send, state_send}), {}).status());
+  pb.Send(output_channel, pb.Literal(Value::Token()), state);
+  pb.Send(state_channel, receive_token, next_state);
+  XLS_ASSERT_OK(pb.Build().status());
 
   std::unique_ptr<ProcRuntime> runtime =
       GetParam().CreateRuntime(package.get());
@@ -571,67 +657,67 @@ TEST_P(ProcRuntimeTestBase, XNetwork) {
   const std::string kIrText = R"(
 package p
 
-chan i_a(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=none, metadata="")
-chan i_b(bits[32], id=1, kind=streaming, ops=receive_only, flow_control=none, metadata="")
-chan a_c(bits[32], id=2, kind=streaming, ops=send_receive, flow_control=none, metadata="")
-chan b_c(bits[32], id=3, kind=streaming, ops=send_receive, flow_control=none, metadata="")
-chan c_d(bits[32], id=4, kind=streaming, ops=send_receive, flow_control=none, metadata="")
-chan c_e(bits[32], id=5, kind=streaming, ops=send_receive, flow_control=none, metadata="")
-chan d_o(bits[32], id=6, kind=streaming, ops=send_only, flow_control=none, metadata="")
-chan e_o(bits[32], id=7, kind=streaming, ops=send_only, flow_control=none, metadata="")
+chan i_a(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=none)
+chan i_b(bits[32], id=1, kind=streaming, ops=receive_only, flow_control=none)
+chan a_c(bits[32], id=2, kind=streaming, ops=send_receive, flow_control=none)
+chan b_c(bits[32], id=3, kind=streaming, ops=send_receive, flow_control=none)
+chan c_d(bits[32], id=4, kind=streaming, ops=send_receive, flow_control=none)
+chan c_e(bits[32], id=5, kind=streaming, ops=send_receive, flow_control=none)
+chan d_o(bits[32], id=6, kind=streaming, ops=send_only, flow_control=none)
+chan e_o(bits[32], id=7, kind=streaming, ops=send_only, flow_control=none)
 
-proc a(my_token: token, state: (), init={()}) {
+proc a(my_token: token, state: (), init={token, ()}) {
   literal.1: bits[32] = literal(value=1)
-  receive.2: (token, bits[32]) = receive(my_token, channel_id=0)
+  receive.2: (token, bits[32]) = receive(my_token, channel=i_a)
   tuple_index.3: token = tuple_index(receive.2, index=0)
   tuple_index.4: bits[32] = tuple_index(receive.2, index=1)
   umul.5: bits[32] = umul(literal.1, tuple_index.4)
-  send.6: token = send(tuple_index.3, umul.5, channel_id=2)
+  send.6: token = send(tuple_index.3, umul.5, channel=a_c)
   next (send.6, state)
 }
 
-proc b(my_token: token, state: (), init={()}) {
+proc b(my_token: token, state: (), init={token, ()}) {
   literal.101: bits[32] = literal(value=2)
-  receive.102: (token, bits[32]) = receive(my_token, channel_id=1)
+  receive.102: (token, bits[32]) = receive(my_token, channel=i_b)
   tuple_index.103: token = tuple_index(receive.102, index=0)
   tuple_index.104: bits[32] = tuple_index(receive.102, index=1)
   umul.105: bits[32] = umul(literal.101, tuple_index.104)
-  send.106: token = send(tuple_index.103, umul.105, channel_id=3)
+  send.106: token = send(tuple_index.103, umul.105, channel=b_c)
   next (send.106, state)
 }
 
-proc c(my_token: token, state: (), init={()}) {
+proc c(my_token: token, state: (), init={token, ()}) {
   literal.201: bits[32] = literal(value=3)
-  receive.202: (token, bits[32]) = receive(my_token, channel_id=2)
+  receive.202: (token, bits[32]) = receive(my_token, channel=a_c)
   tuple_index.203: token = tuple_index(receive.202, index=0)
   tuple_index.204: bits[32] = tuple_index(receive.202, index=1)
-  receive.205: (token, bits[32]) = receive(tuple_index.203, channel_id=3)
+  receive.205: (token, bits[32]) = receive(tuple_index.203, channel=b_c)
   tuple_index.206: token = tuple_index(receive.205, index=0)
   tuple_index.207: bits[32] = tuple_index(receive.205, index=1)
   umul.208: bits[32] = umul(literal.201, tuple_index.204)
   umul.209: bits[32] = umul(literal.201, tuple_index.207)
-  send.210: token = send(tuple_index.206, umul.208, channel_id=4)
-  send.211: token = send(send.210, umul.209, channel_id=5)
+  send.210: token = send(tuple_index.206, umul.208, channel=c_d)
+  send.211: token = send(send.210, umul.209, channel=c_e)
   next (send.211, state)
 }
 
-proc d(my_token: token, state: (), init={()}) {
+proc d(my_token: token, state: (), init={token, ()}) {
   literal.301: bits[32] = literal(value=4)
-  receive.302: (token, bits[32]) = receive(my_token, channel_id=4)
+  receive.302: (token, bits[32]) = receive(my_token, channel=c_d)
   tuple_index.303: token = tuple_index(receive.302, index=0)
   tuple_index.304: bits[32] = tuple_index(receive.302, index=1)
   umul.305: bits[32] = umul(literal.301, tuple_index.304)
-  send.306: token = send(tuple_index.303, umul.305, channel_id=6)
+  send.306: token = send(tuple_index.303, umul.305, channel=d_o)
   next (send.306, state)
 }
 
-proc e(my_token: token, state: (), init={()}) {
+proc e(my_token: token, state: (), init={token, ()}) {
   literal.401: bits[32] = literal(value=5)
-  receive.402: (token, bits[32]) = receive(my_token, channel_id=5)
+  receive.402: (token, bits[32]) = receive(my_token, channel=c_e)
   tuple_index.403: token = tuple_index(receive.402, index=0)
   tuple_index.404: bits[32] = tuple_index(receive.402, index=1)
   umul.405: bits[32] = umul(literal.401, tuple_index.404)
-  send.406: token = send(tuple_index.403, umul.405, channel_id=7)
+  send.406: token = send(tuple_index.403, umul.405, channel=e_o)
   next (send.406, state)
 }
 )";
@@ -666,7 +752,7 @@ TEST_P(ProcRuntimeTestBase, ChannelInitValues) {
   // using the explicit proc state. However, the state channel has multiple
   // initial values which results in interleaving of difference sequences of
   // iota values.
-  ProcBuilder pb("backedge_proc", /*token_name=*/"tok", package.get());
+  ProcBuilder pb("backedge_proc", package.get());
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * state_channel,
       package->CreateStreamingChannel(
@@ -680,13 +766,13 @@ TEST_P(ProcRuntimeTestBase, ChannelInitValues) {
       package->CreateStreamingChannel("out", ChannelOps::kSendOnly,
                                       package->GetBitsType(32)));
 
-  BValue state_receive = pb.Receive(state_channel, pb.GetTokenParam());
+  BValue state_receive = pb.Receive(state_channel, pb.Literal(Value::Token()));
   BValue receive_token = pb.TupleIndex(state_receive, /*idx=*/0);
   BValue state = pb.TupleIndex(state_receive, /*idx=*/1);
   BValue next_state = pb.Add(state, pb.Literal(UBits(1, 32)));
-  BValue out_send = pb.Send(output_channel, pb.GetTokenParam(), state);
-  BValue state_send = pb.Send(state_channel, receive_token, next_state);
-  XLS_ASSERT_OK(pb.Build(pb.AfterAll({out_send, state_send}), {}).status());
+  pb.Send(output_channel, pb.Literal(Value::Token()), state);
+  pb.Send(state_channel, receive_token, next_state);
+  XLS_ASSERT_OK(pb.Build().status());
 
   std::unique_ptr<ProcRuntime> runtime =
       GetParam().CreateRuntime(package.get());
@@ -716,12 +802,12 @@ TEST_P(ProcRuntimeTestBase, StateReset) {
       Channel * ch_out,
       package->CreateStreamingChannel("out", ChannelOps::kSendOnly, u32));
 
-  ProcBuilder pb("state_reset", /*token_name=*/"tkn", package.get());
+  ProcBuilder pb("state_reset", package.get());
   BValue st = pb.StateElement("st", Value(UBits(11, 32)));
-  BValue send_token = pb.Send(ch_out, pb.GetTokenParam(), st);
+  pb.Send(ch_out, pb.Literal(Value::Token()), st);
   BValue add_lit = pb.Literal(SBits(3, 32));
   BValue next_int = pb.Add(st, add_lit);
-  XLS_ASSERT_OK(pb.Build(send_token, {next_int}));
+  XLS_ASSERT_OK(pb.Build({next_int}));
 
   std::unique_ptr<ProcRuntime> runtime =
       GetParam().CreateRuntime(package.get());
@@ -755,11 +841,12 @@ TEST_P(ProcRuntimeTestBase, NonBlockingReceivesProc) {
                                                "out0", ChannelOps::kSendOnly,
                                                package->GetBitsType(32)));
 
-  ProcBuilder pb("nb_recv", /*token_name=*/"tok", package.get());
+  ProcBuilder pb("nb_recv", package.get());
+  BValue tok = pb.StateElement("tok", Value::Token());
 
-  BValue in0_data_and_valid = pb.ReceiveNonBlocking(in0, pb.GetTokenParam());
-  BValue in1_data_and_valid = pb.ReceiveNonBlocking(in1, pb.GetTokenParam());
-  BValue in2_data_and_valid = pb.ReceiveNonBlocking(in2, pb.GetTokenParam());
+  BValue in0_data_and_valid = pb.ReceiveNonBlocking(in0, tok);
+  BValue in1_data_and_valid = pb.ReceiveNonBlocking(in1, tok);
+  BValue in2_data_and_valid = pb.ReceiveNonBlocking(in2, tok);
 
   BValue sum = pb.Literal(UBits(0, 32));
 
@@ -784,7 +871,7 @@ TEST_P(ProcRuntimeTestBase, NonBlockingReceivesProc) {
   BValue after_in_tok = pb.AfterAll({in0_tok, in1_tok, in2_tok});
   BValue tok_fin = pb.Send(out0, after_in_tok, sum2);
 
-  XLS_ASSERT_OK(pb.Build(tok_fin, {}));
+  XLS_ASSERT_OK(pb.Build({tok_fin}));
 
   std::unique_ptr<ProcRuntime> runtime =
       GetParam().CreateRuntime(package.get());
@@ -840,7 +927,7 @@ TEST_P(ProcRuntimeTestBase, NonBlockingReceivesProc) {
 
   EXPECT_THAT(output_queue.Read(), Optional(Value(SBits(43, 32))));
 
-  // Try large numnbers in the channels.
+  // Try large numbers in the channels.
   XLS_ASSERT_OK(in0_queue.Write(Value(UBits(0xffffffff, 32))));
   XLS_ASSERT_OK(in0_queue.Write(Value(UBits(0x0faabbcc, 32))));
   XLS_ASSERT_OK(in0_queue.Write(Value(UBits(0xfffffff2, 32))));
@@ -862,6 +949,222 @@ TEST_P(ProcRuntimeTestBase, NonBlockingReceivesProc) {
   EXPECT_THAT(output_queue.Read(), Optional(Value(UBits(0xffaabbcc, 32))));
   EXPECT_THAT(output_queue.Read(), Optional(Value(UBits(0, 32))));
   EXPECT_THAT(output_queue.Read(), Optional(Value(UBits(1, 32))));
+}
+
+TEST_P(ProcRuntimeTestBase, NewStyleAccumulator) {
+  auto package = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc,
+                           CreateNewStyleAccumProc("my_proc", package.get()));
+  std::unique_ptr<ProcRuntime> runtime = GetParam().CreateRuntime(proc);
+  ProcInstance* top_instance = runtime->elaboration().top();
+  XLS_ASSERT_OK_AND_ASSIGN(ChannelInstance * in_channel,
+                           top_instance->GetChannelInstance("accum_in"));
+  XLS_ASSERT_OK_AND_ASSIGN(ChannelInstance * out_channel,
+                           top_instance->GetChannelInstance("accum_out"));
+  ChannelQueue& in_queue = runtime->queue_manager().GetQueue(in_channel);
+  ChannelQueue& out_queue = runtime->queue_manager().GetQueue(out_channel);
+
+  XLS_ASSERT_OK(in_queue.Write(Value(UBits(0, 32))));
+  XLS_ASSERT_OK(in_queue.Write(Value(UBits(1, 32))));
+  XLS_ASSERT_OK(in_queue.Write(Value(UBits(2, 32))));
+  XLS_ASSERT_OK(in_queue.Write(Value(UBits(3, 32))));
+
+  XLS_ASSERT_OK_AND_ASSIGN(int64_t tick_count,
+                           runtime->TickUntilOutput({{out_channel, 4}}));
+
+  EXPECT_EQ(tick_count, 4);
+  EXPECT_EQ(out_queue.GetSize(), 4);
+  EXPECT_THAT(out_queue.Read(), Optional(Value(UBits(0, 32))));
+  EXPECT_THAT(out_queue.Read(), Optional(Value(UBits(1, 32))));
+  EXPECT_THAT(out_queue.Read(), Optional(Value(UBits(3, 32))));
+  EXPECT_THAT(out_queue.Read(), Optional(Value(UBits(6, 32))));
+}
+
+TEST_P(ProcRuntimeTestBase, MultipleNewStyleProcs) {
+  // Construct a proc which instantiates two accumulator procs tied in series.
+  auto package = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * leaf_proc,
+                           CreateNewStyleAccumProc("leaf_proc", package.get()));
+
+  TokenlessProcBuilder pb(NewStyleProc(), "top_proc", "tkn", package.get());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      ReceiveChannelInterface * in_channel,
+      pb.AddInputChannel("in_ch", package->GetBitsType(32)));
+  XLS_ASSERT_OK_AND_ASSIGN(ChannelWithInterfaces middle_channel,
+                           pb.AddChannel("mid_ch", package->GetBitsType(32)));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      SendChannelInterface * out_channel,
+      pb.AddOutputChannel("out_ch", package->GetBitsType(32)));
+
+  XLS_ASSERT_OK(
+      pb.InstantiateProc("inst0", leaf_proc,
+                         std::vector<ChannelInterface*>{
+                             in_channel, middle_channel.send_interface}));
+  XLS_ASSERT_OK(
+      pb.InstantiateProc("inst1", leaf_proc,
+                         std::vector<ChannelInterface*>{
+                             middle_channel.receive_interface, out_channel}));
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * top_proc, pb.Build({}));
+
+  std::unique_ptr<ProcRuntime> runtime = GetParam().CreateRuntime(top_proc);
+  ProcInstance* top_instance = runtime->elaboration().top();
+  XLS_ASSERT_OK_AND_ASSIGN(ChannelInstance * in_channel_instance,
+                           top_instance->GetChannelInstance("in_ch"));
+  XLS_ASSERT_OK_AND_ASSIGN(ChannelInstance * out_channel_instance,
+                           top_instance->GetChannelInstance("out_ch"));
+  ChannelQueue& in_queue =
+      runtime->queue_manager().GetQueue(in_channel_instance);
+  ChannelQueue& out_queue =
+      runtime->queue_manager().GetQueue(out_channel_instance);
+
+  XLS_ASSERT_OK(in_queue.Write(Value(UBits(0, 32))));
+  XLS_ASSERT_OK(in_queue.Write(Value(UBits(1, 32))));
+  XLS_ASSERT_OK(in_queue.Write(Value(UBits(2, 32))));
+  XLS_ASSERT_OK(in_queue.Write(Value(UBits(3, 32))));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      int64_t tick_count,
+      runtime->TickUntilOutput({{out_channel_instance, 4}}));
+
+  // Result is accum(accum({0, 1, 2, 3})) = accum({0, 1, 3, 6}) = {0, 1, 4, 10}
+  EXPECT_EQ(tick_count, 4);
+  EXPECT_EQ(out_queue.GetSize(), 4);
+  EXPECT_THAT(out_queue.Read(), Optional(Value(UBits(0, 32))));
+  EXPECT_THAT(out_queue.Read(), Optional(Value(UBits(1, 32))));
+  EXPECT_THAT(out_queue.Read(), Optional(Value(UBits(4, 32))));
+  EXPECT_THAT(out_queue.Read(), Optional(Value(UBits(10, 32))));
+}
+
+TEST_P(ProcRuntimeTestBase, ProcSetState) {
+  auto package = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * channel,
+      package->CreateStreamingChannel("iota_out", ChannelOps::kSendOnly,
+                                      package->GetBitsType(32)));
+
+  // Create an output-only proc which counts up by 7 starting at 42.
+  ProcBuilder pb("iota", package.get());
+  BValue counter = pb.StateElement("cnt", Value(UBits(42, 32)));
+  pb.Send(channel, pb.Literal(Value::Token()), counter);
+  BValue new_value = pb.Add(counter, pb.Literal(UBits(7, 32)));
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build({new_value}));
+
+  std::unique_ptr<ProcRuntime> runtime =
+      GetParam().CreateRuntime(package.get());
+
+  ChannelQueue& ch0_queue = runtime->queue_manager().GetQueue(channel);
+  ASSERT_TRUE(ch0_queue.IsEmpty());
+
+  // Before running, the state should be the initial value.
+  EXPECT_THAT(runtime->ResolveState(proc), ElementsAre(Value(UBits(42, 32))));
+
+  // Override state and tick twice.
+  XLS_ASSERT_OK(
+      runtime->SetState(proc, std::vector<Value>{Value(UBits(20, 32))}));
+  EXPECT_THAT(runtime->ResolveState(proc), ElementsAre(Value(UBits(20, 32))));
+
+  XLS_ASSERT_OK(runtime->Tick());
+  EXPECT_THAT(runtime->ResolveState(proc), ElementsAre(Value(UBits(27, 32))));
+  XLS_ASSERT_OK(runtime->Tick());
+  EXPECT_THAT(runtime->ResolveState(proc), ElementsAre(Value(UBits(34, 32))));
+
+  // Set state and run again
+  XLS_ASSERT_OK(
+      runtime->SetState(proc, std::vector<Value>{Value(UBits(100, 32))}));
+  XLS_ASSERT_OK(runtime->Tick());
+  EXPECT_THAT(runtime->ResolveState(proc), ElementsAre(Value(UBits(107, 32))));
+
+  // Check that each tick sent the right value on the output port.
+  ASSERT_EQ(ch0_queue.GetSize(), 3);
+
+  EXPECT_THAT(ch0_queue.Read(), Optional(Value(UBits(20, 32))));
+  EXPECT_THAT(ch0_queue.Read(), Optional(Value(UBits(27, 32))));
+  EXPECT_THAT(ch0_queue.Read(), Optional(Value(UBits(100, 32))));
+
+  EXPECT_TRUE(ch0_queue.IsEmpty());
+}
+
+TEST_P(ProcRuntimeTestBase, TraceChannels) {
+  auto package = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * in_channel,
+      package->CreateStreamingChannel("in", ChannelOps::kReceiveOnly,
+                                      package->GetBitsType(32)));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * out_channel,
+      package->CreateStreamingChannel("out", ChannelOps::kSendOnly,
+                                      package->GetBitsType(32)));
+
+  TokenlessProcBuilder pb("incrementer", "tkn", package.get());
+  pb.Send(out_channel,
+          pb.Add(pb.Literal(UBits(1, 32)), pb.Receive(in_channel)));
+  XLS_ASSERT_OK(pb.Build({}).status());
+
+  {
+    // Test with channel tracing on with decimal formatting.
+    std::unique_ptr<ProcRuntime> runtime = GetParam().CreateRuntime(
+        package.get(),
+        EvaluatorOptions().set_trace_channels(true).set_format_preference(
+            FormatPreference::kUnsignedDecimal));
+    ChannelQueue& in_queue = runtime->queue_manager().GetQueue(in_channel);
+    XLS_ASSERT_OK(in_queue.Write({Value(UBits(42, 32))}));
+    XLS_ASSERT_OK(in_queue.Write({Value(UBits(123, 32))}));
+    XLS_ASSERT_OK(runtime->TickUntilBlocked(/*max_ticks=*/100));
+
+    InterpreterEvents events = runtime->GetGlobalEvents();
+    std::vector<std::string> event_messages;
+    event_messages.reserve(events.trace_msgs.size());
+    for (const TraceMessage& message : events.trace_msgs) {
+      event_messages.push_back(message.message);
+    }
+    EXPECT_THAT(
+        event_messages,
+        ElementsAre(ContainsRegex("Sent data on channel `in`.*:42"),
+                    ContainsRegex("Sent data on channel `in`.*:123"),
+                    ContainsRegex("Received data on channel `in`.*:42"),
+                    ContainsRegex("Sent data on channel `out`.*:43"),
+                    ContainsRegex("Received data on channel `in`.*:123"),
+                    ContainsRegex("Sent data on channel `out`.*:124")));
+  }
+
+  {
+    // Test with channel tracing on with hexadecimal formatting.
+    std::unique_ptr<ProcRuntime> runtime = GetParam().CreateRuntime(
+        package.get(),
+        EvaluatorOptions().set_trace_channels(true).set_format_preference(
+            FormatPreference::kHex));
+    ChannelQueue& in_queue = runtime->queue_manager().GetQueue(in_channel);
+    XLS_ASSERT_OK(in_queue.Write({Value(UBits(42, 32))}));
+    XLS_ASSERT_OK(in_queue.Write({Value(UBits(123, 32))}));
+    XLS_ASSERT_OK(runtime->TickUntilBlocked(/*max_ticks=*/100));
+
+    InterpreterEvents events = runtime->GetGlobalEvents();
+    std::vector<std::string> event_messages;
+    event_messages.reserve(events.trace_msgs.size());
+    for (const TraceMessage& message : events.trace_msgs) {
+      event_messages.push_back(message.message);
+    }
+    EXPECT_THAT(
+        event_messages,
+        ElementsAre(ContainsRegex("Sent data on channel `in`.*:0x2a"),
+                    ContainsRegex("Sent data on channel `in`.*:0x7b"),
+                    ContainsRegex("Received data on channel `in`.*:0x2a"),
+                    ContainsRegex("Sent data on channel `out`.*:0x2b"),
+                    ContainsRegex("Received data on channel `in`.*:0x7b"),
+                    ContainsRegex("Sent data on channel `out`.*:0x7c")));
+  }
+
+  {
+    // Test with channel tracing off.
+    std::unique_ptr<ProcRuntime> runtime = GetParam().CreateRuntime(
+        package.get(), EvaluatorOptions().set_trace_channels(false));
+    ChannelQueue& in_queue = runtime->queue_manager().GetQueue(in_channel);
+    XLS_ASSERT_OK(in_queue.Write({Value(UBits(42, 32))}));
+    XLS_ASSERT_OK(in_queue.Write({Value(UBits(123, 32))}));
+    XLS_ASSERT_OK(in_queue.Write({Value(UBits(100, 32))}));
+    XLS_ASSERT_OK(runtime->TickUntilBlocked(/*max_ticks=*/100));
+    EXPECT_TRUE(runtime->GetGlobalEvents().trace_msgs.empty());
+  }
 }
 
 }  // namespace

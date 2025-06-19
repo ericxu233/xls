@@ -26,6 +26,7 @@ exports_files(["LICENSE"])
 xls_dslx_test(
     name = "hsv2rgb_dslx_test",
     srcs = ["hsv2rgb.x"],
+    dslx_test_args = {"compare": "jit"},
 )
 
 cc_test(
@@ -38,8 +39,6 @@ cc_test(
     tags = ["optonly"],
     deps = [
         ":fast_hsv2rgb",
-        "//xls/codegen:combinational_generator",
-        "//xls/common:xls_gunit",
         "//xls/common:xls_gunit_main",
         "//xls/common/file:filesystem",
         "//xls/common/file:get_runfile_path",
@@ -47,10 +46,12 @@ cc_test(
         "//xls/dslx:create_import_data",
         "//xls/dslx:import_data",
         "//xls/dslx:parse_and_typecheck",
+        "//xls/dslx/ir_convert:convert_options",
         "//xls/dslx/ir_convert:ir_converter",
-        "//xls/ir",
-        "//xls/ir:ir_parser",
-        "//xls/ir:ir_test_base",
+        "//xls/ir:bits",
+        "//xls/ir:value",
+        "//xls/simulation:sim_test_base",
+        "@googletest//:gtest",
     ],
 )
 

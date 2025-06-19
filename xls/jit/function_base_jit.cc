@@ -14,31 +14,80 @@
 #include "xls/jit/function_base_jit.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
+#include "absl/base/casts.h"
+#include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 #include "llvm/include/llvm/IR/Constants.h"
 #include "llvm/include/llvm/IR/DerivedTypes.h"
 #include "llvm/include/llvm/IR/Function.h"
 #include "llvm/include/llvm/IR/IRBuilder.h"
+#include "llvm/include/llvm/IR/Instructions.h"
+#include "llvm/include/llvm/IR/LLVMContext.h"
 #include "llvm/include/llvm/IR/Type.h"
 #include "llvm/include/llvm/IR/Value.h"
-#include "xls/common/logging/logging.h"
+#include "llvm/include/llvm/Support/Alignment.h"
+#include "llvm/include/llvm/Support/Casting.h"
+#include "xls/common/math_util.h"
+#include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/ir/block.h"
 #include "xls/ir/call_graph.h"
+#include "xls/ir/events.h"
 #include "xls/ir/function_base.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/op.h"
+#include "xls/ir/register.h"
+#include "xls/ir/state_element.h"
+#include "xls/ir/topo_sort.h"
+#include "xls/ir/type.h"
+#include "xls/jit/aot_entrypoint.pb.h"
 #include "xls/jit/ir_builder_visitor.h"
+#include "xls/jit/jit_buffer.h"
+#include "xls/jit/jit_callbacks.h"
+#include "xls/jit/jit_runtime.h"
+#include "xls/jit/llvm_compiler.h"
 #include "xls/jit/llvm_type_converter.h"
+#include "xls/jit/orc_jit.h"
+#include "xls/jit/type_buffer_metadata.h"
 
 namespace xls {
 namespace {
+
+// A fake function entrypoint we can use if we didn't actually load the compiled
+// code.
+int64_t InvalidJitFunctionUse(const uint8_t* const* inputs,
+                              uint8_t* const* outputs, void* temp_buffer,
+                              InterpreterEvents* events,
+                              InstanceContext* instance_context,
+                              JitRuntime* jit_runtime,
+                              int64_t continuation_point) {
+  static_assert(
+      std::is_same_v<decltype(&InvalidJitFunctionUse), JitFunctionType>);
+  LOG(FATAL)
+      << "Attempt to call invalid function pointer in JitObjectCode structure!";
+}
 
 // Loads a pointer from the `index`-th slot in the array pointed to by
 // `pointer_array`.
@@ -46,43 +95,14 @@ llvm::Value* LoadPointerFromPointerArray(int64_t index,
                                          llvm::Value* pointer_array,
                                          llvm::IRBuilder<>* builder) {
   llvm::LLVMContext& context = builder->getContext();
-  llvm::Type* pointer_array_type =
-      llvm::ArrayType::get(llvm::Type::getInt8PtrTy(context), 0);
+  llvm::Type* pointer_type = llvm::PointerType::getUnqual(context);
   llvm::Value* gep = builder->CreateGEP(
-      pointer_array_type, pointer_array,
+      pointer_type, pointer_array,
       {
-          llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0),
           llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), index),
       });
 
   return builder->CreateLoad(llvm::PointerType::get(context, 0), gep);
-}
-
-// Marks the given buffer of the given size (in bytes) as "unpoisoned" for MSAN
-// - in other words, prevent false positives from being thrown when running
-// under MSAN (since it can't yet follow values into LLVM space (it might be
-// able to _technically_, but we've not enabled it).
-void UnpoisonBuffer(llvm::Value* buffer, int64_t size,
-                    llvm::IRBuilder<>* builder) {
-#ifdef ABSL_HAVE_MEMORY_SANITIZER
-  llvm::LLVMContext& context = builder->getContext();
-  llvm::ConstantInt* fn_addr =
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                             absl::bit_cast<uint64_t>(&__msan_unpoison));
-  llvm::Type* void_type = llvm::Type::getVoidTy(context);
-  llvm::Type* ptr_type = llvm::PointerType::get(builder->getContext(), 0);
-  llvm::Type* size_t_type =
-      llvm::Type::getIntNTy(context, sizeof(size_t) * CHAR_BIT);
-  llvm::FunctionType* fn_type =
-      llvm::FunctionType::get(void_type, {ptr_type, size_t_type}, false);
-  llvm::Value* fn_ptr =
-      builder->CreateIntToPtr(fn_addr, llvm::PointerType::get(fn_type, 0));
-
-  std::vector<llvm::Value*> args = {buffer,
-                                    llvm::ConstantInt::get(size_t_type, size)};
-
-  builder->CreateCall(fn_type, fn_ptr, args);
-#endif
 }
 
 // Abstraction around an LLVM function of type `JitFunctionType`. Signature of
@@ -90,7 +110,7 @@ void UnpoisonBuffer(llvm::Value* buffer, int64_t size,
 //
 //  ReturnT f(const uint8_t* const* inputs,
 //            uint8_t* const* outputs, void* temp_buffer,
-//            InterpreterEvents* events, void* user_data,
+//            InterpreterEvents* events, InstanceContext* instance_context,
 //            JitRuntime* jit_runtime)
 //
 // This type of function is used for the jitted functions implementing XLS
@@ -100,7 +120,7 @@ void UnpoisonBuffer(llvm::Value* buffer, int64_t size,
 // `input_args` are the Nodes whose values are passed in the `inputs` function
 // argument. `output_args` are Nodes whose values are written out to buffers
 // indicated by the `outputs` function argument.
-class LlvmFunctionWrapper {
+class LlvmFunctionWrapper final : public JitCompilationMetadata {
  public:
   struct FunctionArg {
     std::string name;
@@ -123,7 +143,7 @@ class LlvmFunctionWrapper {
     llvm::FunctionType* function_type =
         llvm::FunctionType::get(return_type, param_types,
                                 /*isVarArg=*/false);
-    XLS_CHECK_EQ(jit_context.module()->getFunction(name), nullptr)
+    CHECK_EQ(jit_context.module()->getFunction(name), nullptr)
         << absl::StreamFormat(
                "Function named `%s` already exists in LLVM module", name);
     llvm::Function* fn = llvm::cast<llvm::Function>(
@@ -134,7 +154,7 @@ class LlvmFunctionWrapper {
     fn->getArg(1)->setName("output_ptrs");
     fn->getArg(2)->setName("tmp_buffer");
     fn->getArg(3)->setName("events");
-    fn->getArg(4)->setName("user_data");
+    fn->getArg(4)->setName("instance_context");
     fn->getArg(5)->setName("runtime");
     if (extra_arg.has_value()) {
       fn->getArg(6)->setName(extra_arg->name);
@@ -156,7 +176,9 @@ class LlvmFunctionWrapper {
 
   // Returns whether `node` is one of the nodes whose value is passed in via the
   // `inputs` function argument.
-  bool IsInputNode(Node* node) const { return input_indices_.contains(node); }
+  bool IsInputNode(Node* node) const final {
+    return input_indices_.contains(node);
+  }
 
   // Returns the index within the array passed into the `input` function
   // argument corresponding to `node`. CHECK fails if `node` is not an input
@@ -170,9 +192,21 @@ class LlvmFunctionWrapper {
                                        &builder);
   }
 
+  absl::StatusOr<llvm::Value*> GetInputBufferFrom(
+      Node* node, llvm::Value* base_ptr,
+      llvm::IRBuilder<>& builder) const final {
+    XLS_RET_CHECK(IsInputNode(node));
+    return LoadPointerFromPointerArray(GetInputArgIndex(node), base_ptr,
+                                       &builder);
+  }
+
   // Returns whether `node` is one of the nodes whose value should be written to
   // one of the output buffers passed in via the `inputs` function argument.
   bool IsOutputNode(Node* node) const { return output_indices_.contains(node); }
+  bool IsOutputPortOrRegister(Node* node) const {
+    return IsOutputNode(node) &&
+           (node->Is<OutputPort>() || node->Is<RegisterWrite>());
+  }
 
   // Returns the index(es) within the array passed into the `output` function
   // argument corresponding to `node`. `node` must be an output node.
@@ -205,7 +239,7 @@ class LlvmFunctionWrapper {
   llvm::Value* GetOutputsArg() const { return fn_->getArg(1); }
   llvm::Value* GetTempBufferArg() const { return fn_->getArg(2); }
   llvm::Value* GetInterpreterEventsArg() const { return fn_->getArg(3); }
-  llvm::Value* GetUserDataArg() const { return fn_->getArg(4); }
+  llvm::Value* GetInstanceContextArg() const { return fn_->getArg(4); }
   llvm::Value* GetJitRuntimeArg() const { return fn_->getArg(5); }
   std::optional<llvm::Value*> GetExtraArg() const {
     if (fn_->arg_size() == 7) {
@@ -232,7 +266,7 @@ class LlvmFunctionWrapper {
       : input_args_(input_args.begin(), input_args.end()),
         output_args_(output_args.begin(), output_args.end()) {
     for (int64_t i = 0; i < input_args.size(); ++i) {
-      XLS_CHECK(!input_indices_.contains(input_args[i]));
+      CHECK(!input_indices_.contains(input_args[i]));
       input_indices_[input_args[i]] = i;
     }
     for (int64_t i = 0; i < output_args.size(); ++i) {
@@ -251,7 +285,7 @@ class LlvmFunctionWrapper {
 };
 
 // The kinds of allocations assigned to xls::Nodes by BufferAllocator.
-enum class AllocationKind {
+enum class AllocationKind : uint8_t {
   // The node should be allocated a buffer in the temp block. The temp block is
   // passed in to the top-level JITted functions so temp buffers persist across
   // partitions and continuation points.
@@ -275,7 +309,7 @@ class BufferAllocator {
       : type_converter_(type_converter) {}
 
   void SetAllocationKind(Node* node, AllocationKind kind) {
-    XLS_CHECK(!allocation_kinds_.contains(node));
+    CHECK(!allocation_kinds_.contains(node));
     allocation_kinds_[node] = kind;
     if (kind == AllocationKind::kTempBlock) {
       AllocateTempBuffer(node);
@@ -289,22 +323,28 @@ class BufferAllocator {
   // Returns the offset within the temp block for the buffer allocated for
   // `node`. Node must be assigned allocation kind kTempblock.
   int64_t GetOffset(Node* node) const {
-    XLS_CHECK(allocation_kinds_.at(node) == AllocationKind::kTempBlock);
+    CHECK(allocation_kinds_.at(node) == AllocationKind::kTempBlock);
     return temp_block_offsets_.at(node);
   }
 
   // Returns the total size of the allocated memory.
   int64_t size() const { return current_offset_; }
+  int64_t alignment() const { return alignment_; }
 
  private:
   void AllocateTempBuffer(Node* node) {
-    XLS_CHECK(!temp_block_offsets_.contains(node));
-    int64_t offset = current_offset_;
+    CHECK(!node->Is<RegisterWrite>());
+    CHECK(!node->Is<OutputPort>());
+    CHECK(!temp_block_offsets_.contains(node));
+    int64_t offset =
+        type_converter_->AlignFor(node->GetType(), current_offset_);
     int64_t node_size = type_converter_->GetTypeByteSize(node->GetType());
     temp_block_offsets_[node] = offset;
-    current_offset_ =
-        type_converter_->AlignFor(node->GetType(), current_offset_ + node_size);
-    XLS_VLOG(3) << absl::StreamFormat(
+    alignment_ =
+        std::max(alignment_,
+                 type_converter_->GetTypePreferredAlignment(node->GetType()));
+    current_offset_ = offset + node_size;
+    VLOG(3) << absl::StreamFormat(
         "Allocated %s at offset %d (size = %d): total size %d", node->GetName(),
         offset, node_size, current_offset_);
   }
@@ -312,6 +352,7 @@ class BufferAllocator {
   const LlvmTypeConverter* type_converter_;
   absl::flat_hash_map<Node*, int64_t> temp_block_offsets_;
   int64_t current_offset_ = 0;
+  int64_t alignment_ = 1;
   absl::flat_hash_map<Node*, AllocationKind> allocation_kinds_;
 };
 
@@ -356,7 +397,7 @@ bool IsEarlyExitPoint(Node* node) {
 // continue after `node` when execution resumes. If false, then execution
 // continues before `node`.
 bool ExecutionContinuesAfterNode(Node* node) {
-  XLS_CHECK(IsEarlyExitPoint(node));
+  CHECK(IsEarlyExitPoint(node));
   return node->Is<Send>();
 }
 
@@ -370,7 +411,7 @@ std::vector<Partition> PartitionFunctionBase(FunctionBase* f) {
   absl::flat_hash_set<int64_t> resume_partitions;
   // Partitions at which execution may exit early. Value is whether execution
   // resumes after or at the point where execution broke.
-  enum Resume { kNextPartition, kThisPartition };
+  enum class Resume : uint8_t { kNextPartition, kThisPartition };
   absl::flat_hash_map<int64_t, Resume> early_exit_partitions;
 
   // Naively assign nodes to partitions based on a topological sort. First N
@@ -379,7 +420,7 @@ std::vector<Partition> PartitionFunctionBase(FunctionBase* f) {
   int64_t partition_size = 0;
   for (Node* node : TopoSort(f)) {
     if (IsEarlyExitPoint(node)) {
-      XLS_CHECK(f->IsProc())
+      CHECK(f->IsProc())
           << "Early exit points are only supported in procs in the JIT";
       // Nodes which are early exits are placed in their own partition.
       if (partition_size != 0) {
@@ -459,6 +500,18 @@ std::vector<Partition> PartitionFunctionBase(FunctionBase* f) {
   return partitions;
 }
 
+// Get the type this node reserves as input.
+Type* InputType(const Node* node) { return node->GetType(); }
+
+// Get the type this node outputs into the functions return value.
+Type* OutputType(const Node* node) {
+  if (node->Is<RegisterWrite>() || node->Is<OutputPort>()) {
+    // Operand 0 is the data we write to the register/port
+    return node->operand(0)->GetType();
+  }
+  return node->GetType();
+}
+
 // Builds an LLVM function of the given `name` which executes the given set of
 // nodes. The signature of the partition function is the same as the jitted
 // function implementing a FunctionBase (i.e., `JitFunctionType`). A partition
@@ -473,7 +526,7 @@ std::vector<Partition> PartitionFunctionBase(FunctionBase* f) {
 //                   uint8_t* const* outputs,
 //                   void* temp_buffer,
 //                   InterpreterEvents* events,
-//                   void* user_data,
+//                   InstanceContext* instance_context,
 //                   JitRuntime* jit_runtime) {
 //     ...
 //     x_operand_0 = /* load pointer from `inputs` */
@@ -516,9 +569,8 @@ absl::StatusOr<llvm::Function*> BuildPartitionFunction(
   absl::flat_hash_map<Node*, llvm::Value*> value_buffers;
   for (Node* node : partition.nodes) {
     if (wrapper.IsInputNode(node)) {
-      // Node is an input node. There is no need to generate a node function for
-      // this node (its value is an input and already computed). Simply copy the
-      // value to output buffers associated with `node` (if any).
+      // Node is an input node. We need to generate a node function for  this
+      // node to call callbacks on the node.
       XLS_RET_CHECK(allocator.GetAllocationKind(node) == AllocationKind::kNone);
       if (wrapper.IsOutputNode(node)) {
         // `node` is also an output node. This can occur, for example, if a
@@ -527,24 +579,38 @@ absl::StatusOr<llvm::Function*> BuildPartitionFunction(
         for (llvm::Value* output_buffer : wrapper.GetOutputBuffers(node, b)) {
           LlvmMemcpy(
               output_buffer, input_buffer,
-              jit_context.type_converter().GetTypeByteSize(node->GetType()), b);
+              jit_context.type_converter().GetTypeByteSize(OutputType(node)),
+              b);
         }
       }
-      continue;
     }
 
     // Gather the buffers to which the value of `node` must be written.
     std::vector<llvm::Value*> output_buffers;
-    if (wrapper.IsOutputNode(node)) {
+    if (node->Is<Next>()) {
+      // next_value nodes store their output in the state-read's location, and
+      // return nothing themselves.
+      StateRead* state_read = node->As<Next>()->state_read()->As<StateRead>();
+      XLS_RET_CHECK(allocator.GetAllocationKind(state_read) ==
+                    AllocationKind::kNone);
+      output_buffers = wrapper.GetOutputBuffers(state_read, b);
+    } else if (wrapper.IsInputNode(node)) {
+      XLS_RET_CHECK(allocator.GetAllocationKind(node) == AllocationKind::kNone);
+      output_buffers = {};
+    } else if (wrapper.IsOutputNode(node)) {
       XLS_RET_CHECK(allocator.GetAllocationKind(node) == AllocationKind::kNone);
       output_buffers = wrapper.GetOutputBuffers(node, b);
     } else if (allocator.GetAllocationKind(node) ==
                AllocationKind::kTempBlock) {
+      XLS_RET_CHECK(!node->Is<RegisterWrite>());
+      XLS_RET_CHECK(!node->Is<OutputPort>());
       output_buffers = {
           wrapper.GetOffsetIntoTempBuffer(allocator.GetOffset(node), b)};
     } else if (allocator.GetAllocationKind(node) == AllocationKind::kAlloca) {
       // `node` is used exclusively inside this partition (not an input, output,
       // nor has a temp buffer). Allocate a buffer on the stack with alloca.
+      XLS_RET_CHECK(!node->Is<RegisterWrite>());
+      XLS_RET_CHECK(!node->Is<OutputPort>());
       output_buffers = {b.CreateAlloca(
           jit_context.type_converter().ConvertToLlvmType(node->GetType()))};
     } else {
@@ -555,12 +621,14 @@ absl::StatusOr<llvm::Function*> BuildPartitionFunction(
       continue;
     }
 
-    value_buffers[node] = output_buffers.front();
+    if (!output_buffers.empty()) {
+      value_buffers[node] = output_buffers.front();
+    }
 
     // Create the function which computes the node value.
     XLS_ASSIGN_OR_RETURN(
         NodeFunction node_function,
-        CreateNodeFunction(node, output_buffers.size(), jit_context));
+        CreateNodeFunction(node, output_buffers.size(), wrapper, jit_context));
 
     // Gather the operand values to be passed to the node function.
     std::vector<llvm::Value*> operand_buffers;
@@ -601,9 +669,13 @@ absl::StatusOr<llvm::Function*> BuildPartitionFunction(
       args.push_back(wrapper.GetOutputsArg());
       args.push_back(wrapper.GetTempBufferArg());
       args.push_back(wrapper.GetInterpreterEventsArg());
-      args.push_back(wrapper.GetUserDataArg());
+      args.push_back(wrapper.GetInstanceContextArg());
       args.push_back(wrapper.GetJitRuntimeArg());
+    } else {
+      // The instance context is always passed so the node can upcall.
+      args.push_back(wrapper.GetInstanceContextArg());
     }
+    XLS_RET_CHECK_EQ(node_function.function->arg_size(), args.size());
     llvm::CallInst* node_blocked = b.CreateCall(node_function.function, args);
 
     if (partition.early_exit_point.has_value()) {
@@ -616,8 +688,8 @@ absl::StatusOr<llvm::Function*> BuildPartitionFunction(
   b.CreateRet(interrupt_execution == nullptr ? b.getFalse()
                                              : interrupt_execution);
 
-  XLS_VLOG(3) << "Partition function:";
-  XLS_VLOG(3) << DumpLlvmObjectToString(*wrapper.function());
+  VLOG(3) << "Partition function:";
+  VLOG(3) << DumpLlvmObjectToString(*wrapper.function());
   return wrapper.function();
 }
 
@@ -633,7 +705,8 @@ absl::Status AllocateBuffers(absl::Span<const Partition> partitions,
       if (wrapper.IsInputNode(node) || wrapper.IsOutputNode(node) ||
           ShouldMaterializeAtUse(node)) {
         allocator.SetAllocationKind(node, AllocationKind::kNone);
-      } else if (std::all_of(
+      } else if (!node->function_base()->HasImplicitUse(node) &&
+                 std::all_of(
                      node->users().begin(), node->users().end(),
                      [&](Node* u) { return partition_set.contains(u); })) {
         // All of the uses of node are in the partition.
@@ -650,6 +723,23 @@ absl::Status AllocateBuffers(absl::Span<const Partition> partitions,
 // Returns the nodes which comprise the inputs to a jitted function implementing
 // `function_base`. These nodes are passed in via the `inputs` argument.
 std::vector<Node*> GetJittedFunctionInputs(FunctionBase* function_base) {
+  if (function_base->IsBlock()) {
+    Block* block = function_base->AsBlockOrDie();
+    std::vector<Node*> out;
+    out.reserve(block->GetInputPorts().size() + block->GetRegisters().size());
+    absl::c_copy(block->GetInputPorts(), std::back_inserter(out));
+    absl::c_transform(
+        block->GetRegisters(), std::back_inserter(out),
+        [&](Register* r) -> Node* { return *block->GetRegisterRead(r); });
+    return out;
+  }
+  if (function_base->IsProc()) {
+    Proc* proc = function_base->AsProcOrDie();
+    std::vector<Node*> out;
+    absl::c_transform(proc->StateElements(), std::back_inserter(out),
+                      [&](StateElement* st) { return proc->GetStateRead(st); });
+    return out;
+  }
   std::vector<Node*> inputs(function_base->params().begin(),
                             function_base->params().end());
   return inputs;
@@ -663,14 +753,45 @@ std::vector<Node*> GetJittedFunctionOutputs(FunctionBase* function_base) {
     Function* f = function_base->AsFunctionOrDie();
     return {f->return_value()};
   }
-  XLS_CHECK(function_base->IsProc());
-  // The outputs of a proc are the next state values.
+  if (function_base->IsBlock()) {
+    // Order of block outputs is:
+    //   (1) output ports
+    //   (2) First RegisterWrite of each register.
+    //   (3) Second, and later RegisterWrites of each register (if any).
+    // Multiple RegisterWrites are reconciled at the end of each cycle.
+    Block* block = function_base->AsBlockOrDie();
+    std::vector<Node*> out;
+    out.reserve(block->GetOutputPorts().size() + block->GetRegisters().size());
+    absl::c_copy(block->GetOutputPorts(), std::back_inserter(out));
+    for (Register* reg : block->GetRegisters()) {
+      out.push_back(block->GetRegisterWrites(reg)->front());
+    }
+    for (Register* reg : block->GetRegisters()) {
+      for (RegisterWrite* rw : block->GetRegisterWrites(reg)->subspan(1)) {
+        out.push_back(rw);
+      }
+    }
+    return out;
+  }
+  // The outputs of a proc are the next state values - which will be stored in
+  // the memory locations for the state reads.
   Proc* proc = function_base->AsProcOrDie();
   std::vector<Node*> outputs;
-  outputs.push_back(proc->NextToken());
-  outputs.insert(outputs.end(), proc->NextState().begin(),
-                 proc->NextState().end());
+  outputs.reserve(proc->StateElements().size());
+  absl::c_transform(proc->StateElements(), std::back_inserter(outputs),
+                    [&](StateElement* st) { return proc->GetStateRead(st); });
   return outputs;
+}
+
+// Mangle the name to avoid important POSIX symbol names. (eg 'main').
+std::string MangleForLLVM(std::string_view name) {
+  if (name == "main") {
+    return "__XLS__main";
+  }
+  if (name == "write") {
+    return "__XLS__write";
+  }
+  return std::string(name);
 }
 
 // Build an llvm::Function implementing the given FunctionBase. The jitted
@@ -686,7 +807,7 @@ std::vector<Node*> GetJittedFunctionOutputs(FunctionBase* function_base) {
 //        uint8_t* const* outputs,
 //        void* temp_buffer,
 //        InterpreterEvents* events,
-//        void* user_data,
+//        InstanceContext* instance_context,
 //        JitRuntime* jit_runtime,
 //        int64_t continuation_point) {
 //     entry:
@@ -698,36 +819,45 @@ std::vector<Node*> GetJittedFunctionOutputs(FunctionBase* function_base) {
 //
 //     start:
 //      __f_partition_0(inputs, outputs, temp_buffer,
-//                      events, user_data, jit_runtime)
+//                      events, instance_context, jit_runtime)
 //      __f_partition_1(inputs, outputs, temp_buffer,
-//                      events, user_data, jit_runtime)
+//                      events, instance_context, jit_runtime)
 //      ...
 //     resume_point_1:
 //      __f_partition_n(inputs, outputs, temp_buffer,
-//                      events, user_data, jit_runtime)
+//                      events, instance_context, jit_runtime)
 //      ...
 //     resume_point_n:
 //      return 0;
 //   }
 //
-// If `unpoison_outputs` is true then when built with sanizers enabled, the
-// output buffers of the function will be unpoisoned to avoid uninitialized
-// memory use errors.
 struct PartitionedFunction {
   llvm::Function* function;
   std::vector<Partition> partitions;
 };
 absl::StatusOr<PartitionedFunction> BuildFunctionInternal(
     FunctionBase* xls_function, BufferAllocator& allocator,
-    JitBuilderContext& jit_context, bool unpoison_outputs) {
-  XLS_VLOG(4) << "BuildFunction:";
-  XLS_VLOG(4) << xls_function->DumpIr();
+    JitBuilderContext& jit_context) {
+  VLOG(4) << "BuildFunction:";
+  VLOG(4) << xls_function->DumpIr();
   std::vector<Partition> partitions = PartitionFunctionBase(xls_function);
 
+  // For shared compilations (ie AOT proc-networks) we need to have multiple
+  // different procs all hitting the same function. The issue is that we
+  // assign slots in the temp buffer globally starting from 0 for each call to
+  // JittedFunctionBase::Build. This means that different 'procs' have
+  // different ideas about where in the temp buffer things go. For now to
+  // avoid this issue simple create a different copy all dependent functions
+  // for each top.
+  // TODO(allight): Long term it would be good to avoid this headache and
+  // extra code. Since the function call graph is a DAG we should be able to
+  // have each function assign its own tmp buffer starting from 0 and make the
+  // overall tmp-buffer the topo sort.
+  std::string base_name = jit_context.MangleFunctionName(xls_function);
   std::vector<Node*> inputs = GetJittedFunctionInputs(xls_function);
   std::vector<Node*> outputs = GetJittedFunctionOutputs(xls_function);
   LlvmFunctionWrapper wrapper = LlvmFunctionWrapper::Create(
-      xls_function->name(), inputs, outputs,
+      MangleForLLVM(base_name), inputs, outputs,
       llvm::Type::getInt64Ty(jit_context.context()), jit_context,
       LlvmFunctionWrapper::FunctionArg{
           .name = "continuation_point",
@@ -737,8 +867,7 @@ absl::StatusOr<PartitionedFunction> BuildFunctionInternal(
 
   std::vector<llvm::Function*> partition_functions;
   for (int64_t i = 0; i < partitions.size(); ++i) {
-    std::string name =
-        absl::StrFormat("__%s_partition_%d", xls_function->name(), i);
+    std::string name = absl::StrFormat("__%s_partition_%d", base_name, i);
     XLS_ASSIGN_OR_RETURN(
         llvm::Function * partition_function,
         BuildPartitionFunction(name, partitions[i], inputs, outputs, allocator,
@@ -748,9 +877,9 @@ absl::StatusOr<PartitionedFunction> BuildFunctionInternal(
 
   // Args passed to each partition function.
   std::vector<llvm::Value*> args = {
-      wrapper.GetInputsArg(),     wrapper.GetOutputsArg(),
-      wrapper.GetTempBufferArg(), wrapper.GetInterpreterEventsArg(),
-      wrapper.GetUserDataArg(),   wrapper.GetJitRuntimeArg()};
+      wrapper.GetInputsArg(),          wrapper.GetOutputsArg(),
+      wrapper.GetTempBufferArg(),      wrapper.GetInterpreterEventsArg(),
+      wrapper.GetInstanceContextArg(), wrapper.GetJitRuntimeArg()};
 
   // To handle continuation points, sequential basic blocks are created in the
   // body.
@@ -770,7 +899,7 @@ absl::StatusOr<PartitionedFunction> BuildFunctionInternal(
           wrapper.function(),
           /*InsertBefore=*/nullptr);
       // The index in the resume block should correspond to the resume point id.
-      XLS_CHECK_EQ(resume_blocks.size(), partitions[i].resume_point->id);
+      CHECK_EQ(resume_blocks.size(), partitions[i].resume_point->id);
       resume_blocks.push_back(resume_block);
       builder->CreateBr(resume_block);
       builder = std::make_unique<llvm::IRBuilder<>>(resume_block);
@@ -804,17 +933,6 @@ absl::StatusOr<PartitionedFunction> BuildFunctionInternal(
     }
   }
 
-  if (unpoison_outputs) {
-    for (Node* output : outputs) {
-      int64_t index = wrapper.GetOutputArgIndices(output).front();
-      llvm::Value* output_buffer = LoadPointerFromPointerArray(
-          index, wrapper.GetOutputsArg(), builder.get());
-      UnpoisonBuffer(
-          output_buffer,
-          jit_context.type_converter().GetTypeByteSize(output->GetType()),
-          builder.get());
-    }
-  }
   // Return zero indicating that the execution of the FunctionBase completed.
   builder->CreateRet(builder->getInt64(0));
 
@@ -843,7 +961,7 @@ absl::StatusOr<PartitionedFunction> BuildFunctionInternal(
 // `unpacked_buffer`. `bit_offset` is a value maintained across recursive
 // calls of this function indicating the offset within `packed_buffer` to read
 // the packed value.
-// TODO(meheff): 2022/10/03 Consider loading values in granuality larger than
+// TODO(meheff): 2022/10/03 Consider loading values in granularity larger than
 // bytes when unpacking values.
 absl::Status UnpackValue(llvm::Value* packed_buffer,
                          llvm::Value* unpacked_buffer, Type* xls_type,
@@ -867,9 +985,14 @@ absl::Status UnpackValue(llvm::Value* packed_buffer,
       int64_t bytes_to_load =
           CeilOfRatio(xls_type->GetFlatBitCount() + remainder, int64_t{8});
 
+      // The packed interface has no alignment assumptions, so make accesses
+      // align(1).
+      llvm::Align packed_alignment(1);
       // Load the bits and shift by the remainder.
       llvm::Value* loaded_value = builder->CreateLShr(
-          builder->CreateLoad(builder->getIntNTy(bytes_to_load * 8), byte_ptr),
+          builder->CreateAlignedLoad(
+              builder->getIntNTy(static_cast<unsigned int>(bytes_to_load * 8)),
+              byte_ptr, packed_alignment),
           remainder);
 
       // Convert to the native type and mask off any extra bits.
@@ -962,16 +1085,19 @@ absl::Status PackValue(llvm::Value* unpacked_buffer, llvm::Value* packed_buffer,
                               unpacked_buffer),
           loaded_type, /*isSigned=*/false);
 
+      // The packed interface has no alignment assumptions, so make accesses
+      // align(1).
+      llvm::Align packed_alignment(1);
       if (remainder == 0) {
         // The packed value is on a byte boundary. Just write the value into the
         // buffer.
-        builder->CreateStore(unpacked_value, byte_ptr);
+        builder->CreateAlignedStore(unpacked_value, byte_ptr, packed_alignment);
       } else {
         // Packed value is not on a byte boundary. Load in the packed value at
         // the location and do some masking and shifting. First load the packed
         // bits in the location to be written to.
         llvm::Value* loaded_packed_value =
-            builder->CreateLoad(loaded_type, byte_ptr);
+            builder->CreateAlignedLoad(loaded_type, byte_ptr, packed_alignment);
 
         // Mask off any beyond the remainder bits.
         llvm::Value* remainder_mask =
@@ -987,7 +1113,7 @@ absl::Status PackValue(llvm::Value* unpacked_buffer, llvm::Value* packed_buffer,
         // Or the value to write with the existing bits in the loaded value.
         llvm::Value* value = builder->CreateOr(shifted_unpacked_value,
                                                masked_loaded_packed_value);
-        builder->CreateStore(value, byte_ptr);
+        builder->CreateAlignedStore(value, byte_ptr, packed_alignment);
       }
       return absl::OkStatus();
     }
@@ -1065,7 +1191,7 @@ absl::StatusOr<llvm::Function*> BuildPackedWrapper(
   llvm::Value* input_arg_array = wrapper.entry_builder().CreateAlloca(
       llvm::ArrayType::get(llvm::PointerType::get(*context, 0), inputs.size()));
   llvm::Type* pointer_array_type =
-      llvm::ArrayType::get(llvm::Type::getInt8PtrTy(*context), 0);
+      llvm::ArrayType::get(llvm::PointerType::getUnqual(*context), 0);
   for (int64_t i = 0; i < inputs.size(); ++i) {
     Node* input = inputs[i];
     llvm::Value* input_buffer = wrapper.entry_builder().CreateAlloca(
@@ -1093,7 +1219,7 @@ absl::StatusOr<llvm::Function*> BuildPackedWrapper(
   for (int64_t i = 0; i < outputs.size(); ++i) {
     Node* output = outputs[i];
     llvm::Value* output_buffer = wrapper.entry_builder().CreateAlloca(
-        jit_context.type_converter().ConvertToLlvmType(output->GetType()));
+        jit_context.type_converter().ConvertToLlvmType(OutputType(output)));
     llvm::Value* gep = wrapper.entry_builder().CreateGEP(
         pointer_array_type, output_arg_array,
         {
@@ -1108,7 +1234,7 @@ absl::StatusOr<llvm::Function*> BuildPackedWrapper(
   args.push_back(output_arg_array);
   args.push_back(wrapper.GetTempBufferArg());
   args.push_back(wrapper.GetInterpreterEventsArg());
-  args.push_back(wrapper.GetUserDataArg());
+  args.push_back(wrapper.GetInstanceContextArg());
   args.push_back(wrapper.GetJitRuntimeArg());
   args.push_back(wrapper.GetExtraArg().value());
 
@@ -1127,14 +1253,9 @@ absl::StatusOr<llvm::Function*> BuildPackedWrapper(
         i, wrapper.GetOutputsArg(), &wrapper.entry_builder());
 
     XLS_RETURN_IF_ERROR(PackValue(
-        unpacked_output_buffer, packed_output_buffer, output->GetType(),
+        unpacked_output_buffer, packed_output_buffer, OutputType(output),
         /*bit_offset=*/0, jit_context.type_converter(),
         &wrapper.entry_builder()));
-
-    UnpoisonBuffer(
-        packed_output_buffer,
-        jit_context.type_converter().GetPackedTypeByteSize(output->GetType()),
-        &wrapper.entry_builder());
   }
 
   // Return value of zero means that the FunctionBase completed execution.
@@ -1143,9 +1264,33 @@ absl::StatusOr<llvm::Function*> BuildPackedWrapper(
   return wrapper.function();
 }
 
+}  // namespace
+
+std::unique_ptr<JitArgumentSetOwnedBuffer>
+JittedFunctionBase::CreateInputBuffer(bool zero) const {
+  return JitArgumentSetOwnedBuffer::CreateInput(this, GetInputBufferMetadata(),
+                                                zero);
+}
+
+std::unique_ptr<JitArgumentSetOwnedBuffer>
+JittedFunctionBase::CreateOutputBuffer() const {
+  return JitArgumentSetOwnedBuffer::CreateOutput(this,
+                                                 GetOutputBufferMetadata());
+}
+
+absl::StatusOr<std::unique_ptr<JitArgumentSetOwnedBuffer>>
+JittedFunctionBase::CreateInputOutputBuffer() const {
+  return JitArgumentSetOwnedBuffer::CreateInputOutput(
+      this, GetInputBufferMetadata(), GetOutputBufferMetadata());
+}
+
+JitTempBuffer JittedFunctionBase::CreateTempBuffer() const {
+  return JitTempBuffer(this, temp_buffer_alignment(), temp_buffer_size());
+}
+
 // Jits a function implementing `xls_function`. Also jits all transitively
 // dependent xls::Functions which may be called by `xls_function`.
-absl::StatusOr<JittedFunctionBase> BuildFunctionAndDependencies(
+absl::StatusOr<JittedFunctionBase> JittedFunctionBase::BuildInternal(
     FunctionBase* xls_function, JitBuilderContext& jit_context,
     bool build_packed_wrapper) {
   std::vector<FunctionBase*> functions = GetDependentFunctions(xls_function);
@@ -1153,10 +1298,22 @@ absl::StatusOr<JittedFunctionBase> BuildFunctionAndDependencies(
   llvm::Function* top_function = nullptr;
   std::vector<Partition> top_partitions;
   for (FunctionBase* f : functions) {
-    XLS_ASSIGN_OR_RETURN(
-        PartitionedFunction partitioned_function,
-        BuildFunctionInternal(f, allocator, jit_context,
-                              /*unpoison_outputs=*/f == xls_function));
+    // For shared compilations (ie AOT proc-networks) we need to have multiple
+    // different procs all hitting the same function. The issue is that we
+    // assign slots in the temp buffer globally starting from 0 for each call to
+    // JittedFunctionBase::Build. This means that different 'procs' have
+    // different ideas about where in the temp buffer things go. For now to
+    // avoid this issue simple create a different copy all dependent functions
+    // for each top.
+    // TODO(allight): Long term it would be good to avoid this headache and
+    // extra code. Since the function call graph is a DAG we should be able to
+    // have each function assign its own tmp buffer starting from 0 and make the
+    // overall tmp-buffer the topo sort.
+    XLS_RET_CHECK_EQ(
+        jit_context.module()->getFunction(MangleForLLVM(f->name())), nullptr)
+        << "Multiple copies of the same function created";
+    XLS_ASSIGN_OR_RETURN(PartitionedFunction partitioned_function,
+                         BuildFunctionInternal(f, allocator, jit_context));
     jit_context.SetLlvmFunction(f, partitioned_function.function);
     if (f == xls_function) {
       top_function = partitioned_function.function;
@@ -1165,7 +1322,7 @@ absl::StatusOr<JittedFunctionBase> BuildFunctionAndDependencies(
   }
   XLS_RET_CHECK(top_function != nullptr);
 
-  std::string function_name = top_function->getName().str();
+  std::string function_name = MangleForLLVM(top_function->getName().str());
   std::string packed_wrapper_name;
   if (build_packed_wrapper) {
     XLS_ASSIGN_OR_RETURN(
@@ -1175,63 +1332,245 @@ absl::StatusOr<JittedFunctionBase> BuildFunctionAndDependencies(
   }
 
   XLS_RETURN_IF_ERROR(
-      jit_context.orc_jit().CompileModule(jit_context.ConsumeModule()));
+      jit_context.llvm_compiler().CompileModule(jit_context.ConsumeModule()));
 
   JittedFunctionBase jitted_function;
 
-  jitted_function.function_name = function_name;
-  XLS_ASSIGN_OR_RETURN(auto fn_address,
-                       jit_context.orc_jit().LoadSymbol(function_name));
-  jitted_function.function = absl::bit_cast<JitFunctionType>(fn_address);
+  jitted_function.function_name_ = function_name;
+  if (jit_context.llvm_compiler().IsOrcJit()) {
+    XLS_ASSIGN_OR_RETURN(auto* orc_jit, jit_context.llvm_compiler().AsOrcJit());
+    XLS_ASSIGN_OR_RETURN(auto fn_address, orc_jit->LoadSymbol(function_name));
+    jitted_function.function_ = absl::bit_cast<JitFunctionType>(fn_address);
+  } else {
+    // Give it a function that will give a sort of useful error message if you
+    // actually try to invoke it.
+    jitted_function.function_ = InvalidJitFunctionUse;
+  }
 
   if (build_packed_wrapper) {
-    jitted_function.packed_function_name = packed_wrapper_name;
-    XLS_ASSIGN_OR_RETURN(auto packed_fn_address,
-                         jit_context.orc_jit().LoadSymbol(packed_wrapper_name));
-    jitted_function.packed_function =
-        absl::bit_cast<JitFunctionType>(packed_fn_address);
+    jitted_function.packed_function_name_ = packed_wrapper_name;
+    if (jit_context.llvm_compiler().IsOrcJit()) {
+      XLS_ASSIGN_OR_RETURN(auto* orc_jit,
+                           jit_context.llvm_compiler().AsOrcJit());
+      XLS_ASSIGN_OR_RETURN(auto packed_fn_address,
+                           orc_jit->LoadSymbol(packed_wrapper_name));
+      jitted_function.packed_function_ =
+          absl::bit_cast<JitFunctionType>(packed_fn_address);
+    } else {
+      // Give it a function that will give a sort of useful error message if you
+      // actually try to invoke it.
+      jitted_function.packed_function_ = InvalidJitFunctionUse;
+    }
   }
 
   for (const Node* input : GetJittedFunctionInputs(xls_function)) {
-    jitted_function.input_buffer_sizes.push_back(
-        jit_context.type_converter().GetTypeByteSize(input->GetType()));
-    jitted_function.packed_input_buffer_sizes.push_back(
-        jit_context.type_converter().GetPackedTypeByteSize(input->GetType()));
+    Type* input_type = InputType(input);
+    jitted_function.input_buffer_metadata_.push_back(
+        jit_context.type_converter().GetTypeBufferMetadata(input_type));
   }
   for (const Node* output : GetJittedFunctionOutputs(xls_function)) {
-    jitted_function.output_buffer_sizes.push_back(
-        jit_context.type_converter().GetTypeByteSize(output->GetType()));
-    jitted_function.packed_output_buffer_sizes.push_back(
-        jit_context.type_converter().GetPackedTypeByteSize(output->GetType()));
+    Type* output_type = OutputType(output);
+    jitted_function.output_buffer_metadata_.push_back(
+        jit_context.type_converter().GetTypeBufferMetadata(output_type));
   }
-  jitted_function.temp_buffer_size = allocator.size();
+  jitted_function.temp_buffer_size_ = allocator.size();
+  jitted_function.temp_buffer_alignment_ = allocator.alignment();
 
   // Indicate which nodes correspond to which early exit points.
   for (const Partition& partition : top_partitions) {
     if (partition.early_exit_point.has_value()) {
       XLS_RET_CHECK_EQ(partition.nodes.size(), 1);
-      jitted_function.continuation_points[partition.early_exit_point->id] =
-          partition.nodes.front();
+      jitted_function.continuation_points_[partition.early_exit_point->id] =
+          partition.nodes.front()->id();
     }
   }
+
+  jitted_function.queue_indices_ = jit_context.queue_indices();
 
   return std::move(jitted_function);
 }
 
+absl::StatusOr<JittedFunctionBase> JittedFunctionBase::Build(
+    Function* xls_function, LlvmCompiler& compiler) {
+  JitBuilderContext jit_context(compiler, xls_function);
+  return JittedFunctionBase::BuildInternal(xls_function, jit_context,
+                                           /*build_packed_wrapper=*/true);
+}
+
+absl::StatusOr<JittedFunctionBase> JittedFunctionBase::Build(
+    Proc* proc, LlvmCompiler& compiler) {
+  JitBuilderContext jit_context(compiler, proc);
+  return JittedFunctionBase::BuildInternal(proc, jit_context,
+                                           /*build_packed_wrapper=*/false);
+}
+
+absl::StatusOr<JittedFunctionBase> JittedFunctionBase::Build(
+    Block* block, LlvmCompiler& compiler) {
+  JitBuilderContext jit_context(compiler, block);
+  return JittedFunctionBase::BuildInternal(block, jit_context,
+                                           /*build_packed_wrapper=*/false);
+}
+
+absl::StatusOr<JittedFunctionBase> JittedFunctionBase::BuildFromAot(
+    const AotEntrypointProto& abi, JitFunctionType entrypoint,
+    std::optional<JitFunctionType> packed_entrypoint) {
+  XLS_RET_CHECK(abi.has_function_symbol());
+  XLS_RET_CHECK_EQ(abi.input_buffer_sizes().size(),
+                   abi.input_buffer_alignments().size());
+  XLS_RET_CHECK_EQ(abi.input_buffer_sizes().size(),
+                   abi.input_buffer_abi_alignments().size());
+  XLS_RET_CHECK_EQ(abi.output_buffer_sizes().size(),
+                   abi.output_buffer_alignments().size());
+  XLS_RET_CHECK_EQ(abi.output_buffer_sizes().size(),
+                   abi.output_buffer_abi_alignments().size());
+  std::optional<std::string> packed_name;
+  if (packed_entrypoint) {
+    XLS_RET_CHECK(abi.has_packed_function_symbol());
+    XLS_RET_CHECK_EQ(abi.packed_input_buffer_sizes().size(),
+                     abi.input_buffer_sizes().size());
+    XLS_RET_CHECK_EQ(abi.packed_output_buffer_sizes().size(),
+                     abi.output_buffer_sizes().size());
+    packed_name = abi.packed_function_symbol();
+  }
+  XLS_RET_CHECK(abi.has_temp_buffer_size());
+  XLS_RET_CHECK(abi.has_temp_buffer_alignment());
+  XLS_RET_CHECK_EQ(abi.type() == AotEntrypointProto::PROC,
+                   abi.has_proc_metadata());
+  absl::flat_hash_map<int64_t, int64_t> continuation_points;
+  absl::btree_map<std::string, int64_t> queue_indices;
+
+  if (abi.type() == AotEntrypointProto::PROC) {
+    continuation_points.insert(
+        abi.proc_metadata().continuation_point_node_ids().begin(),
+        abi.proc_metadata().continuation_point_node_ids().end());
+    queue_indices.insert(abi.proc_metadata().channel_queue_indices().begin(),
+                         abi.proc_metadata().channel_queue_indices().end());
+  }
+
+  std::vector<TypeBufferMetadata> input_buffer_metadata;
+  input_buffer_metadata.reserve(abi.input_buffer_sizes().size());
+  for (int64_t i = 0; i < abi.input_buffer_sizes().size(); ++i) {
+    input_buffer_metadata.push_back(TypeBufferMetadata{
+        .size = abi.input_buffer_sizes()[i],
+        .preferred_alignment = abi.input_buffer_alignments()[i],
+        .abi_alignment = abi.input_buffer_abi_alignments()[i],
+        .packed_size =
+            packed_entrypoint ? abi.packed_input_buffer_sizes()[i] : 0});
+  }
+
+  std::vector<TypeBufferMetadata> output_buffer_metadata;
+  output_buffer_metadata.reserve(abi.output_buffer_sizes().size());
+  for (int64_t i = 0; i < abi.output_buffer_sizes().size(); ++i) {
+    output_buffer_metadata.push_back(TypeBufferMetadata{
+        .size = abi.output_buffer_sizes()[i],
+        .preferred_alignment = abi.output_buffer_alignments()[i],
+        .abi_alignment = abi.output_buffer_abi_alignments()[i],
+        .packed_size =
+            packed_entrypoint ? abi.packed_output_buffer_sizes()[i] : 0});
+  }
+
+  return JittedFunctionBase(
+      abi.function_symbol(), entrypoint, packed_name, packed_entrypoint,
+      input_buffer_metadata, output_buffer_metadata, abi.temp_buffer_size(),
+      abi.temp_buffer_alignment(), std::move(continuation_points),
+      std::move(queue_indices));
+}
+
+int64_t JittedFunctionBase::RunJittedFunction(
+    const JitArgumentSet& inputs, JitArgumentSet& outputs,
+    JitTempBuffer& temp_buffer, InterpreterEvents* events,
+    InstanceContext* instance_context, JitRuntime* jit_runtime,
+    int64_t continuation_point) const {
+  CHECK(inputs.is_inputs());
+  CHECK_EQ(inputs.source(), this);
+  CHECK(outputs.is_outputs());
+  CHECK_EQ(outputs.source(), this);
+  CHECK_EQ(temp_buffer.source(), this);
+  return function_(inputs.get_base_pointer(), outputs.get_base_pointer(),
+                   temp_buffer.get_base_pointer(), events, instance_context,
+                   jit_runtime, continuation_point);
+}
+
+namespace {
+bool IsAligned(const void* ptr, int64_t align) {
+  return (absl::bit_cast<uintptr_t>(ptr) % align) == 0;
+}
+
+absl::Status VerifyOffsetAbiAlignments(
+    uint8_t const* const* const ptrs,
+    absl::Span<const TypeBufferMetadata> alignments) {
+  for (int64_t i = 0; i < alignments.size(); ++i) {
+    if (absl::bit_cast<uintptr_t>(ptrs[i]) % alignments[i].abi_alignment != 0) {
+      return absl::InvalidArgumentError(
+          absl::StrFormat("element %d of input vector does not have alignment "
+                          "of %d. Pointer is %p",
+                          i, alignments[i].abi_alignment, ptrs[i]));
+    }
+  }
+  return absl::OkStatus();
+}
 }  // namespace
 
-absl::StatusOr<JittedFunctionBase> BuildFunction(Function* xls_function,
-                                                 OrcJit& orc_jit) {
-  JitBuilderContext jit_context(orc_jit);
-  return BuildFunctionAndDependencies(xls_function, jit_context,
-                                      /*build_packed_wrapper=*/true);
+template <bool kForceZeroCopy>
+int64_t JittedFunctionBase::RunUnalignedJittedFunction(
+    const uint8_t* const* inputs, uint8_t* const* outputs, void* temp_buffer,
+    InterpreterEvents* events, InstanceContext* instance_context,
+    JitRuntime* jit_runtime, int64_t continuation) const {
+  if constexpr (kForceZeroCopy) {
+    DCHECK_OK(VerifyOffsetAbiAlignments(inputs, GetInputBufferMetadata()));
+    DCHECK_OK(VerifyOffsetAbiAlignments(outputs, GetOutputBufferMetadata()));
+    DCHECK(IsAligned(temp_buffer, temp_buffer_alignment_));
+  } else {
+    if (!VerifyOffsetAbiAlignments(inputs, GetInputBufferMetadata()).ok() ||
+        !VerifyOffsetAbiAlignments(outputs, GetOutputBufferMetadata()).ok() ||
+        !IsAligned(temp_buffer, temp_buffer_alignment_)) {
+      std::unique_ptr<JitArgumentSetOwnedBuffer> aligned_input =
+          CreateInputBuffer();
+      std::unique_ptr<JitArgumentSetOwnedBuffer> aligned_output =
+          CreateOutputBuffer();
+      JitTempBuffer temp(CreateTempBuffer());
+      memcpy(temp.get_base_pointer(), temp_buffer, temp_buffer_size_);
+      for (int i = 0; i < GetInputBufferMetadata().size(); ++i) {
+        memcpy(aligned_input->get_element_pointers()[i], inputs[i],
+               GetInputBufferMetadata()[i].size);
+      }
+      auto result =
+          RunJittedFunction(*aligned_input, *aligned_output, temp, events,
+                            instance_context, jit_runtime, continuation);
+      memcpy(temp_buffer, temp.get_base_pointer(), temp_buffer_size_);
+      for (int i = 0; i < GetOutputBufferMetadata().size(); ++i) {
+        memcpy(outputs[i], aligned_output->get_element_pointers()[i],
+               GetOutputBufferMetadata()[i].size);
+      }
+      return result;
+    }
+  }
+  return function_(inputs, outputs, temp_buffer, events, instance_context,
+                   jit_runtime, continuation);
 }
 
-absl::StatusOr<JittedFunctionBase> BuildProcFunction(
-    Proc* proc, JitChannelQueueManager* queue_mgr, OrcJit& orc_jit) {
-  JitBuilderContext jit_context(orc_jit, queue_mgr);
-  return BuildFunctionAndDependencies(proc, jit_context,
-                                      /*build_packed_wrapper=*/false);
-}
+template int64_t
+JittedFunctionBase::RunUnalignedJittedFunction</*kForceZeroCopy=*/true>(
+    const uint8_t* const* inputs, uint8_t* const* outputs, void* temp_buffer,
+    InterpreterEvents* events, InstanceContext* instance_context,
+    JitRuntime* jit_runtime, int64_t continuation) const;
 
+template int64_t
+JittedFunctionBase::RunUnalignedJittedFunction</*kForceZeroCopy=*/false>(
+    const uint8_t* const* inputs, uint8_t* const* outputs, void* temp_buffer,
+    InterpreterEvents* events, InstanceContext* instance_context,
+    JitRuntime* jit_runtime, int64_t continuation) const;
+
+std::optional<int64_t> JittedFunctionBase::RunPackedJittedFunction(
+    const uint8_t* const* inputs, uint8_t* const* outputs, void* temp_buffer,
+    InterpreterEvents* events, InstanceContext* instance_context,
+    JitRuntime* jit_runtime, int64_t continuation_point) const {
+  // Packed Jit makes no alignment assumptions, so nothing to check.
+  if (packed_function_) {
+    return (*packed_function_)(inputs, outputs, temp_buffer, events,
+                               instance_context, jit_runtime,
+                               continuation_point);
+  }
+  return std::nullopt;
+}
 }  // namespace xls

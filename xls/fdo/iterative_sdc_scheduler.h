@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <utility>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
@@ -25,6 +26,7 @@
 #include "xls/fdo/delay_manager.h"
 #include "xls/fdo/synthesizer.h"
 #include "xls/ir/node.h"
+#include "xls/scheduling/schedule_graph.h"
 #include "xls/scheduling/scheduling_options.h"
 #include "xls/scheduling/sdc_scheduler.h"
 
@@ -36,9 +38,11 @@ class IterativeSDCSchedulingModel : public SDCSchedulingModel {
  public:
   // Delay map is no longer needed as the delay calculation is completely
   // handled by the delay manager.
-  IterativeSDCSchedulingModel(FunctionBase* func,
+  IterativeSDCSchedulingModel(ScheduleGraph graph,
                               const DelayManager& delay_manager)
-      : SDCSchedulingModel(func, DelayMap()), delay_manager_(delay_manager) {}
+      : SDCSchedulingModel(std::move(graph), DelayMap(),
+                           /*initiation_interval=*/std::nullopt),
+        delay_manager_(delay_manager) {}
 
   // Overrides the original timing constraints builder. This method directly
   // call delay manager to extract the paths longer than the given clock period
@@ -66,7 +70,7 @@ absl::StatusOr<ScheduleCycleMap> ScheduleByIterativeSDC(
     int64_t clock_period_ps, DelayManager& delay_manager,
     absl::Span<const SchedulingConstraint> constraints,
     const IterativeSDCSchedulingOptions& options,
-    bool explain_infeasibility = true);
+    SchedulingFailureBehavior failure_behavior = SchedulingFailureBehavior{});
 
 }  // namespace xls
 

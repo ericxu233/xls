@@ -14,6 +14,7 @@
 
 #include "xls/flows/ir_wrapper.h"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -21,21 +22,35 @@
 #include <utility>
 #include <vector>
 
+#include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
+#include "absl/types/span.h"
 #include "xls/common/logging/log_lines.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/dslx/frontend/module.h"
+#include "xls/dslx/import_data.h"
+#include "xls/dslx/ir_convert/conversion_info.h"
+#include "xls/dslx/ir_convert/convert_options.h"
 #include "xls/dslx/ir_convert/ir_converter.h"
 #include "xls/dslx/mangle.h"
 #include "xls/dslx/parse_and_typecheck.h"
+#include "xls/interpreter/serial_proc_runtime.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/package.h"
+#include "xls/ir/value.h"
+#include "xls/jit/function_jit.h"
+#include "xls/jit/jit_channel_queue.h"
 #include "xls/jit/jit_proc_runtime.h"
 #include "xls/jit/jit_runtime.h"
 #include "xls/passes/optimization_pass_pipeline.h"
 
 namespace xls {
-using dslx::Module;
-using dslx::TypecheckedModule;
+using ::xls::dslx::Module;
+using ::xls::dslx::TypecheckedModule;
 
 absl::StatusOr<JitChannelQueueWrapper> JitChannelQueueWrapper::Create(
     JitChannelQueue* queue, JitRuntime* jit_runtime) {
@@ -103,9 +118,11 @@ absl::Status JitChannelQueueWrapper::Read(absl::Span<uint8_t> buffer) {
 }
 
 absl::StatusOr<DslxModuleAndPath> DslxModuleAndPath::Create(
-    std::string_view module_name, std::string_view file_path) {
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<dslx::Module> module,
-                       dslx::ParseModuleFromFileAtPath(file_path, module_name));
+    std::string_view module_name, std::string_view file_path,
+    dslx::ImportData* import_data) {
+  XLS_ASSIGN_OR_RETURN(
+      std::unique_ptr<dslx::Module> module,
+      dslx::ParseModuleFromFileAtPath(file_path, module_name, import_data));
 
   return Create(std::move(module), file_path);
 }
@@ -153,8 +170,9 @@ absl::StatusOr<Package*> IrWrapper::GetIrPackage() const {
 
 absl::StatusOr<IrWrapper> IrWrapper::Create(
     std::string_view ir_package_name, DslxModuleAndPath top_module,
-    std::vector<DslxModuleAndPath> import_modules, IrWrapper::Flags flags) {
-  IrWrapper ir_wrapper(ir_package_name);
+    std::vector<DslxModuleAndPath> import_modules,
+    dslx::ImportData* import_data, IrWrapper::Flags flags) {
+  IrWrapper ir_wrapper(import_data);
 
   // Compile DSLX
   for (DslxModuleAndPath& module_and_path : import_modules) {
@@ -163,7 +181,7 @@ absl::StatusOr<IrWrapper> IrWrapper::Create(
     XLS_ASSIGN_OR_RETURN(TypecheckedModule module_typechecked,
                          TypecheckModule(module_and_path.GiveUpDslxModule(),
                                          module_and_path.GetFilePath(),
-                                         &ir_wrapper.import_data_));
+                                         ir_wrapper.import_data_));
 
     ir_wrapper.other_modules_.push_back(module_typechecked.module);
 
@@ -174,7 +192,7 @@ absl::StatusOr<IrWrapper> IrWrapper::Create(
   XLS_ASSIGN_OR_RETURN(
       TypecheckedModule top_typechecked,
       TypecheckModule(top_module.GiveUpDslxModule(), top_module.GetFilePath(),
-                      &ir_wrapper.import_data_));
+                      ir_wrapper.import_data_));
   ir_wrapper.top_module_ = top_typechecked.module;
   XLS_VLOG_LINES(3, ir_wrapper.top_module_->ToString());
 
@@ -182,11 +200,14 @@ absl::StatusOr<IrWrapper> IrWrapper::Create(
   const dslx::ConvertOptions convert_options = {
       .emit_positions = true, .emit_fail_as_assert = true, .verify_ir = true};
 
+  dslx::PackageConversionData data{
+      .package = std::make_unique<Package>(ir_package_name)};
   XLS_RET_CHECK_OK(dslx::ConvertModuleIntoPackage(
-      ir_wrapper.top_module_, &ir_wrapper.import_data_, convert_options,
-      ir_wrapper.package_.get()));
+      ir_wrapper.top_module_, ir_wrapper.import_data_, convert_options, &data));
 
-  XLS_VLOG(3) << "IrWrapper Package (pre-opt):";
+  ir_wrapper.package_ = std::move(data).package;
+
+  VLOG(3) << "IrWrapper Package (pre-opt):";
   XLS_VLOG_LINES(3, ir_wrapper.package_->DumpIr());
 
   // Optimize IR using default options
@@ -200,8 +221,9 @@ absl::StatusOr<IrWrapper> IrWrapper::Create(
 
 absl::StatusOr<IrWrapper> IrWrapper::Create(
     std::string_view ir_package_name, std::unique_ptr<Module> top_module,
-    std::string_view top_module_path, std::unique_ptr<Module> other_module,
-    std::string_view other_module_path, IrWrapper::Flags flags) {
+    std::string_view top_module_path, dslx::ImportData* import_data,
+    std::unique_ptr<Module> other_module, std::string_view other_module_path,
+    IrWrapper::Flags flags) {
   XLS_ASSIGN_OR_RETURN(
       DslxModuleAndPath top_module_and_path,
       DslxModuleAndPath::Create(std::move(top_module), top_module_path));
@@ -217,7 +239,7 @@ absl::StatusOr<IrWrapper> IrWrapper::Create(
   }
 
   return Create(ir_package_name, std::move(top_module_and_path),
-                std::move(other_module_and_path_vec), flags);
+                std::move(other_module_and_path_vec), import_data, flags);
 }
 
 absl::StatusOr<Function*> IrWrapper::GetIrFunction(

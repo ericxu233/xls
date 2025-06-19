@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@rules_hdl//static_timing:build_defs.bzl", "run_opensta")
+load("@rules_hdl//synthesis:build_defs.bzl", "synthesize_rtl")
+load("@rules_hdl//verilog:providers.bzl", "verilog_library")
 load(
     "//xls/build_rules:xls_build_defs.bzl",
     "cc_xls_ir_jit_wrapper",
@@ -23,13 +27,14 @@ load(
     "xls_ir_verilog_fdo",
     "xls_synthesis_metrics",
 )
-load("@rules_hdl//verilog:providers.bzl", "verilog_library")
-load("@rules_hdl//synthesis:build_defs.bzl", "synthesize_rtl")
-load("@rules_hdl//static_timing:build_defs.bzl", "run_opensta")
 
 package(
     default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],
 )
 
@@ -43,7 +48,7 @@ xls_dslx_opt_ir(
 
 xls_ir_verilog(
     name = "idct_chen_5000ps_model_unit",
-    src = ":idct_chen.opt.ir",
+    src = ":idct_chen",
     codegen_args = {
         "delay_model": "unit",
         "clock_period_ps": "5000",
@@ -92,7 +97,7 @@ xls_benchmark_ir(
 
 xls_ir_verilog(
     name = "idct_chen_13000ps_model_sky130",
-    src = ":idct_chen.opt.ir",
+    src = ":idct_chen",
     codegen_args = {
         "delay_model": "sky130",
         "clock_period_ps": "13000",
@@ -138,7 +143,7 @@ xls_synthesis_metrics(
 
 xls_ir_verilog_fdo(
     name = "idct_chen_6400ps_model_sky130_fdo",
-    src = ":idct_chen.opt.ir",
+    src = ":idct_chen",
     codegen_args = {
         "delay_model": "sky130",
         "clock_period_ps": "6400",
@@ -161,6 +166,7 @@ xls_ir_verilog_fdo(
 xls_dslx_test(
     name = "idct_chen_dslx_test",
     srcs = ["idct_chen.x"],
+    dslx_test_args = {"compare": "jit"},
 )
 
 # TODO: 2021-05-28 Add xls_ir_equivalence_test. Note: times out.
@@ -173,9 +179,9 @@ xls_eval_ir_test(
 
 cc_xls_ir_jit_wrapper(
     name = "idct_chen_jit_wrapper",
-    src = ":idct_chen.opt.ir",
+    src = ":idct_chen",
     jit_wrapper_args = {
-        "class_name": "idct_chen",
+        "class_name": "IdctChen",
         "namespace": "xls::jpeg",
     },
 )
@@ -185,9 +191,10 @@ cc_test(
     srcs = ["idct_chen_jit_wrapper_test.cc"],
     deps = [
         ":idct_chen_jit_wrapper",
-        "//xls/common:xls_gunit",
         "//xls/common:xls_gunit_main",
         "//xls/common/status:matchers",
+        "//xls/ir:value_view",
+        "@googletest//:gtest",
     ],
 )
 
@@ -204,11 +211,15 @@ cc_library(
     hdrs = ["streams.h"],
     deps = [
         ":constants",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings:str_format",
-        "//xls/common/logging",
         "//xls/common/status:ret_check",
         "//xls/common/status:status_macros",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -218,9 +229,12 @@ cc_test(
     deps = [
         ":constants",
         ":streams",
-        "//xls/common:xls_gunit",
         "//xls/common:xls_gunit_main",
         "//xls/common/status:matchers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@googletest//:gtest",
     ],
 )
 
@@ -232,9 +246,16 @@ cc_library(
         ":constants",
         ":idct_chen_jit_wrapper",
         ":streams",
+        "//xls/common:math_util",
+        "//xls/common/status:ret_check",
+        "//xls/common/status:status_macros",
+        "//xls/ir:value_view",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
-        "//xls/common/status:status_macros",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -242,12 +263,22 @@ cc_test(
     name = "jpeg_grm_test",
     srcs = ["jpeg_grm_test.cc"],
     deps = [
+        ":constants",
         ":jpeg_grm",
-        "@com_google_absl//absl/strings:str_format",
-        "//xls/common:xls_gunit",
+        ":streams",
         "//xls/common:xls_gunit_main",
-        "//xls/common/logging",
         "//xls/common/status:matchers",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings:str_format",
+        "@googletest//:gtest",
+    ],
+)
+
+build_test(
+    name = "jpeg_build_test",
+    targets = [
+        "idct_chen_13000ps_model_sky130",
+        "idct_chen_6400ps_model_sky130_fdo",
     ],
 )
 

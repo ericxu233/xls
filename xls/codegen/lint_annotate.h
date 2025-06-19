@@ -15,7 +15,13 @@
 #ifndef XLS_CODEGEN_LINT_ANNOTATE_H_
 #define XLS_CODEGEN_LINT_ANNOTATE_H_
 
-#include "xls/codegen/vast.h"
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "absl/base/optimization.h"
+#include "absl/log/log.h"
+#include "xls/codegen/vast/vast.h"
 
 namespace xls::verilog {
 
@@ -54,7 +60,8 @@ inline std::string LintToString(Lint flag) {
     case Lint::kMultiply:
       return "MULTIPLY";
   }
-  return absl::StrFormat("<invalid Lint(%d)>", static_cast<int>(flag));
+  LOG(FATAL) << "Unknown lint flag: " << static_cast<int>(flag);
+  ABSL_UNREACHABLE();
 }
 
 }  // namespace xls::verilog

@@ -17,6 +17,11 @@
 load("@xls_pip_deps//:requirements.bzl", "requirement")
 
 package(
+    default_applicable_licenses = ["//:license"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -27,9 +32,9 @@ cc_binary(
         "//xls/common:exit_status",
         "//xls/common:init_xls",
         "//xls/common/file:filesystem",
-        "//xls/common/logging",
-        "//xls/common/status:status_macros",
         "@at_clifford_yosys//:json11",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
     ],
 )
@@ -41,16 +46,17 @@ cc_binary(
         "//xls/common:init_xls",
         "//xls/common/file:filesystem",
         "//xls/common/file:temp_directory",
-        "//xls/common/logging",
         "//xls/common/status:status_macros",
         "//xls/synthesis:credentials",
         "//xls/synthesis:synthesis_cc_proto",
         "//xls/synthesis:synthesis_service_cc_grpc",
         "@at_clifford_yosys//:json11",
-        "@com_github_grpc_grpc//:grpc++",
-        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
+        "@grpc//:grpc++",
     ],
 )
 
@@ -62,15 +68,13 @@ py_test(
         ":json_metrics_server_main",
         "//xls/synthesis:synthesis_client_main",
     ],
-    python_version = "PY3",
     # One shard for each different server test.
     shard_count = 5,
-    srcs_version = "PY3",
     deps = [
         requirement("portpicker"),
         "//xls/common:runfiles",
         "//xls/synthesis:synthesis_py_pb2",
-        "@com_google_absl_py//absl/testing:absltest",
+        "@abseil-py//absl/testing:absltest",
         "@com_google_protobuf//:protobuf_python",
     ],
 )

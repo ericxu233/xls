@@ -25,6 +25,8 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -32,16 +34,16 @@
 #include "absl/strings/str_join.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/delay_model/analyze_critical_path.h"
-#include "xls/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/analyze_critical_path.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/ir/function_base.h"
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/ir/package.h"
+#include "xls/ir/topo_sort.h"
 #include "xls/ir/verifier.h"
 #include "xls/scheduling/pipeline_schedule.h"
 #include "xls/scheduling/run_pipeline_schedule.h"
@@ -49,7 +51,7 @@
 #include "xls/tools/scheduling_options_flags.h"
 #include "xls/tools/scheduling_options_flags.pb.h"
 
-const char kUsage[] = R"(
+static constexpr std::string_view kUsage = R"(
 Dump scheduling result to stdout in Graphviz's dot plain text format.
 Explicitly show the pipeline stage.
 
@@ -71,7 +73,7 @@ void AllocateDigraphNodeId(
     const PipelineSchedule& sched,
     std::vector<absl::flat_hash_map<Node*, int64_t>>* output_registers_id,
     absl::flat_hash_map<Node*, int64_t>* xls_nodes_id) {
-  XLS_CHECK(output_registers_id->empty() && xls_nodes_id->empty());
+  CHECK(output_registers_id->empty() && xls_nodes_id->empty());
 
   output_registers_id->resize(sched.length() - 1);
 
@@ -211,7 +213,7 @@ std::string GenerateDigraphContents(
     const absl::flat_hash_set<Node*>& nodes_on_cp) {
   absl::flat_hash_map<Node*, int64_t> topo_index;
   {
-    std::vector<Node*> topo_sort = TopoSort(sched.function_base()).AsVector();
+    std::vector<Node*> topo_sort = TopoSort(sched.function_base());
     for (int64_t i = 0; i < topo_sort.size(); ++i) {
       topo_index[topo_sort[i]] = i;
     }
@@ -322,7 +324,7 @@ absl::StatusOr<PipelineSchedule> RunSchedulingPipeline(
       // infeasible. Emit a meaningful error in this case.
       if (scheduling_options.pipeline_stages().has_value() &&
           scheduling_options.clock_period_ps().has_value()) {
-        XLS_LOG(QFATAL) << absl::StreamFormat(
+        LOG(QFATAL) << absl::StreamFormat(
             "Design cannot be scheduled in %d stages with a %dps clock.",
             scheduling_options.pipeline_stages().value(),
             scheduling_options.clock_period_ps().value());
@@ -345,8 +347,10 @@ absl::Status RealMain(std::string_view ir_path) {
   XLS_RETURN_IF_ERROR(VerifyPackage(p.get()));
 
   std::string top_str = absl::GetFlag(FLAGS_top);
-  std::optional<std::string_view> maybe_top_str =
-      top_str.empty() ? std::nullopt : std::make_optional(top_str);
+  std::optional<std::string_view> maybe_top_str;
+  if (!top_str.empty()) {
+    maybe_top_str = top_str;
+  }
   XLS_ASSIGN_OR_RETURN(FunctionBase * main, FindTop(p.get(), maybe_top_str));
 
   XLS_ASSIGN_OR_RETURN(
@@ -356,8 +360,8 @@ absl::Status RealMain(std::string_view ir_path) {
       SchedulingOptions scheduling_options,
       SetUpSchedulingOptions(scheduling_options_flags_proto, p.get()));
 
-  XLS_QCHECK(scheduling_options.pipeline_stages() != 0 ||
-             scheduling_options.clock_period_ps() != 0)
+  QCHECK(scheduling_options.pipeline_stages() != 0 ||
+         scheduling_options.clock_period_ps() != 0)
       << "Must specify --pipeline_stages or --clock_period_ps (or both).";
 
   XLS_ASSIGN_OR_RETURN(const DelayEstimator* delay_estimator,
@@ -392,9 +396,9 @@ int main(int argc, char** argv) {
       xls::InitXls(kUsage, argc, argv);
 
   if (positional_arguments.empty() || positional_arguments[0].empty()) {
-    XLS_LOG(QFATAL) << "Expected path argument with IR: " << argv[0]
-                    << " <ir_path>";
+    LOG(QFATAL) << "Expected path argument with IR: " << argv[0]
+                << " <ir_path>";
   }
-  XLS_CHECK_OK(xls::RealMain(positional_arguments[0]));
+  CHECK_OK(xls::RealMain(positional_arguments[0]));
   return EXIT_SUCCESS;
 }

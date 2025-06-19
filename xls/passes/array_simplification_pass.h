@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_PASSES_ARRAY_SIMPLIFICATION_H_
-#define XLS_PASSES_ARRAY_SIMPLIFICATION_H_
+#ifndef XLS_PASSES_ARRAY_SIMPLIFICATION_PASS_H_
+#define XLS_PASSES_ARRAY_SIMPLIFICATION_PASS_H_
+
+#include <string_view>
 
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
@@ -25,17 +28,16 @@ namespace xls {
 // ArrayIndex.
 class ArraySimplificationPass : public OptimizationFunctionBasePass {
  public:
-  explicit ArraySimplificationPass(int64_t opt_level = kMaxOptLevel)
-      : OptimizationFunctionBasePass("array_simp", "Array Simplification"),
-        opt_level_(opt_level) {}
+  static constexpr std::string_view kName = "array_simp";
+  explicit ArraySimplificationPass()
+      : OptimizationFunctionBasePass(kName, "Array Simplification") {}
 
  protected:
-  int64_t opt_level_;
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
 };
 
 }  // namespace xls
 
-#endif  // XLS_PASSES_ARRAY_SIMPLIFICATION_H_
+#endif  // XLS_PASSES_ARRAY_SIMPLIFICATION_PASS_H_

@@ -17,7 +17,10 @@
 #include "absl/status/statusor.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/function_base.h"
+#include "xls/ir/node.h"
+#include "xls/ir/op.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
 #include "xls/passes/pass_base.h"
 
 namespace xls {
@@ -26,7 +29,7 @@ namespace xls {
 // identities with their respective operands.
 absl::StatusOr<bool> IdentityRemovalPass::RunOnFunctionBaseInternal(
     FunctionBase* f, const OptimizationPassOptions& options,
-    PassResults* results) const {
+    PassResults* results, OptimizationContext& context) const {
   bool changed = false;
   for (Node* node : f->nodes()) {
     if (node->op() == Op::kIdentity) {
@@ -36,5 +39,7 @@ absl::StatusOr<bool> IdentityRemovalPass::RunOnFunctionBaseInternal(
   }
   return changed;
 }
+
+REGISTER_OPT_PASS(IdentityRemovalPass);
 
 }  // namespace xls

@@ -14,6 +14,7 @@
 
 #include "xls/jit/type_layout.h"
 
+#include <cstdint>
 #include <memory>
 #include <random>
 #include <string>
@@ -21,22 +22,29 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/log/log.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
+#include "absl/types/variant.h"
 #include "xls/common/bits_util.h"
 #include "xls/common/logging/log_lines.h"
 #include "xls/common/status/matchers.h"
 #include "xls/data_structures/leaf_type_tree.h"
 #include "xls/interpreter/random_value.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/ir_test_base.h"
 #include "xls/ir/number_parser.h"
 #include "xls/ir/type.h"
+#include "xls/ir/value.h"
 #include "xls/jit/llvm_type_converter.h"
 #include "xls/jit/orc_jit.h"
 
 namespace xls {
 namespace {
 
-using testing::ElementsAre;
+using ::testing::ElementsAre;
 
 class TypeLayoutTest : public IrTestBase {};
 
@@ -80,6 +88,7 @@ TEST_F(TypeLayoutTest, EmptyTuple) {
   EXPECT_TRUE(layout.elements().empty());
   std::vector<uint8_t> buffer;
   EXPECT_EQ(layout.NativeLayoutToValue(buffer.data()), Value::Tuple({}));
+  EXPECT_THAT(layout.mask(), testing::IsEmpty());
   layout.ValueToNativeLayout(Value::Tuple({}), buffer.data());
 
   XLS_ASSERT_OK_AND_ASSIGN(
@@ -97,6 +106,7 @@ TEST_F(TypeLayoutTest, Bits1) {
     TypeLayout layout(
         u1, 1,
         {ElementLayout({.offset = 0, .data_size = 1, .padded_size = 1})});
+    EXPECT_THAT(layout.mask(), ElementsAre(0x1));
     EXPECT_EQ(layout.size(), 1);
     EXPECT_EQ(layout.elements().size(), 1);
     // Verify conversion to native layout. In each case, fill buffer with all
@@ -127,6 +137,7 @@ TEST_F(TypeLayoutTest, Bits1) {
     TypeLayout layout(
         u1, 7,
         {ElementLayout({.offset = 0, .data_size = 1, .padded_size = 7})});
+    EXPECT_THAT(layout.mask(), ElementsAre(0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0));
     EXPECT_EQ(layout.size(), 7);
     EXPECT_EQ(layout.elements().size(), 1);
     // Verify conversion to native layout. In each case, fill buffer with all
@@ -159,6 +170,7 @@ TEST_F(TypeLayoutTest, Bits1) {
         u1, 7,
         {ElementLayout({.offset = 2, .data_size = 1, .padded_size = 5})});
     EXPECT_EQ(layout.size(), 7);
+    EXPECT_THAT(layout.mask(), ElementsAre(0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0));
     EXPECT_EQ(layout.elements().size(), 1);
     // Verify conversion to native layout. In each case, fill buffer with all
     // ones to check that padding is cleared.
@@ -191,6 +203,7 @@ TEST_F(TypeLayoutTest, Bits24) {
   TypeLayout layout(
       u24, 4, {ElementLayout({.offset = 0, .data_size = 3, .padded_size = 4})});
   EXPECT_EQ(layout.size(), 4);
+  EXPECT_THAT(layout.mask(), ElementsAre(0xFF, 0xFF, 0xFF, 0x0));
   EXPECT_EQ(layout.elements().size(), 1);
   {
     std::vector<uint8_t> buffer = {0xff, 0xff, 0xff, 0xff};
@@ -209,6 +222,8 @@ TEST_F(TypeLayoutTest, Bits42) {
   TypeLayout layout(
       u42, 8, {ElementLayout({.offset = 1, .data_size = 6, .padded_size = 6})});
   EXPECT_EQ(layout.size(), 8);
+  EXPECT_THAT(layout.mask(),
+              ElementsAre(0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0b11, 0x00));
   EXPECT_EQ(layout.elements().size(), 1);
   {
     std::vector<uint8_t> buffer = {0xff, 0xff, 0xff, 0xff,
@@ -231,6 +246,9 @@ TEST_F(TypeLayoutTest, Bits100) {
       u100, 16,
       {ElementLayout({.offset = 0, .data_size = 13, .padded_size = 16})});
   EXPECT_EQ(layout.size(), 16);
+  EXPECT_THAT(layout.mask(),
+              ElementsAre(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                          0xFF, 0xFF, 0xFF, 0x0F, 0x00, 0x00, 0x00));
   EXPECT_EQ(layout.elements().size(), 1);
   for (const Value& value :
        {Value(UBits(0, 100)), Value(Bits::AllOnes(100)),
@@ -252,6 +270,7 @@ TEST_F(TypeLayoutTest, SimpleTuple) {
        ElementLayout{.offset = 2, .data_size = 2, .padded_size = 2},
        ElementLayout{.offset = 4, .data_size = 2, .padded_size = 2}});
   EXPECT_EQ(layout.size(), 6);
+  EXPECT_THAT(layout.mask(), ElementsAre(0x0F, 0x0, 0xFF, 0x7F, 0xFF, 0xFF));
   EXPECT_EQ(layout.elements().size(), 3);
   {
     std::vector<uint8_t> buffer = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
@@ -271,6 +290,7 @@ TEST_F(TypeLayoutTest, SimpleArray) {
        ElementLayout{.offset = 2, .data_size = 2, .padded_size = 2},
        ElementLayout{.offset = 4, .data_size = 2, .padded_size = 2}});
   EXPECT_EQ(layout.size(), 6);
+  EXPECT_THAT(layout.mask(), ElementsAre(0xFF, 0x01, 0xFF, 0x01, 0xFF, 0x01));
   EXPECT_EQ(layout.elements().size(), 3);
   {
     std::vector<uint8_t> buffer = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
@@ -306,14 +326,14 @@ TEST_F(TypeLayoutTest, JitTypes) {
     XLS_ASSERT_OK_AND_ASSIGN(Type * type,
                              Parser::ParseType(type_str, package.get()));
     TypeLayout layout = CreateTypeLayout(type);
-    XLS_VLOG(1) << layout.ToString();
+    VLOG(1) << layout.ToString();
 
     std::vector<Type*> leaf_types = GetLeafTypes(type);
     ASSERT_EQ(leaf_types.size(), layout.elements().size());
 
     for (int64_t i = 0; i < kValuesPerType; ++i) {
       Value value = RandomValue(type, bitgen);
-      XLS_VLOG(1) << value.ToString();
+      VLOG(1) << value.ToString();
 
       std::vector<uint8_t> buffer(layout.size(), 0xff);
       layout.ValueToNativeLayout(value, buffer.data());

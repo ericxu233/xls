@@ -22,10 +22,10 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
-#include "xls/common/status/ret_check.h"
 #include "xls/noc/config/network_config.pb.h"
 #include "xls/noc/simulation/common.h"
 
@@ -44,7 +44,6 @@ namespace noc {
 //
 // TODO(tedhong): 2020-12-23 - Add a third abstraction that maps proto names
 //                             to network graph ids.
-
 
 // Interface to protos describing a virtual channel
 struct VirtualChannelParam {
@@ -140,7 +139,7 @@ struct PortParam {
           vc_proto = &p;
         }
       }
-      XLS_CHECK(vc_proto != nullptr);  // The VC should be configured.
+      CHECK(vc_proto != nullptr);  // The VC should be configured.
       ret.emplace_back(*network_proto_, *vc_proto);
     }
     return ret;

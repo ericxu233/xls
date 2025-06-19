@@ -21,9 +21,11 @@
 #include <variant>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/container/btree_set.h"
-#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -31,11 +33,19 @@
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
 #include "absl/types/variant.h"
+#include "xls/common/casts.h"
 #include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/common/visitor.h"
 #include "xls/dslx/frontend/ast.h"
-#include "xls/dslx/frontend/builtins_metadata.h"
+#include "xls/dslx/frontend/ast_node.h"
+#include "xls/dslx/frontend/ast_utils.h"
+#include "xls/dslx/frontend/builtin_stubs_utils.h"
+#include "xls/dslx/frontend/module.h"
+#include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/frontend/proc_id.h"
 #include "xls/dslx/type_system/parametric_env.h"
+#include "xls/dslx/type_system/type_info.h"
 
 namespace xls::dslx {
 namespace {
@@ -82,7 +92,7 @@ Callee::Callee(Function* f, const Invocation* invocation, Module* m,
       type_info_(type_info),
       parametric_env_(std::move(parametric_env)),
       proc_id_(std::move(proc_id)) {
-  XLS_CHECK_EQ(type_info->module(), m)
+  CHECK_EQ(type_info->module(), m)
       << "type_info module: " << type_info->module()->name()
       << " vs module: " << m->name();
 }
@@ -153,131 +163,6 @@ std::string ConversionRecord::ToString() const {
       parametric_env_.ToString(), CalleesToString(callees_));
 }
 
-// TODO(vmirian) 2022-02-11 Consider collapsing this visitor
-// (CalleeCollectorVisitor) with the InvocationVisitor.
-// Collects callee information from Invocation node into a list.
-class CalleeCollectorVisitor : public AstNodeVisitorWithDefault {
- public:
-  CalleeCollectorVisitor(Module* module, TypeInfo* type_info)
-      : module_(module), type_info_(type_info) {
-    XLS_CHECK_EQ(type_info_->module(), module_);
-  }
-  absl::Status HandleInvocation(const Invocation* node) override {
-    std::optional<CalleeInfo> callee_info;
-    if (auto* colon_ref = dynamic_cast<const ColonRef*>(node->callee())) {
-      XLS_ASSIGN_OR_RETURN(callee_info, HandleColonRefInvocation(colon_ref));
-    } else if (auto* name_ref = dynamic_cast<const NameRef*>(node->callee())) {
-      XLS_ASSIGN_OR_RETURN(callee_info,
-                           HandleNameRefInvocation(name_ref, node));
-    } else {
-      return absl::UnimplementedError(
-          "Only calls to named functions are currently supported "
-          "for IR conversion; callee: " +
-          node->callee()->ToString());
-    }
-
-    if (!callee_info.has_value()) {
-      // Happens for example when we're invoking a builtin, there's nothing to
-      // convert.
-      return absl::OkStatus();
-    }
-
-    callees_.emplace_back(callee_info.value());
-    return absl::OkStatus();
-  }
-
-  ~CalleeCollectorVisitor() override = default;
-
-  // Helper type used to hold callee information for different forms of
-  // invocations.
-  struct CalleeInfo {
-    Module* module = nullptr;
-    Function* function = nullptr;
-
-    template <typename H>
-    friend H AbslHashValue(H h, const CalleeInfo& c);
-
-    friend bool operator==(const CalleeInfo& lhs, const CalleeInfo& rhs);
-  };
-
-  absl::Span<const CalleeInfo> GetCallees() { return callees_; }
-
- private:
-  // Helper for invocations of ColonRef callees.
-  absl::StatusOr<CalleeInfo> HandleColonRefInvocation(
-      const ColonRef* colon_ref) {
-    std::optional<Import*> import = colon_ref->ResolveImportSubject();
-    XLS_RET_CHECK(import.has_value());
-    std::optional<const ImportedInfo*> info = type_info_->GetImported(*import);
-    XLS_RET_CHECK(info.has_value());
-    Module* module = (*info)->module;
-    XLS_ASSIGN_OR_RETURN(Function * f,
-                         module->GetMemberOrError<Function>(colon_ref->attr()));
-    return CalleeInfo{module, f};
-  }
-
-  // Helper for invocations of NameRef callees.
-  absl::StatusOr<std::optional<CalleeInfo>> HandleNameRefInvocation(
-      const NameRef* name_ref, const Invocation* invocation) {
-    Module* this_m = module_;
-    // TODO(leary): 2020-01-16 change to detect builtinnamedef map, identifier
-    // is fragile due to shadowing. It is also appears in the InvocationVisitor.
-    std::string identifier = name_ref->identifier();
-    if (identifier == "map") {
-      // We need to make sure we convert the mapped function!
-      XLS_RET_CHECK_EQ(invocation->args().size(), 2);
-      Expr* fn_node = invocation->args()[1];
-      XLS_VLOG(5) << "map() invoking: " << fn_node->ToString();
-      if (auto* mapped_colon_ref = dynamic_cast<ColonRef*>(fn_node)) {
-        XLS_VLOG(5) << "map() invoking ColonRef: "
-                    << mapped_colon_ref->ToString();
-        identifier = mapped_colon_ref->attr();
-        std::optional<Import*> import =
-            mapped_colon_ref->ResolveImportSubject();
-        XLS_RET_CHECK(import.has_value());
-        std::optional<const ImportedInfo*> info =
-            type_info_->GetImported(*import);
-        XLS_RET_CHECK(info.has_value());
-        this_m = (*info)->module;
-        XLS_VLOG(5) << "Module for callee: " << this_m->name();
-      } else {
-        XLS_VLOG(5) << "map() invoking NameRef";
-        auto* mapped_name_ref = dynamic_cast<NameRef*>(fn_node);
-        XLS_RET_CHECK(mapped_name_ref != nullptr);
-        identifier = mapped_name_ref->identifier();
-      }
-    }
-
-    Function* f = nullptr;
-    absl::StatusOr<Function*> maybe_f =
-        this_m->GetMemberOrError<Function>(identifier);
-    if (maybe_f.ok()) {
-      f = maybe_f.value();
-    } else {
-      if (IsNameParametricBuiltin(identifier)) {
-        return std::nullopt;
-      }
-      return absl::InternalError("Could not resolve invoked function: " +
-                                 identifier);
-    }
-
-    return CalleeInfo{this_m, f};
-  }
-  Module* module_;
-  TypeInfo* type_info_;
-  std::vector<CalleeInfo> callees_;
-};
-
-template <typename H>
-H AbslHashValue(H h, const CalleeCollectorVisitor::CalleeInfo& c) {
-  return H::combine(std::move(h), c.module, c.function);
-}
-
-bool operator==(const CalleeCollectorVisitor::CalleeInfo& lhs,
-                const CalleeCollectorVisitor::CalleeInfo& rhs) {
-  return lhs.module == rhs.module && lhs.function == rhs.function;
-}
-
 // Collects all Invocation nodes below the visited node.
 class InvocationVisitor : public ExprVisitor {
  public:
@@ -288,10 +173,12 @@ class InvocationVisitor : public ExprVisitor {
         type_info_(type_info),
         bindings_(bindings),
         proc_id_(std::move(proc_id)) {
-    XLS_CHECK_EQ(type_info_->module(), module_);
+    CHECK_EQ(type_info_->module(), module_);
   }
 
   ~InvocationVisitor() override = default;
+
+  const FileTable& file_table() const { return *module_->file_table(); }
 
   // Helper type used to hold callee information for different forms of
   // invocations.
@@ -317,7 +204,7 @@ class InvocationVisitor : public ExprVisitor {
     return expr->rhs()->AcceptExpr(this);
   }
 
-  absl::Status HandleBlock(const Block* expr) override {
+  absl::Status HandleStatementBlock(const StatementBlock* expr) override {
     for (Statement* stmt : expr->statements()) {
       XLS_RETURN_IF_ERROR(
           absl::visit(Visitor{
@@ -330,6 +217,10 @@ class InvocationVisitor : public ExprVisitor {
                           [&](TypeAlias*) {
                             // Nothing needed for conversion.
                             return absl::OkStatus();
+                          },
+                          [&](VerbatimNode*) {
+                            return absl::UnimplementedError(
+                                "Should not convert VerbatimNode");
                           },
                       },
                       stmt->wrapped()));
@@ -347,20 +238,33 @@ class InvocationVisitor : public ExprVisitor {
     return absl::OkStatus();
   }
 
-  absl::Status HandleConstantArray(const ConstantArray* expr) override {
-    return HandleArray(expr);
-  }
-
   absl::Status HandleFor(const For* expr) override {
     XLS_RETURN_IF_ERROR(expr->init()->AcceptExpr(this));
     XLS_RETURN_IF_ERROR(expr->iterable()->AcceptExpr(this));
     return expr->body()->AcceptExpr(this);
   }
 
+  absl::Status HandleUnrollFor(const UnrollFor* expr) override {
+    std::optional<const Expr*> unrolled =
+        type_info_->GetUnrolledLoop(expr, bindings_);
+    if (unrolled.has_value()) {
+      XLS_RETURN_IF_ERROR((*unrolled)->AcceptExpr(this));
+    }
+    return absl::OkStatus();
+  }
+
   absl::Status HandleFormatMacro(const FormatMacro* expr) override {
     for (const Expr* arg : expr->args()) {
       XLS_RETURN_IF_ERROR(arg->AcceptExpr(this));
     }
+    return absl::OkStatus();
+  }
+
+  absl::Status HandleFunctionRef(const FunctionRef* expr) override {
+    return absl::OkStatus();
+  }
+
+  absl::Status HandleAllOnesMacro(const AllOnesMacro* expr) override {
     return absl::OkStatus();
   }
 
@@ -384,21 +288,33 @@ class InvocationVisitor : public ExprVisitor {
       XLS_RETURN_IF_ERROR(arg->AcceptExpr(this));
     }
 
-    if (auto* colon_ref = dynamic_cast<ColonRef*>(node->callee())) {
-      XLS_ASSIGN_OR_RETURN(callee_info, HandleColonRefInvocation(colon_ref));
-    } else if (auto* name_ref = dynamic_cast<NameRef*>(node->callee())) {
-      XLS_ASSIGN_OR_RETURN(callee_info,
-                           HandleNameRefInvocation(name_ref, node));
-    } else {
-      return absl::UnimplementedError(
-          "Only calls to named functions are currently supported "
-          "for IR conversion; callee: " +
-          node->callee()->ToString());
-    }
+    std::optional<const InvocationData> inv_data =
+        type_info_->GetInvocationData(node);
 
-    if (!callee_info.has_value()) {
-      // Happens for example when we're invoking a builtin, there's nothing to
-      // convert.
+    // TODO: erinzmoore - Once v1 is removed, delete if/else clause here and
+    // require that `inv_data` is present and complete.
+    if (inv_data.has_value() && (*inv_data).callee() != nullptr) {
+      if (IsBuiltin((*inv_data).callee())) {
+        return absl::OkStatus();
+      }
+
+      bool is_parametric = (*inv_data).callee()->IsParametric();
+      // Temporarily store null type_info for parametric functions. Parametric
+      // bindings will be resolved below and used to look up the invocation type
+      // info.
+      // TODO: erinzmoore - Once v1 is removed, provide way to look up all
+      // CalleeInfo directly from `TypeInfo` for an {invocation, bindings} pair.
+      TypeInfo* invocation_ti = is_parametric ? nullptr : type_info_;
+      if (!is_parametric && (*inv_data).callee()->owner() != module_) {
+        invocation_ti =
+            *type_info_->GetImportedTypeInfo((*inv_data).callee()->owner());
+      }
+
+      callee_info = CalleeInfo{(*inv_data).callee()->owner(),
+                               const_cast<Function*>((*inv_data).callee()),
+                               invocation_ti};
+    } else {
+      XLS_RET_CHECK(IsBuiltinFn(node->callee()));
       return absl::OkStatus();
     }
 
@@ -409,33 +325,35 @@ class InvocationVisitor : public ExprVisitor {
     if (maybe_proc.has_value()) {
       XLS_RET_CHECK(proc_id_.has_value()) << "Functions cannot spawn procs.";
 
-      std::vector<Proc*> proc_stack = proc_id_.value().proc_stack;
-      proc_stack.push_back(maybe_proc.value());
-      proc_id = ProcId{proc_stack, proc_instances_[proc_stack]};
-      // Only increment on next so that Config & Next have the same ID.
-      // This assumes that we call a Proc's config & next calls in that order,
-      // which is indeed the case.
-      if (callee_info->callee->tag() == Function::Tag::kProcNext) {
-        proc_instances_[proc_stack]++;
-      }
+      // Only count `next` as a new instance, so that `config` and `next` have
+      // the same ID. This assumes that we call a proc's `config` and `next` in
+      // that order, which is indeed the case.
+      const bool count_as_new_instance =
+          callee_info->callee->tag() == FunctionTag::kProcNext;
+      proc_id = proc_id_factory_.CreateProcId(*proc_id_, maybe_proc.value(),
+                                              count_as_new_instance);
     }
 
     // See if there are parametric bindings to use in the callee for this
     // invocation.
-    XLS_VLOG(5) << "Getting callee bindings for invocation: "
-                << node->ToString() << " @ " << node->span()
-                << " caller bindings: " << bindings_.ToString();
+    VLOG(5) << "Getting callee bindings for invocation: " << node->ToString()
+            << " @ " << node->span().ToString(file_table())
+            << " caller bindings: " << bindings_.ToString();
+
     std::optional<const ParametricEnv*> callee_bindings =
         type_info_->GetInvocationCalleeBindings(node, bindings_);
+
     if (callee_bindings.has_value()) {
       XLS_RET_CHECK(*callee_bindings != nullptr);
-      XLS_VLOG(5) << "Found callee bindings: " << **callee_bindings
-                  << " for node: " << node->ToString();
+      VLOG(5) << "Found callee bindings: " << **callee_bindings
+              << " for node: " << node->ToString();
       std::optional<TypeInfo*> instantiation_type_info =
-          type_info_->GetInvocationTypeInfo(node, **callee_bindings);
+          type_info_->GetInvocationTypeInfo(node, bindings_);
+
       XLS_RET_CHECK(instantiation_type_info.has_value())
           << "Could not find instantiation for `" << node->ToString() << "`"
-          << " via bindings: " << **callee_bindings;
+          << " via bindings: " << *callee_bindings.value();
+
       // Note: when mapping a function that is non-parametric, the instantiated
       // type info can be nullptr (no associated type info, as the callee didn't
       // have to be instantiated).
@@ -443,6 +361,7 @@ class InvocationVisitor : public ExprVisitor {
         callee_info->type_info = *instantiation_type_info;
       }
     }
+    XLS_RET_CHECK(callee_info->type_info != nullptr);
 
     XLS_ASSIGN_OR_RETURN(
         auto callee,
@@ -452,6 +371,10 @@ class InvocationVisitor : public ExprVisitor {
                      proc_id));
     callees_.push_back(std::move(callee));
     return absl::OkStatus();
+  }
+
+  absl::Status HandleLambda(const Lambda* expr) override {
+    return absl::UnimplementedError("lambdas not yet supported");
   }
 
   absl::Status HandleLet(const Let* expr) override {
@@ -509,6 +432,11 @@ class InvocationVisitor : public ExprVisitor {
     return expr->operand()->AcceptExpr(this);
   }
 
+  absl::Status HandleVerbatimNode(const VerbatimNode* node) override {
+    return absl::Status(absl::StatusCode::kUnimplemented,
+                        "Should not convert VerbatimNode");
+  }
+
   absl::Status HandleXlsTuple(const XlsTuple* expr) override {
     for (const Expr* member : expr->members()) {
       XLS_RETURN_IF_ERROR(member->AcceptExpr(this));
@@ -524,121 +452,82 @@ class InvocationVisitor : public ExprVisitor {
   // No ColonRef handling (ColonRef invocations are handled in HandleInvocation;
   // all other ColonRefs are to constant values, which don't need their deriving
   // exprs converted to IR.
-  // No ConstRef handling: constants don't need their defiving exprs converted
-  // to IR.
   DEFAULT_HANDLE(ChannelDecl)
   DEFAULT_HANDLE(ColonRef)
-  DEFAULT_HANDLE(ConstRef)
   DEFAULT_HANDLE(NameRef)
   DEFAULT_HANDLE(Number)
   DEFAULT_HANDLE(String)
-  DEFAULT_HANDLE(UnrollFor)
 #undef DEFAULT_HANDLE
 
   std::vector<Callee>& callees() { return callees_; }
 
  private:
-  // Helper for invocations of ColonRef callees.
-  absl::StatusOr<CalleeInfo> HandleColonRefInvocation(
-      const ColonRef* colon_ref) {
-    std::optional<Import*> import = colon_ref->ResolveImportSubject();
-    XLS_RET_CHECK(import.has_value());
-    std::optional<const ImportedInfo*> info = type_info_->GetImported(*import);
-    XLS_RET_CHECK(info.has_value());
-    Module* module = (*info)->module;
-    XLS_ASSIGN_OR_RETURN(Function * f,
-                         module->GetMemberOrError<Function>(colon_ref->attr()));
-    return CalleeInfo{module, f, (*info)->type_info};
-  }
-
-  // Helper for invocations of NameRef callees.
-  absl::StatusOr<std::optional<CalleeInfo>> HandleNameRefInvocation(
-      const NameRef* name_ref, const Invocation* invocation) {
-    Module* this_m = module_;
-    TypeInfo* callee_type_info = type_info_;
-    // TODO(leary): 2020-01-16 change to detect builtinnamedef map, identifier
-    // is fragile due to shadowing. It is also appears in the
-    // CalleeCollectorVisitor.
-    std::string identifier = name_ref->identifier();
-    if (identifier == "map") {
-      // We need to make sure we convert the mapped function!
-      XLS_RET_CHECK_EQ(invocation->args().size(), 2);
-      Expr* fn_node = invocation->args()[1];
-      XLS_VLOG(5) << "map() invoking: " << fn_node->ToString();
-      if (auto* mapped_colon_ref = dynamic_cast<ColonRef*>(fn_node)) {
-        XLS_VLOG(5) << "map() invoking ColonRef: "
-                    << mapped_colon_ref->ToString();
-        identifier = mapped_colon_ref->attr();
-        std::optional<Import*> import =
-            mapped_colon_ref->ResolveImportSubject();
-        XLS_RET_CHECK(import.has_value());
-        std::optional<const ImportedInfo*> info =
-            type_info_->GetImported(*import);
-        XLS_RET_CHECK(info.has_value());
-        this_m = (*info)->module;
-        callee_type_info = (*info)->type_info;
-        XLS_VLOG(5) << "Module for callee: " << this_m->name();
-      } else {
-        XLS_VLOG(5) << "map() invoking NameRef";
-        auto* mapped_name_ref = dynamic_cast<NameRef*>(fn_node);
-        XLS_RET_CHECK(mapped_name_ref != nullptr);
-        identifier = mapped_name_ref->identifier();
-      }
-    }
-
-    Function* f = nullptr;
-    absl::StatusOr<Function*> maybe_f =
-        this_m->GetMemberOrError<Function>(identifier);
-    if (maybe_f.ok()) {
-      f = maybe_f.value();
-    } else {
-      if (IsNameParametricBuiltin(identifier)) {
-        return std::nullopt;
-      }
-      return absl::InternalError("Could not resolve invoked function: " +
-                                 identifier);
-    }
-
-    return CalleeInfo{this_m, f, callee_type_info};
-  }
-
   Module* module_;
   TypeInfo* type_info_;
   const ParametricEnv& bindings_;
   std::optional<ProcId> proc_id_;
-  absl::flat_hash_map<std::vector<Proc*>, int> proc_instances_;
+  ProcIdFactory proc_id_factory_;
 
   // Built up list of callee records discovered during traversal.
   std::vector<Callee> callees_;
 };
 
-// Top level procs are procs where their config or next function is not invoked
-// within the module.
-// For example, for a given module with four procs: ProcA, ProcB, ProcC and
-// ProcD. The procs have the following invocation scheme: ProcA invokes ProcC
-// and ProcD, and ProcB does not invoke any procs. Given that there is no
-// invocation of ProcA and ProcB, they (ProcA and ProcB) are the top level
-// procs.
-static absl::StatusOr<std::vector<Proc*>> GetTopLevelProcs(
-    Module* module, TypeInfo* type_info) {
-  CalleeCollectorVisitor visitor(module, type_info);
-  std::vector<Proc*> procs;
-  XLS_RETURN_IF_ERROR(WalkPostOrder(module, &visitor, /*want_types=*/true));
-  absl::Span<const CalleeCollectorVisitor::CalleeInfo> callees =
-      visitor.GetCallees();
-  absl::flat_hash_set<CalleeCollectorVisitor::CalleeInfo> callee_set;
-  for (auto& callee : callees) {
-    callee_set.insert(callee);
+// Returns all spawns contained in the configuration of `p`.
+static absl::StatusOr<std::vector<Spawn*>> GetSpawns(Proc& p) {
+  Function& config = p.config();
+  std::vector<Spawn*> results;
+  XLS_ASSIGN_OR_RETURN(std::vector<AstNode*> nodes,
+                       CollectUnder(config.body(), /*want_types=*/false));
+  for (AstNode* node : nodes) {
+    if (auto* spawn = dynamic_cast<Spawn*>(node); spawn != nullptr) {
+      results.push_back(spawn);
+    }
   }
+  return results;
+}
+
+absl::StatusOr<std::vector<Proc*>> GetTopLevelProcs(Module* module,
+                                                    TypeInfo* type_info) {
+  absl::flat_hash_set<Spawn*> spawns;
+
+  std::vector<Proc*> procs;
   for (Proc* proc : module->GetProcs()) {
-    // Checking the presence of the config function suffices since the config
-    // is instantiated prior to the next function.
-    if (callee_set.find({proc->owner(), proc->config()}) != callee_set.end()) {
+    XLS_RET_CHECK(proc != nullptr);
+    XLS_ASSIGN_OR_RETURN(std::vector<Spawn*> this_spawns, GetSpawns(*proc));
+    spawns.insert(this_spawns.begin(), this_spawns.end());
+  }
+
+  absl::flat_hash_set<Proc*> spawned;
+  for (Spawn* spawn : spawns) {
+    Expr* spawnee = spawn->callee();
+    NameRef* spawnee_nameref = dynamic_cast<NameRef*>(spawnee);
+
+    // If it's not a reference to a name in the local module, it can't be a top
+    // level proc in this module anyway.
+    if (spawnee_nameref == nullptr) {
       continue;
     }
-    procs.emplace_back(proc);
+
+    auto* this_spawned = down_cast<Proc*>(spawnee_nameref->GetDefiner());
+    spawned.insert(this_spawned);
   }
-  return procs;
+
+  // All non-parametric procs that are not spawned are top level.
+  std::vector<Proc*> results;
+  for (Proc* proc : module->GetProcs()) {
+    if (!proc->IsParametric() && !spawned.contains(proc) &&
+        absl::c_all_of(proc->config().params(),
+                       [&](const Param* param) -> bool {
+                         // param is a channel.
+                         return dynamic_cast<ChannelTypeAnnotation*>(
+                                    param->type_annotation()) != nullptr;
+                       })) {
+      // Proc is not parametric and not spawned, thus top level.
+      results.push_back(proc);
+    }
+  }
+
+  return results;
 }
 
 // This function removes duplicate conversion records containing a non-derived
@@ -654,16 +543,30 @@ static void RemoveFunctionDuplicates(std::vector<ConversionRecord>* ready) {
 
       bool same_fns = function_cr.f() == subject_cr.f();
       bool either_is_proc_instance_fn =
-          function_cr.f()->tag() == Function::Tag::kProcConfig ||
-          function_cr.f()->tag() == Function::Tag::kProcNext ||
-          subject_cr.f()->tag() == Function::Tag::kProcConfig ||
-          subject_cr.f()->tag() == Function::Tag::kProcNext;
+          function_cr.f()->tag() == FunctionTag::kProcConfig ||
+          function_cr.f()->tag() == FunctionTag::kProcNext ||
+          subject_cr.f()->tag() == FunctionTag::kProcConfig ||
+          subject_cr.f()->tag() == FunctionTag::kProcNext;
       bool either_is_parametric =
           function_cr.f()->IsParametric() || subject_cr.f()->IsParametric();
+      bool both_are_parametric =
+          function_cr.f()->IsParametric() && subject_cr.f()->IsParametric();
 
-      if (same_fns && !either_is_proc_instance_fn && !either_is_parametric) {
-        iter_subject = ready->erase(iter_subject);
-        continue;
+      if (same_fns && !either_is_proc_instance_fn) {
+        // If neither are parametric, then function identity comparison is
+        // a sufficient test to eliminate detected duplicates.
+        if (!either_is_parametric) {
+          iter_subject = ready->erase(iter_subject);
+          continue;
+        }
+
+        // If the functions are the same and they have the same parametric
+        // environment, eliminate any duplicates.
+        if (both_are_parametric &&
+            function_cr.parametric_env() == subject_cr.parametric_env()) {
+          iter_subject = ready->erase(iter_subject);
+          continue;
+        }
       }
       iter_subject++;
     }
@@ -685,9 +588,9 @@ static void RemoveFunctionDuplicates(std::vector<ConversionRecord>* ready) {
 static absl::StatusOr<std::vector<Callee>> GetCallees(
     Expr* node, Module* m, TypeInfo* type_info, const ParametricEnv& bindings,
     std::optional<ProcId> proc_id) {
-  XLS_VLOG(5) << "Getting callees of " << node->ToString();
-  XLS_CHECK_EQ(type_info->module(), m);
-  InvocationVisitor visitor(m, type_info, bindings, proc_id);
+  VLOG(5) << "Getting callees of " << node->ToString();
+  XLS_RET_CHECK_EQ(type_info->module(), m);
+  InvocationVisitor visitor(m, type_info, bindings, std::move(proc_id));
   XLS_RETURN_IF_ERROR(node->AcceptExpr(&visitor));
   return std::move(visitor.callees());
 }
@@ -715,13 +618,46 @@ static bool IsReady(std::variant<Function*, TestFunction*> f, Module* m,
 }
 
 // Forward decl.
+static absl::Status ProcessCallees(absl::Span<const Callee> orig_callees,
+                                   std::vector<ConversionRecord>* ready);
+
+// Adds (f, bindings) to conversion order after deps have been added.
 static absl::Status AddToReady(std::variant<Function*, TestFunction*> f,
                                const Invocation* invocation, Module* m,
                                TypeInfo* type_info,
                                const ParametricEnv& bindings,
                                std::vector<ConversionRecord>* ready,
-                               std::optional<ProcId> proc_id,
-                               bool is_top = false);
+                               const std::optional<ProcId>& proc_id,
+                               bool is_top = false) {
+  XLS_RET_CHECK_EQ(type_info->module(), m);
+  if (IsReady(f, m, bindings, ready)) {
+    return absl::OkStatus();
+  }
+
+  // TestFunctions are covered by IsReady()
+  Expr* body = std::get<Function*>(f)->body();
+  XLS_ASSIGN_OR_RETURN(const std::vector<Callee> orig_callees,
+                       GetCallees(body, m, type_info, bindings, proc_id));
+  VLOG(5) << "Original callees of " << std::get<Function*>(f)->identifier()
+          << ": " << CalleesToString(orig_callees);
+  XLS_RETURN_IF_ERROR(ProcessCallees(orig_callees, ready));
+
+  XLS_RET_CHECK(!IsReady(f, m, bindings, ready));
+
+  // We don't convert the bodies of test constructs of IR.
+  if (std::holds_alternative<TestFunction*>(f)) {
+    return absl::OkStatus();
+  }
+
+  auto* fn = std::get<Function*>(f);
+  VLOG(3) << "Adding to ready sequence: " << fn->identifier();
+  XLS_ASSIGN_OR_RETURN(
+      ConversionRecord cr,
+      ConversionRecord::Make(fn, invocation, m, type_info, bindings,
+                             orig_callees, proc_id, is_top));
+  ready->push_back(std::move(cr));
+  return absl::OkStatus();
+}
 
 static absl::Status ProcessCallees(absl::Span<const Callee> orig_callees,
                                    std::vector<ConversionRecord>* ready) {
@@ -746,44 +682,6 @@ static absl::Status ProcessCallees(absl::Span<const Callee> orig_callees,
   return absl::OkStatus();
 }
 
-// Adds (f, bindings) to conversion order after deps have been added.
-static absl::Status AddToReady(std::variant<Function*, TestFunction*> f,
-                               const Invocation* invocation, Module* m,
-                               TypeInfo* type_info,
-                               const ParametricEnv& bindings,
-                               std::vector<ConversionRecord>* ready,
-                               const std::optional<ProcId> proc_id,
-                               bool is_top) {
-  XLS_CHECK_EQ(type_info->module(), m);
-  if (IsReady(f, m, bindings, ready)) {
-    return absl::OkStatus();
-  }
-
-  // TestFunctions are covered by IsReady()
-  Expr* body = std::get<Function*>(f)->body();
-  XLS_ASSIGN_OR_RETURN(const std::vector<Callee> orig_callees,
-                       GetCallees(body, m, type_info, bindings, proc_id));
-  XLS_VLOG(5) << "Original callees of " << std::get<Function*>(f)->identifier()
-              << ": " << CalleesToString(orig_callees);
-  XLS_RETURN_IF_ERROR(ProcessCallees(orig_callees, ready));
-
-  XLS_RET_CHECK(!IsReady(f, m, bindings, ready));
-
-  // We don't convert the bodies of test constructs of IR.
-  if (std::holds_alternative<TestFunction*>(f)) {
-    return absl::OkStatus();
-  }
-
-  auto* fn = std::get<Function*>(f);
-  XLS_VLOG(3) << "Adding to ready sequence: " << fn->identifier();
-  XLS_ASSIGN_OR_RETURN(
-      ConversionRecord cr,
-      ConversionRecord::Make(fn, invocation, m, type_info, bindings,
-                             orig_callees, proc_id, is_top));
-  ready->push_back(std::move(cr));
-  return absl::OkStatus();
-}
-
 static absl::StatusOr<std::vector<ConversionRecord>> GetOrderForProc(
     std::variant<Proc*, TestProc*> entry, TypeInfo* type_info, bool is_top) {
   std::vector<ConversionRecord> ready;
@@ -796,13 +694,14 @@ static absl::StatusOr<std::vector<ConversionRecord>> GetOrderForProc(
 
   // The next function of a proc is the entry function when converting a proc to
   // IR.
-  XLS_RETURN_IF_ERROR(AddToReady(p->next(),
+  XLS_RETURN_IF_ERROR(
+      AddToReady(&p->next(),
+                 /*invocation=*/nullptr, p->owner(), type_info, ParametricEnv(),
+                 &ready, ProcId{.proc_instance_stack = {{p, 0}}}, is_top));
+  XLS_RETURN_IF_ERROR(AddToReady(&p->config(),
                                  /*invocation=*/nullptr, p->owner(), type_info,
-                                 ParametricEnv(), &ready, ProcId{{p}, 0},
-                                 is_top));
-  XLS_RETURN_IF_ERROR(AddToReady(p->config(),
-                                 /*invocation=*/nullptr, p->owner(), type_info,
-                                 ParametricEnv(), &ready, ProcId{{p}, 0}));
+                                 ParametricEnv(), &ready,
+                                 ProcId{.proc_instance_stack = {{p, 0}}}));
 
   // Constants and "member" vars are assigned and defined in Procs' "config'"
   // functions, so we need to execute those before their "next" functions.
@@ -812,9 +711,9 @@ static absl::StatusOr<std::vector<ConversionRecord>> GetOrderForProc(
   std::vector<ConversionRecord> config_fns;
   std::vector<ConversionRecord> next_fns;
   for (const auto& record : ready) {
-    if (record.f()->tag() == Function::Tag::kProcConfig) {
+    if (record.f()->tag() == FunctionTag::kProcConfig) {
       config_fns.push_back(record);
-    } else if (record.f()->tag() == Function::Tag::kProcNext) {
+    } else if (record.f()->tag() == FunctionTag::kProcNext) {
       next_fns.push_back(record);
     } else {
       // Regular functions can go wherever.
@@ -829,41 +728,72 @@ static absl::StatusOr<std::vector<ConversionRecord>> GetOrderForProc(
 }
 
 absl::StatusOr<std::vector<ConversionRecord>> GetOrder(Module* module,
-                                                       TypeInfo* type_info) {
-  XLS_CHECK_EQ(type_info->module(), module);
+                                                       TypeInfo* type_info,
+                                                       bool include_tests) {
+  XLS_RET_CHECK_EQ(type_info->module(), module);
   std::vector<ConversionRecord> ready;
 
-  for (ModuleMember member : module->top()) {
-    if (std::holds_alternative<QuickCheck*>(member)) {
-      auto* quickcheck = std::get<QuickCheck*>(member);
-      Function* function = quickcheck->f();
-      XLS_RET_CHECK(!function->IsParametric()) << function->ToString();
-
-      XLS_RETURN_IF_ERROR(AddToReady(function, /*invocation=*/nullptr, module,
-                                     type_info, ParametricEnv(), &ready, {}));
-    } else if (std::holds_alternative<Function*>(member)) {
-      // Proc creation is driven by Spawn instantiations - the required constant
-      // args are only specified there, so we can't convert Procs as encountered
-      // at top level.
-      Function* f = std::get<Function*>(member);
-      if (f->IsParametric() || f->proc().has_value()) {
-        continue;
-      }
-
-      XLS_RETURN_IF_ERROR(AddToReady(f, /*invocation=*/nullptr, module,
-                                     type_info, ParametricEnv(), &ready, {}));
-    } else if (std::holds_alternative<ConstantDef*>(member)) {
-      auto* constant_def = std::get<ConstantDef*>(member);
-      XLS_ASSIGN_OR_RETURN(const std::vector<Callee> callees,
-                           GetCallees(constant_def->value(), module, type_info,
-                                      ParametricEnv(), {}));
-      XLS_RETURN_IF_ERROR(ProcessCallees(callees, &ready));
+  auto handle_function = [&](Function* f) -> absl::Status {
+    // NOTE: Proc creation is driven by Spawn instantiations - the
+    // required constant args are only specified there, so we can't
+    // convert Procs as encountered at top level.
+    if (f->IsParametric() || f->proc().has_value()) {
+      return absl::OkStatus();
     }
+
+    return AddToReady(f, /*invocation=*/nullptr, module, type_info,
+                      ParametricEnv(), &ready, {});
+  };
+  for (ModuleMember member : module->top()) {
+    absl::Status status = absl::visit(
+        Visitor{
+            handle_function,
+            [&](QuickCheck* quickcheck) -> absl::Status {
+              Function* function = quickcheck->fn();
+              XLS_RET_CHECK(!function->IsParametric()) << function->ToString();
+
+              return AddToReady(function, /*invocation=*/nullptr, module,
+                                type_info, ParametricEnv(), &ready, {});
+            },
+            [&](ConstantDef* constant_def) -> absl::Status {
+              XLS_ASSIGN_OR_RETURN(const std::vector<Callee> callees,
+                                   GetCallees(constant_def->value(), module,
+                                              type_info, ParametricEnv(), {}));
+              return ProcessCallees(callees, &ready);
+            },
+            // See note above: proc creation is driven by spawn()
+            // instantiations.
+            [](Proc*) { return absl::OkStatus(); },
+            [](TestProc*) { return absl::OkStatus(); },
+
+            [&](TestFunction* test) {
+              if (!include_tests) {
+                // Nothing to do.
+                return absl::OkStatus();
+              }
+              return handle_function(&test->fn());
+            },
+            [](TypeAlias*) { return absl::OkStatus(); },
+            [](StructDef*) { return absl::OkStatus(); },
+            [](ProcDef*) { return absl::OkStatus(); },
+            [](Impl*) { return absl::OkStatus(); },
+            [](EnumDef*) { return absl::OkStatus(); },
+            [](Import*) { return absl::OkStatus(); },
+            [](Use*) { return absl::OkStatus(); },
+            [](ConstAssert*) { return absl::OkStatus(); },
+            [](VerbatimNode*) {
+              return absl::UnimplementedError(
+                  "Should not convert VerbatimNode");
+            },
+        },
+        member);
+    XLS_RETURN_IF_ERROR(status);
   }
 
   // Collect the top level procs.
   XLS_ASSIGN_OR_RETURN(std::vector<Proc*> top_level_procs,
                        GetTopLevelProcs(module, type_info));
+
   // Get the order for each top level proc.
   for (Proc* proc : top_level_procs) {
     XLS_ASSIGN_OR_RETURN(TypeInfo * proc_ti,
@@ -880,7 +810,7 @@ absl::StatusOr<std::vector<ConversionRecord>> GetOrder(Module* module,
   // be a single instance of the function to convert.
   RemoveFunctionDuplicates(&ready);
 
-  XLS_VLOG(5) << "Ready list: " << ConversionRecordsToString(ready);
+  VLOG(5) << "Ready list: " << ConversionRecordsToString(ready);
 
   return ready;
 }

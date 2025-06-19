@@ -15,18 +15,21 @@
 #ifndef XLS_TOOLS_PROTO_TO_DSLX_H_
 #define XLS_TOOLS_PROTO_TO_DSLX_H_
 
-#include <filesystem>
+#include <filesystem>  // NOLINT
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "google/protobuf/descriptor.h"
 #include "google/protobuf/dynamic_message.h"
 #include "google/protobuf/message.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/pos.h"
 
 namespace xls {
 namespace internal {
@@ -72,6 +75,46 @@ class ProtoToDslxManager {
       name_to_records_;
 };
 
+// Construct a DSLX module for the given proto definitions.
+//
+// Args:
+//   module_name: name to assign to the DSLX module.
+//   params: list of (binding_name, proto_param) pairs where
+//     binding_name will be the name of the DSLX constant and
+//     proto_param is a pointer to a proto defining the values of the constant.
+//
+// Example:
+//   Given the proto def:
+//     message MyProtoMessage {
+//       optional uint32 my_field = 1;
+//     }
+//
+//   And protos proto_one and proto_two :
+//     proto_one : {
+//       my_field: 1
+//     }
+//     proto_two : {
+//       my_field: 2
+//     }
+//
+//   CreateDslxFromParams("my_proto_module",
+//     {{"MY_CONSTANT_ONE", &proto_one},
+//      {"MY_CONSTANT_TWO", &proto_two}});
+//
+//   Gives the approximate DSLX:
+//     struct MyProtoMessage {
+//       my_field: u32
+//     }
+//     const MY_CONSTANT_ONE = MyProtoMessage{my_field: u32:1};
+//     const MY_CONSTANT_TWO = MyProtoMessage{my_field: u32:2};
+//
+// See ProtoToDslxTest.CreateDslxFromParamsTest for a full example.
+absl::StatusOr<std::unique_ptr<dslx::Module>> CreateDslxFromParams(
+    std::string_view module_name,
+    absl::Span<const std::pair<std::string_view, const google::protobuf::Message*>>
+        params,
+    dslx::FileTable& file_table);
+
 // ProtoToDslx accepts a proto schema and textproto instantiating such, and
 // converts those definitions into a corresponding DSLX file.
 // Args:
@@ -88,7 +131,7 @@ absl::StatusOr<std::unique_ptr<dslx::Module>> ProtoToDslx(
     const std::filesystem::path& source_root,
     const std::filesystem::path& proto_schema_path,
     std::string_view message_name, std::string_view text_proto,
-    std::string_view binding_name);
+    std::string_view binding_name, dslx::FileTable& file_table);
 
 // As above, but doesn't refer directly to the filesystem for resolution.
 //
@@ -97,7 +140,8 @@ absl::StatusOr<std::unique_ptr<dslx::Module>> ProtoToDslx(
 //  ..rest: as above
 absl::StatusOr<std::unique_ptr<dslx::Module>> ProtoToDslxViaText(
     std::string_view proto_def, std::string_view message_name,
-    std::string_view text_proto, std::string_view binding_name);
+    std::string_view text_proto, std::string_view binding_name,
+    dslx::FileTable& file_table);
 
 // Compiles the specified proto schema into a "Descriptor" (contained in the
 // returned pool), potentially loading dependent schema files along the way.

@@ -15,6 +15,8 @@
 #ifndef XLS_NETLIST_CELL_LIBRARY_H_
 #define XLS_NETLIST_CELL_LIBRARY_H_
 
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -25,6 +27,8 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/netlist/netlist.pb.h"
@@ -249,9 +253,9 @@ absl::StatusOr<StateTableSignal> StateTableSignalFromProto(
 
 // Constructs an AbstractStateTable object from the matching proto.
 template <typename EvalT>
-/* static */
-absl::StatusOr<AbstractStateTable<EvalT>> AbstractStateTable<EvalT>::FromProto(
-    const StateTableProto& proto, EvalT zero, EvalT one) {
+/* static */ absl::StatusOr<AbstractStateTable<EvalT>>
+AbstractStateTable<EvalT>::FromProto(const StateTableProto& proto, EvalT zero,
+                                     EvalT one) {
   std::vector<Row> rows;
   absl::flat_hash_set<std::string> signals;
   absl::flat_hash_set<std::string> internal_names;
@@ -422,10 +426,9 @@ absl::StatusOr<EvalT> AbstractStateTable<EvalT>::GetSignalValue(
       if (switched_signal) {
         if (stimulus_signal == response_signal) {
           return input_stimulus.at(signal);
-        } else {
-          EvalT value = input_stimulus.at(signal);
-          return !value;
         }
+        EvalT value = input_stimulus.at(signal);
+        return !value;
       }
 
       return response_signal == StateTableSignal::kHigh ? one_ : zero_;
@@ -484,7 +487,7 @@ AbstractCellLibraryEntry<EvalT>::FromProto(const CellLibraryEntryProto& proto,
                                            EvalT zero, EvalT one) {
   XLS_ASSIGN_OR_RETURN(CellKind cell_kind, CellKindFromProto(proto.kind()));
 
-  OutputPinListProto output_pin_list = proto.output_pin_list();
+  const OutputPinListProto& output_pin_list = proto.output_pin_list();
   OutputPinToFunction pins;
   pins.reserve(output_pin_list.pins_size());
   for (const auto& proto : output_pin_list.pins()) {

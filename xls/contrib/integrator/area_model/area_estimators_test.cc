@@ -18,6 +18,7 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status_matchers.h"
 #include "xls/common/status/matchers.h"
 #include "xls/contrib/integrator/area_model/area_estimator.h"
 #include "xls/ir/function_builder.h"
@@ -28,7 +29,7 @@
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 
 class AreaEstimatorTest : public IrTestBase {};
 
@@ -46,8 +47,9 @@ TEST_F(AreaEstimatorTest, AreaModelTesting2Point5MuxPerNode) {
   Node* mux_node = FindNode("mux", func);
 
   XLS_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<AreaEstimator> area_estimator,
-      GetAreaEstimatorByName("area_model_testing_2_point_5_mux_per_node"));
+      std::unique_ptr<integrator::AreaEstimator> area_estimator,
+      integrator::GetAreaEstimatorByName(
+          "area_model_testing_2_point_5_mux_per_node"));
   EXPECT_THAT(area_estimator->GetOperationArea(add_node), IsOkAndHolds(5));
   EXPECT_THAT(area_estimator->GetOperationArea(mux_node), IsOkAndHolds(2));
 }
@@ -66,8 +68,9 @@ TEST_F(AreaEstimatorTest, AreaModelIce40Multiply) {
   Node* mul_b = FindNode("mul_b", func);
   Node* mul_a = FindNode("mul_a", func);
 
-  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<AreaEstimator> area_estimator,
-                           GetAreaEstimatorByName("ice40_lut4"));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<integrator::AreaEstimator> area_estimator,
+      integrator::GetAreaEstimatorByName("ice40_lut4"));
   XLS_ASSERT_OK_AND_ASSIGN(int64_t mul_c_area,
                            area_estimator->GetOperationArea(mul_c));
   XLS_ASSERT_OK_AND_ASSIGN(int64_t mul_b_area,

@@ -23,16 +23,16 @@
 #include <variant>
 #include <vector>
 
-#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xls/common/strong_int.h"
 #include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/interp_value.h"
-#include "xls/dslx/type_system/concrete_type.h"
 #include "xls/dslx/type_system/parametric_env.h"
+#include "xls/dslx/type_system/type.h"
 #include "xls/dslx/type_system/type_info.h"
+#include "xls/dslx/value_format_descriptor.h"
 #include "xls/ir/format_strings.h"
 
 namespace xls::dslx {
@@ -43,7 +43,7 @@ class Bytecode {
  public:
   // In these descriptions, "TOS1" refers to the second-to-top-stack element and
   // "TOS0" refers to the top stack element.
-  enum class Op {
+  enum class Op : uint8_t {
     // Adds the top two values on the stack.
     kUAdd,
     kSAdd,
@@ -51,7 +51,8 @@ class Bytecode {
     kAnd,
     // Invokes the function given in the Bytecode's data argument. Arguments are
     // given on the stack with deeper elements being earlier in the arg list
-    // (rightmost arg is TOS0 because we evaluate args left-to-right).
+    // (rightmost arg is TOS1 because we evaluate args left-to-right, TOS0 is
+    // the callee).
     kCall,
     // Casts the element on top of the stack to the type given in the optional
     // arg.
@@ -68,6 +69,9 @@ class Bytecode {
     // Creates an N-tuple (N given in the data argument) from the values on the
     // stack.
     kCreateTuple,
+    // Decodes the element on top of the stack to a one-hot of the type given as
+    // the parametric arg.
+    kDecode,
     // Divides the N-1th value on the stack by the Nth value.
     kDiv,
     // Determines remainder of division of the N-1th value by the Nth value.
@@ -90,7 +94,7 @@ class Bytecode {
     kGt,
     // Selects the TOS0'th element of the array- or tuple-typed value at TOS1.
     kIndex,
-    // Same as kIndex but runtime checks that the the value TOS1 is a tuple.
+    // Same as kIndex but runtime checks that the value TOS1 is a tuple.
     kTupleIndex,
     // Inverts the bits of TOS0.
     kInvert,
@@ -158,7 +162,8 @@ class Bytecode {
     // otherwise it'll be logical.
     kShr,
     // Slices out a subset of the bits-typed value on TOS2,
-    // starting at index TOS1 and ending at index TOS0.
+    // starting at index TOS1 with bitwidth at TOS0.
+    // Note: the start index and the bitwidth should both be non-negative.
     kSlice,
     // Creates a new proc interpreter using the data in the optional data member
     // (as a `SpawnData`).
@@ -171,7 +176,10 @@ class Bytecode {
     // Swaps TOS0 and TOS1 on the stack.
     kSwap,
     // Prints information about the given arguments to the terminal.
-    kTrace,
+    kTraceFmt,
+    // Prints a single operand argument to the terminal and acts as identity
+    // function (i.e. places the operand value back on the stack).
+    kTraceArg,
     // Slices out TOS0 bits of the array- or bits-typed value on TOS2,
     // starting at index TOS1.
     kWidthSlice,
@@ -193,11 +201,27 @@ class Bytecode {
 
   // Data needed to resolve a potentially parametric Function invocation to
   // its concrete implementation.
-  struct InvocationData {
-    const Invocation* invocation;
-    // Can't store a pointer, since the underlying storage isn't guaranteed to
-    // be stable.
-    std::optional<ParametricEnv> bindings;
+  class InvocationData {
+   public:
+    InvocationData(const Invocation* invocation,
+                   std::optional<ParametricEnv> caller_bindings,
+                   std::optional<ParametricEnv> callee_bindings)
+        : invocation_(invocation),
+          caller_bindings_(std::move(caller_bindings)),
+          callee_bindings_(std::move(callee_bindings)) {}
+
+    const Invocation* invocation() const { return invocation_; }
+    const std::optional<ParametricEnv>& caller_bindings() const {
+      return caller_bindings_;
+    }
+    const std::optional<ParametricEnv>& callee_bindings() const {
+      return callee_bindings_;
+    }
+
+   private:
+    const Invocation* invocation_;
+    std::optional<ParametricEnv> caller_bindings_;
+    std::optional<ParametricEnv> callee_bindings_;
   };
 
   // Encapsulates an element in a MatchArm's NameDefTree. For literals, a
@@ -213,14 +237,16 @@ class Bytecode {
     static MatchArmItem MakeRange(InterpValue start, InterpValue limit);
     static MatchArmItem MakeTuple(std::vector<MatchArmItem> elements);
     static MatchArmItem MakeWildcard();
+    static MatchArmItem MakeRestOfTuple();
 
-    enum class Kind {
+    enum class Kind : uint8_t {
       kInterpValue,
       kLoad,
       kRange,
       kStore,
       kTuple,
       kWildcard,
+      kRestOfTuple,
     };
 
     struct RangeData {
@@ -248,27 +274,52 @@ class Bytecode {
         data_;
   };
 
-  // Information necessary to spawn a child proc.
-  // The data here is used to drive evaluation and/or translation of the proc's
-  // component functions: for constexpr evaluating the `config` call and for
-  // setting up the proc's `next` function.
+  // Represents the functions that are provided by a `Spawn` node, to decouple
+  // the `Spawn` node from the bytecode interpreter.
+  struct SpawnFunctions {
+    Invocation* config;
+    Invocation* next;
+  };
+
+  // Information necessary to spawn a child proc. The data here is used to drive
+  // evaluation and/or translation of the proc's component functions.
   // TODO(https://github.com/google/xls/issues/608): Reduce the AST surface
   // exposed here to just Functions.
-  struct SpawnData {
-    const Spawn* spawn;
+  class SpawnData {
+   public:
+    SpawnData(SpawnFunctions spawn_functions, Proc* proc,
+              InterpValue initial_state,
+              std::optional<ParametricEnv> caller_bindings,
+              std::optional<ParametricEnv> callee_bindings)
+        : spawn_functions_(spawn_functions),
+          proc_(proc),
+          initial_state_(std::move(initial_state)),
+          caller_bindings_(std::move(caller_bindings)),
+          callee_bindings_(std::move(callee_bindings)) {}
+
+    const SpawnFunctions& spawn_functions() const { return spawn_functions_; }
+    Proc* proc() const { return proc_; }
+    const InterpValue& initial_state() const { return initial_state_; }
+    const std::optional<ParametricEnv>& caller_bindings() const {
+      return caller_bindings_;
+    }
+    const std::optional<ParametricEnv>& callee_bindings() const {
+      return callee_bindings_;
+    }
+
+   private:
+    SpawnFunctions spawn_functions_;
 
     // The proc itself.
-    Proc* proc;
-
-    // The arguments to the proc's `config` function.
-    std::vector<InterpValue> config_args;
+    Proc* proc_;
 
     // The initial state of the new proc.
-    InterpValue initial_state;
+    InterpValue initial_state_;
 
-    // Can't store a pointer, since the underlying storage isn't guaranteed to
-    // be stable.
-    std::optional<ParametricEnv> caller_bindings;
+    // Note: can't store a pointer, since the underlying storage isn't
+    // guaranteed to be stable.
+    std::optional<ParametricEnv> caller_bindings_;
+    std::optional<ParametricEnv> callee_bindings_;
   };
 
   // Information necessary to run a trace operation.
@@ -278,15 +329,13 @@ class Bytecode {
     TraceData(TraceData&& other) = default;
     TraceData& operator=(TraceData&& other) = default;
 
-    TraceData(
-        std::vector<FormatStep> steps,
-        std::vector<std::unique_ptr<ValueFormatDescriptor>> value_fmt_descs)
+    TraceData(std::vector<FormatStep> steps,
+              std::vector<ValueFormatDescriptor> value_fmt_descs)
         : steps_(std::move(steps)),
           value_fmt_descs_(std::move(value_fmt_descs)) {}
 
     absl::Span<const FormatStep> steps() const { return steps_; }
-    absl::Span<const std::unique_ptr<ValueFormatDescriptor>> value_fmt_descs()
-        const {
+    absl::Span<const ValueFormatDescriptor> value_fmt_descs() const {
       return value_fmt_descs_;
     }
 
@@ -295,7 +344,7 @@ class Bytecode {
 
     // For default formatting of struct operands we hold metadata that allows us
     // to format them in more detail (struct name, fields, etc).
-    std::vector<std::unique_ptr<ValueFormatDescriptor>> value_fmt_descs_;
+    std::vector<ValueFormatDescriptor> value_fmt_descs_;
   };
 
   // Information necessary for channel operations.
@@ -306,27 +355,27 @@ class Bytecode {
     ChannelData& operator=(ChannelData&& other) = default;
 
     ChannelData(std::string_view channel_name,
-                std::unique_ptr<ConcreteType> payload_type,
-                std::unique_ptr<ValueFormatDescriptor> value_fmt_desc)
+                std::unique_ptr<Type> payload_type,
+                ValueFormatDescriptor value_fmt_desc)
         : channel_name_(channel_name),
           payload_type_(std::move(payload_type)),
           value_fmt_desc_(std::move(value_fmt_desc)) {}
 
     std::string_view channel_name() const { return channel_name_; }
-    const ConcreteType& payload_type() const { return *payload_type_; }
-    const ValueFormatDescriptor* value_fmt_desc() const {
-      return value_fmt_desc_.get();
+    const Type& payload_type() const { return *payload_type_; }
+    const ValueFormatDescriptor& value_fmt_desc() const {
+      return value_fmt_desc_;
     }
 
    private:
     std::string channel_name_;
-    std::unique_ptr<ConcreteType> payload_type_;
-    std::unique_ptr<ValueFormatDescriptor> value_fmt_desc_;
+    std::unique_ptr<Type> payload_type_;
+    ValueFormatDescriptor value_fmt_desc_;
   };
 
   using Data = std::variant<InterpValue, JumpTarget, NumElements, SlotIndex,
-                            std::unique_ptr<ConcreteType>, InvocationData,
-                            MatchArmItem, SpawnData, TraceData, ChannelData>;
+                            std::unique_ptr<Type>, InvocationData, MatchArmItem,
+                            SpawnData, TraceData, ChannelData>;
 
   static Bytecode MakeDup(Span span);
   static Bytecode MakeIndex(Span span);
@@ -335,7 +384,9 @@ class Bytecode {
   static Bytecode MakeJumpDest(Span span);
   static Bytecode MakeJumpRelIf(Span span, JumpTarget target);
   static Bytecode MakeJumpRel(Span span, JumpTarget target);
-  static Bytecode MakeLiteral(Span span, InterpValue literal);
+  static Bytecode MakeLiteral(
+      Span span, InterpValue literal,
+      std::optional<ValueFormatDescriptor> = std::nullopt);
   static Bytecode MakeLoad(Span span, SlotIndex slot_index);
   static Bytecode MakeLogicalOr(Span span);
   static Bytecode MakeMatchArm(Span span, MatchArmItem item);
@@ -356,8 +407,13 @@ class Bytecode {
       : source_span_(std::move(source_span)), op_(op), data_(std::nullopt) {}
 
   // Creates an operation with associated string or InterpValue data.
-  Bytecode(Span source_span, Op op, std::optional<Data> data)
-      : source_span_(std::move(source_span)), op_(op), data_(std::move(data)) {}
+  Bytecode(
+      Span source_span, Op op, std::optional<Data> data,
+      std::optional<ValueFormatDescriptor> format_descriptor = std::nullopt)
+      : source_span_(std::move(source_span)),
+        op_(op),
+        data_(std::move(data)),
+        format_descriptor_(std::move(format_descriptor)) {}
 
   // Not copyable, but move-able.
   Bytecode(const Bytecode& other) = delete;
@@ -378,10 +434,11 @@ class Bytecode {
   absl::StatusOr<const SpawnData*> spawn_data() const;
   absl::StatusOr<const TraceData*> trace_data() const;
   absl::StatusOr<const ChannelData*> channel_data() const;
-  absl::StatusOr<const ConcreteType*> type_data() const;
+  absl::StatusOr<const Type*> type_data() const;
   absl::StatusOr<InterpValue> value_data() const;
 
-  std::string ToString(bool source_locs = true) const;
+  std::string ToString(const FileTable& file_table,
+                       bool source_locs = false) const;
 
   // Value used as an integer data placeholder in jumps before their
   // target/amount has become known during bytecode emission.
@@ -399,10 +456,18 @@ class Bytecode {
   // that should be patched.
   void PatchJumpTarget(int64_t value);
 
+  const std::optional<ValueFormatDescriptor>& format_descriptor() const {
+    return format_descriptor_;
+  }
+
  private:
   Span source_span_;
   Op op_;
   std::optional<Data> data_;
+
+  // For numbers and literals, this field carries the numeric format of original
+  // text input. This enables better messages in assert_eq!, for example.
+  std::optional<ValueFormatDescriptor> format_descriptor_;
 };
 
 std::string OpToString(Bytecode::Op op);
@@ -410,10 +475,13 @@ std::string OpToString(Bytecode::Op op);
 // Holds all the bytecode implementing a function along with useful metadata.
 class BytecodeFunction {
  public:
-  // We need the function's containing module in order to get the root TypeInfo
-  // for top-level BytecodeFunctions.
-  // `source_fn` may be nullptr for ephemeral functions, such as those created
-  // for realizing `match` ops.
+  // Args:
+  //  module: The function's containing module -- we need the function's
+  //    containing module in order to get the root TypeInfo for top-level
+  //    BytecodeFunctions.
+  //  source_fn: may be nullptr for ephemeral functions, such as those created
+  //    for realizing `match` ops.
+  //
   // Note: this is an O(N) operation where N is the number of ops in the
   // bytecode.
   static absl::StatusOr<std::unique_ptr<BytecodeFunction>> Create(
@@ -442,7 +510,7 @@ class BytecodeFunction {
 // source_locs indicating whether source locations are annotated on the bytecode
 // lines.
 std::string BytecodesToString(absl::Span<const Bytecode> bytecodes,
-                              bool source_locs);
+                              bool source_locs, const FileTable& file_table);
 
 // Converts a string as given by BytecodesToString(..., /*source_locs=*/false)
 // into a bytecode sequence; e.g. for testing.

@@ -20,42 +20,37 @@ message FifoConfigProto {
   optional int64 width = 1;
   optional int64 depth = 2;
   optional bool bypass = 3;
+  optional bool register_push_outputs = 4;
+  optional bool register_pop_outputs = 5;
 }
 
-// Metadata for a channel which describes ports on a Verilog module.
-message ModulePortProto {
-  // Whether the port is flopped on entry (exit) to (from) the module.
-  // TODO(meheff): 2021-04-23 This is effectively unused. Remove it.
-  optional bool flopped = 1;
-
-  // A number used to determine the ordering of the ports. Within a proc, the
-  // port_order of the channels must be numbered densely from zero. Channels
-  // with lower numbered port_order values will have corresponding ports earlier
-  // in the module declaration. The port_order value does not necessarily
-  // correspond to the position of the port in the Verilog module because a
-  // channel can correspond to multiple ports and the module may have other
-  // ports such as clock and reset.
-  // TODO(meheff): 2021-04-23 Remove this and replace uses with
-  // PortChannel::Position.
-  optional int64 port_order = 2;
+// The kinds of flops a channels input/output may have.
+enum FlopKindProto {
+  // Use the default passed by codegen options
+  FLOP_KIND_DEFAULT = 0;
+  // The input/output is not flopped and is directly connected by wires.
+  FLOP_KIND_NONE = 1;
+  // Adds a pipeline stage at the beginning or end of the channel to hold
+  // inputs or outputs. This is essentially a single-element FIFO.
+  FLOP_KIND_FLOP = 2;
+  // Adds a skid buffer at the inputs or outputs of the channel. The skid
+  // buffer can hold 2 entries
+  FLOP_KIND_SKID = 3;
+  // Adds a zero-latency buffer at the beginning or end of the block. This is
+  // essentially a single-element FIFO with bypass
+  FLOP_KIND_ZERO_LATENCY = 4;
 }
 
-// Metadata associating channels with specific ports in a block/module.
-message BlockPortMappingProto {
-  optional string block_name = 1;
-  optional string data_port_name = 2;
-  optional string ready_port_name = 3;
-  optional string valid_port_name = 4;
-}
+// Configuration for a single channel.
+message ChannelConfigProto {
+  // Configuration passed to the MaybeMaterializeFifosPass or the FIFO module
+  // instantiation to set up the actual verilog fifo backing the channel.
+  //
+  // It is an error to include this for non-streaming channels.
+  optional FifoConfigProto fifo = 1;
 
-// Metadata about an XLS channel. Generally, information held in this proto is
-// used by code generation. Information used for IR transformations or analysis
-// (e.g., data types) should be held directly in the xls::Channel data
-// structure.
-message ChannelMetadataProto {
-  oneof channel_oneof {
-    ModulePortProto module_port = 1;
-  }
-
-  optional BlockPortMappingProto block_ports = 2;
+  // Flop to put before all inputs associated with this channel.
+  FlopKindProto flop_inputs = 2;
+  // Flop to put before all outputs associated with this channel.
+  FlopKindProto flop_outputs = 3;
 }

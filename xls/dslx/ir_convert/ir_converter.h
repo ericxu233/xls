@@ -15,18 +15,19 @@
 #ifndef XLS_DSLX_IR_CONVERT_IR_CONVERTER_H_
 #define XLS_DSLX_IR_CONVERT_IR_CONVERTER_H_
 
-#include <memory>
+#include <filesystem>  // NOLINT
 #include <optional>
 #include <string>
 #include <string_view>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/import_data.h"
+#include "xls/dslx/ir_convert/conversion_info.h"
 #include "xls/dslx/ir_convert/convert_options.h"
 #include "xls/dslx/type_system/parametric_env.h"
-#include "xls/ir/package.h"
 
 namespace xls::dslx {
 
@@ -38,7 +39,7 @@ namespace xls::dslx {
 //
 // Returns:
 //   The IR package that corresponds to this module.
-absl::StatusOr<std::unique_ptr<Package>> ConvertModuleToPackage(
+absl::StatusOr<PackageConversionData> ConvertModuleToPackage(
     Module* module, ImportData* import_data, const ConvertOptions& options);
 
 // As above, but the package is provided explicitly (instead of being created).
@@ -47,7 +48,7 @@ absl::StatusOr<std::unique_ptr<Package>> ConvertModuleToPackage(
 // inside of it, it may not be nullptr.
 absl::Status ConvertModuleIntoPackage(Module* module, ImportData* import_data,
                                       const ConvertOptions& options,
-                                      Package* package);
+                                      PackageConversionData* package);
 
 // Wrapper around ConvertModuleToPackage that converts to IR text.
 absl::StatusOr<std::string> ConvertModule(Module* module,
@@ -86,7 +87,14 @@ absl::Status ConvertOneFunctionIntoPackage(Module* module,
                                            ImportData* import_data,
                                            const ParametricEnv* parametric_env,
                                            const ConvertOptions& options,
-                                           Package* package);
+                                           PackageConversionData* conv);
+
+// As above but takes a function pointer for a function in the module.
+absl::Status ConvertOneFunctionIntoPackage(Function* fn,
+                                           ImportData* import_data,
+                                           const ParametricEnv* parametric_env,
+                                           const ConvertOptions& options,
+                                           PackageConversionData* conv);
 
 // Converts DSLX files at paths into a package.
 //
@@ -102,8 +110,8 @@ absl::Status ConvertOneFunctionIntoPackage(Module* module,
 //   package_name: Optionally, the name of the package.
 //   printed_error: If a non-null pointer is passes, sets the contents to a
 //     boolean value indicating if an error was printed during conversion.
-absl::StatusOr<std::unique_ptr<Package>> ConvertFilesToPackage(
-    absl::Span<const std::string_view> paths, const std::string& stdlib_path,
+absl::StatusOr<PackageConversionData> ConvertFilesToPackage(
+    absl::Span<const std::string_view> paths, std::string_view stdlib_path,
     absl::Span<const std::filesystem::path> dslx_paths,
     const ConvertOptions& convert_options,
     std::optional<std::string_view> top = std::nullopt,

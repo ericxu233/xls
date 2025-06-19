@@ -26,50 +26,67 @@
 #include "gtest/gtest-spi.h"
 #include "gtest/gtest.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xls/common/casts.h"
+#include "xls/common/file/filesystem.h"
+#include "xls/common/file/get_runfile_path.h"
 #include "xls/common/status/matchers.h"
 #include "xls/dslx/command_line_utils.h"
 #include "xls/dslx/error_test_utils.h"
 #include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/frontend/bindings.h"
 #include "xls/dslx/frontend/builtins_metadata.h"
+#include "xls/dslx/frontend/module.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/frontend/scanner.h"
+#include "xls/dslx/virtualizable_file_system.h"
 
 namespace xls::dslx {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
-using testing::HasSubstr;
-
-static const char kFilename[] = "test.x";
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
+using ::testing::HasSubstr;
 
 class ParserTest : public ::testing::Test {
  public:
-  std::unique_ptr<Module> RoundTrip(
-      std::string program,
-      std::optional<std::string_view> target = std::nullopt) {
-    scanner_.emplace(kFilename, program);
+  absl::StatusOr<std::unique_ptr<Module>> Parse(std::string_view program) {
+    scanner_.emplace(file_table_, Fileno(0), std::string(program));
     parser_.emplace("test", &*scanner_);
-    auto module_or = parser_->ParseModule();
-    if (!module_or.ok()) {
-      TryPrintError(module_or.status(),
-                    [&](std::string_view path) -> absl::StatusOr<std::string> {
-                      return program;
-                    });
-      XLS_EXPECT_OK(module_or) << module_or.status();
+    return parser_->ParseModule();
+  }
+
+  std::unique_ptr<Module> RoundTrip(
+      std::string_view program,
+      std::optional<std::string_view> target = std::nullopt) {
+    absl::StatusOr<std::unique_ptr<Module>> module = Parse(program);
+    if (!module.ok()) {
+      UniformContentFilesystem vfs(program);
+      TryPrintError(module.status(), file_table_, vfs);
+      XLS_EXPECT_OK(module) << module.status();
       return nullptr;
     }
-    std::unique_ptr<Module> module = std::move(module_or).value();
+    std::unique_ptr<Module> module_ptr = std::move(*module);
     if (target.has_value()) {
-      EXPECT_EQ(module->ToString(), *target);
+      EXPECT_EQ(module_ptr->ToString(), *target);
     } else {
-      EXPECT_EQ(module->ToString(), program);
+      EXPECT_EQ(module_ptr->ToString(), program);
     }
+    return module_ptr;
+  }
 
-    return module;
+  std::unique_ptr<Module> ExpectParsesSuccessfully(std::string_view program) {
+    absl::StatusOr<std::unique_ptr<Module>> module = Parse(program);
+    if (!module.ok()) {
+      UniformContentFilesystem vfs(program);
+      TryPrintError(module.status(), file_table_, vfs);
+      XLS_EXPECT_OK(module) << module.status();
+      return nullptr;
+    }
+    return std::move(*module);
   }
 
   // Note: given expression text should have no free variables other than those
@@ -78,7 +95,7 @@ class ParserTest : public ::testing::Test {
   absl::StatusOr<Expr*> ParseExpr(std::string_view expr_text,
                                   absl::Span<const std::string> predefine = {},
                                   bool populate_dslx_builtins = false) {
-    scanner_.emplace(kFilename, std::string{expr_text});
+    scanner_.emplace(file_table_, Fileno(0), std::string{expr_text});
     parser_.emplace("test", &*scanner_);
     Bindings b;
 
@@ -93,34 +110,28 @@ class ParserTest : public ::testing::Test {
     for (const std::string& s : predefine) {
       b.Add(s, mod.GetOrCreateBuiltinNameDef(s));
     }
-    auto expr_or = parser_->ParseExpression(/*bindings=*/b);
-    if (!expr_or.ok()) {
-      TryPrintError(expr_or.status(),
-                    [&](std::string_view path) -> absl::StatusOr<std::string> {
-                      return std::string{expr_text};
-                    });
+    absl::StatusOr<Expr*> expr = parser_->ParseExpression(/*bindings=*/b);
+    if (!expr.ok()) {
+      UniformContentFilesystem vfs(expr_text);
+      TryPrintError(expr.status(), file_table_, vfs);
     }
-    return expr_or;
+    return expr;
   }
 
   Expr* RoundTripExpr(std::string_view expr_text,
                       absl::Span<const std::string> predefine = {},
                       bool populate_dslx_builtins = false,
                       std::optional<std::string> target = std::nullopt) {
-    absl::StatusOr<Expr*> e_or =
+    absl::StatusOr<Expr*> expr =
         ParseExpr(expr_text, predefine, populate_dslx_builtins);
-    if (!e_or.ok()) {
-      XLS_EXPECT_OK(e_or.status());
+    if (!expr.ok()) {
+      XLS_EXPECT_OK(expr.status());
       return nullptr;
     }
-    Expr* e = e_or.value();
-    if (target.has_value()) {
-      EXPECT_EQ(e->ToString(), *target);
-    } else {
-      EXPECT_EQ(e->ToString(), expr_text);
-    }
 
-    return e;
+    EXPECT_EQ((*expr)->ToString(), target.has_value() ? *target : expr_text);
+
+    return *expr;
   }
 
   // Allows the private ParseTypeAnnotation method to be used by subtypes (test
@@ -130,12 +141,14 @@ class ParserTest : public ::testing::Test {
     return p.ParseTypeAnnotation(bindings);
   }
 
+  FileTable file_table_;
   std::optional<Scanner> scanner_;
   std::optional<Parser> parser_;
 };
 
 TEST(BindingsTest, BindingsStack) {
-  Module module("test", /*fs_path=*/std::nullopt);
+  FileTable file_table;
+  Module module("test", /*fs_path=*/std::nullopt, file_table);
   Bindings top;
   Bindings leaf0(&top);
   Bindings leaf1(&top);
@@ -148,27 +161,26 @@ TEST(BindingsTest, BindingsStack) {
   leaf0.Add("b", b);
   leaf1.Add("c", c);
 
-  const char* kFakeFilename = "fake.x";
-  Pos pos(kFakeFilename, 0, 0);
+  Pos pos(Fileno(0), 0, 0);
   Span span(pos, pos);
 
   // Everybody can resolve the binding in "top".
-  EXPECT_THAT(leaf0.ResolveNodeOrError("a", span), IsOkAndHolds(a));
-  EXPECT_THAT(leaf1.ResolveNodeOrError("a", span), IsOkAndHolds(a));
-  EXPECT_THAT(top.ResolveNodeOrError("a", span), IsOkAndHolds(a));
+  EXPECT_THAT(leaf0.ResolveNodeOrError("a", span, file_table), IsOkAndHolds(a));
+  EXPECT_THAT(leaf1.ResolveNodeOrError("a", span, file_table), IsOkAndHolds(a));
+  EXPECT_THAT(top.ResolveNodeOrError("a", span, file_table), IsOkAndHolds(a));
 
-  EXPECT_THAT(top.ResolveNodeOrError("b", span),
+  EXPECT_THAT(top.ResolveNodeOrError("b", span, file_table),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("Cannot find a definition for name: \"b\"")));
-  EXPECT_THAT(leaf1.ResolveNodeOrError("b", span),
+  EXPECT_THAT(leaf1.ResolveNodeOrError("b", span, file_table),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("Cannot find a definition for name: \"b\"")));
-  EXPECT_THAT(leaf0.ResolveNodeOrError("c", span),
+  EXPECT_THAT(leaf0.ResolveNodeOrError("c", span, file_table),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("Cannot find a definition for name: \"c\"")));
 
-  EXPECT_THAT(leaf0.ResolveNodeOrError("b", span), IsOkAndHolds(b));
-  EXPECT_THAT(leaf1.ResolveNodeOrError("c", span), IsOkAndHolds(c));
+  EXPECT_THAT(leaf0.ResolveNodeOrError("b", span, file_table), IsOkAndHolds(b));
+  EXPECT_THAT(leaf1.ResolveNodeOrError("c", span, file_table), IsOkAndHolds(c));
 }
 
 TEST_F(ParserTest, TestRoundTripFailsOnSyntaxError) {
@@ -181,6 +193,17 @@ TEST_F(ParserTest, TestIdentityFunction) {
 })");
 }
 
+TEST_F(ParserTest, DuplicateFn) {
+  EXPECT_NONFATAL_FAILURE(
+      RoundTrip(R"(fn f(){} fn f(){})"),
+      "Function 'f' is defined in this module multiple times");
+}
+
+TEST_F(ParserTest, DuplicateMember) {
+  EXPECT_NONFATAL_FAILURE(RoundTrip(R"(fn f(){} struct f {})"),
+                          "already contains a member named `f`");
+}
+
 TEST_F(ParserTest, TestIdentityFunctionWithLet) {
   std::unique_ptr<Module> module = RoundTrip(R"(fn f(x: u32) -> u32 {
     let y = x;
@@ -190,7 +213,7 @@ TEST_F(ParserTest, TestIdentityFunctionWithLet) {
   ASSERT_TRUE(maybe_f.has_value());
   Function* f = maybe_f.value();
   ASSERT_NE(f, nullptr);
-  Block* f_body = f->body();
+  StatementBlock* f_body = f->body();
   ASSERT_EQ(f_body->statements().size(), 2);
 }
 
@@ -212,7 +235,7 @@ TEST_F(ParserTest, TestBlockOfTwoUnits) {
     ()
 })");
   ASSERT_NE(e, nullptr);
-  auto* block = dynamic_cast<Block*>(e);
+  auto* block = dynamic_cast<StatementBlock*>(e);
   ASSERT_NE(block, nullptr);
   ASSERT_EQ(block->statements().size(), 2);
   EXPECT_TRUE(
@@ -227,6 +250,453 @@ TEST_F(ParserTest, TestTokenIdentity) {
 })");
 }
 
+TEST_F(ParserTest, ImplDefRoundTrip) {
+  RoundTrip(R"(pub struct foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl foo {
+})");
+}
+
+TEST_F(ParserTest, ImplWithFunctionDefRoundTrip) {
+  RoundTrip(R"(struct foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl foo {
+    fn my_func() -> u9 {
+        u9:0
+    }
+})");
+}
+
+TEST_F(ParserTest, ImplWithMethodDefRoundTrip) {
+  std::unique_ptr<Module> module = RoundTrip(R"(struct foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl foo {
+    fn my_func(self) -> u9 {
+        self.a
+    }
+}
+fn main() -> u9 {
+    let st = foo { a: u9:5, b: u16:0 };
+    st.my_func()
+})");
+  Impl* impl = module->GetImpls().at(0);
+  EXPECT_TRUE(impl->GetFunction("my_func").has_value());
+}
+
+TEST_F(ParserTest, ImplWithExplicitSelfType) {
+  RoundTrip(R"(struct foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl foo {
+    fn my_func(self: Self) -> u9 {
+        self.a
+    }
+}
+fn main() -> u9 {
+    let st = foo { a: u9:5, b: u16:0 };
+    st.my_func()
+})");
+}
+
+TEST_F(ParserTest, ImplFunctionOnTypeRefAnnotation) {
+  RoundTrip(R"(struct foo<N: u32> {
+}
+impl foo {
+    const CONST = u32:2;
+}
+fn main() -> u32 {
+    foo<u32:2>::CONST
+})");
+}
+
+TEST_F(ParserTest, ImplWithMethodMultipleParams) {
+  RoundTrip(R"(struct foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl foo {
+    fn my_func(self, mult: u9) -> u9 {
+        self.a * mult
+    }
+})");
+}
+
+TEST(ParserErrorTest, LetMut) {
+  constexpr std::string_view kProgram = R"(fn main() -> u32 {
+    let mut x = u32:0;
+    x
+})";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(
+      module.status(),
+      IsPosError(
+          "ParseError",
+          HasSubstr("`mut` and mutable bindings are not supported in DSLX")));
+}
+
+TEST(ParserErrorTest, ImplWithMisplacedSelf) {
+  constexpr std::string_view kProgram = R"(struct foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl foo {
+    fn my_func(b: u32, self, mult: u9) -> u9 {
+        self.a * mult
+    }
+}
+fn main() -> u9 {
+    self.a
+})";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(module.status(),
+              IsPosError("ParseError",
+                         HasSubstr("`self` must be the first parameter")));
+}
+
+TEST(ParserErrorTest, SelfOutsideImpl) {
+  constexpr std::string_view kProgram = R"(struct foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl foo {
+    fn my_func(self, mult: u9) -> u9 {
+        self.a * mult
+    }
+}
+fn main() -> u9 {
+    self.a
+})";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(
+      module.status(),
+      IsPosError("ParseError",
+                 HasSubstr("Cannot find a definition for name: \"self\"")));
+}
+
+TEST(ParserErrorTest, ImplUsingMisnamedSelf) {
+  constexpr std::string_view kProgram = R"(struct foo { }
+impl foo {
+    fn my_func(me: Self) -> Self {
+        me
+    }
+})";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(
+      module.status(),
+      IsPosError("ParseError",
+                 HasSubstr("Parameter with type `Self` must be named `self`")));
+}
+
+TEST(ParserErrorTest, ImplUsingSelfInFunction) {
+  constexpr std::string_view kProgram = R"(struct foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl foo {
+    fn my_func(self, mult: u9) -> u9 {
+        self.a * mult
+    }
+
+    fn static_func() -> u16 {
+        self.b
+    }
+})";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(
+      module.status(),
+      IsPosError("ParseError",
+                 HasSubstr("Cannot find a definition for name: \"self\"")));
+}
+
+TEST_F(ParserTest, ImplSpanSetsCorrectSpan) {
+  std::unique_ptr<Module> module = RoundTrip(R"(struct foo {
+}
+impl foo {
+})");
+  Impl* impl = module->GetImpls().at(0);
+  EXPECT_EQ(impl->span().start().lineno(), 2);
+  EXPECT_EQ(impl->span().start().colno(), 0);
+  EXPECT_EQ(impl->span().limit().lineno(), 3);
+  EXPECT_EQ(impl->span().limit().colno(), 1);
+}
+
+TEST_F(ParserTest, PubImplSetsCorrectSpan) {
+  std::unique_ptr<Module> module = RoundTrip(R"(struct foo {
+}
+pub impl foo {
+})");
+  Impl* impl = module->GetImpls().at(0);
+  EXPECT_EQ(impl->span().start().lineno(), 2);
+  EXPECT_EQ(impl->span().start().colno(), 0);
+  EXPECT_EQ(impl->span().limit().lineno(), 3);
+  EXPECT_EQ(impl->span().limit().colno(), 1);
+}
+
+TEST_F(ParserTest, PubStructSetsCorrectSpan) {
+  std::unique_ptr<Module> module = RoundTrip(R"(pub struct foo {
+})");
+  StructDef* struct_def = module->GetStructDefs().at(0);
+  EXPECT_EQ(struct_def->span().start().lineno(), 0);
+  EXPECT_EQ(struct_def->span().start().colno(), 0);
+  EXPECT_EQ(struct_def->span().limit().lineno(), 1);
+  EXPECT_EQ(struct_def->span().limit().colno(), 1);
+}
+
+TEST_F(ParserTest, ProcWithImplRoundTrip) {
+  RoundTrip(R"(pub proc Foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl Foo {
+})");
+}
+
+TEST_F(ParserTest, ProcWithImplAndSemicolonSeparator) {
+  constexpr std::string_view kProgram = R"(pub proc Foo {
+    a: bits[9];
+    b: bits[16];
+}
+impl Foo {
+})";
+
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(
+      module.status(),
+      StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          HasSubstr("Impl-style procs must use commas to separate members.")));
+}
+
+TEST_F(ParserTest, ProcWithImplEmptyInstantiation) {
+  RoundTrip(R"(proc Foo {
+}
+impl Foo {
+}
+fn foo() -> Foo {
+    Foo {  }
+})");
+}
+
+TEST_F(ParserTest, ProcWithImplInstantiation) {
+  RoundTrip(R"(proc Foo<N: u32> {
+    foo: u32,
+    bar: bits[N],
+}
+impl Foo {
+}
+fn foo() -> Foo<u32:8> {
+    Foo<u32:8> { foo: u32:5, bar: u8:6 }
+})");
+}
+
+TEST_F(ParserTest, ProcWithNoImplAndCommaSeparator) {
+  constexpr std::string_view kProgram = R"(pub proc Foo {
+    x: u32,
+    y: u32,
+    config() { () }
+    init { (u32:0, u32:0) }
+    next(addend: u32) { x + y + addend }
+})";
+
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(module.status(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Non-impl-style procs must use semicolons to "
+                                 "separate members.")));
+}
+
+TEST_F(ParserTest, ImplWithConstRoundTrip) {
+  RoundTrip(R"(pub struct foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl foo {
+    const FOO_VAL = u32:5;
+    const FOO_STRING = "foo";
+})");
+}
+
+TEST_F(ParserTest, PublicImplWithConstRoundTrip) {
+  RoundTrip(R"(pub struct foo {
+    a: bits[9],
+    b: bits[16],
+}
+pub impl foo {
+    const FOO_VAL = u32:5;
+    const FOO_STRING = "foo";
+})");
+}
+
+TEST_F(ParserTest, ImplWithParametricsRoundTrip) {
+  RoundTrip(R"(pub struct foo<N: u32> {
+    a: bits[9],
+    b: bits[16],
+}
+impl foo<N> {
+    const FOO_VAL = N;
+    const FOO_STRING = "foo";
+})");
+}
+
+TEST_F(ParserTest, ImplUseConstantDefRoundTrip) {
+  RoundTrip(R"(pub struct foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl foo {
+    const FOO_VAL = u32:5;
+    const FOO_STRING = "foo";
+}
+fn f(my_foo: foo) -> u32 {
+    my_foo::FOO_VAL
+})");
+}
+
+TEST_F(ParserTest, ImplWithFnDefinitionRoundTrip) {
+  RoundTrip(R"(pub struct Foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl Foo {
+    fn get_foo() -> u32 {
+        u32:5
+    }
+}
+fn f(my_foo: Foo) -> u32 {
+    my_foo.get_foo()
+})");
+}
+
+TEST_F(ParserTest, ImplWithFnAndConstsDefinitionRoundTrip) {
+  RoundTrip(R"(pub struct Foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl Foo {
+    const FOO_VAL = u32:5;
+    fn get_foo() -> u32 {
+        FOO_VAL
+    }
+    const SECOND_CONST = u32:1;
+    fn nada() {}
+}
+fn f(my_foo: Foo) -> u32 {
+    my_foo.get_foo()
+})");
+}
+
+TEST_F(ParserTest, ParseErrorForDuplicateImpl) {
+  constexpr std::string_view kProgram = R"(pub struct foo {
+    a: bits[9],
+    b: bits[16],
+}
+impl foo {
+    const FOO_VAL = u32:5;
+}
+impl foo {
+    const FOO_STRING = "foo";
+})";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(module.status(),
+              IsPosError("ParseError", HasSubstr("can only be defined once")));
+}
+
+TEST(ParserErrorTest, ParseErrorForUseOutsideStruct) {
+  constexpr std::string_view kProgram = R"(pub struct foo {
+    a: bits[9],
+    b: bits[16],
+}
+
+impl foo {
+    const FOO_VAL = u32:5;
+}
+
+const MY_FOO = FOO_VAL;
+)";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(
+      module.status(),
+      IsPosError("ParseError", HasSubstr("Cannot find a definition for name")));
+}
+
+TEST(ParserErrorTest, ParseErrorForImplOnBuiltin) {
+  constexpr std::string_view kProgram = R"(impl u32 {
+    const ONE = u32:1;
+})";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(
+      module.status(),
+      IsPosError("ParseError",
+                 HasSubstr("'impl' can only be defined for a 'struct'")));
+}
+
+TEST(ParserErrorTest, ParseErrorForImplOnNonStruct) {
+  constexpr std::string_view kProgram = R"(type foo = u32;
+
+impl foo {
+    const ONE = u32:1;
+})";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(
+      module.status(),
+      IsPosError("ParseError",
+                 HasSubstr("'impl' can only be defined for a 'struct'")));
+}
+
+TEST(ParserErrorTest, ParseErrorForImplWithoutStructDef) {
+  constexpr std::string_view kProgram = (R"(impl foo {
+    const FOO_VAL = u32:5;
+    const FOO_STRING = "foo";
+})");
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(
+      module.status(),
+      IsPosError("ParseError", HasSubstr("Cannot find a definition for name")));
+}
+
 TEST_F(ParserTest, StructDefRoundTrip) {
   RoundTrip(R"(pub struct foo<A: u32, B: bits[16]> {
     a: bits[A],
@@ -235,27 +705,26 @@ TEST_F(ParserTest, StructDefRoundTrip) {
 }
 
 TEST_F(ParserTest, ParseErrorSpan) {
-  const char* kFakeFilename = "fake.x";
-  Scanner scanner(kFakeFilename, "+");
+  Scanner scanner(file_table_, Fileno(0), "+");
   Parser parser("test_module", &scanner);
   Bindings b;
-  absl::StatusOr<Expr*> expr_or = parser.ParseExpression(b);
-  ASSERT_THAT(expr_or, StatusIs(absl::StatusCode::kInvalidArgument,
-                                "ParseError: fake.x:1:1-1:2 Expected start of "
-                                "an expression; got: +"));
+  absl::StatusOr<Expr*> expr = parser.ParseExpression(b);
+  ASSERT_THAT(expr, StatusIs(absl::StatusCode::kInvalidArgument,
+                             "ParseError: <no-file>:1:1-1:2 Expected start of "
+                             "an expression; got: +"));
 }
 
 TEST_F(ParserTest, EmptyTupleWithComma) {
-  const char* kFakeFilename = "fake.x";
-  Scanner scanner(kFakeFilename, "(,)");
+  Scanner scanner(file_table_, Fileno(0), "(,)");
   Parser parser("test_module", &scanner);
   Bindings b;
-  absl::StatusOr<Expr*> expr_or = parser.ParseExpression(b);
+  absl::StatusOr<Expr*> expr = parser.ParseExpression(b);
   ASSERT_THAT(
-      expr_or,
-      StatusIs(absl::StatusCode::kInvalidArgument,
-               testing::HasSubstr(
-                   "fake.x:1:2-1:3 Expected start of an expression; got: ,")));
+      expr,
+      StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          testing::HasSubstr(
+              "<no-file>:1:2-1:3 Expected start of an expression; got: ,")));
 }
 
 TEST_F(ParserTest, ParseLet) {
@@ -263,10 +732,10 @@ TEST_F(ParserTest, ParseLet) {
     let x: u32 = 2;
     x
 })";
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser p{"test", &s};
   Bindings b;
-  XLS_ASSERT_OK_AND_ASSIGN(Block * block,
+  XLS_ASSERT_OK_AND_ASSIGN(StatementBlock * block,
                            p.ParseBlockExpression(/*bindings=*/b));
 
   absl::Span<Statement* const> stmts = block->statements();
@@ -287,10 +756,10 @@ TEST_F(ParserTest, ParseLetWildcardBinding) {
   const char* text = R"({
   let _ = 2;
 })";
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser p{"test", &s};
   Bindings b;
-  XLS_ASSERT_OK_AND_ASSIGN(Block * block,
+  XLS_ASSERT_OK_AND_ASSIGN(StatementBlock * block,
                            p.ParseBlockExpression(/*bindings=*/b));
 
   ASSERT_TRUE(block->trailing_semi());
@@ -307,16 +776,32 @@ TEST_F(ParserTest, ParseLetWildcardBinding) {
   ASSERT_TRUE(let->name_def_tree()->IsWildcardLeaf());
 }
 
+TEST_F(ParserTest, ParseLetWildcardBindingTwice) {
+  const char* text = R"({
+  let (y, y) = (u32:0, u32:0);
+})";
+  Scanner s{file_table_, Fileno(0), std::string{text}};
+  Parser p{"test", &s};
+  Bindings b;
+  absl::StatusOr<StatementBlock*> block =
+      p.ParseBlockExpression(/*bindings=*/b);
+  ASSERT_FALSE(block.ok());
+  EXPECT_THAT(block,
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       testing::HasSubstr(
+                           "Name 'y' is defined twice in this pattern")));
+}
+
 TEST_F(ParserTest, ParseLetExpressionWithShadowing) {
   const char* text = R"({
     let x: u32 = 2;
     let x: u32 = 4;
     x
 })";
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser p{"test", &s};
   Bindings b;
-  XLS_ASSERT_OK_AND_ASSIGN(Block * block,
+  XLS_ASSERT_OK_AND_ASSIGN(StatementBlock * block,
                            p.ParseBlockExpression(/*bindings=*/b));
 
   absl::Span<Statement* const> stmts = block->statements();
@@ -337,13 +822,13 @@ TEST_F(ParserTest, ParseBlockMultiLet) {
     let y = g(x);
     x + y
 })";
-  Scanner s{"test.x", std::string{kProgram}};
+  Scanner s{file_table_, Fileno(0), std::string{kProgram}};
   Parser p{"test", &s};
   Bindings bindings;
   Module& mod = p.module();
   bindings.Add("f", mod.GetOrCreateBuiltinNameDef("f"));
   bindings.Add("g", mod.GetOrCreateBuiltinNameDef("g"));
-  XLS_ASSERT_OK_AND_ASSIGN(Block * block,
+  XLS_ASSERT_OK_AND_ASSIGN(StatementBlock * block,
                            p.ParseBlockExpression(/*bindings=*/bindings));
 
   EXPECT_EQ(3, block->statements().size());
@@ -362,14 +847,14 @@ TEST_F(ParserTest, ParseBlockMultiLet) {
 
 TEST_F(ParserTest, ParseIdentityFunction) {
   const char* text = "fn ident(x: bits) { x }";
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser p{"test", &s};
   Bindings bindings;
   XLS_ASSERT_OK_AND_ASSIGN(
       Function * f,
-      p.ParseFunction(/*is_public=*/false, /*bindings=*/bindings));
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
 
-  Block* block = f->body();
+  StatementBlock* block = f->body();
   ASSERT_TRUE(block != nullptr);
   absl::Span<Statement* const> stmts = block->statements();
   ASSERT_EQ(stmts.size(), 1);
@@ -389,25 +874,282 @@ TEST_F(ParserTest, ParseSimpleProc) {
     init {
         u32:0
     }
-    next(tok: token, addend: u32) {
+    next(addend: u32) {
         x + addend
     }
 })";
 
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser parser{"test", &s};
   Bindings bindings;
-  auto proc_or =
-      parser.ParseProc(/*is_public=*/false, /*outer_bindings=*/bindings);
-  if (!proc_or.ok()) {
-    TryPrintError(proc_or.status(),
-                  [&](std::string_view path) -> absl::StatusOr<std::string> {
-                    return std::string(text);
-                  });
-    XLS_ASSERT_OK(proc_or.status());
+  auto proc =
+      parser.ParseProc(Pos(), /*is_public=*/false, /*bindings=*/bindings);
+  if (!proc.ok()) {
+    UniformContentFilesystem vfs(text);
+    TryPrintError(proc.status(), file_table_, vfs);
+    XLS_ASSERT_OK(proc.status());
   }
-  const Proc* p = proc_or.value();
+  const Proc* p = std::get<Proc*>(*proc);
   EXPECT_EQ(p->ToString(), text);
+  EXPECT_FALSE(p->IsStateless());
+}
+
+TEST_F(ParserTest, ParseStatelessProc) {
+  const char* text = R"(proc simple {
+    config() {
+        ()
+    }
+    init {
+        ()
+    }
+    next(state: ()) {
+        ()
+    }
+})";
+
+  Scanner s{file_table_, Fileno(0), std::string{text}};
+  Parser parser{"test", &s};
+  Bindings bindings;
+  auto proc =
+      parser.ParseProc(Pos(), /*is_public=*/false, /*bindings=*/bindings);
+  if (!proc.ok()) {
+    UniformContentFilesystem vfs(text);
+    TryPrintError(proc.status(), file_table_, vfs);
+    XLS_ASSERT_OK(proc.status());
+  }
+  const Proc* p = std::get<Proc*>(*proc);
+  EXPECT_EQ(p->ToString(), text);
+  EXPECT_TRUE(p->IsStateless());
+}
+
+TEST_F(ParserTest, TraceFmtNoArgs) {
+  RoundTrip(R"(fn main() {
+    trace_fmt!("Hello world!");
+})");
+}
+
+TEST_F(ParserTest, TraceFmtWithArgs) {
+  RoundTrip(R"(fn main() {
+    let foo = u32:2;
+    trace_fmt!("Hello {} {:x}!", "world", foo + u32:1);
+})");
+}
+
+TEST_F(ParserTest, VTraceFmtNoArgs) {
+  RoundTrip(R"(fn main() {
+    vtrace_fmt!(3, "Hello world!");
+})");
+}
+
+TEST_F(ParserTest, VTraceFmtWithArgs) {
+  RoundTrip(R"(fn main() {
+    const VERBOSITY = u32:4;
+    let foo = u32:3;
+    vtrace_fmt!(VERBOSITY + u32:1, "Hello {} {:x}!", "world", foo + u32:1);
+})");
+}
+
+TEST_F(ParserTest, ParseProcWithConst) {
+  RoundTrip(R"(proc simple {
+    const MAX_X = u32:10;
+    x: u32;
+    config() {
+        ()
+    }
+    init {
+        u32:0
+    }
+    next(addend: u32) {
+        if x > MAX_X { x } else { x + addend }
+    }
+})");
+}
+
+TEST_F(ParserTest, ParseParametricProcWithConstant) {
+  RoundTrip(R"(proc MyProc<X: u32> {
+    const INC = u32:20;
+    c: chan<u32> in;
+    config(c: chan<u32> in) {
+        (c,)
+    }
+    init {
+        u32:0
+    }
+    next(state: ()) {
+        state + INC
+    }
+})");
+}
+
+TEST_F(ParserTest, ParseParametricProcWithConstantRefParam) {
+  RoundTrip(R"(proc MyProc<X: u32> {
+    const DOUBLE_X = u32:2 * X;
+    c: chan<u32> in;
+    config(c: chan<u32> in) {
+        (c,)
+    }
+    init {
+        u32:0
+    }
+    next(state: ()) {
+        state + DOUBLE_X
+    }
+})");
+}
+
+TEST_F(ParserTest, ParseProcWithConstantRefFunction) {
+  RoundTrip(R"(fn double(x: u32) -> u32 {
+    x * u32:2
+}
+proc MyProc<X: u32> {
+    const DOUBLE_X = double(X);
+    c: chan<u32> in;
+    config(c: chan<u32> in) {
+        (c,)
+    }
+    init {
+        u32:0
+    }
+    next(state: ()) {
+        state + DOUBLE_X
+    }
+})");
+}
+
+TEST_F(ParserTest, ParseProcWithConstantRefGlobalConstant) {
+  RoundTrip(R"(const MY_VAL = u32:15;
+proc MyProc {
+    const DOUBLE_VAL = u32:2 * MY_VAL;
+    c: chan<u32> in;
+    config(c: chan<u32> in) {
+        (c,)
+    }
+    init {
+        u32:0
+    }
+    next(state: ()) {
+        state + DOUBLE_VAL
+    }
+})");
+}
+
+TEST_F(ParserTest, ParseProcWithConstantInType) {
+  RoundTrip(R"(const MY_VAL = u32:15;
+proc MyProc {
+    const DOUBLE_VAL = u32:2 * MY_VAL;
+    c: chan<uN[DOUBLE_VAL]> in;
+    config(c: chan<uN[DOUBLE_VAL]> in) {
+        (c,)
+    }
+    init {
+        u32:0
+    }
+    next(state: ()) {
+        state + DOUBLE_VAL
+    }
+})");
+}
+
+TEST_F(ParserTest, ParseProcWithConstantRefConstant) {
+  RoundTrip(R"(proc MyProc {
+    const MY_VAL = u32:15;
+    const DOUBLE_VAL = u32:2 * MY_VAL;
+    c: chan<u32> in;
+    config(c: chan<u32> in) {
+        (c,)
+    }
+    init {
+        u32:0
+    }
+    next(state: ()) {
+        state + DOUBLE_VAL
+    }
+})");
+}
+
+TEST_F(ParserTest, ParseNextTooManyArgs) {
+  const char* text = R"(proc confused {
+    config() { () }
+    init { () }
+    next(state: (), more: u32, even_more: u64) { () }
+})";
+
+  Scanner s{file_table_, Fileno(0), std::string{text}};
+  Parser parser{"test", &s};
+  Bindings bindings;
+  auto proc =
+      parser.ParseProc(Pos(), /*is_public=*/false, /*bindings=*/bindings);
+  if (!proc.ok()) {
+    UniformContentFilesystem vfs(text);
+    TryPrintError(proc.status(), file_table_, vfs);
+  }
+  EXPECT_THAT(proc,
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       testing::HasSubstr(
+                           "<no-file>:4:47-4:47 A Proc next function takes one "
+                           "argument (a recurrent state element); got 3 "
+                           "parameters: [state, more, even_more]")));
+}
+
+TEST_F(ParserTest, ParseSimpleProcWithAlias) {
+  const char* text = R"(proc simple {
+    type MyU32 = u32;
+    x: MyU32;
+    config() {
+        ()
+    }
+    init {
+        MyU32:0
+    }
+    next(addend: MyU32) {
+        x + addend
+    }
+})";
+
+  Scanner s{file_table_, Fileno(0), std::string{text}};
+  Parser parser{"test", &s};
+  Bindings bindings;
+  auto proc =
+      parser.ParseProc(Pos(), /*is_public=*/false, /*bindings=*/bindings);
+  if (!proc.ok()) {
+    UniformContentFilesystem vfs(text);
+    TryPrintError(proc.status(), file_table_, vfs);
+    XLS_ASSERT_OK(proc.status());
+  }
+  const Proc* p = std::get<Proc*>(*proc);
+  EXPECT_EQ(p->ToString(), text)
+      << "Proc ToString() did not match original text.";
+}
+
+TEST_F(ParserTest, ParseSimpleProcWithDepdenentTypeAlias) {
+  const char* text = R"(proc simple {
+    type MyU32 = u32;
+    type MyOtherU32 = MyU32;
+    x: MyOtherU32;
+    config() {
+        ()
+    }
+    init {
+        MyOtherU32:0
+    }
+    next(addend: MyOtherU32) {
+        x + addend
+    }
+})";
+
+  Scanner s{file_table_, Fileno(0), std::string{text}};
+  Parser parser{"test", &s};
+  Bindings bindings;
+  auto proc =
+      parser.ParseProc(Pos(), /*is_public=*/false, /*bindings=*/bindings);
+  if (!proc.ok()) {
+    UniformContentFilesystem vfs(text);
+    TryPrintError(proc.status(), file_table_, vfs);
+    XLS_ASSERT_OK(proc.status());
+  }
+  const Proc* p = std::get<Proc*>(*proc);
+  EXPECT_EQ(p->ToString(), text)
+      << "Proc ToString() did not match original text.";
 }
 
 // Parses the "iota" example.
@@ -421,8 +1163,8 @@ TEST_F(ParserTest, ParseProcNetwork) {
     init {
         u32:0
     }
-    next(tok: token, i: u32) {
-        let tok = send(tok, c_, i);
+    next(i: u32) {
+        let tok = send(join(), c_, i);
         i + 1
     }
 }
@@ -434,14 +1176,14 @@ proc consumer<N: u32> {
     init {
         u32:0
     }
-    next(tok: token, i: u32) {
-        let (tok1, e) = recv(tok, c_);
+    next(i: u32) {
+        let (tok1, e) = recv(join(), c_);
         i + 1
     }
 }
 proc main {
     config() {
-        let (p, c) = chan<u32>;
+        let (p, c) = chan<u32>("my_chan");
         spawn producer(u32:10, p);
         spawn consumer(range(10), c);
         ()
@@ -449,7 +1191,7 @@ proc main {
     init {
         ()
     }
-    next(tok: token, state: ()) {
+    next(state: ()) {
         ()
     }
 })";
@@ -468,8 +1210,8 @@ TEST_F(ParserTest, ParseProcNetworkWithFifoDepthOnInternalChannel) {
     init {
         u32:0
     }
-    next(tok: token, i: u32) {
-        let tok = send(tok, c_, i);
+    next(i: u32) {
+        let tok = send(join(), c_, i);
         i + 1
     }
 }
@@ -481,14 +1223,14 @@ proc consumer<N: u32> {
     init {
         u32:0
     }
-    next(tok: token, i: u32) {
-        let (tok1, e) = recv(tok, c_);
+    next(i: u32) {
+        let (tok1, e) = recv(join(), c_);
         i + 1
     }
 }
 proc main {
     config() {
-        let (p, c) = chan<u32, 2>;
+        let (p, c) = chan<u32, 2>("my_chan");
         spawn producer(u32:10, p);
         spawn consumer(range(10), c);
         ()
@@ -496,7 +1238,7 @@ proc main {
     init {
         ()
     }
-    next(tok: token, state: ()) {
+    next(state: ()) {
         ()
     }
 })";
@@ -510,17 +1252,17 @@ TEST_F(ParserTest, ChannelsNotAsNextArgs) {
     config(c: chan<u32> out) {
         (c,)
     }
-    next(tok: token, i: (chan<u32> out, u32)) {
-        let tok = send(tok, c, i);
+    next(i: (chan<u32> out, u32)) {
+        let tok = send(join(), c, i);
         (c, i + i)
     }
 })";
 
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser parser{"test", &s};
   Bindings bindings;
-  auto status_or_module = parser.ParseModule();
-  EXPECT_THAT(status_or_module,
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(module,
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("Channels cannot be Proc next params.")));
 }
@@ -534,23 +1276,23 @@ TEST_F(ParserTest, ChannelArraysOneD) {
     init {
         u32:100
     }
-    next(tok: token, i: u32) {
-        recv(tok, c);
+    next(i: u32) {
+        recv(join(), c);
         i + i
     }
 }
 proc producer {
     channels: chan<u32>[32] out;
     config() {
-        let (ps, cs) = chan<u32>[32];
+        let (ps, cs) = chan<u32>[32]("my_chan");
         spawn consumer(cs[0]);
         (ps,)
     }
     init {
         ()
     }
-    next(tok: token, state: ()) {
-        send(tok, channels[0], u32:0);
+    next(state: ()) {
+        send(join(), channels[0], u32:0);
     }
 })";
 
@@ -566,23 +1308,23 @@ TEST_F(ParserTest, ChannelArraysThreeD) {
     init {
         u32:0
     }
-    next(tok: token, i: u32) {
-        let tok = recv(tok, c);
+    next(i: u32) {
+        let tok = recv(join(), c);
         i + i
     }
 }
 proc producer {
     channels: chan<u32>[32][64][128] out;
     config() {
-        let (ps, cs) = chan<u32>[32][64][128];
+        let (ps, cs) = chan<u32>[32][64][128]("my_chan");
         spawn consumer(cs[0]);
         (ps,)
     }
     init {
         ()
     }
-    next(tok: token, state: ()) {
-        send(tok, channels[0][1][2], u32:0);
+    next(state: ()) {
+        send(join(), channels[0][1][2], u32:0);
     }
 })";
 
@@ -598,8 +1340,8 @@ TEST_F(ParserTest, ParseSendIfAndRecvIf) {
     init {
         false
     }
-    next(tok: token, do_send: bool) {
-        send_if(tok, c, do_send, do_send as u32);
+    next(do_send: bool) {
+        send_if(join(), c, do_send, do_send as u32);
         (!do_send,)
     }
 }
@@ -611,8 +1353,8 @@ proc consumer {
     init {
         false
     }
-    next(tok: token, do_recv: bool) {
-        let (_, foo) = recv_if(tok, c, do_recv, u32:0);
+    next(do_recv: bool) {
+        let (_, foo) = recv_if(join(), c, do_recv, u32:0);
         let _ = assert_eq(foo, true);
         (!do_recv,)
     }
@@ -630,8 +1372,8 @@ TEST_F(ParserTest, ParseSendIfAndRecvNb) {
     init {
         false
     }
-    next(tok: token, do_send: bool) {
-        let _ = send_if(tok, c, do_send, do_send as u32);
+    next(do_send: bool) {
+        let _ = send_if(join(), c, do_send, do_send as u32);
         (!do_send,)
     }
 }
@@ -643,8 +1385,8 @@ proc consumer {
     init {
         ()
     }
-    next(tok: token, state: ()) {
-        let (_, foo, valid) = recv_non_blocking(tok, c, u32:0);
+    next(state: ()) {
+        let (_, foo, valid) = recv_non_blocking(join(), c, u32:0);
         assert_eq(!(foo ^ valid), true);
     }
 })";
@@ -661,8 +1403,8 @@ TEST_F(ParserTest, ParseRecvIfNb) {
     init {
         ()
     }
-    next(tok: token, state: ()) {
-        recv_if_non_blocking(tok, c, true, u32:0);
+    next(state: ()) {
+        recv_if_non_blocking(join(), c, true, u32:0);
     }
 })";
 
@@ -681,7 +1423,8 @@ TEST_F(ParserTest, ParseJoin) {
     init {
         u32:0
     }
-    next(tok: token, state: u32) {
+    next(state: u32) {
+        let tok = join();
         let tok0 = send(tok, c0, state as u32);
         let tok1 = send(tok, c1, state as u32);
         let tok2 = send(tok, c2, state as u32);
@@ -705,9 +1448,9 @@ TEST_F(ParserTest, ParseTestProc) {
     init {
         u32:0
     }
-    next(tok: token, x: u32) {
-        let (tok, y) = recv(tok, input);
-        let tok = send(tok, output, x + y);
+    next(x: u32) {
+        let (tok, y) = recv(join(), input);
+        let tok = send(join(), output, x + y);
         (x + y,)
     }
 }
@@ -717,15 +1460,16 @@ proc tester {
     c: chan<u32> in;
     terminator: chan<u32> out;
     config(terminator: chan<u32> out) {
-        let (input_p, input_c) = chan<u32>;
-        let (output_p, output_c) = chan<u32>;
+        let (input_p, input_c) = chan<u32>("input");
+        let (output_p, output_c) = chan<u32>("output");
         spawn testee(input_c, output_p);
         (input_p, output_c, terminator)
     }
     init {
         u32:0
     }
-    next(tok: token, iter: u32) {
+    next(iter: u32) {
+        let tok = join();
         let tok = send(tok, p, u32:0);
         let tok = send(tok, p, u32:1);
         let tok = send(tok, p, u32:2);
@@ -754,14 +1498,14 @@ TEST_F(ParserTest, ParseStructSplat) {
 fn f(p: Point) -> Point {
     Point { x: u32:42, ..p }
 })";
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser parser{"test", &s};
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Module> m, parser.ParseModule());
   XLS_ASSERT_OK_AND_ASSIGN(TypeDefinition c, m->GetTypeDefinition("Point"));
   ASSERT_TRUE(std::holds_alternative<StructDef*>(c));
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, m->GetMemberOrError<Function>("f"));
 
-  Block* block = f->body();
+  StatementBlock* block = f->body();
   absl::Span<Statement* const> stmts = block->statements();
   ASSERT_EQ(stmts.size(), 1);
   Statement* stmt = stmts.at(0);
@@ -779,15 +1523,15 @@ TEST_F(ParserTest, ConcatFunction) {
   // should make a test that doesn't make it through typechecking if it's not a
   // parse-time error.
   const char* text = "fn concat(x: bits, y: bits) { x ++ y }";
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser p{"test", &s};
   Bindings bindings;
   XLS_ASSERT_OK_AND_ASSIGN(
       Function * f,
-      p.ParseFunction(/*is_public=*/false, /*bindings=*/bindings));
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
   EXPECT_EQ(f->params().size(), 2);
 
-  Block* block = f->body();
+  StatementBlock* block = f->body();
   absl::Span<Statement* const> stmts = block->statements();
   ASSERT_EQ(stmts.size(), 1);
   Statement* stmt = stmts.at(0);
@@ -813,12 +1557,12 @@ fn concat(
   x ++ y
 }
 )";
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser p{"test", &s};
   Bindings bindings;
   XLS_ASSERT_OK_AND_ASSIGN(
       Function * f,
-      p.ParseFunction(/*is_public=*/false, /*bindings=*/bindings));
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
   EXPECT_EQ(f->params().size(), 2);
 }
 
@@ -828,14 +1572,14 @@ fn f(x: u32) -> u8 {
   x[0:8]
 }
 )";
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser p{"test", &s};
   Bindings bindings;
   XLS_ASSERT_OK_AND_ASSIGN(
       Function * f,
-      p.ParseFunction(/*is_public=*/false, /*bindings=*/bindings));
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
 
-  Block* block = f->body();
+  StatementBlock* block = f->body();
   absl::Span<Statement* const> stmts = block->statements();
   ASSERT_EQ(stmts.size(), 1);
   Statement* stmt = stmts.at(0);
@@ -855,13 +1599,13 @@ TEST_F(ParserTest, LocalConstBinding) {
     FOO
 })";
   RoundTrip(text);
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser p{"test", &s};
   Bindings bindings;
   XLS_ASSERT_OK_AND_ASSIGN(
       Function * f,
-      p.ParseFunction(/*is_public=*/false, /*bindings=*/bindings));
-  Block* body = f->body();
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
+  StatementBlock* body = f->body();
   absl::Span<Statement* const> stmts = body->statements();
   ASSERT_EQ(stmts.size(), 2);
 
@@ -870,16 +1614,19 @@ TEST_F(ParserTest, LocalConstBinding) {
   ASSERT_TRUE(const_let->is_const());
   EXPECT_EQ("u8:42", const_let->rhs()->ToString());
 
-  auto* const_ref =
-      dynamic_cast<ConstRef*>(std::get<Expr*>(stmts.at(1)->wrapped()));
-  ASSERT_NE(const_ref, nullptr);
-  const NameDef* name_def = const_ref->name_def();
+  auto* name_ref =
+      dynamic_cast<NameRef*>(std::get<Expr*>(stmts.at(1)->wrapped()));
+  ASSERT_NE(name_ref, nullptr);
+  auto* name_def = std::get<const NameDef*>(name_ref->name_def());
   EXPECT_EQ(name_def->ToString(), "FOO");
   AstNode* definer = name_def->definer();
   EXPECT_EQ(definer, const_let);
 }
 
-TEST_F(ParserTest, ParenthesizedUnop) { RoundTripExpr("(!x)", {"x"}); }
+TEST_F(ParserTest, ParenthesizedUnop) {
+  Expr* e = RoundTripExpr("(!x)", {"x"});
+  EXPECT_EQ(e->span().ToString(file_table_), "<no-file>:1:2-1:4");
+}
 
 TEST_F(ParserTest, BitSliceOfCall) { RoundTripExpr("id(x)[0:8]", {"id", "x"}); }
 
@@ -915,10 +1662,90 @@ TEST_F(ParserTest, ZeroMacroSimpleBitsArray) {
   RoundTripExpr("zero!<bits[32][10]>()", {}, /*populate_dslx_builtins=*/true);
 }
 
-// TODO(google/xls#984): 2023-06-02
-TEST_F(ParserTest, DISABLED_ZeroMacroSimpleStructArray) {
+TEST_F(ParserTest, ZeroMacroArrayOfImportedType) {
+  RoundTrip(R"(import bar;
+fn foo() -> bar::T[2] {
+    zero!<bar::T[2]>()
+})");
+}
+
+TEST_F(ParserTest, ZeroMacroImportedTypeWithParametric) {
+  RoundTrip(R"(import bar;
+fn foo() -> bar::T<2> {
+    zero!<bar::T<2>>()
+})");
+}
+
+TEST_F(ParserTest, ZeroMacroArrayOfImportedTypeWithParametric) {
+  RoundTrip(R"(import bar;
+fn foo() -> bar::T<2>[3] {
+    zero!<bar::T<2>[3]>()
+})");
+}
+
+TEST_F(ParserTest, UseOneItemFromModule) {
+  std::unique_ptr<Module> m = RoundTrip(R"(#![feature(use_syntax)]
+
+use foo::BAR;
+fn main() -> u32 {
+    BAR
+})");
+  std::optional<ModuleMember*> member = m->FindMemberWithName("BAR");
+  ASSERT_TRUE(member.has_value());
+  ASSERT_TRUE(std::holds_alternative<Use*>(*member.value()));
+  Use* use = std::get<Use*>(*member.value());
+  std::vector<UseSubject> subjects = use->LinearizeToSubjects();
+  ASSERT_EQ(subjects.size(), 1);
+  EXPECT_EQ(subjects.at(0).identifiers(),
+            std::vector<std::string>({"foo", "BAR"}));
+  EXPECT_EQ(subjects.at(0).name_def().identifier(), "BAR");
+  EXPECT_EQ(subjects.at(0).ToErrorString(), "`foo::BAR`");
+}
+
+TEST_F(ParserTest, UseTwoItemsFromModule) {
+  RoundTrip(R"(#![feature(use_syntax)]
+
+use foo::{BAR, BAZ};
+fn main() -> u32 {
+    BAR + BAZ
+})");
+}
+
+TEST_F(ParserTest, UseWithNestedLevels) {
+  RoundTrip(R"(#![feature(use_syntax)]
+
+use foo::{bar::{baz, qux}, quux};
+fn main() -> u32 {
+    baz + qux + quux
+})");
+}
+
+TEST_F(ParserTest, UseCollidesWithImport) {
+  constexpr std::string_view kProgram = R"(#![feature(use_syntax)]
+
+use foo; import foo;
+)";
+  absl::StatusOr<std::unique_ptr<Module>> module = Parse(kProgram);
+  EXPECT_THAT(
+      module.status(),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("`import` syntax is disabled for this module via "
+                         "`#![feature(use_syntax)]` at module scope")));
+}
+
+TEST_F(ParserTest, UseWithPeersAtTopLevelNotAllowed) {
+  constexpr std::string_view kProgram = R"(#![feature(use_syntax)]
+use {foo, bar};)";
+  absl::StatusOr<std::unique_ptr<Module>> module = Parse(kProgram);
+  EXPECT_THAT(
+      module.status(),
+      IsPosError("ParseError",
+                 HasSubstr("Cannot `use` multiple modules in one statement")));
+}
+
+TEST_F(ParserTest, ZeroMacroSimpleStructArray) {
   const char* text = R"(zero!<MyType[10]>())";
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser p{"test", &s};
 
   Bindings b;
@@ -929,29 +1756,25 @@ TEST_F(ParserTest, DISABLED_ZeroMacroSimpleStructArray) {
     b.Add(name, mod.GetOrCreateBuiltinNameDef(name));
   }
 
-  NameDef* name_def = mod.Make<NameDef>(
-    Span::Fake(), std::string("MyType"), nullptr);
+  NameDef* name_def =
+      mod.Make<NameDef>(Span::Fake(), std::string("MyType"), nullptr);
 
-  using StructMember = std::pair<NameDef*, TypeAnnotation*>;
   auto* struct_def = mod.Make<StructDef>(
-    Span::Fake(), name_def, std::vector<ParametricBinding*>(),
-    std::vector<StructMember>(), false);
+      Span::Fake(), name_def, std::vector<ParametricBinding*>(),
+      std::vector<StructMemberNode*>{}, false);
   b.Add(name_def->identifier(), struct_def);
 
-  auto expr_or = p.ParseExpression(/*bindings=*/b);
-  if (!expr_or.ok()) {
-    TryPrintError(expr_or.status(),
-                  [&](std::string_view path) -> absl::StatusOr<std::string> {
-                    return std::string{text};
-                  });
+  absl::StatusOr<Expr*> expr = p.ParseExpression(/*bindings=*/b);
+  if (!expr.ok()) {
+    UniformContentFilesystem vfs(text);
+    TryPrintError(expr.status(), file_table_, vfs);
   }
-  ASSERT_TRUE(expr_or.ok());
+  ASSERT_TRUE(expr.ok());
 }
 
-// TODO(google/xls#984): 2023-06-02
-TEST_F(ParserTest, DISABLED_ZeroMacroParametricStruct) {
+TEST_F(ParserTest, ZeroMacroParametricStruct) {
   const char* text = R"(zero!<MyType<MyParm0, MyParm1>>())";
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser p{"test", &s};
 
   Bindings b;
@@ -964,45 +1787,38 @@ TEST_F(ParserTest, DISABLED_ZeroMacroParametricStruct) {
 
   std::vector<ParametricBinding*> params;
 
-  NameDef* name_def = mod.Make<NameDef>(
-    Span::Fake(), std::string("MyParm0"), nullptr);
+  NameDef* name_def =
+      mod.Make<NameDef>(Span::Fake(), std::string("MyParm0"), nullptr);
   b.Add(name_def->identifier(), name_def);
   BuiltinType builtin_type = BuiltinTypeFromString("u32").value();
   TypeAnnotation* elem_type = mod.Make<BuiltinTypeAnnotation>(
-    Span::Fake(), builtin_type, mod.GetOrCreateBuiltinNameDef("u32"));
+      Span::Fake(), builtin_type, mod.GetOrCreateBuiltinNameDef(builtin_type));
   params.push_back(mod.Make<ParametricBinding>(name_def, elem_type, nullptr));
 
-  name_def = mod.Make<NameDef>(
-    Span::Fake(), std::string("MyParm1"), nullptr);
+  name_def = mod.Make<NameDef>(Span::Fake(), std::string("MyParm1"), nullptr);
   b.Add(name_def->identifier(), name_def);
   builtin_type = BuiltinTypeFromString("u32").value();
   elem_type = mod.Make<BuiltinTypeAnnotation>(
-    Span::Fake(), builtin_type, mod.GetOrCreateBuiltinNameDef("u32"));
+      Span::Fake(), builtin_type, mod.GetOrCreateBuiltinNameDef(builtin_type));
   params.push_back(mod.Make<ParametricBinding>(name_def, elem_type, nullptr));
 
-  name_def = mod.Make<NameDef>(
-    Span::Fake(), std::string("MyType"), nullptr);
+  name_def = mod.Make<NameDef>(Span::Fake(), std::string("MyType"), nullptr);
 
-  using StructMember = std::pair<NameDef*, TypeAnnotation*>;
   auto* struct_def = mod.Make<StructDef>(
-    Span::Fake(), name_def, params,
-    std::vector<StructMember>(), false);
+      Span::Fake(), name_def, params, std::vector<StructMemberNode*>{}, false);
   b.Add(name_def->identifier(), struct_def);
 
-  auto expr_or = p.ParseExpression(/*bindings=*/b);
-  if (!expr_or.ok()) {
-    TryPrintError(expr_or.status(),
-                  [&](std::string_view path) -> absl::StatusOr<std::string> {
-                    return std::string{text};
-                  });
+  absl::StatusOr<Expr*> expr = p.ParseExpression(/*bindings=*/b);
+  if (!expr.ok()) {
+    UniformContentFilesystem vfs(text);
+    TryPrintError(expr.status(), file_table_, vfs);
   }
-  ASSERT_TRUE(expr_or.ok());
+  ASSERT_TRUE(expr.ok());
 }
 
-// TODO(google/xls#984): 2023-06-02
-TEST_F(ParserTest, DISABLED_ZeroMacroParametricStructArray) {
+TEST_F(ParserTest, ZeroMacroParametricStructArray) {
   const char* text = R"(zero!<MyType<MyParm0, MyParm1>[10]>())";
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser p{"test", &s};
 
   Bindings b;
@@ -1015,39 +1831,140 @@ TEST_F(ParserTest, DISABLED_ZeroMacroParametricStructArray) {
 
   std::vector<ParametricBinding*> params;
 
-  NameDef* name_def = mod.Make<NameDef>(
-    Span::Fake(), std::string("MyParm0"), nullptr);
+  NameDef* name_def =
+      mod.Make<NameDef>(Span::Fake(), std::string("MyParm0"), nullptr);
   b.Add(name_def->identifier(), name_def);
   BuiltinType builtin_type = BuiltinTypeFromString("u32").value();
   TypeAnnotation* elem_type = mod.Make<BuiltinTypeAnnotation>(
-    Span::Fake(), builtin_type, mod.GetOrCreateBuiltinNameDef("u32"));
+      Span::Fake(), builtin_type, mod.GetOrCreateBuiltinNameDef(builtin_type));
   params.push_back(mod.Make<ParametricBinding>(name_def, elem_type, nullptr));
 
-  name_def = mod.Make<NameDef>(
-    Span::Fake(), std::string("MyParm1"), nullptr);
+  name_def = mod.Make<NameDef>(Span::Fake(), std::string("MyParm1"), nullptr);
   b.Add(name_def->identifier(), name_def);
   builtin_type = BuiltinTypeFromString("u32").value();
   elem_type = mod.Make<BuiltinTypeAnnotation>(
-    Span::Fake(), builtin_type, mod.GetOrCreateBuiltinNameDef("u32"));
+      Span::Fake(), builtin_type, mod.GetOrCreateBuiltinNameDef(builtin_type));
   params.push_back(mod.Make<ParametricBinding>(name_def, elem_type, nullptr));
 
-  name_def = mod.Make<NameDef>(
-    Span::Fake(), std::string("MyType"), nullptr);
+  name_def = mod.Make<NameDef>(Span::Fake(), std::string("MyType"), nullptr);
 
-  using StructMember = std::pair<NameDef*, TypeAnnotation*>;
   auto* struct_def = mod.Make<StructDef>(
-    Span::Fake(), name_def, params,
-    std::vector<StructMember>(), false);
+      Span::Fake(), name_def, params, std::vector<StructMemberNode*>{}, false);
   b.Add(name_def->identifier(), struct_def);
 
-  auto expr_or = p.ParseExpression(/*bindings=*/b);
-  if (!expr_or.ok()) {
-    TryPrintError(expr_or.status(),
-                  [&](std::string_view path) -> absl::StatusOr<std::string> {
-                    return std::string{text};
-                  });
+  absl::StatusOr<Expr*> expr = p.ParseExpression(/*bindings=*/b);
+  if (!expr.ok()) {
+    UniformContentFilesystem vfs(text);
+    TryPrintError(expr.status(), file_table_, vfs);
   }
-  ASSERT_TRUE(expr_or.ok());
+  ASSERT_TRUE(expr.ok());
+}
+
+TEST_F(ParserTest, AllonesMacroSimple) {
+  RoundTripExpr("all_ones!<u32>()", {}, /*populate_dslx_builtins=*/true);
+}
+
+TEST_F(ParserTest, AllOnesMacroSimpleStruct) {
+  RoundTripExpr("all_ones!<MyType>()", {"MyType"},
+                /*populate_dslx_builtins=*/true);
+}
+
+TEST_F(ParserTest, AllOnesMacroSimpleArray) {
+  RoundTripExpr("all_ones!<u32[10]>()", {}, /*populate_dslx_builtins=*/true);
+}
+
+TEST_F(ParserTest, AllOnesMacroSimpleBitsArray) {
+  RoundTripExpr("all_ones!<bits[32][10]>()", {},
+                /*populate_dslx_builtins=*/true);
+}
+
+TEST_F(ParserTest, LocalParametricStruct) {
+  ExpectParsesSuccessfully(R"(struct my_struct<N: u32> {
+    my_field: uN[N],
+}
+const local_struct = my_struct<5> { my_field: u5:10 };)");
+}
+
+TEST_F(ParserTest, LocalParametricStructArray) {
+  ExpectParsesSuccessfully(R"(struct my_struct<N: u32> {
+    my_field: uN[N],
+}
+const local_struct = my_struct<5>[1]:[
+  my_struct { my_field: u5:10 },
+  my_struct { my_field: u5:11 }
+];)");
+}
+
+TEST_F(ParserTest, ImportedStruct) {
+  ExpectParsesSuccessfully(R"(import lib;
+const lib_struct = lib::my_lib_struct { my_field: u5:10 };)");
+}
+
+// Exercises https://github.com/google/xls/issues/1030
+TEST_F(ParserTest, ImportedParametricStruct) {
+  ExpectParsesSuccessfully(R"(import lib;
+const lib_struct = lib::my_lib_struct<5> { my_field: u5:10 };)");
+}
+
+TEST_F(ParserTest, SyntaxErrorParametricStruct) {
+  constexpr std::string_view kProgram = R"(import lib;
+const lib_struct = lib::my_lib_struct<{ my_field: u5:10 };)";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(module,
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Expected start of an expression; got: {")));
+}
+
+TEST_F(ParserTest, SyntaxErrorNoParametricForParametricStruct) {
+  constexpr std::string_view kProgram = R"(import lib;
+const lib_struct = lib::my_lib_struct<,>{ my_field: u5:10 };)";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(module,
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Expected start of an expression; got: ,")));
+}
+
+TEST_F(ParserTest, ImportedEnum) {
+  ExpectParsesSuccessfully(R"(import lib;
+const lib_enum_value = lib::my_lib_enum.value;
+)");
+}
+
+TEST_F(ParserTest, ImportedParametricFn) {
+  ExpectParsesSuccessfully(R"(import lib;
+fn main() -> () {
+    lib::my_proc<5>();
+})");
+}
+
+TEST_F(ParserTest, ImportedParametricStructArray) {
+  ExpectParsesSuccessfully(R"(import lib;
+const imported_structs = lib::my_struct<5>[2]:[
+  lib::my_struct { my_field: u5:10 },
+  lib::my_struct { my_field: u5:11 }
+];)");
+}
+
+TEST_F(ParserTest, ImportedParametricStructArrayField) {
+  ExpectParsesSuccessfully(R"(import lib;
+const imported_structs = lib::my_struct<5>[1]:[lib::my_struct { my_field: u5:10 }];
+const imported_field = imported_structs[0].my_field;
+)");
+}
+
+TEST_F(ParserTest, ImportedParametricLt) {
+  ExpectParsesSuccessfully(R"(import lib;
+
+fn main() -> bool {
+  lib::OFFSET < u32:32
+}
+)");
 }
 
 TEST_F(ParserTest, ParseBlockWithTwoStatements) {
@@ -1066,11 +1983,20 @@ const MY_TUPLE = (MyEnum::FOO, MyEnum::BAR) as (MyEnum, MyEnum);)");
   ASSERT_NE(module, nullptr);
   XLS_ASSERT_OK_AND_ASSIGN(EnumDef * my_enum,
                            module->GetMemberOrError<EnumDef>("MyEnum"));
-  EXPECT_EQ(my_enum->span().ToString(), "test.x:1:1-4:2");
+  EXPECT_EQ(my_enum->span().ToString(file_table_), "<no-file>:1:1-4:2");
 }
 
 TEST_F(ParserTest, Struct) {
   const char* text = R"(struct Point {
+    x: u32,
+    y: u32,
+})";
+  RoundTrip(text);
+}
+
+TEST_F(ParserTest, StructAnnotation) {
+  const char* text = R"(#[sv_type("cool")]
+struct Point {
     x: u32,
     y: u32,
 })";
@@ -1126,6 +2052,34 @@ TEST_F(ParserTest, LetDestructureWildcard) {
 })");
 }
 
+TEST_F(ParserTest, LetDestructureRestEnd) {
+  RoundTripExpr(R"({
+    let (x, ..): (u32, u32, u32) = (1, 2, 3);
+    x
+})");
+}
+
+TEST_F(ParserTest, LetDestructureRestBeginning) {
+  RoundTripExpr(R"({
+    let (.., x): (u32, u32, u32) = (1, 2, 3);
+    x
+})");
+}
+
+TEST_F(ParserTest, LetDestructureRestMiddle) {
+  RoundTripExpr(R"({
+    let (x, .., y): (u32, u32, u32) = (1, 2, 3);
+    x
+})");
+}
+
+TEST_F(ParserTest, LetDestructureZeroMatches) {
+  RoundTripExpr(R"({
+    let (x, .., y): (u32, u32) = (1, 2);
+    x
+})");
+}
+
 TEST_F(ParserTest, For) {
   RoundTripExpr(R"({
     let accum: u32 = 0;
@@ -1159,6 +2113,15 @@ fn f(x: u32) {
 })");
 }
 
+TEST_F(ParserTest, MatchWithMultiplePatterns) {
+  RoundTrip(R"(fn f(x: u32) {
+    match x {
+        u32:42 | u32:64 => u32:64,
+        _ => u32:42,
+    }
+})");
+}
+
 TEST_F(ParserTest, MatchWithNumberRangePattern) {
   RoundTrip(R"(fn f(x: u32) {
     match x {
@@ -1168,9 +2131,56 @@ TEST_F(ParserTest, MatchWithNumberRangePattern) {
 })");
 }
 
+TEST_F(ParserTest, MatchWithNumberRangePatternInclusiveEnd) {
+  RoundTrip(R"(fn f(x: u32) {
+    match x {
+        u32:42..=u32:64 => u32:64,
+        _ => u32:42,
+    }
+})");
+}
+
+TEST_F(ParserTest, MatchWithRestOfTuple) {
+  RoundTrip(R"(const FOO = u32:64;
+fn f(x: u32) {
+    match x {
+        (FOO, ..) => u32:61,
+        (.., FOO) => u32:62,
+        (FOO, .., FOO) => u32:63,
+        _ => u32:42,
+    }
+})");
+}
+
+TEST_F(ParserTest, MatchWithDuplicateRestOfTuple) {
+  const char* kProgram = R"(const FOO = u32:64;
+fn f(x: u32) {
+    match x {
+        (FOO, .., ..) => u32:61,
+        _ => u32:42,
+    }
+})";
+  EXPECT_NONFATAL_FAILURE(
+      RoundTrip(kProgram),
+      "Rest-of-tuple (`..`) can only be used once per tuple pattern");
+}
+
+TEST_F(ParserTest, MatchWithRestOfTupleOnly) {
+  const char* kProgram = R"(const FOO = u32:64;
+fn f(x: u32) {
+    match x {
+        .. => u32:41,
+        _ => u32:42,
+    }
+})";
+  EXPECT_NONFATAL_FAILURE(
+      RoundTrip(kProgram),
+      "`..` patterns are not allowed outside of a tuple pattern");
+}
+
 TEST_F(ParserTest, ArrayTypeAnnotation) {
   std::string s = "u8[2]";
-  scanner_.emplace(kFilename, s);
+  scanner_.emplace(file_table_, Fileno(0), s);
   parser_.emplace("test", &*scanner_);
   Bindings bindings;
   XLS_ASSERT_OK_AND_ASSIGN(TypeAnnotation * ta,
@@ -1178,11 +2188,61 @@ TEST_F(ParserTest, ArrayTypeAnnotation) {
 
   auto* array_type = dynamic_cast<ArrayTypeAnnotation*>(ta);
   EXPECT_EQ(array_type->span(),
-            Span(Pos(kFilename, 0, 0), Pos(kFilename, 0, 5)));
+            Span(Pos(Fileno(0), 0, 0), Pos(Fileno(0), 0, 5)));
   EXPECT_EQ(array_type->ToString(), "u8[2]");
   EXPECT_EQ(array_type->element_type()->span(),
-            Span(Pos(kFilename, 0, 0), Pos(kFilename, 0, 2)));
+            Span(Pos(Fileno(0), 0, 0), Pos(Fileno(0), 0, 2)));
   EXPECT_EQ(array_type->element_type()->ToString(), "u8");
+}
+
+TEST_F(ParserTest, UnsizedArrayTypeAnnotation) {
+  const std::string kProgram = "u8[]";
+  scanner_.emplace(file_table_, Fileno(0), kProgram);
+  parser_.emplace("test", &*scanner_);
+  Bindings bindings;
+  absl::StatusOr<TypeAnnotation*> ta =
+      ParseTypeAnnotation(parser_.value(), bindings);
+  ASSERT_FALSE(ta.ok());
+  EXPECT_THAT(ta.status(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Unsized arrays are not supported")));
+}
+
+// Tests parsing of a type annotation made from the `xN` bits constructor.
+TEST_F(ParserTest, xNTypeAnnotation) {
+  std::string s = "xN[false][128]";
+  scanner_.emplace(file_table_, Fileno(0), s);
+  parser_.emplace("test", &*scanner_);
+  Bindings bindings;
+  XLS_ASSERT_OK_AND_ASSIGN(TypeAnnotation * ta,
+                           ParseTypeAnnotation(parser_.value(), bindings));
+
+  // Outer array type gives the bit count.
+  auto* outer_array_type = dynamic_cast<ArrayTypeAnnotation*>(ta);
+  EXPECT_NE(outer_array_type, nullptr);
+  auto* element_type = outer_array_type->element_type();
+  EXPECT_NE(element_type, nullptr);
+  auto* outer_dim = outer_array_type->dim();
+  EXPECT_NE(outer_dim, nullptr);
+  auto* outer_number = dynamic_cast<Number*>(outer_dim);
+  EXPECT_NE(outer_number, nullptr);
+  EXPECT_EQ(outer_number->ToString(), "128");
+
+  // Inner array type gives the signedness.
+  auto* inner_array_type = dynamic_cast<ArrayTypeAnnotation*>(element_type);
+  EXPECT_NE(inner_array_type, nullptr);
+  auto* inner_dim = inner_array_type->dim();
+  EXPECT_NE(inner_dim, nullptr);
+  auto* inner_number = dynamic_cast<Number*>(inner_dim);
+  EXPECT_NE(inner_number, nullptr);
+  EXPECT_EQ(inner_number->ToString(), "false");
+
+  // The innermost element is an `xN` builtin type annotation.
+  auto* builtin_type =
+      dynamic_cast<BuiltinTypeAnnotation*>(inner_array_type->element_type());
+  EXPECT_NE(builtin_type, nullptr);
+  EXPECT_EQ(builtin_type->builtin_type(), BuiltinType::kXN);
+  EXPECT_EQ(builtin_type->GetBitCount(), 0);
 }
 
 TEST_F(ParserTest, TupleArrayAndInt) {
@@ -1190,7 +2250,7 @@ TEST_F(ParserTest, TupleArrayAndInt) {
   auto* tuple = dynamic_cast<XlsTuple*>(e);
   EXPECT_EQ(2, tuple->members().size());
   auto* array = tuple->members()[0];
-  EXPECT_NE(dynamic_cast<ConstantArray*>(array), nullptr);
+  EXPECT_NE(dynamic_cast<Array*>(array), nullptr);
 }
 
 TEST_F(ParserTest, Cast) { RoundTripExpr("foo() as u32", {"foo"}); }
@@ -1212,6 +2272,16 @@ TEST_F(ParserTest, WideningCastOfCheckedCastOfCast) {
                 /*populate_dslx_builtins=*/true);
 }
 
+TEST_F(ParserTest, BitCount) {
+  RoundTripExpr("bit_count<u32>()", {},
+                /*populate_dslx_builtins=*/true, "bit_count<u32>()");
+}
+
+TEST_F(ParserTest, ElementCount) {
+  RoundTripExpr("element_count<u32[u32:5]>()", {},
+                /*populate_dslx_builtins=*/true, "element_count<u32[u32:5]>()");
+}
+
 TEST_F(ParserTest, CastOfCastEnum) {
   RoundTrip(R"(enum MyEnum : u3 {
     SOME_VALUE = 0,
@@ -1226,6 +2296,11 @@ TEST_F(ParserTest, CastToTypeAlias) {
 fn f(x: u32) -> u128 {
     x as u128
 })");
+}
+
+TEST_F(ParserTest, xNTypeConstructor) {
+  RoundTrip(R"(type u128 = xN[false][128];)");
+  RoundTrip(R"(type s128 = xN[true][128];)");
 }
 
 // Note: parens around the left hand side are required or we attempt to parse
@@ -1246,6 +2321,16 @@ TEST_F(ParserTest, Enum) {
 })");
 }
 
+TEST_F(ParserTest, EnumSvType) {
+  RoundTrip(R"(#[sv_type("cool")]
+enum MyEnum : u2 {
+    A = 0,
+    B = 1,
+    C = 2,
+    D = 3,
+})");
+}
+
 TEST_F(ParserTest, ModuleWithSemis) {
   RoundTrip(R"(fn f() -> s32 {
     let x: s32 = 42;
@@ -1259,19 +2344,68 @@ TEST_F(ParserTest, ModuleWithParametric) {
 })");
 }
 
+TEST_F(ParserTest, ModuleWithGenericType) {
+  RoundTrip(R"(fn parametric<T: type>() -> u32 {
+    zero!<T>()
+})");
+}
+
+TEST_F(ParserTest, ModuleWithInvalidGenericType) {
+  constexpr std::string_view text = R"(fn non_parametric(T: type) -> u32 {
+    zero!<T>()
+})";
+  Scanner s{file_table_, Fileno(0), std::string{text}};
+  Parser parser{"test", &s};
+  auto module_status = parser.ParseModule();
+  ASSERT_THAT(module_status,
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("String is not a BuiltinType: \"type\"")));
+}
+
 TEST_F(ParserTest, ParametricInvocation) { RoundTripExpr("f<u32:2>()", {"f"}); }
+
+TEST_F(ParserTest, ParametricInvocationWithCastToTypeAlias) {
+  RoundTrip(R"(type foo_t = bits[32];
+fn f<N: u32>(x: u32) -> u32 {
+    N + x
+}
+fn main(x: u32) -> u32 {
+    f<foo_t:1>(x)
+})");
+}
+
+TEST_F(ParserTest, ParametricInvocationWithCastToColonRef) {
+  RoundTrip(R"(import foo;
+fn f<N: u32>(x: u32) -> u32 {
+    N + x
+}
+fn main(x: u32) -> u32 {
+    f<foo::bar_t:1>(x)
+})");
+}
+
+TEST_F(ParserTest, ColonRef) {
+  Expr* e = RoundTripExpr("BuiltinEnum::VALUE", /*predefine=*/{"BuiltinEnum"});
+  EXPECT_EQ(e->span(), Span(Pos(Fileno(0), 0, 0), Pos(Fileno(0), 0, 18)));
+}
 
 TEST_F(ParserTest, ParametricColonRefInvocation) {
   RoundTripExpr("f<BuiltinEnum::VALUE>()", {"f", "BuiltinEnum"});
 }
 
 TEST_F(ParserTest, ModuleWithTypeAlias) { RoundTrip("type MyType = u32;"); }
+TEST_F(ParserTest, ModuleWithTypeAliasSvType) {
+  RoundTrip(R"(#[sv_type("cool")]
+type MyType = u32;)");
+}
 
-TEST_F(ParserTest, ModuleWithImport) { RoundTrip("import thing"); }
+TEST_F(ParserTest, ModuleWithImport) { RoundTrip("import thing;"); }
 
-TEST_F(ParserTest, ModuleWithImportDots) { RoundTrip("import thing.subthing"); }
+TEST_F(ParserTest, ModuleWithImportDots) {
+  RoundTrip("import thing.subthing;");
+}
 
-TEST_F(ParserTest, ModuleWithImportAs) { RoundTrip("import thing as other"); }
+TEST_F(ParserTest, ModuleWithImportAs) { RoundTrip("import thing as other;"); }
 
 TEST_F(ParserTest, ConstArrayOfEnumRefs) {
   RoundTrip(R"(enum MyEnum : u3 {
@@ -1294,27 +2428,57 @@ TEST_F(ParserTest, ConstWithTypeAnnotation) {
   RoundTrip(R"(const MOL: u32 = u32:42;)");
 }
 
-TEST_F(ParserTest, ConstArrayOfConstRefs) {
+TEST_F(ParserTest, ConstArrayOfConstantRefs) {
   RoundTrip(R"(const MOL = u32:42;
 const ZERO = u32:0;
 const ARR = u32[2]:[MOL, ZERO];)");
 }
 
 // As above, but uses a trailing ellipsis in the array definition.
-TEST_F(ParserTest, ConstArrayOfConstRefsEllipsis) {
+TEST_F(ParserTest, ConstArrayOfConstantRefsEllipsis) {
   RoundTrip(R"(const MOL = u32:42;
 const ZERO = u32:0;
 const ARR = u32[2]:[MOL, ZERO, ...];)");
 }
 
-TEST_F(ParserTest, QuickCheckDirective) {
+TEST_F(ParserTest, EllipsisNotInTrailingMiddle) {
+  const char* text = R"({
+  const ARR = u32[2]:[u32:0, ..., u32:0];
+})";
+  Scanner s{file_table_, Fileno(0), std::string{text}};
+  Parser p{"test", &s};
+  Bindings b;
+  absl::StatusOr<Expr*> block = p.ParseBlockExpression(/*bindings=*/b);
+  ASSERT_FALSE(block.ok());
+  EXPECT_THAT(block,
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       testing::HasSubstr(
+                           "Ellipsis may only be in trailing position.")));
+}
+
+TEST_F(ParserTest, EllipsisNotInTrailingLeading) {
+  const char* text = R"({
+  const ARR = u32[2]:[..., u32:0];
+})";
+  Scanner s{file_table_, Fileno(0), std::string{text}};
+  Parser p{"test", &s};
+  Bindings b;
+  absl::StatusOr<Expr*> block = p.ParseBlockExpression(/*bindings=*/b);
+  ASSERT_FALSE(block.ok());
+  EXPECT_THAT(block,
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       testing::HasSubstr(
+                           "Ellipsis may only be in trailing position.")));
+}
+
+TEST_F(ParserTest, QuickCheckAttribute) {
   RoundTrip(R"(#[quickcheck]
 fn foo(x: u5) -> bool {
     true
 })");
 }
 
-TEST_F(ParserTest, QuickCheckDirectiveWithTestCount) {
+TEST_F(ParserTest, QuickCheckAttributeWithTestCount) {
   RoundTrip(R"(#[quickcheck(test_count=1024)]
 fn foo(x: u5) -> bool {
     true
@@ -1333,7 +2497,7 @@ fn example() {
 })");
   ASSERT_EQ(mod->top().size(), 1);
   auto* tf = std::get<TestFunction*>(mod->top()[0]);
-  EXPECT_EQ(tf->span().ToString(), "test.x:1:1-4:2");
+  EXPECT_EQ(tf->span().ToString(file_table_), "<no-file>:1:1-4:2");
 }
 
 TEST_F(ParserTest, ModuleWithEmptyExternVerilogFunction) {
@@ -1393,7 +2557,7 @@ TEST_F(ParserTest, MatchFreevars) {
     y => z,
 })",
                           {"x", "y", "z"});
-  FreeVariables fv = GetFreeVariables(e, &e->span().start());
+  FreeVariables fv = GetFreeVariablesByPos(e, &e->span().start());
   EXPECT_THAT(fv.Keys(), testing::ContainerEq(
                              absl::flat_hash_set<std::string>{"x", "y", "z"}));
 }
@@ -1404,10 +2568,12 @@ TEST_F(ParserTest, ForFreevars) {
     new_accum
 }(u32:0))",
                           {"range", "j"});
-  FreeVariables fv = GetFreeVariables(e, &e->span().start());
+  FreeVariables fv = GetFreeVariablesByPos(e, &e->span().start());
   EXPECT_THAT(fv.Keys(), testing::ContainerEq(
                              absl::flat_hash_set<std::string>{"j", "range"}));
 }
+
+TEST_F(ParserTest, IfWithoutElse) { RoundTripExpr("if true {}"); }
 
 TEST_F(ParserTest, EmptyTernary) { RoundTripExpr("if true {} else {}"); }
 
@@ -1478,9 +2644,32 @@ fn f(a: MyStruct) -> u32 {
 })");
 }
 
-TEST_F(ParserTest, ConstantArray) {
+TEST_F(ParserTest, ArrayOfConstantNumberLiterals) {
   Expr* e = RoundTripExpr("u32[2]:[0, 1]", {}, false, std::nullopt);
-  ASSERT_TRUE(dynamic_cast<ConstantArray*>(e) != nullptr);
+  ASSERT_TRUE(dynamic_cast<Array*>(e) != nullptr);
+}
+
+TEST_F(ParserTest, MixedArrayIsNotConstantArray) {
+  std::unique_ptr<Module> module = RoundTrip(R"(const a = u32:0;
+const b = u32[2]:[a, 1];)");
+  XLS_ASSERT_OK_AND_ASSIGN(ConstantDef * constant_def,
+                           module->GetConstantDef("b"));
+  auto array = constant_def->value();
+  ASSERT_TRUE(dynamic_cast<Array*>(array) != nullptr);
+}
+
+TEST_F(ParserTest, NonConstantArrayIsNotConstantArray) {
+  std::unique_ptr<Module> module = RoundTrip(R"(const a = u32:0;
+const b = u32[2]:[a, a];)");
+  XLS_ASSERT_OK_AND_ASSIGN(ConstantDef * constant_def,
+                           module->GetConstantDef("b"));
+  auto array = constant_def->value();
+  ASSERT_TRUE(dynamic_cast<Array*>(array) != nullptr);
+}
+
+TEST_F(ParserTest, EmptyArray) {
+  Expr* e = RoundTripExpr("u32[2]:[]", {}, false, std::nullopt);
+  ASSERT_TRUE(dynamic_cast<Array*>(e) != nullptr);
 }
 
 TEST_F(ParserTest, DoubleNegation) { RoundTripExpr("!!x", {"x"}, false); }
@@ -1554,20 +2743,82 @@ TEST_F(ParserTest, Strings) {
 })");
 }
 
+TEST_F(ParserTest, TupleCast) {
+  const char* text = R"(
+fn f() -> u8 {
+    let a = (u8, u16):(u8:8, u16:64);
+    a.0
+}
+)";
+  Scanner s(file_table_, Fileno(0), std::string(text));
+  Parser p("test", &s);
+  Bindings bindings;
+  XLS_ASSERT_OK(
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
+}
+
+TEST_F(ParserTest, TupleArrayCast) {
+  const char* text = R"(
+fn f() -> u8 {
+    let a = (u8, u16)[1]:[(u8:8, u16:64)];
+    a[0].0
+}
+)";
+  Scanner s(file_table_, Fileno(0), std::string(text));
+  Parser p("test", &s);
+  Bindings bindings;
+  XLS_ASSERT_OK(
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
+}
+
+TEST_F(ParserTest, InvalidParenthetical) {
+  const char* text = R"(
+fn f() -> u8 {
+    let a = (u8, u16);
+    a.0
+}
+)";
+  Scanner s(file_table_, Fileno(0), std::string(text));
+  Parser p("test", &s);
+  Bindings bindings;
+  absl::StatusOr<Function*> function =
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings);
+  EXPECT_THAT(function.status(),
+              IsPosError("ParseError",
+                         HasSubstr("Expected ':', got ',': Expect colon after "
+                                   "type annotation in cast")));
+}
+
+TEST_F(ParserTest, NestedTupleCast) {
+  const char* text = R"(
+fn f() -> u8 {
+    type MyTuple = (u8, u16);
+
+    let a = 2*(MyTuple:(u8:5, u16: 42) + (u8, u16):(u8:8, u16:64)) + MyTuple:(u8:7, u16:42);
+    a.0
+}
+)";
+  Scanner s(file_table_, Fileno(0), std::string(text));
+  Parser p("test", &s);
+  Bindings bindings;
+  XLS_ASSERT_OK(
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
+}
+
 TEST_F(ParserTest, TupleIndex) {
   const char* text = R"(
 fn f(x: u32) -> u8 {
     (u32:6, u32:7).1
 }
 )";
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser p{"test", &s};
   Bindings bindings;
   XLS_ASSERT_OK_AND_ASSIGN(
       Function * f,
-      p.ParseFunction(/*is_public=*/false, /*bindings=*/bindings));
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
 
-  Block* body = f->body();
+  StatementBlock* body = f->body();
   absl::Span<Statement* const> stmts = body->statements();
   ASSERT_EQ(stmts.size(), 1);
 
@@ -1629,6 +2880,18 @@ TEST_F(ParserTest, Range) {
                 {"a", "b"});
 }
 
+TEST_F(ParserTest, RangeInclusiveEnd) {
+  RoundTripExpr(R"({
+    let foo = u32:0..=u32:0xFFFFFFFF;
+    foo
+})");
+  RoundTripExpr(R"({
+    let foo = a..=b;
+    foo
+})",
+                {"a", "b"});
+}
+
 TEST_F(ParserTest, BuiltinFailWithLabels) {
   constexpr std::string_view kProgram = R"(fn main(x: u32) -> u32 {
     let _ = if x == u32:7 { fail!("x_is_7", u32:0) } else { u32:0 };
@@ -1649,7 +2912,7 @@ TEST_F(ParserTest, ProcWithInit) {
     init {
         u32:0
     }
-    next(tok: token, state: u32) {
+    next(state: u32) {
         state
     }
 })";
@@ -1669,35 +2932,52 @@ fn my_fun() -> MyEnum {
     FOO  // Should be qualified as MyEnum::FOO!
 }
 )";
-  Scanner s{"test.x", std::string{text}};
+  Scanner s{file_table_, Fileno(0), std::string{text}};
   Parser parser{"test", &s};
   auto module_status = parser.ParseModule();
-  ASSERT_THAT(module_status, StatusIs(absl::StatusCode::kInvalidArgument,
-                                      "ParseError: test.x:7:5-7:8 Cannot find "
-                                      "a definition for name: \"FOO\""));
+  ASSERT_THAT(module_status,
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       "ParseError: <no-file>:7:5-7:8 Cannot find "
+                       "a definition for name: \"FOO\""));
 }
 
-TEST_F(ParserTest, ProcConfigCantSeeMembers) {
+TEST_F(ParserTest, ProcConfigCannotSeeMembers) {
   constexpr std::string_view kProgram = R"(
 proc main {
     x12: chan<u8> in;
     config(x27: chan<u8> in) {
         (x12,)
     }
-    next(x0: token) {
+    next(s: ()) {
         ()
     }
 })";
-  Scanner s{"test.x", std::string{kProgram}};
+  Scanner s{file_table_, Fileno(0), std::string{kProgram}};
   Parser parser{"test", &s};
   auto module_status = parser.ParseModule();
   ASSERT_THAT(
       module_status,
       StatusIs(absl::StatusCode::kInvalidArgument,
-               "ParseError: test.x:5:10-5:13 "
+               "ParseError: <no-file>:5:10-5:13 "
                "Cannot find a definition for name: \"x12\"; "
                "\"x12\" is a proc member, but those cannot be referenced "
                "from within a proc config function."));
+}
+
+TEST_F(ParserTest, ProcConfigCanSeeTypeAlias) {
+  constexpr std::string_view kProgram = R"(
+proc main {
+    type MyU8RecvChan = chan<u8> in;
+    x12: MyU8RecvChan;
+    config(x27: MyU8RecvChan) {
+        (x27,)
+    }
+    init { () }
+    next(s: ()) { () }
+})";
+  Scanner s{file_table_, Fileno(0), std::string{kProgram}};
+  Parser parser{"test", &s};
+  XLS_ASSERT_OK(parser.ParseModule());
 }
 
 TEST_F(ParserTest, ProcDuplicateConfig) {
@@ -1706,15 +2986,15 @@ proc main {
     x12: chan<u8> in;
     config(x27: chan<u8> in) { (x27,) }
     config(x27: chan<u8> in) { (x27,) }
-    next(x0: token, s: ()) { () }
+    next(s: ()) { () }
 })";
-  Scanner s{"test.x", std::string{kProgram}};
+  Scanner s{file_table_, Fileno(0), std::string{kProgram}};
   Parser parser{"test", &s};
   auto module_status = parser.ParseModule();
   ASSERT_THAT(module_status,
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("proc `main` config function was already "
-                                 "specified @ test.x:5:5-5:11")));
+                                 "specified @ <no-file>:5:5-5:11")));
 }
 
 TEST_F(ParserTest, ProcDuplicateNext) {
@@ -1722,25 +3002,23 @@ TEST_F(ParserTest, ProcDuplicateNext) {
 proc main {
     x12: chan<u8> in;
     config(x27: chan<u8> in) { (x27,) }
-    next(x0: token, s: ()) { () }
-    next(x0: token, s: ()) { () }
+    next(s: ()) { () }
+    next(s: ()) { () }
 })";
-  Scanner s{"test.x", std::string{kProgram}};
+  Scanner s{file_table_, Fileno(0), std::string{kProgram}};
   Parser parser{"test", &s};
   auto module_status = parser.ParseModule();
   ASSERT_THAT(module_status,
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("proc `main` next function was already "
-                                 "specified @ test.x:6:5-6:9")));
+                                 "specified @ <no-file>:6:5-6:9")));
 }
 
 TEST_F(ParserTest, NumberSpan) {
   XLS_ASSERT_OK_AND_ASSIGN(Expr * e, ParseExpr("u32:42"));
   auto* number = dynamic_cast<Number*>(e);
   ASSERT_NE(number, nullptr);
-  // TODO(https://github.com/google/xls/issues/438): 2021-05-24 Fix the
-  // parsing/reporting of number spans so that the span starts at 0,0.
-  EXPECT_EQ(number->span(), Span(Pos(kFilename, 0, 4), Pos(kFilename, 0, 6)));
+  EXPECT_EQ(number->span(), Span(Pos(Fileno(0), 0, 0), Pos(Fileno(0), 0, 6)));
 }
 
 TEST_F(ParserTest, DetectsDuplicateFailLabels) {
@@ -1752,14 +3030,43 @@ fn main(x: u32) -> u32 {
 }
 )";
 
-  Scanner s{"test.x", std::string(kProgram)};
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
-  absl::StatusOr<std::unique_ptr<Module>> module_or = parser.ParseModule();
-  ASSERT_FALSE(module_or.ok()) << module_or.status();
-  XLS_LOG(INFO) << "status: " << module_or.status();
-  EXPECT_THAT(module_or.status(),
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  ASSERT_FALSE(module.ok()) << module.status();
+  LOG(INFO) << "status: " << module.status();
+  EXPECT_THAT(module.status(),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("A fail label must be unique")));
+}
+
+TEST_F(ParserTest, ParseAllowNonstandardConstantNamingAnnotation) {
+  constexpr std::string_view kProgram = R"(
+#![allow(nonstandard_constant_naming)]
+)";
+
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Module> module,
+                           parser.ParseModule());
+  EXPECT_THAT(
+      module->attributes(),
+      testing::ElementsAre(ModuleAttribute::kAllowNonstandardConstantNaming));
+}
+
+TEST_F(ParserTest, NoAttributeForTypeInferenceVersion) {
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Module> module, Parse(R"(
+fn f() { () }
+)"));
+  EXPECT_THAT(module->attributes(), testing::IsEmpty());
+}
+
+TEST_F(ParserTest, ParseTypeInferenceVersionAttributeWithValue2) {
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Module> module, Parse(R"(
+#![feature(type_inference_v2)]
+)"));
+  EXPECT_THAT(module->attributes(),
+              testing::ElementsAre(ModuleAttribute::kTypeInferenceVersion2));
 }
 
 // Verifies that we can walk backwards through a tree. In this case, from the
@@ -1774,14 +3081,15 @@ fn main() -> u32 {
 }
 )";
 
-  Scanner s{"test.x", std::string(kProgram)};
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Module> module,
                            parser.ParseModule());
   XLS_ASSERT_OK_AND_ASSIGN(Function * f,
                            module->GetMemberOrError<Function>("main"));
 
-  Block* body = f->body();
+  StatementBlock* body = f->body();
   absl::Span<Statement* const> stmts = body->statements();
   ASSERT_EQ(stmts.size(), 4);
 
@@ -1804,11 +3112,11 @@ fn main(x: u32, y: u32, z: bool) -> bool {
 }
 )";
 
-  Scanner s{"test.x", std::string(kProgram)};
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
   EXPECT_THAT(parser.ParseModule(),
               StatusIs(absl::StatusCode::kInvalidArgument,
-                       HasSubstr("ParseError: test.x:3:12-3:14 comparison "
+                       HasSubstr("ParseError: <no-file>:3:12-3:14 comparison "
                                  "operators cannot be chained")));
 }
 
@@ -1819,11 +3127,11 @@ fn main(x: u32, y: u32, z: bool) -> bool {
 }
 )";
 
-  Scanner s{"test.x", std::string(kProgram)};
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
   EXPECT_THAT(parser.ParseModule(),
               StatusIs(absl::StatusCode::kInvalidArgument,
-                       HasSubstr("ParseError: test.x:3:11-3:12 comparison "
+                       HasSubstr("ParseError: <no-file>:3:11-3:12 comparison "
                                  "operators cannot be chained")));
 }
 
@@ -1834,113 +3142,108 @@ fn main(x: u32, y: u32, z: bool) -> bool {
 }
 )";
 
-  Scanner s{"test.x", std::string(kProgram)};
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
-  EXPECT_THAT(
-      parser.ParseModule(),
-      StatusIs(
-          absl::StatusCode::kInvalidArgument,
-          HasSubstr(
-              "Expected a '(' after parametrics for function invocation.")));
+  EXPECT_THAT(parser.ParseModule(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Expected '}', got 'identifier'")));
 }
 
 TEST_F(ParserTest, ChannelDeclWithFifoDepthExpression) {
   constexpr std::string_view kProgram = R"(proc foo<N: u32, M: u32> {
     c_in: chan<u32> in;
     c_out: chan<u32> out;
-    config () {
-        let (c_p, c_c) = chan<u32, {N + M}>;
+    config() {
+        let (c_p, c_c) = chan<u32, {N + M}>("my_chan");
         (c_p, c_c)
     }
     init {}
-    next(tok: token, state: ()) {
+    next(state: ()) {
       ()
     }
 }
 )";
-  Scanner s{"test.x", std::string(kProgram)};
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
   XLS_EXPECT_OK(parser.ParseModule());
 }
 
 TEST_F(ParserTest, UnterminatedString) {
   constexpr std::string_view kProgram = R"(const A=")";
-  Scanner s{"test.x", std::string(kProgram)};
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
   EXPECT_THAT(
       parser.ParseModule(),
       StatusIs(absl::StatusCode::kInvalidArgument,
-               HasSubstr("ScanError: test.x:1:10-1:10 Reached end of file "
+               HasSubstr("ScanError: <no-file>:1:10-1:10 Reached end of file "
                          "without finding a closing double quote")));
 }
 
 TEST_F(ParserTest, UnterminatedEscapedChar) {
   constexpr std::string_view kProgram = "'\\d";
-  Scanner s{"test.x", std::string(kProgram)};
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
   EXPECT_THAT(parser.ParseModule(),
               StatusIs(absl::StatusCode::kInvalidArgument,
-                       HasSubstr("ScanError: test.x:1:2-1:3 Unrecognized "
+                       HasSubstr("ScanError: <no-file>:1:2-1:3 Unrecognized "
                                  "escape sequence: `\\d`")));
 }
 
 TEST_F(ParserTest, UnterminatedEscapedUnicodeChar) {
   constexpr std::string_view kProgram = R"(const A="\u)";
-  Scanner s{"test.x", std::string(kProgram)};
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
-  auto module_or = parser.ParseModule();
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
   EXPECT_THAT(
-      module_or,
+      module,
       StatusIs(absl::StatusCode::kInvalidArgument,
                HasSubstr("Unexpected EOF in escaped unicode character")));
 }
 
 TEST_F(ParserTest, UnterminatedEscapedHexChar) {
   constexpr std::string_view kProgram = "const A='\\x";
-  Scanner s{"test.x", std::string(kProgram)};
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
-  auto module_or = parser.ParseModule();
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
   EXPECT_THAT(
-      module_or,
+      module,
       StatusIs(absl::StatusCode::kInvalidArgument,
-               HasSubstr("Unexpected EOF in escaped hexadecimal character")))
-      << module_or.status();
+               HasSubstr("Unexpected EOF in escaped hexadecimal character")));
 }
 
 TEST_F(ParserTest, ConstShadowsImport) {
-  constexpr std::string_view kProgram = R"(import x
+  constexpr std::string_view kProgram = R"(import x;
 const x)";
-  Scanner s{"test.x", std::string(kProgram)};
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
-  EXPECT_THAT(parser.ParseModule(),
-              StatusIs(absl::StatusCode::kInvalidArgument,
-                       "ParseError: test.x:2:7-2:8 Constant definition is "
-                       "shadowing an existing definition from test.x:1:1-1:7"));
+  EXPECT_THAT(
+      parser.ParseModule(),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               "ParseError: <no-file>:2:7-2:8 Constant definition is "
+               "shadowing an existing definition from <no-file>:1:1-1:10"));
 }
 
 TEST_F(ParserTest, ZeroLengthStringAtEof) {
   constexpr std::string_view kProgram = "const A=\"\"";
-  Scanner s{"test.x", std::string(kProgram)};
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
-  auto module_or = parser.ParseModule();
-  EXPECT_THAT(module_or,
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(module,
               StatusIs(absl::StatusCode::kInvalidArgument,
-                       HasSubstr("Zero-length strings are not supported.")))
-      << module_or.status();
+                       HasSubstr("Zero-length strings are not supported.")));
 }
 
 TEST_F(ParserTest, RepetitiveImport) {
-  constexpr std::string_view kProgram = R"(import repetitively
-import repetitively)";
-  Scanner s{"test.x", std::string(kProgram)};
+  constexpr std::string_view kProgram = R"(import repetitively;
+import repetitively;)";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
-  auto module_or = parser.ParseModule();
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
   EXPECT_THAT(
-      module_or,
+      module,
       StatusIs(absl::StatusCode::kInvalidArgument,
                HasSubstr("Import of `repetitively` is shadowing an existing "
-                         "definition at test.x:1:1-1:7")))
-      << module_or.status();
+                         "definition at <no-file>:1:1-1:21")));
 }
 
 TEST_F(ParserTest, UnreasonablyDeepExpr) {
@@ -1948,25 +3251,57 @@ TEST_F(ParserTest, UnreasonablyDeepExpr) {
   // error.
   constexpr std::string_view kProgram = R"(const E=
 ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((()";
-  Scanner s{"test.x", std::string(kProgram)};
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
-  auto module_or = parser.ParseModule();
-  EXPECT_THAT(module_or, StatusIs(absl::StatusCode::kInvalidArgument,
-                                  HasSubstr("Expression is too deeply nested")))
-      << module_or.status();
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(module, StatusIs(absl::StatusCode::kInvalidArgument,
+                               HasSubstr("Extremely deep nesting detected")));
+}
+
+// Previously we could avoid the nesting detector by entering an interior
+// production in the grammar like a Term.
+TEST_F(ParserTest, UnreasonablyDeepTermExprNesting) {
+  constexpr std::string_view kProgram = R"(const E=
+0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0(0()";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(module, StatusIs(absl::StatusCode::kInvalidArgument,
+                               HasSubstr("Extremely deep nesting detected")));
+}
+
+// As above but guards the TypeAnnotation production in the grammar.
+TEST_F(ParserTest, UnreasonablyDeepTypeDefinition) {
+  constexpr std::string_view kProgram = R"(type T=
+((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((()";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(module, StatusIs(absl::StatusCode::kInvalidArgument,
+                               HasSubstr("Extremely deep nesting detected")));
+}
+
+// As above but guards the pattern-match production in the grammar.
+TEST_F(ParserTest, UnreasonablyDeepPatternMatch) {
+  constexpr std::string_view kProgram = R"(fn f(x: u32) { match x {
+((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((()";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(module, StatusIs(absl::StatusCode::kInvalidArgument,
+                               HasSubstr("Extremely deep nesting detected")));
 }
 
 TEST_F(ParserTest, NonTypeDefinitionBeforeArrayLiteralColon) {
   constexpr std::string_view kProgram = "const A=4[5]:[";
-  Scanner s{"test.x", std::string(kProgram)};
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
-  auto module_or = parser.ParseModule();
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
   EXPECT_THAT(
-      module_or,
+      module,
       StatusIs(absl::StatusCode::kInvalidArgument,
                HasSubstr("Type before ':' for presumed array literal was not a "
-                         "type definition; got `4` (kind: number)")))
-      << module_or.status();
+                         "type definition; got `4` (kind: number)")));
 }
 
 TEST(ParserErrorTest, WildcardPatternExpressionStatement) {
@@ -1978,15 +3313,399 @@ fn test_f() {
     _
 }
 )";
-  Scanner s{"test.x", std::string(kProgram)};
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
   Parser parser{"test", &s};
-  auto module_or = parser.ParseModule();
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
   EXPECT_THAT(
-      module_or.status(),
+      module.status(),
       IsPosError(
           "ParseError",
-          HasSubstr("Wildcard pattern `_` cannot be used as a reference")))
-      << module_or.status();
+          HasSubstr("Wildcard pattern `_` cannot be used as a reference")));
+}
+
+TEST(ParserErrorTest, BadTestTarget) {
+  constexpr std::string_view kProgram = R"(#[test] let x=42;)";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(module.status(),
+              IsPosError("ParseError", HasSubstr("Invalid test type: let")));
+}
+
+TEST(ParserErrorTest, BadAttributeTokenType) {
+  constexpr std::string_view kProgram = R"(#[3])";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(
+      module.status(),
+      IsPosError("ParseError", HasSubstr("Expected attribute identifier")));
+}
+
+TEST(ParserErrorTest, BadAttribute) {
+  constexpr std::string_view kProgram = R"(#[foo])";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+  EXPECT_THAT(module.status(),
+              IsPosError("ParseError", HasSubstr("Unknown attribute: 'foo'")));
+}
+
+TEST(ParserErrorTest, FailLabelVerilogIdentifierConstraintReported) {
+  constexpr std::string_view kProgram = R"(
+fn will_fail(x:u32) -> u32 {
+   fail!("not a proper label", x)
+}
+)";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+
+  // Check expected message
+  EXPECT_THAT(
+      module.status(),
+      IsPosError(
+          "ParseError",
+          HasSubstr("The label parameter to fail!() must be a valid Verilog")));
+
+  // Highlight span of the label parameter
+  EXPECT_THAT(module.status(), StatusIs(absl::StatusCode::kInvalidArgument,
+                                        HasSubstr("<no-file>:3:10-3:30")));
+}
+
+TEST(ParserErrorTest, FailLabelAtTopLevel) {
+  constexpr std::string_view kProgram = R"(
+const ZERO_FAIL = fail!("always_fails", u32:0);
+)";
+  FileTable file_table;
+  Scanner s{file_table, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  absl::StatusOr<std::unique_ptr<Module>> module = parser.ParseModule();
+
+  // Check expected message
+  EXPECT_THAT(
+      module.status(),
+      IsPosError(
+          "ParseError",
+          HasSubstr("Cannot use the `fail!` builtin at module top-level.")));
+}
+
+TEST_F(ParserTest, ParseParametricProcWithConstAssert) {
+  const char* text = R"(proc MyProc<N: u32> {
+    const_assert!(N == u32:42);
+    config() {
+        ()
+    }
+    init {
+        ()
+    }
+    next(state: ()) {
+        ()
+    }
+})";
+
+  Scanner s{file_table_, Fileno(0), std::string{text}};
+  Parser parser{"test", &s};
+  Bindings bindings;
+  auto proc =
+      parser.ParseProc(Pos(), /*is_public=*/false, /*bindings=*/bindings);
+  if (!proc.ok()) {
+    UniformContentFilesystem vfs(text);
+    TryPrintError(proc.status(), file_table_, vfs);
+    XLS_ASSERT_OK(proc.status());
+  }
+  const Proc* p = std::get<Proc*>(*proc);
+  EXPECT_EQ(p->ToString(), text);
+}
+
+TEST_F(ParserTest, ParseMapWithLambdaParamAnnotation) {
+  RoundTrip(R"(const ARR = map(range(0, u16:5), |i: u16| { 2 * i });)");
+}
+
+TEST_F(ParserTest, LambdaInLetNoParams) {
+  RoundTrip(R"(fn uses_lambda(i: u32) -> u32 {
+    let X = || { u32:2 * i };
+    X()
+})");
+}
+
+TEST_F(ParserTest, LambdaInLetNoParamsWithReturn) {
+  RoundTrip(R"(fn uses_lambda(i: u32) -> u32 {
+    let X = || -> u32 { u32:2 * i };
+    X()
+})");
+}
+
+TEST_F(ParserTest, ParseMapWithLambdaCapture) {
+  RoundTrip(R"(const X = u16:3;
+const ARR = map(range(0, u16:5), |i: u16| { X * i });)");
+}
+
+TEST_F(ParserTest, ParseMapWithLambdaWithReturnType) {
+  RoundTrip(
+      R"(const ARR = map(range(0, u16:5), |i: u16| -> u32 { 2 * i as u32 });)");
+}
+
+TEST_F(ParserTest, ParseMapWithLambdaMultilineBody) {
+  RoundTrip(
+      R"(const ARR = map(range(0, u16:5), |i: u16| {
+    let x = 2 * i as u32;
+    x
+});)");
+}
+
+// TODO(https://github.com/google/xls/issues/1671): Support once
+// `AnyTypeAnnotation` is available.
+TEST_F(ParserTest, DISABLED_ParseMapWithLambdaNoParamAnnotation) {
+  RoundTrip(R"(const ARR = map(range(0, u16:5), |i| { 2 * i });)");
+}
+
+TEST_F(ParserTest, ParseParametricInMapBuiltin) {
+  constexpr std::string_view kProgram = R"(
+fn truncate<OUT: u32, IN: u32>(x: bits[IN]) -> bits[OUT] {
+    x[0:OUT]
+}
+
+fn main(x: u32[64]) -> u16[64] {
+    map(x, truncate<16>)
+}
+)";
+
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  XLS_EXPECT_OK(parser.ParseModule());
+}
+
+TEST_F(ParserTest, ParseWithUncompletedStateTransaction) {
+  constexpr std::string_view kProgram =
+      "import st0;fn n(x:u6){let()=st0::w<\xb0";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  EXPECT_THAT(parser.ParseModule(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Unrecognized character: '\xb0' (0xb0)")));
+}
+
+// This sample would previously cause a segfault because we'd try to set a
+// definer on a NameDef binding but we only have a NameDefTree.
+TEST_F(ParserTest, LocalConstWithNoNameDef) {
+  constexpr std::string_view kProgram = "fn f(){const(X)=();}";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  XLS_EXPECT_OK(parser.ParseModule());
+}
+
+TEST_F(ParserTest, StubAcceptedWithStubOnlyFlag) {
+  constexpr std::string_view kProgram = "fn f();";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s, true};
+  XLS_EXPECT_OK(parser.ParseModule());
+}
+
+TEST_F(ParserTest, StubFunctionIsEmpty) {
+  constexpr std::string_view kProgram = "fn ident(x: bits);";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser p{"test", &s, true};
+  Bindings bindings;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Function * f,
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
+
+  StatementBlock* block = f->body();
+  absl::Span<Statement* const> stmts = block->statements();
+  ASSERT_EQ(stmts.size(), 0);
+}
+
+TEST_F(ParserTest, FullFunctionRejectedWithStubOnlyFlag) {
+  constexpr std::string_view kProgram = "fn f() { }";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s, true};
+  EXPECT_THAT(parser.ParseModule(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Expected ';', got '{'")));
+}
+
+TEST_F(ParserTest, StubRejectedWithoutStubOnlyFlag) {
+  constexpr std::string_view kProgram = "fn f();";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  EXPECT_THAT(parser.ParseModule(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Expected '{', got ';'")));
+}
+
+TEST_F(ParserTest, GenericTypeReturn) {
+  constexpr std::string_view kProgram = "fn parametric<T: type>(a: u32) -> T;";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser p{"test", &s, true};
+  Bindings bindings;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Function * f,
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
+
+  const TypeAnnotation* return_type = f->return_type();
+  const TypeVariableTypeAnnotation* tvta =
+      dynamic_cast<const TypeVariableTypeAnnotation*>(return_type);
+  EXPECT_NE(tvta, nullptr);
+  const NameRef* name_ref = tvta->type_variable();
+  EXPECT_EQ(name_ref->identifier(), "T");
+}
+
+TEST_F(ParserTest, GenericTypeParameters) {
+  constexpr std::string_view kProgram =
+      "fn parametric<T: type>(a: T, b: T) -> u32;";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser p{"test", &s, true};
+  Bindings bindings;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Function * f,
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
+
+  auto params = f->params();
+  EXPECT_EQ(params.size(), 2);
+  TypeAnnotation* first_type = params[0]->type_annotation();
+  EXPECT_NE(dynamic_cast<TypeVariableTypeAnnotation*>(first_type), nullptr);
+  TypeAnnotation* second_type = params[1]->type_annotation();
+  EXPECT_NE(dynamic_cast<TypeVariableTypeAnnotation*>(second_type), nullptr);
+  // They are actually different objects, but have the same name and span, so
+  // it's OK.
+  EXPECT_EQ(first_type->ToString(), second_type->ToString());
+}
+
+TEST_F(ParserTest, GenericTypeParametersDifferentTypes) {
+  constexpr std::string_view kProgram =
+      "fn parametric<T: type, S: type>(a: T, b: S) -> u32;";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser p{"test", &s, true};
+  Bindings bindings;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Function * f,
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
+
+  auto params = f->params();
+  EXPECT_EQ(params.size(), 2);
+  TypeAnnotation* first_type = params[0]->type_annotation();
+  EXPECT_NE(dynamic_cast<TypeVariableTypeAnnotation*>(first_type), nullptr);
+  TypeAnnotation* second_type = params[1]->type_annotation();
+  EXPECT_NE(dynamic_cast<TypeVariableTypeAnnotation*>(second_type), nullptr);
+  EXPECT_NE(first_type->ToString(), second_type->ToString());
+}
+
+TEST_F(ParserTest, GenericTypeArray) {
+  constexpr std::string_view kProgram =
+      "fn parametric<T: type, N: u32>() -> T[N];";
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser p{"test", &s, true};
+  Bindings bindings;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Function * f,
+      p.ParseFunction(Pos(), /*is_public=*/false, /*bindings=*/bindings));
+
+  const TypeAnnotation* return_type = f->return_type();
+  const ArrayTypeAnnotation* array_type =
+      dynamic_cast<const ArrayTypeAnnotation*>(return_type);
+  EXPECT_NE(array_type, nullptr);
+  const TypeVariableTypeAnnotation* element_type =
+      dynamic_cast<const TypeVariableTypeAnnotation*>(
+          array_type->element_type());
+  EXPECT_NE(element_type, nullptr);
+  const NameRef* name_ref = element_type->type_variable();
+  EXPECT_EQ(name_ref->identifier(), "T");
+}
+
+TEST_F(ParserTest, ReadStubFile) {
+  const std::string path = "xls/dslx/frontend/builtin_stubs.x";
+  XLS_ASSERT_OK_AND_ASSIGN(std::string text,
+                           GetFileContents(GetXlsRunfilePath(path).value()));
+  Fileno fileno = file_table_.GetOrCreate(path);
+  Scanner s{file_table_, fileno, text};
+  Parser parser{"test", &s, true};
+  XLS_EXPECT_OK(parser.ParseModule());
+}
+
+TEST_F(ParserTest, BasicChannelAttributeUsage) {
+  RoundTrip(R"(#![feature(channel_attributes)]
+
+proc AProc {
+    a: chan<u32> out;
+    b: chan<u32> in;
+    config() {
+        let (a, b) = 
+        #[channel(depth=1, bypass=true, register_push_outputs=true, register_pop_outputs=true, input_flop_kind=flop, output_flop_kind=zero_latency)]
+        chan<u32>("foo");
+    }
+    init {}
+    next(_: ()) {}
+})");
+
+  RoundTrip(R"(#![feature(channel_attributes)]
+
+proc AProc {
+    a: chan<u32> out;
+    b: chan<u32> in;
+    config() {
+        let (a, b) = 
+        #[channel(depth=1, bypass=true, register_push_outputs=true, register_pop_outputs=true, input_flop_kind=flop)]
+        chan<u32>("foo");
+    }
+    init {}
+    next(_: ()) {}
+})");
+
+  RoundTrip(R"(#![feature(channel_attributes)]
+
+proc AProc {
+    a: chan<u32> out;
+    b: chan<u32> in;
+    config() {
+        let (a, b) = 
+        #[channel(depth=1, bypass=true, register_push_outputs=true, register_pop_outputs=true)]
+        chan<u32>("foo");
+    }
+    init {}
+    next(_: ()) {}
+})");
+
+  RoundTrip(R"(#![feature(channel_attributes)]
+
+proc AProc {
+    a: chan<u32> out;
+    b: chan<u32> in;
+    config() {
+        let (a, b) = 
+        #[channel(depth=0)]
+        chan<u32>("foo");
+    }
+    init {}
+    next(_: ()) {}
+})");
+}
+
+TEST_F(ParserTest, CannotUseOldDepthSyntaxWithChannelAttributes) {
+  constexpr std::string_view kProgram = (R"(#![feature(channel_attributes)]
+
+proc AProc {
+    a: chan<u32> out;
+    b: chan<u32> in;
+    config() {
+        let (a, b) = chan<u32, u32:0>("foo");
+    }
+    init {}
+    next(_: ()) {}
+})");
+  Scanner s{file_table_, Fileno(0), std::string(kProgram)};
+  Parser parser{"test", &s};
+  EXPECT_THAT(
+      parser.ParseModule().status(),
+      IsPosError(
+          "ParseError",
+          HasSubstr("Cannot specify fifo depth when new-style channel "
+                    "attributes are enabled, please use the new syntax.")));
 }
 
 }  // namespace xls::dslx

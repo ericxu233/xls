@@ -20,8 +20,8 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
 #include "absl/status/statusor.h"
-#include "xls/common/logging/logging.h"
 #include "xls/ir/node.h"
 #include "xls/ir/op.h"
 #include "xls/scheduling/scheduling_options.h"
@@ -58,7 +58,7 @@ class NodeCut {
  public:
   explicit NodeCut(Node *root, const absl::flat_hash_set<Node *> &leaves = {})
       : root_(root), leaves_(leaves) {
-    XLS_CHECK(root);
+    CHECK(root);
   }
 
   // Get the trivial cut of root.

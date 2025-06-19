@@ -14,34 +14,33 @@
 
 #include "xls/passes/concat_simplification_pass.h"
 
+#include <cstdint>
 #include <memory>
-#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/substitute.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/interpreter/ir_interpreter.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/value.h"
 #include "xls/passes/bdd_cse_pass.h"
-#include "xls/passes/bdd_simplification_pass.h"
 #include "xls/passes/bit_slice_simplification_pass.h"
 #include "xls/passes/dce_pass.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace m = ::xls::op_matchers;
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 
 class ConcatSimplificationPassTest : public IrTestBase {
  protected:
@@ -53,25 +52,29 @@ class ConcatSimplificationPassTest : public IrTestBase {
     while (changed) {
       changed = false;
       PassResults results;
-      XLS_ASSIGN_OR_RETURN(bool concat_changed,
-                           ConcatSimplificationPass().RunOnFunctionBase(
-                               f, OptimizationPassOptions(), &results));
+      OptimizationContext context;
+      XLS_ASSIGN_OR_RETURN(
+          bool concat_changed,
+          ConcatSimplificationPass().RunOnFunctionBase(
+              f, OptimizationPassOptions(), &results, context));
       changed = changed || concat_changed;
       any_concat_changed = any_concat_changed || concat_changed;
 
       // Run other passes to clean things up.
-      XLS_ASSIGN_OR_RETURN(bool dce_changed,
-                           DeadCodeEliminationPass().RunOnFunctionBase(
-                               f, OptimizationPassOptions(), &results));
+      XLS_ASSIGN_OR_RETURN(
+          bool dce_changed,
+          DeadCodeEliminationPass().RunOnFunctionBase(
+              f, OptimizationPassOptions(), &results, context));
       changed = changed || dce_changed;
-      XLS_ASSIGN_OR_RETURN(bool slice_changed,
-                           BitSliceSimplificationPass().RunOnFunctionBase(
-                               f, OptimizationPassOptions(), &results));
+      XLS_ASSIGN_OR_RETURN(
+          bool slice_changed,
+          BitSliceSimplificationPass().RunOnFunctionBase(
+              f, OptimizationPassOptions(), &results, context));
       changed = changed || slice_changed;
 
-      XLS_ASSIGN_OR_RETURN(bool cse_changed,
-                           BddCsePass().RunOnFunctionBase(
-                               f, OptimizationPassOptions(), &results));
+      XLS_ASSIGN_OR_RETURN(bool cse_changed, BddCsePass().RunOnFunctionBase(
+                                                 f, OptimizationPassOptions(),
+                                                 &results, context));
       changed = changed || cse_changed;
     }
 
@@ -770,6 +773,37 @@ fn __sample__x5(x: bits[32]) -> bits[32] {
                                                        p.get()));
   EXPECT_THAT(Run(f), IsOkAndHolds(true));
   EXPECT_THAT(f->return_value(), m::Param("x"));
+}
+
+TEST_F(ConcatSimplificationPassTest, OrOfConcatWithLiteral) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue a = fb.Param("a", p->GetBitsType(8));
+  BValue b = fb.Param("b", p->GetBitsType(16));
+  BValue c = fb.Param("c", p->GetBitsType(4));
+  BValue concat = fb.Concat({a, b, c});
+  fb.Or(concat, fb.Literal(UBits(0x1234567, 28)));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  EXPECT_THAT(Run(f), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              m::Concat(m::Or(m::Param("a"), m::Literal(0x12)),
+                        m::Or(m::Param("b"), m::Literal(0x3456)),
+                        m::Or(m::Param("c"), m::Literal(0x7))));
+}
+
+TEST_F(ConcatSimplificationPassTest, OrOfConcatWithLiteralAndSomethingElse) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue a = fb.Param("a", p->GetBitsType(8));
+  BValue b = fb.Param("b", p->GetBitsType(16));
+  BValue c = fb.Param("c", p->GetBitsType(4));
+  BValue d = fb.Param("d", p->GetBitsType(28));
+  BValue concat = fb.Concat({a, b, c});
+  fb.Or({concat, d, fb.Literal(UBits(0x1234567, 28))});
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  EXPECT_THAT(Run(f), IsOkAndHolds(false));
 }
 
 }  // namespace

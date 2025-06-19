@@ -17,145 +17,23 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <utility>
+#include <string_view>
+#include <variant>
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "xls/common/logging/logging.h"
+#include "absl/log/log.h"
+#include "xls/common/casts.h"
 #include "xls/common/status/matchers.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/module.h"
 #include "xls/dslx/frontend/parser.h"
 #include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/frontend/scanner.h"
-#include "xls/dslx/import_data.h"
 #include "xls/dslx/parse_and_typecheck.h"
 
 namespace xls::dslx {
 namespace {
-
-TEST(ProcConfigIrConverterTest, ResolveProcNameRef) {
-  Module module("test_module", /*fs_path=*/std::nullopt);
-  NameDef* name_def = module.Make<NameDef>(Span::Fake(), "proc_name", nullptr);
-  NameDef* config_name_def =
-      module.Make<NameDef>(Span::Fake(), "config_name", nullptr);
-  NameDef* next_name_def =
-      module.Make<NameDef>(Span::Fake(), "next_name", nullptr);
-  NameDef* init_name_def =
-      module.Make<NameDef>(Span::Fake(), "init_name", nullptr);
-  BuiltinTypeAnnotation* return_type = module.Make<BuiltinTypeAnnotation>(
-      Span::Fake(), BuiltinType::kU32, module.GetOrCreateBuiltinNameDef("u32"));
-  Number* body =
-      module.Make<Number>(Span::Fake(), "7", NumberKind::kOther, nullptr);
-  Statement* body_stmt = module.Make<Statement>(body);
-
-  Block* block =
-      module.Make<Block>(Span::Fake(), std::vector<Statement*>{body_stmt},
-                         /*trailing_semi=*/false);
-
-  Function* config = module.Make<Function>(
-      Span::Fake(), config_name_def,
-      /*parametric_bindings=*/std::vector<ParametricBinding*>(),
-      /*params=*/std::vector<Param*>(), return_type, block,
-      Function::Tag::kProcConfig, /*is_public=*/true);
-  Function* next = module.Make<Function>(
-      Span::Fake(), next_name_def,
-      /*parametric_bindings=*/std::vector<ParametricBinding*>(),
-      /*params=*/std::vector<Param*>(), return_type, block,
-      Function::Tag::kProcNext, /*is_public=*/true);
-  Function* init = module.Make<Function>(
-      Span::Fake(), init_name_def,
-      /*parametric_bindings=*/std::vector<ParametricBinding*>(),
-      /*params=*/std::vector<Param*>(), return_type, block,
-      Function::Tag::kProcNext, /*is_public=*/true);
-  std::vector<ProcMember*> members;
-  std::vector<ParametricBinding*> bindings;
-  Proc* original_proc =
-      module.Make<Proc>(Span::Fake(), name_def, config_name_def, next_name_def,
-                        bindings, members, config, next, init,
-                        /*is_public=*/true);
-  XLS_ASSERT_OK(module.AddTop(original_proc, /*make_collision_error=*/nullptr));
-  name_def->set_definer(original_proc);
-
-  TypeInfoOwner type_info_owner;
-  XLS_ASSERT_OK_AND_ASSIGN(TypeInfo * type_info, type_info_owner.New(&module));
-
-  NameRef* name_ref = module.Make<NameRef>(Span::Fake(), "proc_name", name_def);
-  XLS_ASSERT_OK_AND_ASSIGN(Proc * p, ResolveProc(name_ref, type_info));
-  EXPECT_EQ(p, original_proc);
-}
-
-TEST(ProcConfigIrConverterTest, ResolveProcColonRef) {
-  std::vector<std::string> import_tokens{"robs", "dslx", "import_module"};
-  ImportTokens subject(import_tokens);
-  ModuleInfo module_info(
-      std::make_unique<Module>("import_module", /*fs_path=*/std::nullopt),
-      /*type_info=*/nullptr, "robs/dslx/import_module.x");
-  Module* import_module = &module_info.module();
-
-  NameDef* name_def =
-      import_module->Make<NameDef>(Span::Fake(), "proc_name", nullptr);
-  NameDef* config_name_def =
-      import_module->Make<NameDef>(Span::Fake(), "config_name", nullptr);
-  NameDef* next_name_def =
-      import_module->Make<NameDef>(Span::Fake(), "next_name", nullptr);
-  NameDef* init_name_def =
-      import_module->Make<NameDef>(Span::Fake(), "init_name", nullptr);
-  BuiltinTypeAnnotation* return_type =
-      import_module->Make<BuiltinTypeAnnotation>(
-          Span::Fake(), BuiltinType::kU32,
-          import_module->GetOrCreateBuiltinNameDef("u32"));
-  Number* body = import_module->Make<Number>(Span::Fake(), "7",
-                                             NumberKind::kOther, nullptr);
-  Statement* body_stmt = import_module->Make<Statement>(body);
-
-  Block* block = import_module->Make<Block>(Span::Fake(),
-                                            std::vector<Statement*>{body_stmt},
-                                            /*trailing_semi=*/false);
-
-  Function* config = import_module->Make<Function>(
-      Span::Fake(), config_name_def,
-      /*parametric_bindings=*/std::vector<ParametricBinding*>(),
-      /*params=*/std::vector<Param*>(), return_type, block,
-      Function::Tag::kProcConfig, /*is_public=*/true);
-  Function* next = import_module->Make<Function>(
-      Span::Fake(), next_name_def,
-      /*parametric_bindings=*/std::vector<ParametricBinding*>(),
-      /*params=*/std::vector<Param*>(), return_type, block,
-      Function::Tag::kProcNext, /*is_public=*/true);
-  Function* init = import_module->Make<Function>(
-      Span::Fake(), init_name_def,
-      /*parametric_bindings=*/std::vector<ParametricBinding*>(),
-      /*params=*/std::vector<Param*>(), return_type, block,
-      Function::Tag::kProcInit, /*is_public=*/true);
-  std::vector<ProcMember*> members;
-  std::vector<ParametricBinding*> bindings;
-  Proc* original_proc = import_module->Make<Proc>(
-      Span::Fake(), name_def, config_name_def, next_name_def, bindings, members,
-      config, next, init, /*is_public=*/true);
-  XLS_ASSERT_OK(
-      import_module->AddTop(original_proc, /*make_collision_error=*/nullptr));
-  name_def->set_definer(original_proc);
-
-  Module module("test_module", /*fs_path=*/std::nullopt);
-  NameDef* module_def =
-      module.Make<NameDef>(Span::Fake(), "import_module", nullptr);
-  Import* import = module.Make<Import>(Span::Fake(), import_tokens, module_def,
-                                       std::nullopt);
-  module_def->set_definer(import);
-  NameRef* module_ref =
-      module.Make<NameRef>(Span::Fake(), "import_module", module_def);
-  ColonRef* colon_ref =
-      module.Make<ColonRef>(Span::Fake(), module_ref, "proc_name");
-
-  TypeInfoOwner type_info_owner;
-  XLS_ASSERT_OK_AND_ASSIGN(TypeInfo * type_info, type_info_owner.New(&module));
-  XLS_ASSERT_OK_AND_ASSIGN(TypeInfo * imported_type_info,
-                           type_info_owner.New(import_module));
-  type_info->AddImport(import, import_module, imported_type_info);
-
-  XLS_ASSERT_OK_AND_ASSIGN(Proc * p, ResolveProc(colon_ref, type_info));
-  EXPECT_EQ(p, original_proc);
-}
 
 TEST(ProcConfigIrConverterTest, BitVectorTests) {
   constexpr std::string_view kDslxText = R"(type MyType = u37;
@@ -182,10 +60,13 @@ struct TheStruct {
   l: MyStruct,
   m: MyTuple,
   n: MyArray,
+  x: xN[bool:0x0][44],
+  y: xN[bool:0x1][44],
 }
  )";
-  XLS_ASSERT_OK_AND_ASSIGN(auto module,
-                           ParseModule(kDslxText, "fake_path.x", "the_module"));
+  FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(auto module, ParseModule(kDslxText, "fake_path.x",
+                                                    "the_module", file_table));
 
   XLS_ASSERT_OK_AND_ASSIGN(std::vector<AstNode*> nodes,
                            CollectUnder(module.get(), /*want_types=*/true));
@@ -198,14 +79,16 @@ struct TheStruct {
     }
   }
   ASSERT_NE(the_struct_def, nullptr);
-  auto get_type_metadata = [&](std::string_view name) {
-    for (std::pair<NameDef*, TypeAnnotation*> member :
-         the_struct_def->members()) {
-      if (member.first->identifier() == name) {
-        return ExtractBitVectorMetadata(member.second);
+
+  // Helper that extracts the metadata associated with a given field name.
+  auto get_type_metadata =
+      [&](std::string_view name) -> std::optional<BitVectorMetadata> {
+    for (const StructMemberNode* member : the_struct_def->members()) {
+      if (member->name() == name) {
+        return ExtractBitVectorMetadata(member->type());
       }
     }
-    XLS_LOG(FATAL) << "Unknown field: " << name;
+    LOG(FATAL) << "Unknown field: " << name;
   };
 
   EXPECT_EQ(std::get<int64_t>(get_type_metadata("a")->bit_count), 32);
@@ -247,11 +130,96 @@ struct TheStruct {
   EXPECT_FALSE(get_type_metadata("i")->is_signed);
   EXPECT_EQ(get_type_metadata("i")->kind, BitVectorKind::kEnumTypeAlias);
 
+  // Note: for an `xN` we expect the bit count to be an expression.
+  ASSERT_TRUE(get_type_metadata("x").has_value());
+  ASSERT_TRUE(std::holds_alternative<Expr*>(get_type_metadata("x")->bit_count));
+  EXPECT_EQ(std::get<Expr*>(get_type_metadata("x")->bit_count)->ToString(),
+            "44");
+  EXPECT_FALSE(get_type_metadata("x")->is_signed);
+  EXPECT_EQ(get_type_metadata("x")->kind, BitVectorKind::kBitType);
+
+  // Note: for an `xN` we expect the bit count to be an expression.
+  ASSERT_TRUE(get_type_metadata("y").has_value());
+  ASSERT_TRUE(std::holds_alternative<Expr*>(get_type_metadata("y")->bit_count));
+  EXPECT_EQ(std::get<Expr*>(get_type_metadata("y")->bit_count)->ToString(),
+            "44");
+  EXPECT_TRUE(get_type_metadata("y")->is_signed);
+  EXPECT_EQ(get_type_metadata("y")->kind, BitVectorKind::kBitType);
+
   EXPECT_FALSE(get_type_metadata("j").has_value());
   EXPECT_FALSE(get_type_metadata("k").has_value());
   EXPECT_FALSE(get_type_metadata("l").has_value());
   EXPECT_FALSE(get_type_metadata("m").has_value());
   EXPECT_FALSE(get_type_metadata("n").has_value());
+}
+
+TEST(CollectUnderTest, MatchWithNameDefs) {
+  const std::string kProgram = R"(
+fn f() -> u32 {
+  let t = (u32:0, u32:1);
+  match t {
+    x => u32:0,
+    (y, z) => u32:1,
+  }
+}
+)";
+  FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(auto module, ParseModule(kProgram, "fake_path.x",
+                                                    "the_module", file_table));
+  std::optional<Function*> f = module->GetFunction("f");
+  ASSERT_TRUE(f.has_value());
+  Statement* stmt = (*f.value()).body()->statements().back();
+  auto* match_expr = std::get<Expr*>(stmt->wrapped());
+  auto* match = down_cast<Match*>(match_expr);
+  XLS_ASSERT_OK_AND_ASSIGN(std::vector<AstNode*> nodes,
+                           CollectUnder(match, /*want_types=*/false));
+  ASSERT_EQ(nodes.size(), 15);
+
+  EXPECT_EQ(nodes[0]->ToString(), "t");
+  EXPECT_EQ(nodes[0]->GetNodeTypeName(), "NameRef");
+
+  EXPECT_EQ(nodes[1]->ToString(), "x");
+  EXPECT_EQ(nodes[1]->GetNodeTypeName(), "NameDef");
+
+  EXPECT_EQ(nodes[2]->ToString(), "x");
+  EXPECT_EQ(nodes[2]->GetNodeTypeName(), "NameDefTree");
+
+  EXPECT_EQ(nodes[3]->ToString(), "u32");
+  EXPECT_EQ(nodes[3]->GetNodeTypeName(), "BuiltinTypeAnnotation");
+
+  EXPECT_EQ(nodes[4]->ToString(), "u32:0");
+  EXPECT_EQ(nodes[4]->GetNodeTypeName(), "Number");
+
+  EXPECT_EQ(nodes[5]->ToString(), "x => u32:0");
+  EXPECT_EQ(nodes[5]->GetNodeTypeName(), "MatchArm");
+
+  EXPECT_EQ(nodes[6]->ToString(), "y");
+  EXPECT_EQ(nodes[6]->GetNodeTypeName(), "NameDef");
+
+  EXPECT_EQ(nodes[7]->ToString(), "y");
+  EXPECT_EQ(nodes[7]->GetNodeTypeName(), "NameDefTree");
+
+  EXPECT_EQ(nodes[8]->ToString(), "z");
+  EXPECT_EQ(nodes[8]->GetNodeTypeName(), "NameDef");
+
+  EXPECT_EQ(nodes[9]->ToString(), "z");
+  EXPECT_EQ(nodes[9]->GetNodeTypeName(), "NameDefTree");
+
+  EXPECT_EQ(nodes[10]->ToString(), "(y, z)");
+  EXPECT_EQ(nodes[10]->GetNodeTypeName(), "NameDefTree");
+
+  EXPECT_EQ(nodes[11]->ToString(), "u32");
+  EXPECT_EQ(nodes[11]->GetNodeTypeName(), "BuiltinTypeAnnotation");
+
+  EXPECT_EQ(nodes[12]->ToString(), "u32:1");
+  EXPECT_EQ(nodes[12]->GetNodeTypeName(), "Number");
+
+  EXPECT_EQ(nodes[13]->ToString(), "(y, z) => u32:1");
+  EXPECT_EQ(nodes[13]->GetNodeTypeName(), "MatchArm");
+
+  EXPECT_EQ(nodes[14]->ToString(),
+            "match t {\n    x => u32:0,\n    (y, z) => u32:1,\n}");
+  EXPECT_EQ(nodes[14]->GetNodeTypeName(), "Match");
 }
 
 // Tests that the ResolveLocalStructDef can see through transitive aliases.
@@ -262,7 +230,8 @@ TEST(ResolveLocalStructDef, StructDefInTransitiveAlias) {
 type MyS1 = S;
 type MyS2 = MyS1;
 )";
-  Scanner scanner("test.x", kProgram);
+  FileTable file_table;
+  Scanner scanner(file_table, Fileno(0), kProgram);
   Parser parser("test", &scanner);
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Module> module,
                            parser.ParseModule());
@@ -270,9 +239,9 @@ type MyS2 = MyS1;
   std::optional<ModuleMember*> maybe_my_s = module->FindMemberWithName("MyS2");
   ASSERT_TRUE(maybe_my_s.has_value());
   auto* type_alias = std::get<TypeAlias*>(*maybe_my_s.value());
-  auto* aliased = type_alias->type_annotation();
+  TypeAnnotation& aliased = type_alias->type_annotation();
   auto* type_ref_type_annotation =
-      dynamic_cast<TypeRefTypeAnnotation*>(aliased);
+      dynamic_cast<TypeRefTypeAnnotation*>(&aliased);
   ASSERT_NE(type_ref_type_annotation, nullptr);
   TypeDefinition td = type_ref_type_annotation->type_ref()->type_definition();
 
@@ -282,6 +251,80 @@ type MyS2 = MyS1;
   ASSERT_TRUE(maybe_s.has_value());
   auto* s = std::get<StructDef*>(*maybe_s.value());
   EXPECT_EQ(s, resolved);
+}
+
+TEST(ContainingFunctionTest, SampleInvocation) {
+  const std::string_view kProgram = R"(
+fn f() { () }
+fn main() { f() }
+)";
+  FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(auto module, ParseModule(kProgram, "fake_path.x",
+                                                    "the_module", file_table));
+  Function* f = module->GetFunctionByName().at("f");
+  Function* main = module->GetFunctionByName().at("main");
+  const Statement* last_stmt = main->body()->statements().back();
+  const Expr* last_expr = std::get<Expr*>(last_stmt->wrapped());
+  const Invocation* call_f = down_cast<const Invocation*>(last_expr);
+
+  // The function "main" has the call to f.
+  ASSERT_TRUE(ContainedWithinFunction(*call_f, *main));
+  ASSERT_EQ(GetContainingFunction(call_f), main);
+
+  // The function "f" does not have the call to f.
+  ASSERT_FALSE(ContainedWithinFunction(*call_f, *f));
+}
+
+TEST(ContainingFunctionTest, StandaloneInvocation) {
+  const std::string_view kProgram = R"(
+fn f() { () }
+const X = f();
+)";
+  FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(auto module, ParseModule(kProgram, "fake_path.x",
+                                                    "the_module", file_table));
+  XLS_ASSERT_OK_AND_ASSIGN(const ConstantDef* x,
+                           module->GetMemberOrError<ConstantDef>("X"));
+  const Invocation* standalone_call = down_cast<const Invocation*>(x->value());
+
+  ASSERT_EQ(GetContainingFunction(standalone_call), std::nullopt);
+}
+
+TEST(ContainingFunctionTest, SampleBuiltinInvocation) {
+  const std::string_view kProgram = R"(
+fn main(x: u32, y: u32, z: u32) -> u32 { bit_slice_update(x, y, z) }
+)";
+  FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(auto module, ParseModule(kProgram, "fake_path.x",
+                                                    "the_module", file_table));
+  Function* main = module->GetFunctionByName().at("main");
+  const Statement* last_stmt = main->body()->statements().back();
+  const Expr* last_expr = std::get<Expr*>(last_stmt->wrapped());
+  const Invocation* call = down_cast<const Invocation*>(last_expr);
+
+  // The function "main" has the call to f.
+  ASSERT_TRUE(ContainedWithinFunction(*call, *main));
+  ASSERT_EQ(GetContainingFunction(call), main);
+}
+
+TEST(ContainingFunctionTest, InvocationWithinParametricExpression) {
+  const std::string_view kProgram = R"(
+fn id(x: u32) -> u32 { x }
+fn f<X: u32, Y: u32 = {id(X)}>() -> u32 { Y }
+)";
+  FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(auto module, ParseModule(kProgram, "fake_path.x",
+                                                    "the_module", file_table));
+  Function* f = module->GetFunctionByName().at("f");
+  const std::vector<ParametricBinding*>& parametric_bindings =
+      f->parametric_bindings();
+  ASSERT_EQ(parametric_bindings.size(), 2);
+  const ParametricBinding* pb = parametric_bindings.at(1);
+  const Invocation* call = down_cast<const Invocation*>(pb->expr());
+
+  // The function "f" has the call to id() contained within its bounds.
+  ASSERT_TRUE(ContainedWithinFunction(*call, *f));
+  ASSERT_EQ(GetContainingFunction(call), f);
 }
 
 }  // namespace

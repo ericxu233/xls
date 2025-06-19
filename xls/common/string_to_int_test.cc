@@ -14,11 +14,13 @@
 
 #include "xls/common/string_to_int.h"
 
+#include <cstdint>
 #include <limits>
 #include <string>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_replace.h"
 #include "xls/common/status/matchers.h"
@@ -26,9 +28,9 @@
 namespace xls {
 namespace {
 
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
-using xls::status_testing::IsOkAndHolds;
-using xls::status_testing::StatusIs;
 
 TEST(StringToInt, TabularTest) {
   struct TestCase {

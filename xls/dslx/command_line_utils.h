@@ -15,12 +15,13 @@
 #ifndef XLS_DSLX_COMMAND_LINE_UTILS_H_
 #define XLS_DSLX_COMMAND_LINE_UTILS_H_
 
-#include <functional>
 #include <string>
 #include <string_view>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/virtualizable_file_system.h"
 
 namespace xls::dslx {
 
@@ -31,9 +32,8 @@ namespace xls::dslx {
 // is not (i.e. because it does not have position information) false is
 // returned, and the status should likely be propagated to the caller instead of
 // squashed in some way.
-bool TryPrintError(const absl::Status& status,
-                   std::function<absl::StatusOr<std::string>(std::string_view)>
-                       get_file_contents = nullptr);
+bool TryPrintError(const absl::Status& status, FileTable& file_table,
+                   VirtualizableFilesystem& vfs);
 
 // Converts a path to a DSLX module into its corresponding module name; e.g.
 //
@@ -42,6 +42,12 @@ bool TryPrintError(const absl::Status& status,
 // Returns an error status if a module name cannot be extracted from the given
 // path.
 absl::StatusOr<std::string> PathToName(std::string_view path);
+
+// PathToName without canonicalization.
+absl::StatusOr<std::string> RawNameFromPath(std::string_view path);
+
+// Returns true if the file name would be unparsable as an XLS-ir identifier.
+bool NameNeedsCanonicalization(std::string_view path);
 
 }  // namespace xls::dslx
 

@@ -8,6 +8,7 @@ theme:
   name: "material"
 nav:
   - Overview: 'README.md'
+  - Talks: 'talks.md'
   - Tutorials:
     - Overview: 'tutorials/index.md'
     - DSLX:
@@ -16,14 +17,17 @@ nav:
       - Intro to parameterics: 'tutorials/intro_to_parametrics.md'
       - For expressions: 'tutorials/crc32.md'
       - Enumerate and match: 'tutorials/prefix_scan.md'
-      - Intro to Procs: 'tutorials/intro_to_procs.md'
-    - XLS[cc]:
+      - What is a Proc?: 'tutorials/what_is_a_proc.md'
+      - How to use Procs: 'tutorials/how_to_use_procs.md'
+      - Dataflow & Time: 'tutorials/dataflow_and_time.md'
+    - \[contrib\] XLS[cc]:
       - Overview: 'tutorials/xlscc_overview.md'
       - Integers: 'tutorials/xlscc_integers.md'
       - Channels: 'tutorials/xlscc_channels.md'
       - Memory: 'tutorials/xlscc_memory.md'
       - State: 'tutorials/xlscc_state.md'
       - Pipelined Loops: 'tutorials/xlscc_pipelined_loops.md'
+  - FAQ: 'faq.md'
   - IR:
     - Overview: 'ir_overview.md'
     - Semantics: 'ir_semantics.md'
@@ -31,18 +35,23 @@ nav:
     - Scheduling:
       - Overview: 'scheduling.md'
       - Delay Estimation: 'delay_estimation.md'
-    - Visualizer: 'ir_visualization.md'
+    - Ir Visualization:
+      - Web Visualizer: 'ir_visualization.md'
+      - Cytoscape: 'ir_to_cytoscape.md'
     - Native JIT:
       - Overview: 'ir_jit.md'
       - Data Layout: 'data_layout.md'
     - Formal: 'solvers.md'
+    - Elaboration: 'elaboration.md'
   - DSLX:
     - Reference: 'dslx_reference.md'
     - Standard Library : 'dslx_std.md'
     - Floating Point: 'floating_point.md'
     - Fuzzer: 'fuzzer.md'
     - Interpreter: 'dslx_bytecode_interpreter.md'
+    - FFI: 'dslx_ffi.md'
     - Language Server: 'dslx_language_server.md'
+    - Type System: 'dslx_type_system.md'
   - Code Generation:
     - Codegen Options: 'codegen_options.md'
     - IR Lowering: 'ir_lowering.md'
@@ -60,8 +69,12 @@ nav:
     - Ideas and Projects: 'ideas_and_projects.md'
     - FPGA characterization (experimental): 'fpga_characterization.md'
     - Design Docs:
-      - Legalize Multiple Channel Ops Per Channel: 'design_docs/legalize_multiple_channel_ops_per_channel.md'
+      - Legalize Multiple Channel Ops Per Channel (v1): 'design_docs/legalize_multiple_channel_ops_per_channel_v1.md'
+      - Legalize Multiple Channel Ops Per Channel (v2): 'design_docs/legalize_multiple_channel_ops_per_channel_v2.md'
       - Proc-scoped channels: 'design_docs/proc_scoped_channels.md'
+      - Synchronous Procs: 'design_docs/synchronous_procs.md'
+      - DSLX Pattern Exhaustiveness: 'design_docs/dslx_pattern_exhaustiveness.md'
+    - Releasing: 'releasing.md'
   - NoC:
     - Overview: 'noc/xls_noc_readme.md'
     - Topologies:
@@ -90,10 +103,12 @@ markdown_extensions:
         generic: true
   - footnotes
   - attr_list
+  - admonition
 extra_javascript:
-  - https://polyfill.io/v3/polyfill.min.js?features=es6
+  - https://cdnjs.cloudflare.com/polyfill/v3/polyfill.min.js?features=es6
   - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
 plugins:
   - exclude:
       glob: BUILD
   - search
+  - print-site

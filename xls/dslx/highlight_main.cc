@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <cstdlib>
 #include <filesystem>  // NOLINT
 #include <iostream>
 #include <string>
@@ -20,20 +19,23 @@
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
-#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "xls/common/exit_status.h"
-#include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/dslx/frontend/builtins_metadata.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/frontend/scanner.h"
+#include "xls/dslx/frontend/token.h"
+#include "xls/dslx/virtualizable_file_system.h"
 
 namespace xls::dslx {
 namespace {
 
-const char* kUsage = R"(
+static constexpr std::string_view kUsage = R"(
 Emits an ANSI-highlighted version of a given DSLX file.
 )";
 
@@ -92,8 +94,12 @@ std::string ToHighlightStr(const Token& t) {
 }
 
 absl::Status RealMain(const std::filesystem::path& path) {
-  XLS_ASSIGN_OR_RETURN(std::string contents, GetFileContents(path));
-  Scanner s(path, contents, /*include_whitespace_and_comments=*/true);
+  RealFilesystem vfs;
+  FileTable file_table;
+  Fileno fileno = file_table.GetOrCreate(path.c_str());
+  XLS_ASSIGN_OR_RETURN(std::string contents, vfs.GetFileContents(path));
+  Scanner s(file_table, fileno, contents,
+            /*include_whitespace_and_comments=*/true);
   while (!s.AtEof()) {
     XLS_ASSIGN_OR_RETURN(Token t, s.Pop());
     std::cout << ToHighlightStr(t);
@@ -108,9 +114,9 @@ int main(int argc, char** argv) {
   std::vector<std::string_view> args =
       xls::InitXls(xls::dslx::kUsage, argc, argv);
   if (args.empty()) {
-    XLS_LOG(QFATAL) << "Wrong number of command-line arguments; got "
-                    << args.size() << ": `" << absl::StrJoin(args, " ")
-                    << "`; want " << argv[0] << " <input-file>";
+    LOG(QFATAL) << "Wrong number of command-line arguments; got " << args.size()
+                << ": `" << absl::StrJoin(args, " ") << "`; want " << argv[0]
+                << " <input-file>";
   }
 
   return xls::ExitStatus(xls::dslx::RealMain(std::filesystem::path(args[0])));

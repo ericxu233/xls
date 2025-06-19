@@ -14,6 +14,7 @@
 
 #include "xls/passes/bit_slice_simplification_pass.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -21,23 +22,34 @@
 #include "gtest/gtest.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/substitute.h"
+#include "absl/time/time.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/interpreter/function_interpreter.h"
 #include "xls/ir/bits.h"
+#include "xls/ir/events.h"
 #include "xls/ir/function.h"
+#include "xls/ir/function_builder.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/value.h"
 #include "xls/passes/dce_pass.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
+#include "xls/solvers/z3_ir_equivalence_testutils.h"
 
 namespace m = ::xls::op_matchers;
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+constexpr absl::Duration kProverTimeout = absl::Seconds(10);
+
+using ::absl_testing::IsOkAndHolds;
+using ::xls::solvers::z3::ScopedVerifyEquivalence;
+
+using ::testing::AllOf;
 
 class BitSliceSimplificationPassTest : public IrTestBase {
  protected:
@@ -45,12 +57,13 @@ class BitSliceSimplificationPassTest : public IrTestBase {
 
   absl::StatusOr<bool> Run(Function* f) {
     PassResults results;
+    OptimizationContext context;
     XLS_ASSIGN_OR_RETURN(bool changed,
                          BitSliceSimplificationPass().RunOnFunctionBase(
-                             f, OptimizationPassOptions(), &results));
+                             f, OptimizationPassOptions(), &results, context));
     XLS_RETURN_IF_ERROR(
         DeadCodeEliminationPass()
-            .RunOnFunctionBase(f, OptimizationPassOptions(), &results)
+            .RunOnFunctionBase(f, OptimizationPassOptions(), &results, context)
             .status());
     return changed;
   }
@@ -186,6 +199,18 @@ TEST_F(BitSliceSimplificationPassTest,
   EXPECT_THAT(Run(f), IsOkAndHolds(false));
 }
 
+TEST_F(BitSliceSimplificationPassTest,
+       NotSoleSliceLowBitsOfAddDoesNotOptimize) {
+  auto p = CreatePackage();
+  FunctionBuilder fb("f", p.get());
+  auto u42 = p->GetBitsType(42);
+  BValue add = fb.Add(fb.Param("x", u42), fb.Param("y", u42));
+  fb.BitSlice(add, /*start=*/0, /*width=*/32);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.BuildWithReturnValue(add));
+  EXPECT_THAT(f->return_value(), m::Add());
+  EXPECT_THAT(Run(f), IsOkAndHolds(false));
+}
+
 TEST_F(BitSliceSimplificationPassTest, SliceOfSignExtCaseOne) {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
@@ -268,7 +293,7 @@ TEST_F(BitSliceSimplificationPassTest, DynamicBitSliceLiteralStart) {
               m::BitSlice(m::Param(), /*start=*/6, /*width=*/15));
 }
 
-TEST_F(BitSliceSimplificationPassTest, DynamicBitSliceLiteralStartOob) {
+TEST_F(BitSliceSimplificationPassTest, DynamicBitSliceLiteralStartPartialOob) {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
  fn f(x: bits[42]) -> bits[15] {
@@ -277,8 +302,101 @@ TEST_F(BitSliceSimplificationPassTest, DynamicBitSliceLiteralStartOob) {
  }
   )",
                                                        p.get()));
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  EXPECT_THAT(
+      f->return_value(),
+      m::ZeroExt(m::BitSlice(m::Param("x"), /*start=*/35, /*width=*/7)));
+}
+
+TEST_F(BitSliceSimplificationPassTest, DynamicBitSliceLiteralStartFullyOob) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+ fn f(x: bits[42]) -> bits[15] {
+    literal.1: bits[23] = literal(value=64)
+    ret result: bits[15] = dynamic_bit_slice(x, literal.1, width=15)
+ }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Literal(0));
+}
+
+TEST_F(BitSliceSimplificationPassTest, DynamicBitSliceSelectOfLiteralStart) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+ fn f(x: bits[42], c: bits[2]) -> bits[15] {
+    literal.1: bits[23] = literal(value=5)
+    literal.2: bits[23] = literal(value=35)
+    literal.3: bits[23] = literal(value=64)
+    start: bits[23] = priority_sel(c, cases=[literal.1, literal.2], default=literal.3)
+    ret result: bits[15] = dynamic_bit_slice(x, start, width=15)
+ }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  EXPECT_THAT(
+      f->return_value(),
+      m::PrioritySelect(m::Param("c"),
+                        /*cases=*/
+                        {
+                            m::BitSlice(m::Param("x"), 5, 15),
+                            m::ZeroExt(m::BitSlice(m::Param("x"), 35, 7)),
+                        },
+                        /*default_value=*/m::Literal(0)));
+}
+
+TEST_F(BitSliceSimplificationPassTest,
+       DynamicBitSliceNestedSelectOfLiteralStart) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+ fn f(x: bits[42], c1: bits[2], c2: bits[1]) -> bits[15] {
+    literal.1: bits[23] = literal(value=5)
+    literal.2: bits[23] = literal(value=10)
+    literal.3: bits[23] = literal(value=35)
+    literal.4: bits[23] = literal(value=64)
+    sel.5: bits[23] = sel(c2, cases=[literal.2, literal.3])
+    start: bits[23] = priority_sel(c1, cases=[literal.1, sel.5], default=literal.4)
+    ret result: bits[15] = dynamic_bit_slice(x, start, width=15)
+ }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  EXPECT_THAT(
+      f->return_value(),
+      m::PrioritySelect(
+          m::Param("c1"),
+          /*cases=*/
+          {
+              m::BitSlice(m::Param("x"), 5, 15),
+              m::Select(m::Param("c2"),
+                        /*cases=*/
+                        {
+                            m::BitSlice(m::Param("x"), 10, 15),
+                            m::ZeroExt(m::BitSlice(m::Param("x"), 35, 7)),
+                        }),
+          },
+          /*default_value=*/m::Literal(0)));
+}
+
+TEST_F(BitSliceSimplificationPassTest,
+       DynamicBitSliceOneHotSelectOfLiteralStart) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+ fn f(x: bits[12]) -> bits[21] {
+    bit_slice.1: bits[6] = bit_slice(x, start=0, width=6)
+    literal.2: bits[39] = literal(value=549755813887)
+    literal.3: bits[39] = literal(value=0)
+    literal.4: bits[21] = literal(value=0)
+    one_hot_sel.5: bits[39] = one_hot_sel(bit_slice.1, cases=[literal.3, literal.2, literal.2, literal.2, literal.2, literal.3])
+    ret bit_slice_update.6: bits[21] = bit_slice_update(literal.4, one_hot_sel.5, x)
+}
+  )",
+                                                       p.get()));
+  // We can't simplify this, since our update's start might actually be the OR
+  // of selected values, not just one of them.
   ASSERT_THAT(Run(f), IsOkAndHolds(false));
-  EXPECT_THAT(f->return_value(), m::DynamicBitSlice(m::Param(), m::Literal()));
+  EXPECT_THAT(f->return_value(),
+              m::BitSliceUpdate(m::Literal(), m::OneHotSelect(), m::Param()));
 }
 
 TEST_F(BitSliceSimplificationPassTest, DynamicBitSliceLiteralInput) {
@@ -326,11 +444,30 @@ TEST_F(BitSliceSimplificationPassTest, SlicedShiftLeftMultipleUsers) {
   Type* u32 = p->GetBitsType(32);
   BValue shift = fb.Shll(fb.Param("in", u32), fb.Param("amt", u32));
   fb.Add(shift, shift);
-  fb.BitSlice(shift, /*start=*/0,
-              /*width=*/10);
+  fb.BitSlice(shift, /*start=*/0, /*width=*/10);
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
   ASSERT_THAT(Run(f), IsOkAndHolds(false));
   EXPECT_THAT(f->return_value(), m::BitSlice(m::Shll()));
+}
+
+TEST_F(BitSliceSimplificationPassTest, SlicedShiftLeftMultipleSliceUsers) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  BValue shift = fb.Shll(fb.Param("in", u32), fb.Param("amt", u32));
+  BValue shift_slice1 = fb.BitSlice(shift, /*start=*/3, /*width=*/5);
+  BValue shift_slice2 = fb.BitSlice(shift, /*start=*/0, /*width=*/10);
+  fb.Concat({shift_slice1, shift_slice2});
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  ScopedVerifyEquivalence check_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  auto sliced_shift = m::Shll(m::BitSlice(m::Param("in"), /*start=*/0,
+                                          /*width=*/10),
+                              m::Param("amt"));
+  EXPECT_THAT(f->return_value(),
+              m::Concat(m::BitSlice(sliced_shift, /*start=*/3, /*width=*/5),
+                        sliced_shift));
 }
 
 TEST_F(BitSliceSimplificationPassTest, SlicedShiftLeftStartNonzero) {
@@ -369,6 +506,83 @@ TEST_F(BitSliceSimplificationPassTest, SlicedShiftRightDoesNotEndAtMsb) {
   EXPECT_THAT(f->return_value(), m::BitSlice(m::Shrl()));
 }
 
+TEST_F(BitSliceSimplificationPassTest, SlicedShiftRightMultipleSliceUsers) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  BValue shift = fb.Shrl(fb.Param("in", u32), fb.Param("amt", u32));
+  BValue shift_slice1 = fb.BitSlice(shift, /*start=*/16, /*width=*/10);
+  BValue shift_slice2 = fb.BitSlice(shift, /*start=*/14, /*width=*/18);
+  fb.Concat({shift_slice1, shift_slice2});
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  ScopedVerifyEquivalence check_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  auto sliced_shift = m::Shrl(m::BitSlice(m::Param("in"), /*start=*/14,
+                                          /*width=*/18),
+                              m::Param("amt"));
+  EXPECT_THAT(f->return_value(),
+              m::Concat(m::BitSlice(sliced_shift, /*start=*/2, /*width=*/10),
+                        sliced_shift));
+}
+
+TEST_F(BitSliceSimplificationPassTest, SlicedDecode) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  fb.BitSlice(fb.Decode(fb.Param("amt", u32), /*width=*/32), /*start=*/0,
+              /*width=*/10);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  ScopedVerifyEquivalence check_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(),
+              AllOf(m::Decode(m::Param("amt")), m::Type("bits[10]")));
+}
+
+TEST_F(BitSliceSimplificationPassTest, SlicedDecodeMultipleUsers) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  BValue decode = fb.Decode(fb.Param("amt", u32), /*width=*/32);
+  fb.Add(decode, decode);
+  fb.BitSlice(decode, /*start=*/0, /*width=*/10);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(f), IsOkAndHolds(false));
+  EXPECT_THAT(f->return_value(), m::BitSlice(AllOf(m::Decode(), m::Type(u32))));
+}
+
+TEST_F(BitSliceSimplificationPassTest, SlicedDecodeMultipleSliceUsers) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  BValue decode = fb.Decode(fb.Param("amt", u32), /*width=*/32);
+  BValue decode_slice1 = fb.BitSlice(decode, /*start=*/0, /*width=*/11);
+  BValue decode_slice2 = fb.BitSlice(decode, /*start=*/1, /*width=*/9);
+  fb.Concat({decode_slice1, decode_slice2});
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  ScopedVerifyEquivalence check_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  auto narrowed_decode =
+      AllOf(m::Decode(m::Param("amt")), m::Type(p->GetBitsType(11)));
+  EXPECT_THAT(
+      f->return_value(),
+      m::Concat(narrowed_decode,
+                m::BitSlice(narrowed_decode, /*start=*/1, /*width=*/9)));
+}
+
+TEST_F(BitSliceSimplificationPassTest, SlicedDecodeStartNonzero) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  fb.BitSlice(fb.Decode(fb.Param("amt", u32), /*width=*/32), /*start=*/12,
+              /*width=*/10);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(f), IsOkAndHolds(false));
+  EXPECT_THAT(f->return_value(), m::BitSlice(AllOf(m::Decode(), m::Type(u32))));
+}
+
 TEST_F(BitSliceSimplificationPassTest, SlicedOhs) {
   auto p = CreatePackage();
   FunctionBuilder fb(TestName(), p.get());
@@ -392,11 +606,100 @@ TEST_F(BitSliceSimplificationPassTest, SlicedOhsWithMoreThanOneUser) {
   Type* u2 = p->GetBitsType(2);
   BValue ohs = fb.OneHotSelect(fb.Param("p", u2),
                                {fb.Param("x", u32), fb.Param("y", u32)});
-  fb.BitSlice(ohs, /*start=*/10, /*width=*/7);
+  fb.Add(ohs, ohs);
   fb.BitSlice(ohs, /*start=*/12, /*width=*/15);
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
   ASSERT_THAT(Run(f), IsOkAndHolds(false));
   EXPECT_THAT(f->return_value(), m::BitSlice(m::OneHotSelect()));
+}
+
+TEST_F(BitSliceSimplificationPassTest, SlicedOhsWithMultipleSliceUsers) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  Type* u2 = p->GetBitsType(2);
+  BValue ohs = fb.OneHotSelect(fb.Param("p", u2),
+                               {fb.Param("x", u32), fb.Param("y", u32)});
+  BValue ohs_slice1 = fb.BitSlice(ohs, /*start=*/10, /*width=*/7);
+  BValue ohs_slice2 = fb.BitSlice(ohs, /*start=*/12, /*width=*/15);
+  BValue ohs_slice3 = fb.BitSlice(ohs, /*start=*/10, /*width=*/18);
+  fb.Concat({ohs_slice1, ohs_slice2, ohs_slice3});
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  ScopedVerifyEquivalence check_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  auto sliced_ohs =
+      m::OneHotSelect(m::Param("p"),
+                      /*cases=*/{m::BitSlice(m::Param("x"), 10, 18),
+                                 m::BitSlice(m::Param("y"), 10, 18)});
+  EXPECT_THAT(f->return_value(),
+              m::Concat(m::BitSlice(sliced_ohs, /*start=*/0, /*width=*/7),
+                        m::BitSlice(sliced_ohs, /*start=*/2, /*width=*/15),
+                        sliced_ohs));
+}
+
+TEST_F(BitSliceSimplificationPassTest, SlicedPrioritySelect) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  Type* u2 = p->GetBitsType(2);
+  BValue sel = fb.PrioritySelect(fb.Param("p", u2),
+                                 {fb.Param("x", u32), fb.Param("y", u32)},
+                                 fb.Param("d", u32));
+  fb.BitSlice(sel, /*start=*/10, /*width=*/7);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  EXPECT_THAT(
+      f->return_value(),
+      m::PrioritySelect(m::Param("p"),
+                        /*cases=*/
+                        {m::BitSlice(m::Param("x"), 10, 7),
+                         m::BitSlice(m::Param("y"), 10, 7)},
+                        /*default_value=*/m::BitSlice(m::Param("d"), 10, 7)));
+}
+
+TEST_F(BitSliceSimplificationPassTest,
+       SlicedPrioritySelectWithMoreThanOneUser) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  Type* u2 = p->GetBitsType(2);
+  BValue sel = fb.PrioritySelect(fb.Param("p", u2),
+                                 {fb.Param("x", u32), fb.Param("y", u32)},
+                                 fb.Param("d", u32));
+  fb.Add(sel, sel);
+  fb.BitSlice(sel, /*start=*/12, /*width=*/15);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(f), IsOkAndHolds(false));
+  EXPECT_THAT(f->return_value(), m::BitSlice(m::PrioritySelect()));
+}
+
+TEST_F(BitSliceSimplificationPassTest,
+       SlicedPrioritySelectWithMultipleSliceUsers) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  Type* u2 = p->GetBitsType(2);
+  BValue sel = fb.PrioritySelect(fb.Param("p", u2),
+                                 {fb.Param("x", u32), fb.Param("y", u32)},
+                                 fb.Param("d", u32));
+  BValue sel_slice1 = fb.BitSlice(sel, /*start=*/10, /*width=*/7);
+  BValue sel_slice2 = fb.BitSlice(sel, /*start=*/12, /*width=*/15);
+  BValue sel_slice3 = fb.BitSlice(sel, /*start=*/10, /*width=*/18);
+  fb.Concat({sel_slice1, sel_slice2, sel_slice3});
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  ScopedVerifyEquivalence check_equivalent(f, kProverTimeout);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  auto sliced_sel = m::PrioritySelect(
+      m::Param("p"),
+      /*cases=*/
+      {m::BitSlice(m::Param("x"), 10, 18), m::BitSlice(m::Param("y"), 10, 18)},
+      /*default_value=*/m::BitSlice(m::Param("d"), 10, 18));
+  EXPECT_THAT(f->return_value(),
+              m::Concat(m::BitSlice(sliced_sel, /*start=*/0, /*width=*/7),
+                        m::BitSlice(sliced_sel, /*start=*/2, /*width=*/15),
+                        sliced_sel));
 }
 
 TEST_F(BitSliceSimplificationPassTest, SlicedSelect) {
@@ -515,6 +818,403 @@ TEST_F(BitSliceSimplificationPassTest, BitSliceUpdateOutOfBounds) {
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
   ASSERT_THAT(Run(f), IsOkAndHolds(true));
   EXPECT_THAT(f->return_value(), m::Param("x"));
+}
+
+TEST_F(BitSliceSimplificationPassTest, BitSliceUpdateSelectOfLiteralStart) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+ fn f(x: bits[42], c: bits[2], v: bits[15]) -> bits[42] {
+    literal.1: bits[23] = literal(value=5)
+    literal.2: bits[23] = literal(value=35)
+    literal.3: bits[23] = literal(value=64)
+    start: bits[23] = priority_sel(c, cases=[literal.1, literal.2], default=literal.3)
+    ret result: bits[42] = bit_slice_update(x, start, v)
+ }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  EXPECT_THAT(
+      f->return_value(),
+      m::PrioritySelect(
+          m::Param("c"),
+          /*cases=*/
+          {
+              m::Concat(m::BitSlice(m::Param("x"), 20, 22), m::Param("v"),
+                        m::BitSlice(m::Param("x"), 0, 5)),
+              m::Concat(m::BitSlice(m::Param("v"), 0, 7),
+                        m::BitSlice(m::Param("x"), 0, 35)),
+          },
+          /*default_value=*/m::Param("x")));
+}
+
+TEST_F(BitSliceSimplificationPassTest,
+       BitSliceUpdateNestedSelectOfLiteralStart) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+ fn f(x: bits[42], c1: bits[2], c2: bits[1], v: bits[15]) -> bits[42] {
+    literal.1: bits[23] = literal(value=5)
+    literal.2: bits[23] = literal(value=10)
+    literal.3: bits[23] = literal(value=35)
+    literal.4: bits[23] = literal(value=64)
+    sel.5: bits[23] = sel(c2, cases=[literal.2, literal.3])
+    start: bits[23] = priority_sel(c1, cases=[literal.1, sel.5], default=literal.4)
+    ret result: bits[42] = bit_slice_update(x, start, v)
+ }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  EXPECT_THAT(
+      f->return_value(),
+      m::PrioritySelect(
+          m::Param("c1"),
+          /*cases=*/
+          {
+              m::Concat(m::BitSlice(m::Param("x"), 20, 22), m::Param("v"),
+                        m::BitSlice(m::Param("x"), 0, 5)),
+              m::Select(m::Param("c2"),
+                        /*cases=*/
+                        {
+                            m::Concat(m::BitSlice(m::Param("x"), 25, 17),
+                                      m::Param("v"),
+                                      m::BitSlice(m::Param("x"), 0, 10)),
+                            m::Concat(m::BitSlice(m::Param("v"), 0, 7),
+                                      m::BitSlice(m::Param("x"), 0, 35)),
+                        }),
+          },
+          /*default_value=*/m::Param("x")));
+}
+
+TEST_F(BitSliceSimplificationPassTest, DynamicBitSliceWithScaledIndex) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u23 = p->GetBitsType(23);
+  Type* u2 = p->GetBitsType(2);
+  BValue x = fb.Param("x", u23);
+  BValue z = fb.Param("z", u2);
+  BValue index = fb.UMul(fb.ZeroExtend(z, 5), fb.Literal(UBits(10, 5)));
+  fb.DynamicBitSlice(x, index, /*width=*/10);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  solvers::z3::ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+
+  ASSERT_THAT(
+      f->return_value(),
+      m::Select(
+          m::ZeroExt(m::Param("z")),
+          {
+              m::BitSlice(m::Param("x"), /*start=*/0, /*width=*/10),
+              m::BitSlice(m::Param("x"), /*start=*/10, /*width=*/10),
+              m::ZeroExt(m::BitSlice(m::Param("x"), /*start=*/20, /*width=*/3)),
+          },
+          m::Literal(0)));
+}
+
+TEST_F(BitSliceSimplificationPassTest,
+       DynamicBitSliceWithPowerOfTwoScaledIndex) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  Type* u3 = p->GetBitsType(3);
+  BValue x = fb.Param("x", u32);
+  BValue z = fb.Param("z", u3);
+  BValue index = fb.UMul(fb.ZeroExtend(z, 5), fb.Literal(UBits(4, 5)));
+  fb.DynamicBitSlice(x, index, /*width=*/4);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  solvers::z3::ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+
+  ASSERT_THAT(
+      f->return_value(),
+      m::Select(m::BitSlice(m::UMul(m::ZeroExt(m::Param("z")), m::Literal(4)),
+                            /*start=*/2, /*width=*/3),
+                {
+                    m::BitSlice(m::Param("x"), /*start=*/0, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/4, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/8, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/12, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/16, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/20, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/24, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/28, /*width=*/4),
+                }));
+}
+
+TEST_F(BitSliceSimplificationPassTest, DynamicBitSliceWithShiftedIndex) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  Type* u3 = p->GetBitsType(3);
+  BValue x = fb.Param("x", u32);
+  BValue z = fb.Param("z", u3);
+  BValue index = fb.Shll(fb.ZeroExtend(z, 5), fb.Literal(UBits(2, 5)));
+  fb.DynamicBitSlice(x, index, /*width=*/4);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  solvers::z3::ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+
+  ASSERT_THAT(
+      f->return_value(),
+      m::Select(m::BitSlice(m::Shll(m::ZeroExt(m::Param("z")), m::Literal(2)),
+                            /*start=*/2, /*width=*/3),
+                {
+                    m::BitSlice(m::Param("x"), /*start=*/0, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/4, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/8, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/12, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/16, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/20, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/24, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/28, /*width=*/4),
+                }));
+}
+
+TEST_F(BitSliceSimplificationPassTest,
+       DynamicBitSliceWithShiftedIndexByConcat) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  Type* u3 = p->GetBitsType(3);
+  BValue x = fb.Param("x", u32);
+  BValue z = fb.Param("z", u3);
+  BValue index = fb.Concat({z, fb.Literal(UBits(0, 2))});
+  fb.DynamicBitSlice(x, index, /*width=*/4);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  solvers::z3::ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+
+  ASSERT_THAT(
+      f->return_value(),
+      m::Select(m::Concat(m::Param("z")),
+                {
+                    m::BitSlice(m::Param("x"), /*start=*/0, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/4, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/8, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/12, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/16, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/20, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/24, /*width=*/4),
+                    m::BitSlice(m::Param("x"), /*start=*/28, /*width=*/4),
+                }));
+}
+
+TEST_F(BitSliceSimplificationPassTest, BitSliceUpdateWithScaledIndex) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u23 = p->GetBitsType(23);
+  Type* u10 = p->GetBitsType(10);
+  Type* u2 = p->GetBitsType(2);
+  BValue x = fb.Param("x", u23);
+  BValue y = fb.Param("y", u10);
+  BValue z = fb.Param("z", u2);
+  BValue index = fb.UMul(fb.ZeroExtend(z, 5), fb.Literal(UBits(10, 5)));
+  fb.BitSliceUpdate(x, index, y);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  solvers::z3::ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+
+  auto array = m::Array(
+      m::BitSlice(m::Param("x"), /*start=*/0, /*width=*/10),
+      m::BitSlice(m::Param("x"), /*start=*/10, /*width=*/10),
+      m::ZeroExt(m::BitSlice(m::Param("x"), /*start=*/20, /*width=*/3)));
+  auto array_update =
+      m::ArrayUpdate(array, m::Param("y"), {m::ZeroExt(m::Param("z"))});
+  ASSERT_THAT(
+      f->return_value(),
+      m::Concat(m::BitSlice(m::ArrayIndex(array_update, {m::Literal(2)}),
+                            /*start=*/0, /*width=*/3),
+                m::ArrayIndex(array_update, {m::Literal(1)}),
+                m::ArrayIndex(array_update, {m::Literal(0)})));
+}
+
+TEST_F(BitSliceSimplificationPassTest,
+       BitSliceUpdateWithScaledIndexThatCanOverflow) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u23 = p->GetBitsType(23);
+  Type* u10 = p->GetBitsType(10);
+  Type* u4 = p->GetBitsType(4);
+  BValue x = fb.Param("x", u23);
+  BValue y = fb.Param("y", u10);
+  BValue z = fb.Param("z", u4);
+  BValue index = fb.UMul(fb.ZeroExtend(z, 5), fb.Literal(UBits(10, 5)));
+  fb.BitSliceUpdate(x, index, y);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  ASSERT_THAT(Run(f), IsOkAndHolds(false));
+}
+
+TEST_F(BitSliceSimplificationPassTest,
+       BitSliceUpdateWithPowerOfTwoScaledIndex) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  Type* u4 = p->GetBitsType(4);
+  Type* u3 = p->GetBitsType(3);
+  BValue x = fb.Param("x", u32);
+  BValue y = fb.Param("y", u4);
+  BValue z = fb.Param("z", u3);
+  BValue index = fb.UMul(fb.ZeroExtend(z, 5), fb.Literal(UBits(4, 5)));
+  fb.BitSliceUpdate(x, index, y);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  solvers::z3::ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+
+  auto array = m::Array(m::BitSlice(m::Param("x"), /*start=*/0, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/4, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/8, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/12, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/16, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/20, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/24, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/28, /*width=*/4));
+  auto array_update = m::ArrayUpdate(
+      array, m::Param("y"),
+      {m::BitSlice(m::UMul(m::ZeroExt(m::Param("z")), m::Literal(4)),
+                   /*start=*/2,
+                   /*width=*/3)});
+  ASSERT_THAT(f->return_value(),
+              m::Concat(m::ArrayIndex(array_update, {m::Literal(7)}),
+                        m::ArrayIndex(array_update, {m::Literal(6)}),
+                        m::ArrayIndex(array_update, {m::Literal(5)}),
+                        m::ArrayIndex(array_update, {m::Literal(4)}),
+                        m::ArrayIndex(array_update, {m::Literal(3)}),
+                        m::ArrayIndex(array_update, {m::Literal(2)}),
+                        m::ArrayIndex(array_update, {m::Literal(1)}),
+                        m::ArrayIndex(array_update, {m::Literal(0)})));
+}
+
+TEST_F(BitSliceSimplificationPassTest, BitSliceUpdateWithShiftedIndex) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  Type* u4 = p->GetBitsType(4);
+  Type* u3 = p->GetBitsType(3);
+  BValue x = fb.Param("x", u32);
+  BValue y = fb.Param("y", u4);
+  BValue z = fb.Param("z", u3);
+  BValue index = fb.Shll(fb.ZeroExtend(z, 5), fb.Literal(UBits(2, 5)));
+  fb.BitSliceUpdate(x, index, y);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  solvers::z3::ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+
+  auto array = m::Array(m::BitSlice(m::Param("x"), /*start=*/0, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/4, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/8, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/12, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/16, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/20, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/24, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/28, /*width=*/4));
+  auto array_update = m::ArrayUpdate(
+      array, m::Param("y"),
+      {m::BitSlice(m::Shll(m::ZeroExt(m::Param("z")), m::Literal(2)),
+                   /*start=*/2,
+                   /*width=*/3)});
+  ASSERT_THAT(f->return_value(),
+              m::Concat(m::ArrayIndex(array_update, {m::Literal(7)}),
+                        m::ArrayIndex(array_update, {m::Literal(6)}),
+                        m::ArrayIndex(array_update, {m::Literal(5)}),
+                        m::ArrayIndex(array_update, {m::Literal(4)}),
+                        m::ArrayIndex(array_update, {m::Literal(3)}),
+                        m::ArrayIndex(array_update, {m::Literal(2)}),
+                        m::ArrayIndex(array_update, {m::Literal(1)}),
+                        m::ArrayIndex(array_update, {m::Literal(0)})));
+}
+
+TEST_F(BitSliceSimplificationPassTest, BitSliceUpdateWithShiftedIndexByConcat) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  Type* u32 = p->GetBitsType(32);
+  Type* u4 = p->GetBitsType(4);
+  Type* u3 = p->GetBitsType(3);
+  BValue x = fb.Param("x", u32);
+  BValue y = fb.Param("y", u4);
+  BValue z = fb.Param("z", u3);
+  BValue index = fb.Concat({z, fb.Literal(UBits(0, 2))});
+  fb.BitSliceUpdate(x, index, y);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  solvers::z3::ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+
+  auto array = m::Array(m::BitSlice(m::Param("x"), /*start=*/0, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/4, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/8, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/12, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/16, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/20, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/24, /*width=*/4),
+                        m::BitSlice(m::Param("x"), /*start=*/28, /*width=*/4));
+  auto array_update =
+      m::ArrayUpdate(array, m::Param("y"), {m::Concat(m::Param("z"))});
+  ASSERT_THAT(f->return_value(),
+              m::Concat(m::ArrayIndex(array_update, {m::Literal(7)}),
+                        m::ArrayIndex(array_update, {m::Literal(6)}),
+                        m::ArrayIndex(array_update, {m::Literal(5)}),
+                        m::ArrayIndex(array_update, {m::Literal(4)}),
+                        m::ArrayIndex(array_update, {m::Literal(3)}),
+                        m::ArrayIndex(array_update, {m::Literal(2)}),
+                        m::ArrayIndex(array_update, {m::Literal(1)}),
+                        m::ArrayIndex(array_update, {m::Literal(0)})));
+}
+
+TEST_F(BitSliceSimplificationPassTest, BitSliceSelectorMassive) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue bit_selector = fb.Param("x", p->GetBitsType(70));
+  BValue scaled = fb.Concat({bit_selector, fb.Literal(UBits(0, 1))});
+  BValue bit_source = fb.Param("y", p->GetBitsType(16));
+  // Can only be selected from the first 16 bits.
+  fb.DynamicBitSlice(bit_source, scaled, 2);
+
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  solvers::z3::ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+
+  EXPECT_THAT(f->return_value(), m::Select(m::Concat(m::Param("x")),
+                                           {
+                                               m::BitSlice(m::Param("y")),
+                                               m::BitSlice(m::Param("y")),
+                                               m::BitSlice(m::Param("y")),
+                                               m::BitSlice(m::Param("y")),
+                                               m::BitSlice(m::Param("y")),
+                                               m::BitSlice(m::Param("y")),
+                                               m::BitSlice(m::Param("y")),
+                                               m::BitSlice(m::Param("y")),
+                                           },
+                                           m::Literal(UBits(0, 2))));
+}
+
+TEST_F(BitSliceSimplificationPassTest, BitSliceCannotReachAllBits) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue bit_selector = fb.Param("x", p->GetBitsType(2));
+  BValue scaled = fb.Concat({bit_selector, fb.Literal(UBits(0, 1))});
+  BValue bit_source = fb.Param("y", p->GetBitsType(256));
+  // Can only be selected from the first 16 bits.
+  fb.DynamicBitSlice(bit_source, scaled, 2);
+
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  solvers::z3::ScopedVerifyEquivalence sve(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+
+  EXPECT_THAT(f->return_value(), m::Select(m::Concat(m::Param("x")),
+                                           {
+                                               m::BitSlice(m::Param("y")),
+                                               m::BitSlice(m::Param("y")),
+                                               m::BitSlice(m::Param("y")),
+                                               m::BitSlice(m::Param("y")),
+                                           }));
 }
 
 }  // namespace

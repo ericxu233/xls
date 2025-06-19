@@ -14,61 +14,71 @@
 
 #include "xls/codegen/combinational_generator.h"
 
-#include "absl/memory/memory.h"
-#include "absl/status/status.h"
+#include <optional>
+#include <string>
+
 #include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
-#include "absl/strings/str_format.h"
-#include "absl/strings/str_join.h"
-#include "absl/strings/str_split.h"
 #include "xls/codegen/block_conversion.h"
 #include "xls/codegen/block_generator.h"
+#include "xls/codegen/block_metrics.h"
 #include "xls/codegen/codegen_options.h"
 #include "xls/codegen/codegen_pass.h"
 #include "xls/codegen/codegen_pass_pipeline.h"
-#include "xls/codegen/flattening.h"
-#include "xls/codegen/module_builder.h"
-#include "xls/codegen/node_expressions.h"
-#include "xls/codegen/signature_generator.h"
-#include "xls/codegen/vast.h"
-#include "xls/common/logging/log_lines.h"
-#include "xls/common/logging/logging.h"
+#include "xls/codegen/codegen_result.h"
+#include "xls/codegen/module_signature.h"
+#include "xls/codegen/verilog_line_map.pb.h"
+#include "xls/codegen/xls_metrics.pb.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/delay_model/delay_estimator.h"
-#include "xls/ir/bits.h"
-#include "xls/ir/dfs_visitor.h"
-#include "xls/ir/function.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
-#include "xls/ir/node_util.h"
-#include "xls/ir/nodes.h"
-#include "xls/ir/type.h"
+#include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 namespace verilog {
 
-absl::StatusOr<ModuleGeneratorResult> GenerateCombinationalModule(
+absl::StatusOr<CodegenResult> GenerateCombinationalModule(
     FunctionBase* module, const CodegenOptions& options,
     const DelayEstimator* delay_estimator) {
-  XLS_ASSIGN_OR_RETURN(CodegenPassUnit unit,
+  XLS_ASSIGN_OR_RETURN(CodegenContext context,
                        FunctionBaseToCombinationalBlock(module, options));
 
-  CodegenPassOptions codegen_pass_options;
-  codegen_pass_options.codegen_options = options;
-  codegen_pass_options.delay_estimator = delay_estimator;
+  const CodegenPassOptions codegen_pass_options = {
+      .codegen_options = options,
+      .delay_estimator = delay_estimator,
+  };
 
   PassResults results;
-  XLS_RETURN_IF_ERROR(CreateCodegenPassPipeline()
-                          ->Run(&unit, codegen_pass_options, &results)
-                          .status());
-  XLS_RET_CHECK(unit.signature.has_value());
+  OptimizationContext opt_context;
+  XLS_RETURN_IF_ERROR(
+      CreateCodegenPassPipeline(opt_context)
+          ->Run(module->package(), codegen_pass_options, &results, context)
+          .status());
+  XLS_RET_CHECK_NE(context.top_block(), nullptr);
+  XLS_RET_CHECK(context.metadata().contains(context.top_block()));
+  XLS_RET_CHECK(context.top_block()->GetSignature().has_value());
   VerilogLineMap verilog_line_map;
-  XLS_ASSIGN_OR_RETURN(std::string verilog,
-                       GenerateVerilog(unit.block, options, &verilog_line_map));
+  XLS_ASSIGN_OR_RETURN(
+      std::string verilog,
+      GenerateVerilog(context.top_block(), options, &verilog_line_map));
 
-  return ModuleGeneratorResult{verilog, verilog_line_map,
-                               unit.signature.value()};
+  XLS_ASSIGN_OR_RETURN(
+      ModuleSignature signature,
+      ModuleSignature::FromProto(*context.top_block()->GetSignature()));
+
+  XlsMetricsProto metrics;
+  XLS_ASSIGN_OR_RETURN(
+      *metrics.mutable_block_metrics(),
+      GenerateBlockMetrics(context.top_block(), /*delay_estimator=*/nullptr));
+
+  // TODO: google/xls#1323 - add all block signatures to ModuleGeneratorResult,
+  // not just top.
+  return CodegenResult{.verilog_text = verilog,
+                       .verilog_line_map = verilog_line_map,
+                       .signature = signature,
+                       .block_metrics = metrics,
+                       .pass_pipeline_metrics = results.ToProto()};
 }
 
 }  // namespace verilog

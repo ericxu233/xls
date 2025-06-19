@@ -36,7 +36,6 @@ PARAMS_HDRS = [
     "src/ackermannization/ackermannization_params.hpp",
     "src/math/realclosure/rcf_params.hpp",
     "src/math/polynomial/algebraic_params.hpp",
-    "src/tactic/sls/sls_params.hpp",
     "src/tactic/smtlogics/qfufbv_tactic_params.hpp",
     "src/params/poly_rewriter_params.hpp",
     "src/params/array_rewriter_params.hpp",
@@ -50,12 +49,13 @@ PARAMS_HDRS = [
     "src/params/solver_params.hpp",
     "src/params/fpa2bv_rewriter_params.hpp",
     "src/params/bool_rewriter_params.hpp",
+    "src/params/sat_params.hpp",
+    "src/params/sls_params.hpp",
     "src/solver/combined_solver_params.hpp",
     "src/solver/parallel_params.hpp",
     "src/opt/opt_params.hpp",
     "src/parsers/util/parser_params.hpp",
     "src/muz/base/fp_params.hpp",
-    "src/sat/sat_params.hpp",
     "src/sat/sat_asymm_branch_params.hpp",
     "src/sat/sat_simplifier_params.hpp",
     "src/sat/sat_scc_params.hpp",
@@ -88,10 +88,12 @@ def gen_srcs():
         outs = MK_MAKE_SRCS + MK_MAKE_HDRS,
         # We can't use $(location) here, since the bundled script internally
         # makes assumptions about where files are located.
-        cmd = "cd external/z3; " +
-              "python scripts/mk_make.py; " +
+        cmd = "python3=`realpath $(PYTHON3)`; " +
+              "cd external/z3; " +
+              "$$python3 scripts/mk_make.py; " +
               "cd ../..;" +
               copy_cmds,
+        toolchains = ["@rules_python//python:current_py_toolchain"],
     )
 
     for params_hdr in PARAMS_HDRS:
@@ -101,7 +103,8 @@ def gen_srcs():
             srcs = [src_file],
             tools = ["scripts/pyg2hpp.py"],
             outs = [params_hdr],
-            cmd = "python $(location scripts/pyg2hpp.py) $< $$(dirname $@)",
+            cmd = "$(PYTHON3) $(location scripts/pyg2hpp.py) $< $$(dirname $@)",
+            toolchains = ["@rules_python//python:current_py_toolchain"],
         )
 
     for db_hdr in DB_HDRS:
@@ -111,5 +114,6 @@ def gen_srcs():
             srcs = [src],
             tools = ["scripts/mk_pat_db.py"],
             outs = [db_hdr],
-            cmd = "python $(location scripts/mk_pat_db.py) $< $@",
+            cmd = "$(PYTHON3) $(location scripts/mk_pat_db.py) $< $@",
+            toolchains = ["@rules_python//python:current_py_toolchain"],
         )

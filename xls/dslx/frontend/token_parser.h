@@ -16,23 +16,29 @@
 #define XLS_DSLX_FRONTEND_TOKEN_PARSER_H_
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/log/die_if_null.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/frontend/scanner.h"
+#include "xls/dslx/frontend/token.h"
 
 namespace xls::dslx {
 
 class TokenParser {
  public:
   explicit TokenParser(Scanner* scanner)
-      : scanner_(XLS_DIE_IF_NULL(scanner)), index_(0) {}
+      : scanner_(ABSL_DIE_IF_NULL(scanner)), index_(0) {}
 
  protected:
   // Currently just a plain integer, representing the index into the token
@@ -53,7 +59,7 @@ class TokenParser {
   // position the token stream.
   Pos GetPos() const {
     if (index_ < tokens_.size()) {
-      return tokens_[index_].span().start();
+      return tokens_[index_]->span().start();
     }
     return scanner_->GetPos();
   }
@@ -81,18 +87,6 @@ class TokenParser {
     return std::nullopt;
   }
 
-  absl::StatusOr<std::optional<Token>> TryPopKeyword(Keyword target,
-                                                      Pos* pos = nullptr) {
-    XLS_ASSIGN_OR_RETURN(const Token* peek, PeekToken());
-    if (peek->IsKeyword(target)) {
-      if (pos != nullptr) {
-        *pos = peek->span().limit();
-      }
-      return PopTokenOrDie();
-    }
-    return std::nullopt;
-  }
-
   absl::StatusOr<bool> TryDropToken(TokenKind target, Pos* pos = nullptr) {
     XLS_ASSIGN_OR_RETURN(const Token* peek, PeekToken());
     if (peek->kind() == target) {
@@ -103,12 +97,6 @@ class TokenParser {
       return true;
     }
     return false;
-  }
-
-  absl::StatusOr<bool> TryDropIdentifierToken(std::string_view target) {
-    XLS_ASSIGN_OR_RETURN(std::optional<Token> maybe_tok,
-                         TryPopIdentifierToken(target));
-    return maybe_tok != std::nullopt;
   }
 
   absl::StatusOr<bool> TryDropKeyword(Keyword target, Pos* pos = nullptr) {
@@ -132,9 +120,9 @@ class TokenParser {
   absl::StatusOr<const Token*> PeekToken() {
     if (index_ >= tokens_.size()) {
       XLS_ASSIGN_OR_RETURN(Token token, scanner_->Pop());
-      tokens_.push_back(token);
+      tokens_.push_back(std::make_unique<Token>(std::move(token)));
     }
-    return &tokens_[index_];
+    return tokens_[index_].get();
   }
 
   // Returns a token that has been popped destructively from the token stream.
@@ -142,27 +130,28 @@ class TokenParser {
     if (index_ >= tokens_.size()) {
       XLS_RETURN_IF_ERROR(PeekToken().status());
     }
-    Token token = tokens_[index_];
+    Token token = *tokens_[index_];
     index_ += 1;
     return token;
   }
 
-  absl::StatusOr<std::string> PopIdentifierOrError() {
+  absl::StatusOr<std::string> PopIdentifierOrError(Span* span_out = nullptr) {
     XLS_ASSIGN_OR_RETURN(Token tok, PopTokenOrError(TokenKind::kIdentifier));
+    if (span_out != nullptr) {
+      *span_out = tok.span();
+    }
     return *tok.GetValue();
   }
 
   // For use only when the caller knows there is lookahead present (in which
   // case we don't need to check for errors in potentially scanning the next
   // token).
-  Token PopTokenOrDie() {
-    return PopToken().value();
-  }
+  Token PopTokenOrDie() { return PopToken().value(); }
 
   // Wraps PopToken() to signify popping a token without needing the value.
   absl::Status DropToken() { return PopToken().status(); }
 
-  void DropTokenOrDie() { XLS_CHECK_OK(DropToken()); }
+  void DropTokenOrDie() { CHECK_OK(DropToken()); }
 
   absl::StatusOr<bool> PeekTokenIs(TokenKind target);
   absl::StatusOr<bool> PeekTokenIs(Keyword target);
@@ -194,30 +183,18 @@ class TokenParser {
 
   absl::Status DropKeywordOrError(Keyword target, Pos* limit_pos = nullptr);
 
-  // Returns a string if present at the head of the token string. This will
-  // match stream contents of "abcd....xyz" - including the quotation marks The
-  // quotation marks will not be present in the returned string.
-  //
-  // When an open quotation mark is seen, characters will be consumed until an
-  // unescaped quotation mark is seen. In other words, ..." will terminate the
-  // string, but ...\" will not.
-  //
-  // Optional "span" is filled with the span the string occupies, exlcuding the
-  // surrounding quotes.
-  //
-  // TODO(leary): 2023-08-19 Strings are tokens just like any other -- this
-  // routine should implicitly be part of the sequence given by
-  // Scanner::PopAll() yielding a string token instead of needing to be
-  // explicitly called on TokenParser via some known parsin context.
-  absl::StatusOr<std::string> PopString(Span* span = nullptr);
-
   void DisableDoubleCAngle() { scanner_->DisableDoubleCAngle(); }
   void EnableDoubleCAngle() { scanner_->EnableDoubleCAngle(); }
+
+  FileTable& file_table() { return scanner_->file_table(); }
+  const Scanner& scanner() const { return *scanner_; }
 
  private:
   Scanner* scanner_;
   int64_t index_;
-  std::vector<Token> tokens_;
+  // A vector of std::unique_ptrs is used for pointer stability as pointers are
+  // handed out by PeekToken
+  std::vector<std::unique_ptr<Token>> tokens_;
 };
 
 }  // namespace xls::dslx

@@ -14,14 +14,15 @@
 """Tests that DSLX blocks in reference documentation are valid."""
 
 import dataclasses
+import difflib
 import re
 import subprocess as subp
 import sys
-from typing import List, Dict, Union
+from typing import Dict, List, Union
 
-from xls.common import runfiles
 from absl.testing import absltest
 from absl.testing import parameterized
+from xls.common import runfiles
 
 # Implementation note: from inspecting pymarkdown it appears that scraping for
 # DSL code blocks via this regex has the same power as using the Markdown parser
@@ -29,16 +30,27 @@ from absl.testing import parameterized
 _DSLX_RE = re.compile('^```dslx$(.*?)^```$', re.MULTILINE | re.DOTALL)
 
 _INTERP_PATH = runfiles.get_path('xls/dslx/interpreter_main')
+_FMT_PATH = runfiles.get_path('xls/dslx/dslx_fmt')
 
 _INPUT_FILES = [
+    'docs_src/dslx_ffi.md',
     'docs_src/dslx_reference.md',
-    'docs_src/tutorials/hello_xls.md',
+    'docs_src/dslx_std.md',
+    'docs_src/dslx_type_system.md',
+    'docs_src/floating_point.md',
+    'docs_src/tutorials/crc32.md',
     'docs_src/tutorials/float_to_int.md',
+    'docs_src/tutorials/hello_xls.md',
     'docs_src/tutorials/intro_to_parametrics.md',
+    'docs_src/tutorials/how_to_use_procs.md',
+    'docs_src/tutorials/what_is_a_proc.md',
+    'docs_src/tutorials/dataflow_and_time.md',
+    'docs_src/tutorials/prefix_scan.md',
 ]
 
 _INTERP_ATTR_RE = re.compile(
-    r'#\[interp_main_(?P<key>\S+) = "(?P<value>\S+)"\]')
+    r'#\[interp_main_(?P<key>\S+) = "(?P<value>\S+)"\]'
+)
 
 
 def get_examples() -> List[Dict[str, Union[int, str]]]:
@@ -50,7 +62,8 @@ def get_examples() -> List[Dict[str, Union[int, str]]]:
     for i, m in enumerate(_DSLX_RE.finditer(contents)):
       dslx_block = m.group(1)
       examples.append(
-          dict(testcase_name=f'dslx_block_{f}_{i}', i=i, dslx_block=dslx_block))
+          dict(testcase_name=f'dslx_block_{f}_{i}', i=i, dslx_block=dslx_block)
+      )
 
   return examples
 
@@ -84,26 +97,57 @@ class DocumentationTest(parameterized.TestCase):
 """
     example = strip_attributes(text)
     self.assertEqual(example.flags, ['--flag=stuff', '--other_flag=thing'])
-    self.assertEqual(example.dslx, """\
+    self.assertEqual(
+        example.dslx,
+        """\
 // Some comment
 
 
 // Another comment
 
-""")
+""",
+    )
 
   @parameterized.named_parameters(get_examples())
   def test_dslx_blocks(self, i: int, dslx_block: str) -> None:
     """Runs the given DSLX block as a DSLX test file."""
     example = strip_attributes(dslx_block)
     x_file = self.create_tempfile(
-        file_path=f'doctest_{i}.x', content=example.dslx)
+        file_path=f'doctest_{i}.x', content=example.dslx
+    )
     cmd = [_INTERP_PATH] + example.flags + [x_file.full_path]
     print('Running command:', subp.list2cmdline(cmd), file=sys.stderr)
     p = subp.run(cmd, check=False, stderr=subp.PIPE, encoding='utf-8')
     if p.returncode != 0:
       print('== DSLX block:')
       print(example.dslx)
+      print('== stderr:')
+      print(p.stderr)
+    self.assertEqual(p.returncode, 0)
+
+  @parameterized.named_parameters(get_examples())
+  def test_dslx_blocks_fmt(self, i: int, dslx_block: str) -> None:
+    """Checks a DSLX block is canonically formatted."""
+    example = strip_attributes(dslx_block)
+    input_contents = example.dslx.lstrip()
+    x_file = self.create_tempfile(
+        file_path=f'doctest_fmt_{i}.x', content=input_contents
+    )
+    cmd = [_FMT_PATH, '--error_on_changes'] + example.flags + [x_file.full_path]
+    print('Running command:', subp.list2cmdline(cmd), file=sys.stderr)
+    p = subp.run(
+        cmd, check=False, stdout=subp.PIPE, stderr=subp.PIPE, encoding='utf-8'
+    )
+    if p.returncode != 0:
+      print('== diff:')
+      diff = difflib.unified_diff(
+          input_contents.splitlines(), p.stdout.splitlines()
+      )
+      print('\n'.join(diff))
+      print('== DSLX block:')
+      print(input_contents)
+      print('== stdout:')
+      print(p.stdout)
       print('== stderr:')
       print(p.stderr)
     self.assertEqual(p.returncode, 0)

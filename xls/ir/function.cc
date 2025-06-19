@@ -15,49 +15,73 @@
 #include "xls/ir/function.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
+#include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/change_listener.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
 #include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/ir/package.h"
+#include "xls/ir/topo_sort.h"
 #include "xls/ir/type.h"
 
 namespace xls {
+
+absl::Status Function::set_return_value(Node* n) {
+  XLS_RET_CHECK_EQ(n->function_base(), this) << absl::StreamFormat(
+      "Return value node %s is not in this function %s (is in function %s)",
+      n->GetName(), name(), n->function_base()->name());
+  Node* old_return_value = return_value_;
+  return_value_ = n;
+  for (ChangeListener* listener : change_listeners_) {
+    listener->ReturnValueChanged(this, old_return_value);
+  }
+  return absl::OkStatus();
+}
 
 FunctionType* Function::GetType() {
   std::vector<Type*> arg_types;
   for (Param* param : params()) {
     arg_types.push_back(param->GetType());
   }
-  XLS_CHECK(return_value() != nullptr);
+  CHECK(return_value() != nullptr);
   return package_->GetFunctionType(arg_types, return_value()->GetType());
 }
-
 std::string Function::DumpIr() const {
+  return DumpIrWithAnnotations(
+      [](Node* n) -> std::optional<std::string> { return std::nullopt; });
+}
+
+std::string Function::DumpIrWithAnnotations(
+    const std::function<std::optional<std::string>(Node*)>& annotate) const {
   std::string res;
 
   absl::StrAppend(&res, "fn " + name() + "(");
-
-  std::vector<std::string> param_strings;
-  param_strings.reserve(params_.size());
-  for (Param* param : params_) {
-    param_strings.push_back(
-        absl::StrFormat("%s: %s", param->name(), param->GetType()->ToString()));
-  }
-  absl::StrAppend(&res, absl::StrJoin(param_strings, ", "));
+  absl::StrAppend(
+      &res,
+      absl::StrJoin(params_, ", ", [&](std::string* s, Param* const param) {
+        std::optional<std::string> annotation = annotate(param);
+        absl::StrAppendFormat(
+            s, "%s: %s id=%d%s", param->name(), param->GetType()->ToString(),
+            param->id(),
+            annotation ? absl::StrCat(" (", *annotation, ")") : "");
+      }));
   absl::StrAppend(&res, ") -> ");
 
   if (return_value() != nullptr) {
@@ -67,16 +91,16 @@ std::string Function::DumpIr() const {
 
   for (Node* node : TopoSort(const_cast<Function*>(this))) {
     if (node->op() == Op::kParam && node == return_value()) {
-      absl::StrAppendFormat(&res, "  ret %s: %s = param(name=%s)\n",
-                            node->GetName(), node->GetType()->ToString(),
-                            node->As<Param>()->name());
+      absl::StrAppendFormat(&res, "  ret %s\n", node->ToString());
       continue;
     }
     if (node->op() == Op::kParam) {
       continue;  // Already accounted for in the signature.
     }
-    absl::StrAppend(&res, "  ", node == return_value() ? "ret " : "",
-                    node->ToString(), "\n");
+    std::optional<std::string> annotation = annotate(node);
+    absl::StrAppend(
+        &res, "  ", node == return_value() ? "ret " : "", node->ToString(),
+        annotation ? absl::StrCat(" (", *annotation, ")") : "", "\n");
   }
 
   absl::StrAppend(&res, "}\n");
@@ -97,9 +121,8 @@ absl::StatusOr<Function*> Function::Clone(
 
   // Clone parameters over first to maintain order.
   for (Param* param : (const_cast<Function*>(this))->params()) {
-    XLS_ASSIGN_OR_RETURN(
-            original_to_clone[param],
-            param->CloneInNewFunction({}, cloned_function));
+    XLS_ASSIGN_OR_RETURN(original_to_clone[param],
+                         param->CloneInNewFunction({}, cloned_function));
   }
   for (Node* node : TopoSort(const_cast<Function*>(this))) {
     if (node->Is<Param>()) {  // Params were already copied.
@@ -175,10 +198,10 @@ static bool IsEqualRecurse(
   }
 
   if (!node->IsDefinitelyEqualTo(other_node)) {
-    XLS_VLOG(2) << absl::StrFormat("Function %s != %s: node %s != %s",
-                                   node->function_base()->name(),
-                                   other_node->function_base()->name(),
-                                   node->GetName(), other_node->GetName());
+    VLOG(2) << absl::StrFormat("Function %s != %s: node %s != %s",
+                               node->function_base()->name(),
+                               other_node->function_base()->name(),
+                               node->GetName(), other_node->GetName());
     return false;
   }
 
@@ -194,14 +217,14 @@ static bool IsEqualRecurse(
 
 bool Function::IsDefinitelyEqualTo(const Function* other) const {
   if (this == other) {
-    XLS_VLOG(2) << absl::StrFormat("Function %s == %s: same pointer", name(),
-                                   other->name());
+    VLOG(2) << absl::StrFormat("Function %s == %s: same pointer", name(),
+                               other->name());
     return true;
   }
 
   // Must have the types of parameters in the same order.
   if (params().size() != other->params().size()) {
-    XLS_VLOG(2) << absl::StrFormat(
+    VLOG(2) << absl::StrFormat(
         "Function %s != %s: different number of parameters (%d vs %d)", name(),
         other->name(), params().size(), other->params().size());
     return false;
@@ -212,7 +235,7 @@ bool Function::IsDefinitelyEqualTo(const Function* other) const {
     // All we care about is the type (not the name) of the parameter so don't
     // use Param::IsDefinitelyEqualTo.
     if (!param(i)->GetType()->IsEqualTo(other->param(i)->GetType())) {
-      XLS_VLOG(2) << absl::StrFormat(
+      VLOG(2) << absl::StrFormat(
           "Function %s != %s: type of parameter %d not the same (%s vs %s)",
           name(), other->name(), i, param(i)->GetType()->ToString(),
           other->param(i)->GetType()->ToString());
@@ -223,8 +246,10 @@ bool Function::IsDefinitelyEqualTo(const Function* other) const {
 
   bool result =
       IsEqualRecurse(return_value(), other->return_value(), &matched_pairs);
-  XLS_VLOG_IF(2, result) << absl::StrFormat("Function %s is equal to %s",
-                                            name(), other->name());
+  if (result) {
+    VLOG(2) << absl::StrFormat("Function %s is equal to %s", name(),
+                               other->name());
+  }
   return result;
 }
 

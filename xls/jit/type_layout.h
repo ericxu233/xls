@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
 #include "xls/ir/package.h"
@@ -88,7 +89,7 @@ class TypeLayout {
   explicit TypeLayout(Type* type, int64_t size,
                       absl::Span<const ElementLayout> elements)
       : type_(type), size_(size), elements_(elements.begin(), elements.end()) {
-    XLS_CHECK_EQ(elements.size(), type->leaf_count());
+    CHECK_EQ(elements.size(), type->leaf_count());
   }
 
   // Converts TypeLayout objects to/from TypeLayoutProtos.
@@ -103,6 +104,10 @@ class TypeLayout {
   // Returns a Value object representing the data of XLS type `type()` stored in
   // `buffer`.
   Value NativeLayoutToValue(const uint8_t* buffer) const;
+
+  // Get a string which is a bitmask of which bits contribute to the native
+  // representations value.
+  std::vector<uint8_t> mask() const;
 
   absl::Span<const ElementLayout> elements() const { return elements_; }
 

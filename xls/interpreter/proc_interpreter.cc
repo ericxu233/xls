@@ -14,42 +14,135 @@
 
 #include "xls/interpreter/proc_interpreter.h"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "absl/types/span.h"
+#include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/interpreter/channel_queue.h"
 #include "xls/interpreter/ir_interpreter.h"
-#include "xls/ir/node_iterator.h"
-#include "xls/ir/value_helpers.h"
+#include "xls/interpreter/observer.h"
+#include "xls/interpreter/proc_evaluator.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/events.h"
+#include "xls/ir/node.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/proc.h"
+#include "xls/ir/proc_elaboration.h"
+#include "xls/ir/state_element.h"
+#include "xls/ir/topo_sort.h"
+#include "xls/ir/value.h"
+#include "xls/ir/value_utils.h"
 
 namespace xls {
 namespace {
 
+// A continuation used by the ProcInterpreter.
+class ProcInterpreterContinuation : public ProcContinuation {
+ public:
+  // Construct a new continuation. Execution the proc begins with the state set
+  // to its initial values with no proc nodes yet executed.
+  explicit ProcInterpreterContinuation(ProcInstance* proc_instance)
+      : ProcContinuation(proc_instance), node_index_(0) {
+    state_.reserve(proc()->GetStateElementCount());
+    for (StateElement* state_element : proc()->StateElements()) {
+      state_.push_back(state_element->initial_value());
+    }
+  }
+
+  ~ProcInterpreterContinuation() override = default;
+
+  std::vector<Value> GetState() const override { return state_; }
+
+  absl::Status SetState(std::vector<Value> v) override {
+    XLS_RETURN_IF_ERROR(CheckConformsToStateType(v));
+    state_ = std::move(v);
+    return absl::OkStatus();
+  }
+
+  const InterpreterEvents& GetEvents() const override { return events_; }
+  InterpreterEvents& GetEvents() override { return events_; }
+  void ClearEvents() override { events_.Clear(); }
+  bool AtStartOfTick() const override { return node_index_ == 0; }
+
+  const absl::flat_hash_map<StateElement*, std::vector<Next*>>&
+  GetActiveNextValues() const {
+    return active_next_values_;
+  }
+  absl::flat_hash_map<StateElement*, std::vector<Next*>>&
+  GetActiveNextValues() {
+    return active_next_values_;
+  }
+  void ClearActiveNextValues() { active_next_values_.clear(); }
+
+  // Resets the continuation so it will start executing at the beginning of the
+  // proc with the given state values.
+  void NextTick(std::vector<Value>&& next_state) {
+    node_index_ = 0;
+    state_ = next_state;
+    node_values_.clear();
+  }
+
+  // Gets/sets the index of the node to be executed next. This index refers to a
+  // place in a topological sort of the proc nodes held by the ProcInterpreter.
+  int64_t GetNodeExecutionIndex() const { return node_index_; }
+  void SetNodeExecutionIndex(int64_t index) { node_index_ = index; }
+
+  // Returns the map of node values computed in the tick so far.
+  absl::flat_hash_map<Node*, Value>& GetNodeValues() { return node_values_; }
+  const absl::flat_hash_map<Node*, Value>& GetNodeValues() const {
+    return node_values_;
+  }
+
+ private:
+  int64_t node_index_;
+  std::vector<Value> state_;
+
+  InterpreterEvents events_;
+  absl::flat_hash_map<Node*, Value> node_values_;
+  absl::flat_hash_map<StateElement*, std::vector<Next*>> active_next_values_;
+};
+
 // A visitor for interpreting procs. Adds handlers for send and receive
-// communcate via ChannelQueues.
+// communicate via ChannelQueues.
 class ProcIrInterpreter : public IrInterpreter {
  public:
   // Constructor args:
+  //   proc_instance: the instance of the proc which is being interpreted.
   //   state: is the value to use for the proc state in the tick being
   //     interpreted.
   //   node_values: map from Node to Value for already computed values in this
   //     tick of the proc. Used for continuations.
   //   events: events object to record events in (e.g, traces).
   //   queue_manager: manager for channel queues.
-  ProcIrInterpreter(absl::Span<const Value> state,
+  ProcIrInterpreter(ProcInstance* proc_instance, absl::Span<const Value> state,
                     absl::flat_hash_map<Node*, Value>* node_values,
                     InterpreterEvents* events,
-                    ChannelQueueManager* queue_manager)
-      : IrInterpreter(node_values, events),
+                    ChannelQueueManager* queue_manager,
+                    absl::flat_hash_map<StateElement*, std::vector<Next*>>*
+                        active_next_values,
+                    std::optional<EvaluationObserver*> observer)
+      : IrInterpreter(node_values, events, observer),
+        proc_instance_(proc_instance),
         state_(state.begin(), state.end()),
-        queue_manager_(queue_manager) {}
+        queue_manager_(queue_manager),
+        active_next_values_(active_next_values) {}
 
   absl::Status HandleReceive(Receive* receive) override {
     XLS_ASSIGN_OR_RETURN(ChannelQueue * queue,
-                         queue_manager_->GetQueueById(receive->channel_id()));
+                         GetChannelQueue(receive->channel_name()));
 
     if (receive->predicate().has_value()) {
       const Bits& pred = ResolveAsBits(receive->predicate().value());
@@ -65,7 +158,7 @@ class ProcIrInterpreter : public IrInterpreter {
     if (!value.has_value()) {
       if (receive->is_blocking()) {
         // Record the channel this receive instruction is blocked on and exit.
-        blocked_channel_ = queue->channel();
+        blocked_channel_instance_ = queue->channel_instance();
         return absl::OkStatus();
       }
       // A non-blocking receive returns a zero data value with a zero valid bit
@@ -83,7 +176,7 @@ class ProcIrInterpreter : public IrInterpreter {
 
   absl::Status HandleSend(Send* send) override {
     XLS_ASSIGN_OR_RETURN(ChannelQueue * queue,
-                         queue_manager_->GetQueueById(send->channel_id()));
+                         GetChannelQueue(send->channel_name()));
     if (send->predicate().has_value()) {
       const Bits& pred = ResolveAsBits(send->predicate().value());
       if (pred.IsZero()) {
@@ -91,7 +184,7 @@ class ProcIrInterpreter : public IrInterpreter {
       }
     }
     // Indicate that data is sent on this channel.
-    sent_channel_ = queue->channel();
+    sent_channel_instance_ = queue->channel_instance();
 
     XLS_RETURN_IF_ERROR(queue->Write(ResolveAsValue(send->data())));
 
@@ -99,39 +192,69 @@ class ProcIrInterpreter : public IrInterpreter {
     return SetValueResult(send, Value::Token());
   }
 
-  absl::Status HandleParam(Param* param) override {
-    XLS_ASSIGN_OR_RETURN(int64_t index,
-                         param->function_base()->GetParamIndex(param));
-    if (index == 0) {
-      return SetValueResult(param, Value::Token());
+  absl::Status HandleStateRead(StateRead* state_read) override {
+    XLS_ASSIGN_OR_RETURN(
+        int64_t index,
+        state_read->function_base()->AsProcOrDie()->GetStateElementIndex(
+            state_read->state_element()));
+    return SetValueResult(state_read, state_[index]);
+  }
+
+  absl::Status HandleNext(Next* next) override {
+    if (next->predicate().has_value()) {
+      Value predicate = ResolveAsValue(*next->predicate());
+      XLS_RET_CHECK(predicate.IsBits());
+      XLS_RET_CHECK_EQ(predicate.bits().bit_count(), 1);
+      if (predicate.bits().IsZero()) {
+        // No change.
+        return SetValueResult(next, Value::Tuple({}));
+      }
     }
-    // Params from 1 on are state.
-    return SetValueResult(param, state_[index - 1]);
+    (*active_next_values_)[next->state_read()->As<StateRead>()->state_element()]
+        .push_back(next);
+    return SetValueResult(next, Value::Tuple({}));
   }
 
   // Executes a single node and return whether the node is blocked on a channel
   // (for receive nodes) or whether data was sent on a channel (for send nodes).
   struct NodeResult {
-    std::optional<Channel*> blocked_channel;
-    std::optional<Channel*> sent_channel;
+    std::optional<ChannelInstance*> blocked_channel_instance;
+    std::optional<ChannelInstance*> sent_channel_instance;
   };
   absl::StatusOr<NodeResult> ExecuteNode(Node* node) {
     // Send/Receive handlers might set these values so clear them before hand.
-    blocked_channel_ = std::nullopt;
-    sent_channel_ = std::nullopt;
+    blocked_channel_instance_ = std::nullopt;
+    sent_channel_instance_ = std::nullopt;
     XLS_RETURN_IF_ERROR(node->VisitSingleNode(this));
-    return NodeResult{.blocked_channel = blocked_channel_,
-                      .sent_channel = sent_channel_};
+    return NodeResult{.blocked_channel_instance = blocked_channel_instance_,
+                      .sent_channel_instance = sent_channel_instance_};
   }
 
  private:
+  // Get the channel queue for the channel or channel reference of the given
+  // name.
+  absl::StatusOr<ChannelQueue*> GetChannelQueue(std::string_view name) {
+    if (proc_instance_->path().has_value()) {
+      // New-style proc-scoped channel.
+      XLS_ASSIGN_OR_RETURN(ChannelInstance * channel_instance,
+                           queue_manager_->elaboration().GetChannelInstance(
+                               name, *proc_instance_->path()));
+      return &queue_manager_->GetQueue(channel_instance);
+    }
+    // Old-style global channel.
+    return queue_manager_->GetQueueByName(name);
+  }
+
+  ProcInstance* proc_instance_;
   std::vector<Value> state_;
   ChannelQueueManager* queue_manager_;
 
+  absl::flat_hash_map<StateElement*, std::vector<Next*>>* active_next_values_;
+
   // Ephemeral values set by the send/receive handlers indicating the channel
   // execution is blocked on or the channel on which data was sent.
-  std::optional<Channel*> blocked_channel_;
-  std::optional<Channel*> sent_channel_;
+  std::optional<ChannelInstance*> blocked_channel_instance_;
+  std::optional<ChannelInstance*> sent_channel_instance_;
 };
 
 }  // namespace
@@ -139,10 +262,11 @@ class ProcIrInterpreter : public IrInterpreter {
 ProcInterpreter::ProcInterpreter(Proc* proc, ChannelQueueManager* queue_manager)
     : ProcEvaluator(proc),
       queue_manager_(queue_manager),
-      execution_order_(TopoSort(proc).AsVector()) {}
+      execution_order_(TopoSort(proc)) {}
 
-std::unique_ptr<ProcContinuation> ProcInterpreter::NewContinuation() const {
-  return std::make_unique<ProcInterpreterContinuation>(proc());
+std::unique_ptr<ProcContinuation> ProcInterpreter::NewContinuation(
+    ProcInstance* proc_instance) const {
+  return std::make_unique<ProcInterpreterContinuation>(proc_instance);
 }
 
 absl::StatusOr<TickResult> ProcInterpreter::Tick(
@@ -151,10 +275,11 @@ absl::StatusOr<TickResult> ProcInterpreter::Tick(
       dynamic_cast<ProcInterpreterContinuation*>(&continuation);
   XLS_RET_CHECK_NE(cont, nullptr) << "ProcInterpreter requires a continuation "
                                      "of type ProcInterpreterContinuation";
-  std::vector<Channel*> sent_channels;
 
-  ProcIrInterpreter ir_interpreter(cont->GetState(), &cont->GetNodeValues(),
-                                   &cont->GetEvents(), queue_manager_);
+  ProcIrInterpreter ir_interpreter(cont->proc_instance(), cont->GetState(),
+                                   &cont->GetNodeValues(), &cont->GetEvents(),
+                                   queue_manager_, &cont->GetActiveNextValues(),
+                                   continuation.GetObserver());
 
   // Resume execution at the node indicated in the continuation
   // (NodeExecutionIndex).
@@ -163,7 +288,7 @@ absl::StatusOr<TickResult> ProcInterpreter::Tick(
     Node* node = execution_order_[i];
     XLS_ASSIGN_OR_RETURN(ProcIrInterpreter::NodeResult result,
                          ir_interpreter.ExecuteNode(node));
-    if (result.sent_channel.has_value()) {
+    if (result.sent_channel_instance.has_value()) {
       // Early exit: proc sent on a channel. Execution should resume _after_ the
       // send.
       cont->SetNodeExecutionIndex(i + 1);
@@ -172,10 +297,10 @@ absl::StatusOr<TickResult> ProcInterpreter::Tick(
       XLS_RETURN_IF_ERROR(InterpreterEventsToStatus(cont->GetEvents()));
       return TickResult{
           .execution_state = TickExecutionState::kSentOnChannel,
-          .channel = result.sent_channel.value(),
+          .channel_instance = result.sent_channel_instance,
           .progress_made = cont->GetNodeExecutionIndex() != starting_index};
     }
-    if (result.blocked_channel.has_value()) {
+    if (result.blocked_channel_instance.has_value()) {
       // Early exit: proc is blocked at a receive node waiting for data on a
       // channel. Execution should resume at the send.
       cont->SetNodeExecutionIndex(i);
@@ -184,18 +309,30 @@ absl::StatusOr<TickResult> ProcInterpreter::Tick(
       XLS_RETURN_IF_ERROR(InterpreterEventsToStatus(cont->GetEvents()));
       return TickResult{
           .execution_state = TickExecutionState::kBlockedOnReceive,
-          .channel = result.blocked_channel.value(),
+          .channel_instance = result.blocked_channel_instance,
           .progress_made = cont->GetNodeExecutionIndex() != starting_index};
     }
   }
 
-  // Proc completed execution of the Tick. Set the next proc state in the
-  // continuation.
-  std::vector<Value> next_state;
-  next_state.reserve(proc()->GetStateElementCount());
-  for (Node* next_node : proc()->NextState()) {
-    next_state.push_back(ir_interpreter.ResolveAsValue(next_node));
+  // Proc completed execution of the Tick. Let the active next_values update the
+  // proc state, then pass it to the continuation.
+  std::vector<Value> next_state = cont->GetState();
+  for (const auto& [state_element, next_values] : cont->GetActiveNextValues()) {
+    if (next_values.size() > 1) {
+      return absl::AlreadyExistsError(absl::StrFormat(
+          "Multiple active next values for state element %d (\"%s\") in a "
+          "single activation: %s",
+          *proc()->GetStateElementIndex(state_element), state_element->name(),
+          absl::StrJoin(next_values, ", ", [](std::string* out, Next* next) {
+            absl::StrAppend(out, next->GetName());
+          })));
+    }
+
+    XLS_ASSIGN_OR_RETURN(int64_t index,
+                         proc()->GetStateElementIndex(state_element));
+    next_state[index] = ir_interpreter.ResolveAsValue(next_values[0]->value());
   }
+  cont->ClearActiveNextValues();
   cont->NextTick(std::move(next_state));
 
   // Raise a status error if interpreter events indicate failure such as a
@@ -203,7 +340,7 @@ absl::StatusOr<TickResult> ProcInterpreter::Tick(
   XLS_RETURN_IF_ERROR(InterpreterEventsToStatus(cont->GetEvents()));
 
   return TickResult{.execution_state = TickExecutionState::kCompleted,
-                    .channel = std::nullopt,
+                    .channel_instance = std::nullopt,
                     .progress_made = true};
 }
 

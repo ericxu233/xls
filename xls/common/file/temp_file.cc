@@ -15,17 +15,20 @@
 #include "xls/common/file/temp_file.h"
 
 #include <fcntl.h>
+#include <stdlib.h>  // NOLINT (needed for mkostemps())
 #include <unistd.h>
 
-#include <cstdlib>
+#include <cerrno>
+#include <filesystem>  // NOLINT
 #include <string>
 #include <string_view>
-#include <system_error>
+#include <system_error>  // NOLINT
 #include <utility>
 
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/strerror.h"
 
@@ -44,7 +47,6 @@ absl::Status WriteContent(int fd, std::string_view content) {
       }
       return absl::UnavailableError(absl::StrCat(
           "Failed to write content to temporary file: ", Strerror(errno)));
-
     }
     bytes_written += bytes_written_this_time;
   }
@@ -122,7 +124,7 @@ TempFile::TempFile(const std::filesystem::path& path) : path_(path) {}
 void TempFile::Cleanup() {
   if (!path_.empty()) {
     if (unlink(path_.c_str()) != 0) {
-      XLS_LOG(ERROR) << "Failed to delete temporary file " << path_;
+      LOG(ERROR) << "Failed to delete temporary file " << path_;
     }
   }
 }

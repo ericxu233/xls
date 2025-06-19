@@ -15,15 +15,16 @@
 #include "xls/common/subprocess.h"
 
 #include <fcntl.h>
-#include <poll.h>
+#include <signal.h>  // NOLINT
 #include <spawn.h>
+#include <stdlib.h>  // NOLINT for WIFEXITED, WEXITSTATUS; not in <cstdlib>
+#include <sys/poll.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
-#include <csignal>  // NOLINT(misc-include-cleaner)
-#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>  // NOLINT
@@ -35,6 +36,8 @@
 #include <vector>
 
 #include "absl/container/fixed_array.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -46,13 +49,12 @@
 #include "xls/common/file/file_descriptor.h"
 #include "xls/common/file/get_runfile_path.h"
 #include "xls/common/logging/log_lines.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/strerror.h"
 #include "xls/common/thread.h"
 
 #if defined(__APPLE__)
-extern char **environ;
+extern char** environ;
 #endif
 
 namespace xls {
@@ -70,7 +72,7 @@ struct Pipe {
   static absl::StatusOr<Pipe> Open() {
     int descriptors[2];
     if (pipe(descriptors) != 0 ||
-        fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) != 0||
+        fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) != 0 ||
         fcntl(descriptors[1], F_SETFD, FD_CLOEXEC) != 0) {
       return absl::InternalError(
           absl::StrCat("Failed to initialize pipe:", Strerror(errno)));
@@ -131,7 +133,8 @@ absl::StatusOr<posix_spawn_file_actions_t> CreateChildFileActions(
 absl::StatusOr<pid_t> ExecInChildProcess(
     const std::vector<const char*>& argv_pointers,
     const std::optional<std::filesystem::path>& cwd, Pipe& stdout_pipe,
-    Pipe& stderr_pipe) {
+    Pipe& stderr_pipe,
+    absl::Span<const EnvironmentVariable> environment_variables) {
   // We previously used fork() & exec() here, but that's prone to many subtle
   // problems (e.g., allocating between fork() and exec() can cause arbitrary
   // problems)... and it's also slow. vfork() might have made the performance
@@ -155,10 +158,33 @@ absl::StatusOr<pid_t> ExecInChildProcess(
   XLS_ASSIGN_OR_RETURN(posix_spawn_file_actions_t file_actions,
                        CreateChildFileActions(stdout_pipe, stderr_pipe));
 
+  // posix_spawnp takes a null-terminate array of char* for environment
+  // variables. Each element has the form "NAME=VALUE".
+  std::vector<std::string> env_vars;
+  std::vector<char*> env_var_ptrs;
+  char** child_env;
+  if (environment_variables.empty()) {
+    // No extra environment variables are specified. Use the existing
+    // environment.
+    child_env = environ;
+  } else {
+    // Append environment variables to the existing environment.
+    for (int i = 0; environ[i] != nullptr; ++i) {
+      env_vars.push_back(environ[i]);
+    }
+    for (const EnvironmentVariable& var : environment_variables) {
+      env_vars.push_back(absl::StrCat(var.name, "=", var.value));
+    }
+    for (const std::string& s : env_vars) {
+      env_var_ptrs.push_back(const_cast<char*>(s.data()));
+    }
+    env_var_ptrs.push_back(nullptr);
+    child_env = env_var_ptrs.data();
+  }
   pid_t pid;
   if (int err = posix_spawnp(
           &pid, subprocess_helper.c_str(), &file_actions, nullptr,
-          const_cast<char* const*>(helper_argv_pointers.data()), environ);
+          const_cast<char* const*>(helper_argv_pointers.data()), child_env);
       err != 0) {
     return absl::InternalError(
         absl::StrCat("Cannot spawn child process: ", Strerror(err)));
@@ -213,7 +239,7 @@ absl::Status ReadFileDescriptors(absl::Span<FileDescriptor*> fds,
       }
 
       // This should "never" happen. If it does, someone has e.g. closed our fd.
-      XLS_CHECK(!(poll_list[i].revents & POLLNVAL));
+      CHECK(!(poll_list[i].revents & POLLNVAL));
 
       // If poll_list[i].revents & POLLHUP, the remote side closed its
       // connection, but there may be data waiting to be read. read() will
@@ -243,7 +269,7 @@ absl::StatusOr<int> WaitForPid(pid_t pid) {
       continue;
     }
     return absl::InternalError(
-         absl::StrCat("waitpid failed: ", Strerror(errno)));
+        absl::StrCat("waitpid failed: ", Strerror(errno)));
   }
   return wait_status;
 }
@@ -253,13 +279,14 @@ absl::StatusOr<int> WaitForPid(pid_t pid) {
 absl::StatusOr<SubprocessResult> InvokeSubprocess(
     absl::Span<const std::string> argv,
     std::optional<std::filesystem::path> cwd,
-    std::optional<absl::Duration> optional_timeout) {
+    std::optional<absl::Duration> optional_timeout,
+    absl::Span<const EnvironmentVariable> environment_variables) {
   if (argv.empty()) {
     return absl::InvalidArgumentError("Cannot invoke empty argv list.");
   }
   std::string bin_name = std::filesystem::path(argv[0]).filename();
 
-  XLS_VLOG(1) << absl::StreamFormat(
+  VLOG(1) << absl::StreamFormat(
       "Running %s; argv: [ %s ], cwd: %s", bin_name, absl::StrJoin(argv, " "),
       cwd.has_value() ? cwd->string()
                       : std::filesystem::current_path().string());
@@ -274,8 +301,9 @@ absl::StatusOr<SubprocessResult> InvokeSubprocess(
   XLS_ASSIGN_OR_RETURN(auto stdout_pipe, Pipe::Open());
   XLS_ASSIGN_OR_RETURN(auto stderr_pipe, Pipe::Open());
 
-  XLS_ASSIGN_OR_RETURN(pid_t pid, ExecInChildProcess(argv_pointers, cwd,
-                                                     stdout_pipe, stderr_pipe));
+  XLS_ASSIGN_OR_RETURN(pid_t pid,
+                       ExecInChildProcess(argv_pointers, cwd, stdout_pipe,
+                                          stderr_pipe, environment_variables));
 
   // Order is important here. The optional<Thread> must appear after the mutex
   // because the thread's destructor calls Join() and because the thread has
@@ -297,12 +325,11 @@ absl::StatusOr<SubprocessResult> InvokeSubprocess(
         return *static_cast<bool*>(release_val);
       };
       if (!watchdog_mutex.AwaitWithTimeout(
-              absl::Condition(condition_lambda, &release_watchdog),
-              timeout)) {
+              absl::Condition(condition_lambda, &release_watchdog), timeout)) {
         // Timeout has lapsed, try to kill the subprocess.
         timeout_expired.store(true);
         if (kill(pid, SIGKILL) == 0) {
-          XLS_VLOG(1) << "Watchdog killed " << pid;
+          VLOG(1) << "Watchdog killed " << pid;
         }
       }
     };
@@ -314,7 +341,7 @@ absl::StatusOr<SubprocessResult> InvokeSubprocess(
   std::vector<std::string> output_strings;
   absl::Status read_status = ReadFileDescriptors(fds, output_strings);
   if (!read_status.ok()) {
-    XLS_VLOG(1) << "ReadFileDescriptors non-ok status: " << read_status;
+    VLOG(1) << "ReadFileDescriptors non-ok status: " << read_status;
   }
   const std::string& stdout_output = output_strings[0];
   const std::string& stderr_output = output_strings[1];
@@ -329,8 +356,8 @@ absl::StatusOr<SubprocessResult> InvokeSubprocess(
     release_watchdog = true;
   }
 
-  return SubprocessResult{.stdout = stdout_output,
-                          .stderr = stderr_output,
+  return SubprocessResult{.stdout_content = stdout_output,
+                          .stderr_content = stderr_output,
                           .exit_status = WEXITSTATUS(wait_status),
                           .normal_termination = WIFEXITED(wait_status),
                           .timeout_expired = timeout_expired.load()};
@@ -339,7 +366,7 @@ absl::StatusOr<SubprocessResult> InvokeSubprocess(
 absl::StatusOr<std::pair<std::string, std::string>> SubprocessResultToStrings(
     absl::StatusOr<SubprocessResult> result) {
   if (result.ok()) {
-    return std::make_pair(result->stdout, result->stderr);
+    return std::make_pair(result->stdout_content, result->stderr_content);
   }
   return result.status();
 }
@@ -354,13 +381,14 @@ absl::StatusOr<SubprocessResult> SubprocessErrorAsStatus(
   return absl::InternalError(absl::StrFormat(
       "Subprocess exit_code: %d normal_termination: %d stdout: %s stderr: %s",
       result_or_status->exit_status, result_or_status->normal_termination,
-      result_or_status->stdout, result_or_status->stderr));
+      result_or_status->stdout_content, result_or_status->stderr_content));
 }
 
 std::ostream& operator<<(std::ostream& os, const SubprocessResult& other) {
   os << "exit_status:" << other.exit_status
      << " normal_termination:" << other.normal_termination
-     << "\nstdout:" << other.stdout << "\nstderr:" << other.stderr << "\n";
+     << "\nstdout:" << other.stdout_content
+     << "\nstderr:" << other.stderr_content << "\n";
   return os;
 }
 

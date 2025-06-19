@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_NOC_EXPERIMENT_H_
-#define XLS_NOC_EXPERIMENT_H_
+#ifndef XLS_NOC_DRIVERS_EXPERIMENT_H_
+#define XLS_NOC_DRIVERS_EXPERIMENT_H_
 
+#include <cstdint>
 #include <functional>
 #include <limits>
-#include <queue>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,12 +25,14 @@
 
 #include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "xls/common/logging/logging.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/noc/config/network_config.pb.h"
-#include "xls/noc/simulation/common.h"
 #include "xls/noc/simulation/flit.h"
 #include "xls/noc/simulation/global_routing_table.h"
 #include "xls/noc/simulation/traffic_description.h"
@@ -226,13 +228,13 @@ class ExperimentRunner {
           DistributedRoutingTableBuilderForTrees()) const;
 
   ExperimentRunner& SetSimulationCycleCount(int64_t count) {
-    XLS_CHECK_GE(count, 0);
+    CHECK_GE(count, 0);
     total_simulation_cycle_count_ = count;
     return *this;
   }
 
   ExperimentRunner& SetCycleTimeInPs(int64_t ps) {
-    XLS_CHECK_GT(ps, 0);
+    CHECK_GT(ps, 0);
     cycle_time_in_ps_ = ps;
     return *this;
   }
@@ -394,4 +396,4 @@ Stats GetStats(absl::Span<const PacketInfo> packets);
 
 }  // namespace xls::noc
 
-#endif  // XLS_NOC_EXPERIMENT_H_
+#endif  // XLS_NOC_DRIVERS_EXPERIMENT_H_

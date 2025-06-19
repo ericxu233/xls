@@ -22,20 +22,19 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_replace.h"
-#include "absl/time/clock.h"
-#include "absl/time/time.h"
 #include "xls/common/file/named_pipe.h"
 #include "xls/common/file/temp_directory.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/thread.h"
 #include "xls/common/undeclared_outputs.h"
 #include "xls/ir/bits.h"
-#include "xls/ir/bits_ops.h"
+#include "xls/ir/bits_ops.h"  // IWYU pragma: keep for Node AbslStringify()
 #include "xls/ir/format_preference.h"
 #include "xls/ir/number_parser.h"
 #include "xls/simulation/verilog_test_base.h"
@@ -98,12 +97,9 @@ endmodule
 
 class TestbenchIoTest : public VerilogTestBase {
  public:
-  // The length of time in ms to delay starting the simulator.
-  static constexpr int64_t kSimulatorDelayMs = 1000;
-
   absl::StatusOr<std::pair<std::string, std::string>> RunSimulator(
       std::string_view verilog) {
-    XLS_VLOG(1) << "Starting simulator.";
+    VLOG(1) << "Starting simulator.";
     std::pair<std::string, std::string> stdout_stderr;
     return GetSimulator()->Run(verilog, GetFileType());
   }
@@ -131,20 +127,20 @@ TEST_P(TestbenchIoTest, SimpleInputOutput) {
 
   const int64_t kSampleCount = 10;
   Thread write_thread([&]() {
-    XLS_VLOG(1) << "Opening input pipe for writing.";
+    VLOG(1) << "Opening input pipe for writing.";
     FileLineWriter fw = input_pipe.OpenForWriting().value();
-    XLS_VLOG(1) << "Feeding input:";
+    VLOG(1) << "Feeding input:";
     for (int32_t i = 0; i < kSampleCount; ++i) {
-      XLS_VLOG(1) << absl::StreamFormat("  input: %x", i);
-      XLS_CHECK_OK(fw.WriteLine(absl::StrFormat("%x\n", i)));
+      VLOG(1) << absl::StreamFormat("  input: %x", i);
+      CHECK_OK(fw.WriteLine(absl::StrFormat("%x\n", i)));
     }
   });
 
   // Read all lines from the output named pipe and return as int32_t's.
   auto read_lines_and_convert = [&]() -> absl::StatusOr<std::vector<int32_t>> {
-    XLS_VLOG(1) << "Opening output pipe for reading.";
+    VLOG(1) << "Opening output pipe for reading.";
     XLS_ASSIGN_OR_RETURN(FileLineReader fr, output_pipe.OpenForReading());
-    XLS_VLOG(1) << "Reading output:";
+    VLOG(1) << "Reading output:";
     std::vector<int32_t> values;
     while (true) {
       XLS_ASSIGN_OR_RETURN(std::optional<std::string> line, fr.ReadLine());
@@ -152,11 +148,11 @@ TEST_P(TestbenchIoTest, SimpleInputOutput) {
         // EOF reached which means the writer has closed the pipe.
         break;
       }
-      XLS_VLOG(1) << absl::StrFormat("Read line `%s`", *line);
+      VLOG(1) << absl::StrFormat("Read line `%s`", *line);
       XLS_ASSIGN_OR_RETURN(
           Bits value, ParseUnsignedNumberWithoutPrefix(
                           *line, FormatPreference::kHex, /*bit_count=*/32));
-      XLS_VLOG(1) << absl::StreamFormat("Value: %v", value);
+      VLOG(1) << absl::StreamFormat("Value: %v", value);
       values.push_back(static_cast<int32_t>(value.ToUint64().value()));
     }
     return values;
@@ -164,15 +160,15 @@ TEST_P(TestbenchIoTest, SimpleInputOutput) {
 
   std::vector<int32_t> results;
   Thread read_thread([&]() {
-    absl::StatusOr<std::vector<int32_t>> values_or = read_lines_and_convert();
-    XLS_CHECK_OK(values_or.status());
-    results = std::move(values_or.value());
+    absl::StatusOr<std::vector<int32_t>> values = read_lines_and_convert();
+    CHECK_OK(values);
+    results = *std::move(values);
   });
 
   std::pair<std::string, std::string> stdout_stderr;
   XLS_ASSERT_OK_AND_ASSIGN(stdout_stderr, RunSimulator(verilog));
 
-  XLS_VLOG(1) << "Joining threads.";
+  VLOG(1) << "Joining threads.";
   read_thread.Join();
   write_thread.Join();
 
@@ -195,22 +191,22 @@ TEST_P(TestbenchIoTest, BadInput) {
       GenerateVerilogFile(input_pipe.path(), output_pipe.path());
 
   Thread write_thread([&]() {
-    XLS_VLOG(1) << "Opening input pipe for writing.";
+    VLOG(1) << "Opening input pipe for writing.";
     FileLineWriter fw = input_pipe.OpenForWriting().value();
-    XLS_VLOG(1) << "Writing input.";
-    XLS_CHECK_OK(fw.WriteLine("thisisnotahexnumber"));
+    VLOG(1) << "Writing input.";
+    CHECK_OK(fw.WriteLine("thisisnotahexnumber"));
   });
 
   Thread read_thread([&]() {
     // Open the pipe to unblock simulation.
-    XLS_VLOG(1) << "Opening output pipe for reading.";
+    VLOG(1) << "Opening output pipe for reading.";
     output_pipe.OpenForReading().value();
-    XLS_VLOG(1) << "read_thread done.";
+    VLOG(1) << "read_thread done.";
   });
 
   std::pair<std::string, std::string> stdout_stderr;
   XLS_ASSERT_OK_AND_ASSIGN(stdout_stderr, RunSimulator(verilog));
-  XLS_VLOG(1) << "Joining threads.";
+  VLOG(1) << "Joining threads.";
   read_thread.Join();
   write_thread.Join();
 
@@ -241,7 +237,7 @@ TEST_P(TestbenchIoTest, InvalidOutputFile) {
 
   // We need to open the input pipe to unblock the $fopen in the testbench.
   Thread write_thread(
-      [&]() { XLS_CHECK_OK(input_pipe.OpenForWriting().status()); });
+      [&]() { CHECK_OK(input_pipe.OpenForWriting().status()); });
 
   std::pair<std::string, std::string> stdout_stderr;
   XLS_ASSERT_OK_AND_ASSIGN(stdout_stderr, RunSimulator(verilog));

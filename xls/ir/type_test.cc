@@ -16,15 +16,17 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "xls/common/status/matchers.h"
-#include "xls/ir/function.h"
-#include "xls/ir/function_builder.h"
+#include "xls/ir/type_manager.h"
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
 
 TEST(TypeTest, TestVariousTypes) {
@@ -152,20 +154,90 @@ TEST(TypeTest, ArrayDimensionAndIndex) {
 
   EXPECT_THAT(GetIndexedElementType(&b32, 0), IsOkAndHolds(&b32));
   EXPECT_THAT(GetIndexedElementType(&b32, 1),
-              status_testing::StatusIs(
-                  absl::StatusCode::kInvalidArgument,
-                  testing::HasSubstr("Index has more elements (1) than type "
-                                     "bits[32] has array dimensions (0)")));
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Index has more elements (1) than type "
+                                 "bits[32] has array dimensions (0)")));
 
   EXPECT_THAT(GetIndexedElementType(&a_1d, 0), IsOkAndHolds(&a_1d));
   EXPECT_THAT(GetIndexedElementType(&a_1d, 1), IsOkAndHolds(&b32));
   EXPECT_THAT(GetIndexedElementType(&a_1d, 2),
-              status_testing::StatusIs(
-                  absl::StatusCode::kInvalidArgument,
-                  testing::HasSubstr("Index has more elements (2) than type "
-                                     "bits[32][7] has array dimensions (1)")));
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Index has more elements (2) than type "
+                                 "bits[32][7] has array dimensions (1)")));
 
   EXPECT_THAT(GetIndexedElementType(&a_3d, 3), IsOkAndHolds(&b32));
+}
+
+TEST(TypeTest, AsXTypeCallsWork) {
+  BitsType b32(32);
+  TupleType t_empty({});
+  TupleType t1({&b32, &b32});
+  ArrayType a1(7, &b32);
+
+  XLS_EXPECT_OK(b32.AsBits());
+  XLS_EXPECT_OK(t_empty.AsTuple());
+  XLS_EXPECT_OK(t1.AsTuple());
+  XLS_EXPECT_OK(a1.AsArray());
+
+  EXPECT_THAT(b32.AsArray(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Type is not an array: bits[32]")));
+  EXPECT_THAT(b32.AsTuple(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Type is not a tuple: bits[32]")));
+
+  EXPECT_THAT(t_empty.AsBits(), StatusIs(absl::StatusCode::kInvalidArgument,
+                                         HasSubstr("Type is not 'bits': ()")));
+  EXPECT_THAT(t_empty.AsArray(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Type is not an array: ()")));
+
+  EXPECT_THAT(t1.AsBits(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Type is not 'bits': (bits[32], bits[32])")));
+  EXPECT_THAT(
+      t1.AsArray(),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("Type is not an array: (bits[32], bits[32])")));
+
+  EXPECT_THAT(a1.AsBits(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Type is not 'bits': bits[32][7]")));
+  EXPECT_THAT(a1.AsTuple(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Type is not a tuple: bits[32][7]")));
+}
+
+TEST(TypeTest, InstantiationType) {
+  TypeManager man;
+  InstantiationType it1(/*input_types=*/{{"foo", man.GetBitsType(32)}},
+                        /*output_types=*/{{"bar", man.GetBitsType(32)}});
+  InstantiationType it2(/*input_types=*/{{"foo", man.GetBitsType(32)}},
+                        /*output_types=*/{{"bar", man.GetBitsType(32)}});
+  EXPECT_EQ(it1, it2);
+  InstantiationType it3(/*input_types=*/{{"bar", man.GetBitsType(32)}},
+                        /*output_types=*/{{"foo", man.GetBitsType(32)}});
+  EXPECT_NE(it1, it3);
+  InstantiationType it4(/*input_types=*/{{"fooooooo", man.GetBitsType(32)}},
+                        /*output_types=*/{{"bar", man.GetBitsType(32)}});
+  EXPECT_NE(it1, it4);
+  InstantiationType it5(/*input_types=*/{{"foo", man.GetBitsType(32)}},
+                        /*output_types=*/{{"baaaaar", man.GetBitsType(32)}});
+  EXPECT_NE(it1, it5);
+  InstantiationType it6(/*input_types=*/{{"foo", man.GetBitsType(32)},
+                                         {"more", man.GetBitsType(32)}},
+                        /*output_types=*/{{"bar", man.GetBitsType(32)}});
+  EXPECT_NE(it1, it6);
+  InstantiationType it7(/*input_types=*/{{"foo", man.GetBitsType(32)}},
+                        /*output_types=*/{{"bar", man.GetBitsType(32)},
+                                          {"more", man.GetBitsType(32)}});
+  EXPECT_NE(it1, it7);
+  InstantiationType it8(/*input_types=*/{{"foo", man.GetBitsType(32)}},
+                        /*output_types=*/{{"bar", man.GetBitsType(3)}});
+  EXPECT_NE(it1, it8);
+  InstantiationType it9(/*input_types=*/{{"foo", man.GetBitsType(3)}},
+                        /*output_types=*/{{"bar", man.GetBitsType(32)}});
+  EXPECT_NE(it1, it9);
 }
 
 }  // namespace

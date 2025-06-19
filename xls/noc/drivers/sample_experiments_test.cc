@@ -14,15 +14,20 @@
 
 #include "xls/noc/drivers/sample_experiments.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/container/btree_map.h"
+#include "absl/log/log.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
+#include "xls/noc/drivers/experiment.h"
 #include "xls/noc/drivers/experiment_factory.h"
+#include "xls/noc/simulation/common.h"
+#include "xls/noc/simulation/flit.h"
 
 namespace xls::noc {
 namespace {
@@ -61,7 +66,7 @@ TEST(SampleExperimentsTest, SimpleVCExperiment) {
 
   std::vector<ExperimentData> experiment_data(4);
   for (int64_t i = 0; i < experiment.GetSweeps().GetStepCount(); ++i) {
-    XLS_LOG(INFO) << absl::StreamFormat("Experiment Step %d", i);
+    LOG(INFO) << absl::StreamFormat("Experiment Step %d", i);
     XLS_ASSERT_OK_AND_ASSIGN(experiment_data.at(i), experiment.RunStep(i));
     XLS_EXPECT_OK(experiment_data.at(i).metrics.DebugDump());
   }
@@ -185,7 +190,7 @@ TEST(SampleExperimentsTest, AggregateTreeTest) {
 
   std::vector<ExperimentData> experiment_data(step_count);
   for (int64_t i = 0; i < step_count; ++i) {
-    XLS_LOG(INFO) << absl::StreamFormat("Experiment Step %d", i);
+    LOG(INFO) << absl::StreamFormat("Experiment Step %d", i);
     XLS_ASSERT_OK_AND_ASSIGN(experiment_data.at(i), experiment.RunStep(i));
     XLS_EXPECT_OK(experiment_data.at(i).metrics.DebugDump());
   }

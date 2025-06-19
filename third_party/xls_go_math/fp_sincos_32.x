@@ -78,10 +78,10 @@
 //  - Input denormals are treated as/flushed to 0.
 //      (denormals-are-zero / DAZ).
 
-import std
-import float32
+import std;
+import float32;
 
-import third_party.xls_go_math.fp_trig_reduce
+import third_party.xls_go_math.fp_trig_reduce;
 
 type F32 = float32::F32;
 
@@ -97,7 +97,7 @@ const COS_COEF =
 // Helper function that calculates taylor
 // series approximation of cos in range [0, Pi/4).
 fn cos_taylor(z_sq: F32) -> F32 {
-  const one = float32::one(u1:0);
+  const ONE = float32::one(u1:0);
 
   // cos = 1.0
   //       - 0.5*z_sq
@@ -139,7 +139,7 @@ fn cos_taylor(z_sq: F32) -> F32 {
   let half_z_sq = F32{bexp: std::bounded_minus_1(z_sq.bexp), ..z_sq};
   float32::sub(
     float32::add(
-      one,
+      ONE,
       big_product
     ),
     half_z_sq
@@ -298,4 +298,3 @@ fn test_fp_cos_32() {
   assert_eq(fp_cos_32(float32::zero(u1:0)),
             float32::one(u1:0));
 }
-

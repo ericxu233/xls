@@ -15,7 +15,10 @@
 #ifndef XLS_SIMULATION_VERILOG_SIMULATOR_H_
 #define XLS_SIMULATION_VERILOG_SIMULATOR_H_
 
+#include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -27,9 +30,9 @@
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
 #include "xls/codegen/name_to_bit_count.h"
-#include "xls/codegen/vast.h"
+#include "xls/codegen/vast/vast.h"
 #include "xls/ir/bits.h"
-#include "xls/tools/verilog_include.h"
+#include "xls/simulation/verilog_include.h"
 
 namespace xls {
 namespace verilog {
@@ -45,20 +48,44 @@ class VerilogSimulator {
  public:
   virtual ~VerilogSimulator() = default;
 
+  // Abstraction representing a macro definition (tick define). Passing in a
+  // MacroDefinition is equivalent to the following if value is specified:
+  //   `define NAME VALUE
+  // or the following if value is std::nullopt:
+  //   `define NAME
+  struct MacroDefinition {
+    std::string name;
+    std::optional<std::string> value;
+  };
+  static constexpr std::string_view kSimulationMacroName = "SIMULATION";
+  static constexpr std::string_view kAssertOnMacroName = "ASSERT_ON";
+
   // Runs the simulator with the given Verilog text as input and returns the
   // stdout/stderr as a string pair.
   absl::StatusOr<std::pair<std::string, std::string>> Run(
       std::string_view text, FileType file_type) const;
+  absl::StatusOr<std::pair<std::string, std::string>> Run(
+      std::string_view text, FileType file_type,
+      absl::Span<const MacroDefinition> macro_definitions) const;
   virtual absl::StatusOr<std::pair<std::string, std::string>> Run(
       std::string_view text, FileType file_type,
+      absl::Span<const MacroDefinition> macro_definitions,
       absl::Span<const VerilogInclude> includes) const = 0;
 
   // Runs the simulator to check the Verilog syntax. Does not run simulation.
-  virtual absl::Status RunSyntaxChecking(
-      std::string_view text, FileType file_type,
-      absl::Span<const VerilogInclude> includes) const = 0;
   absl::Status RunSyntaxChecking(std::string_view text,
                                  FileType file_type) const;
+  absl::Status RunSyntaxChecking(
+      std::string_view text, FileType file_type,
+      absl::Span<const MacroDefinition> macro_definitions) const;
+  virtual absl::Status RunSyntaxChecking(
+      std::string_view text, FileType file_type,
+      absl::Span<const MacroDefinition> macro_definitions,
+      absl::Span<const VerilogInclude> includes) const = 0;
+
+  // Features supported by simulator.
+  virtual bool DoesSupportSystemVerilog() const = 0;
+  virtual bool DoesSupportAssertions() const = 0;
 
   // Simulation runner harness: runs the given Verilog text using the verilog
   // simulator infrastructure and returns observations of data values that arose
@@ -86,15 +113,18 @@ class VerilogSimulator {
 // name.
 class VerilogSimulatorManager {
  public:
+  using SimulatorGenerator =
+      std::function<absl::StatusOr<std::unique_ptr<VerilogSimulator>>()>;
+
   // Returns the delay estimator with the given name, or returns an error if no
   // such estimator exists.
-  absl::StatusOr<VerilogSimulator*> GetVerilogSimulator(
+  absl::StatusOr<std::unique_ptr<VerilogSimulator>> GetVerilogSimulator(
       std::string_view name) const;
 
   // Adds a VerilogSimulator to the manager and associates it with the given
   // name.
-  absl::Status RegisterVerilogSimulator(
-      std::string_view name, std::unique_ptr<VerilogSimulator> simulator);
+  absl::Status RegisterVerilogSimulator(std::string_view name,
+                                        SimulatorGenerator simulator_generator);
 
   // Returns a list of the names of available simulators in this manager.
   absl::Span<const std::string> simulator_names() const {
@@ -102,8 +132,7 @@ class VerilogSimulatorManager {
   }
 
  private:
-  absl::flat_hash_map<std::string, std::unique_ptr<VerilogSimulator>>
-      simulators_;
+  absl::flat_hash_map<std::string, SimulatorGenerator> simulator_generators_;
   std::vector<std::string> simulator_names_;
 };
 

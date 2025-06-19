@@ -27,28 +27,34 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "xls/common/status/status_macros.h"
 #include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/frontend/proc_id.h"
 #include "xls/dslx/import_data.h"
 #include "xls/dslx/interp_value.h"
+#include "xls/dslx/ir_convert/channel_scope.h"
+#include "xls/dslx/ir_convert/conversion_info.h"
 #include "xls/dslx/ir_convert/convert_options.h"
-#include "xls/dslx/ir_convert/extract_conversion_order.h"
 #include "xls/dslx/ir_convert/proc_config_ir_converter.h"
 #include "xls/dslx/mangle.h"
-#include "xls/dslx/type_system/concrete_type.h"
 #include "xls/dslx/type_system/parametric_env.h"
+#include "xls/dslx/type_system/type.h"
 #include "xls/dslx/type_system/type_info.h"
 #include "xls/ir/bits.h"
+#include "xls/ir/channel.h"
 #include "xls/ir/fileno.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_builder.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/package.h"
 #include "xls/ir/source_location.h"
+#include "xls/ir/type.h"
 #include "xls/ir/value.h"
+#include "xls/ir/xls_ir_interface.pb.h"
 
 namespace xls::dslx {
 
@@ -57,11 +63,15 @@ absl::StatusOr<Value> InterpValueToValue(const InterpValue& v);
 
 // For all free variables of "node", adds them transitively for any required
 // constant dependencies to the converter.
-absl::StatusOr<std::vector<ConstantDef*>> GetConstantDepFreevars(AstNode* node);
+//
+// Warning: the `ConstantDef`s may be owned by different modules, e.g. if we had
+// to traverse a name that was `use`d into the current module.
+absl::StatusOr<std::vector<ConstantDef*>> GetConstantDepFreevars(
+    AstNode* node, TypeInfo& type_info);
 
 // Wrapper around the type information query for whether DSL function "f"
 // requires an implicit token calling convention.
-bool GetRequiresImplicitToken(dslx::Function* f, ImportData* import_data,
+bool GetRequiresImplicitToken(const dslx::Function& f, ImportData* import_data,
                               const ConvertOptions& options);
 
 // Creates a function that wraps up `implicit_token_f`.
@@ -73,13 +83,14 @@ bool GetRequiresImplicitToken(dslx::Function* f, ImportData* import_data,
 // normal function, so it can be called by the outside world in a typical
 // fashion as an entry point (e.g. the IR JIT, Verilog module signature, etc).
 absl::StatusOr<xls::Function*> EmitImplicitTokenEntryWrapper(
-    xls::Function* implicit_token_f, dslx::Function* dslx_function,
-    bool is_top);
+    xls::Function* implicit_token_f, dslx::Function* dslx_function, bool is_top,
+    PackageInterfaceProto* interface_proto,
+    const PackageInterfaceProto::Function& implicit_token_proto);
 
 // Bundles together a package pointer with a supplementary map we keep that
 // shows the DSLX function that led to IR functions in the package.
 struct PackageData {
-  Package* package;
+  PackageConversionData* conversion_info;
   absl::flat_hash_map<xls::FunctionBase*, dslx::Function*> ir_to_dslx;
   absl::flat_hash_set<xls::Function*> wrappers;
 };
@@ -127,7 +138,8 @@ class FunctionConverter {
  public:
   FunctionConverter(PackageData& package_data, Module* module,
                     ImportData* import_data, ConvertOptions options,
-                    ProcConversionData* proc_data, bool is_top);
+                    ProcConversionData* proc_data, ChannelScope* channel_scope,
+                    bool is_top);
 
   // Main entry point to request conversion of the DSLX function "f" to an IR
   // function.
@@ -152,18 +164,40 @@ class FunctionConverter {
   // Helper class used for chaining on/off control predicates.
   friend class ScopedControlPredicate;
 
+  // Contains/returns the pertinent information about a range expression (either
+  // a Range node or the range() builtin).
+  struct RangeData {
+    int64_t start_value;
+    int64_t trip_count;
+    int64_t bit_width;
+  };
+
+  const FileTable& file_table() const { return import_data_->file_table(); }
+
   // Wraps up a type so it is (token, u1, type).
-  static Type* WrapIrForImplicitTokenType(Type* type, Package* package) {
-    Type* token_type = package->GetTokenType();
-    Type* u1_type = package->GetBitsType(1);
+  static xls::Type* WrapIrForImplicitTokenType(xls::Type* type,
+                                               Package* package) {
+    xls::Type* token_type = package->GetTokenType();
+    xls::Type* u1_type = package->GetBitsType(1);
     return package->GetTupleType({token_type, u1_type, type});
+  }
+
+  // Helper function used for adding a parameter type in for-loops and similar.
+  BValue AddParam(std::string_view name, xls::Type* type) {
+    CHECK(function_proto_);
+    auto* param_proto = function_proto_.value()->add_parameters();
+    param_proto->set_name(name);
+    *param_proto->mutable_type() = type->ToProto();
+    // This is only for internal 'for-loop' and similar impl functions so they
+    // won't ever be emitted as verilog.
+    return function_builder_->Param(name, type);
   }
 
   // Helper function used for adding a parameter type wrapped up in a
   // token/activation boolean.
-  BValue AddTokenWrappedParam(Type* type) {
+  BValue AddTokenWrappedParam(xls::Type* type) {
     BuilderBase* fb = function_builder_.get();
-    Type* wrapped_type = WrapIrForImplicitTokenType(type, package());
+    xls::Type* wrapped_type = WrapIrForImplicitTokenType(type, package());
     BValue param = fb->Param("__token_wrapped", wrapped_type);
     BValue entry_token = fb->TupleIndex(param, 0);
     BValue activated = fb->TupleIndex(param, 1);
@@ -171,6 +205,10 @@ class FunctionConverter {
     implicit_token_data_ =
         ImplicitTokenData{entry_token, activated, create_control_predicate};
     BValue unwrapped = fb->TupleIndex(param, 2);
+    CHECK(function_proto_);
+    auto* param_proto = function_proto_.value()->add_parameters();
+    param_proto->set_name(param.GetName());
+    *param_proto->mutable_type() = param.GetType()->ToProto();
     return unwrapped;
   }
 
@@ -184,18 +222,21 @@ class FunctionConverter {
   // Every AST node has an "IR value" that is either a function builder value
   // (BValue) or its IR-conversion-time-constant-decorated cousin (CValue), or
   // an inter-proc Channel.
-  using IrValue = std::variant<BValue, CValue, Channel*>;
+  using IrValue = std::variant<BValue, CValue, Channel*, ChannelInterface*>;
 
   // Helper for converting an IR value to its BValue pointer for use in
   // debugging.
   static std::string IrValueToString(const IrValue& value);
 
+  // Helper that checks that the given IrValue is a Channel or ChannelInterface.
+  static absl::Status CheckValueIsChannel(const IrValue& ir_value);
+
   void SetFunctionBuilder(std::unique_ptr<BuilderBase> builder);
 
   // See `GetRequiresImplicitToken(f, import_data, options)`.
-  bool GetRequiresImplicitToken(dslx::Function* f) const;
+  bool GetRequiresImplicitToken(const dslx::Function* f) const;
 
-  CallingConvention GetCallingConvention(Function* f) const {
+  CallingConvention GetCallingConvention(const Function* f) const {
     return GetRequiresImplicitToken(f) ? CallingConvention::kImplicitToken
                                        : CallingConvention::kTypical;
   }
@@ -226,11 +267,10 @@ class FunctionConverter {
   absl::StatusOr<Bits> GetConstBits(const AstNode* node) const;
 
   // Resolves node's type and resolves all of its dimensions via `ResolveDim()`.
-  absl::StatusOr<std::unique_ptr<ConcreteType>> ResolveType(
-      const AstNode* node);
+  absl::StatusOr<std::unique_ptr<Type>> ResolveType(const AstNode* node);
 
   // Helper that composes ResolveType() and TypeToIr().
-  absl::StatusOr<xls::Type*> ResolveTypeToIr(AstNode* node);
+  absl::StatusOr<xls::Type*> ResolveTypeToIr(const AstNode* node);
 
   // -- Accessors
 
@@ -246,6 +286,9 @@ class FunctionConverter {
   // This is useful for generating new symbols for the functions that serve as
   // XLS counted_for "bodies".
   int64_t GetAndBumpCountedForCount() { return counted_for_count_++; }
+
+  // Gets the unrolled version of the given for loop for the current context.
+  std::optional<const Expr*> GetUnrolledForLoop(const UnrollFor* loop);
 
   std::optional<InterpValue> GetParametricBinding(
       std::string_view identifier) const {
@@ -289,28 +332,70 @@ class FunctionConverter {
 
   // AstNode handlers.
   absl::Status HandleBinop(const Binop* node);
-  absl::Status HandleConstRef(const ConstRef* node);
   absl::Status HandleNameRef(const NameRef* node);
+
+  absl::Status HandleExternNameRef(const NameRef* node,
+                                   const UseTreeEntry* use_tree_entry);
+
   absl::Status HandleNumber(const Number* node);
   absl::Status HandleParam(const Param* node);
-  absl::Status HandleProcMember(const ProcMember* node);
   absl::Status HandleString(const String* node);
   absl::Status HandleUnop(const Unop* node);
   absl::Status HandleXlsTuple(const XlsTuple* node);
   absl::Status HandleZeroMacro(const ZeroMacro* node);
+  absl::Status HandleAllOnesMacro(const AllOnesMacro* node);
+  absl::Status HandleUnrollFor(const UnrollFor* node);
 
   // AstNode handlers that recur "manually" internal to the handler.
   absl::Status HandleArray(const Array* node);
   absl::Status HandleAttr(const Attr* node);
-  absl::Status HandleBlock(const Block* node);
+  absl::Status HandleStatementBlock(const StatementBlock* node);
   absl::Status HandleCast(const Cast* node);
   absl::Status HandleColonRef(const ColonRef* node);
-  absl::Status HandleConstantArray(const ConstantArray* node);
   absl::Status HandleConstantDef(const ConstantDef* node);
+
   absl::Status HandleFor(const For* node);
+
+  // Helper that adds a parameter for the induction variable node for a ranged
+  // for loop, e.g. when we have a pattern like: `for (i, accum) in 1..10` this
+  // handles the `ivar` named `i`.
+  absl::StatusOr<BValue> HandleRangedForInductionVariable(
+      const For* node, FunctionConverter& body_converter,
+      NameDefTree::Leaf ivar);
+
+  // Helpers that adds a parameter for the loop carried accumulator value.
+  // Handles the fact that we may need to destructure a pattern for
+  // `carry_node`.
+  absl::Status HandleForLoopCarry(const For* node,
+                                  FunctionConverter& body_converter,
+                                  const std::optional<RangeData>& range_data,
+                                  BValue loop_index, NameDefTree::Leaf ivar,
+                                  AstNode* carry_node);
+
+  // Returns the relevant name definitions for the lexical scope of the for
+  // loop.
+  //
+  // This lets us convert the body of the for loop into a function and pass all
+  // of the lexically required bindings as invariant arguments.
+  absl::StatusOr<std::vector<const NameDef*>> HandleForLexicalScope(
+      const For* node, FunctionConverter& body_converter);
+
+  // Runs conversion on the body block of `node`, placing the built IR into
+  // `body_converter`.
+  //
+  // This encapsulates any token threading that has to happen if the body is
+  // implicit-token calling convention.
+  //
+  // Returns the `init` BValue (which is also appropriately adapted for the
+  // calling convention).
+  absl::StatusOr<BValue> HandleForBody(const For* node,
+                                       FunctionConverter& body_converter,
+                                       int64_t trip_count);
+
   absl::Status HandleFormatMacro(const FormatMacro* node);
   absl::Status HandleIndex(const Index* node);
   absl::Status HandleInvocation(const Invocation* node);
+  absl::Status HandleLambda(const Lambda* node);
   absl::Status HandleLet(const Let* node);
   absl::Status HandleMatch(const Match* node);
   absl::Status HandleRange(const Range* node);
@@ -324,65 +409,65 @@ class FunctionConverter {
   absl::Status HandleUdfInvocation(const Invocation* node, xls::Function* f,
                                    std::vector<BValue> args);
 
-  // Handles the fail!() builtin invocation.
+  // Handles the `fail!()` builtin invocation.
   absl::Status HandleFailBuiltin(const Invocation* node, Expr* label_expr,
                                  BValue arg);
 
-  // Handles the cover!() builtin invocation.
+  // Handles the `assert!()` builtin invocation.
+  absl::Status HandleAssertBuiltin(const Invocation* node, BValue predicate,
+                                   Expr* label_expr);
+
+  // Handles the `assert_eq` builtin invocation.
+  absl::Status HandleAssertEqBuiltin(const Invocation* node, BValue lhs,
+                                     BValue rhs);
+
+  // Handles the `assert_lt` builtin invocation.
+  absl::Status HandleAssertLtBuiltin(const Invocation* node, BValue lhs,
+                                     BValue rhs);
+  // Handles the `cover!()` builtin invocation.
   absl::Status HandleCoverBuiltin(const Invocation* node, BValue condition);
 
   // Handles an arm of a match expression.
   absl::StatusOr<BValue> HandleMatcher(NameDefTree* matcher,
-                                       absl::Span<const int64_t> index,
                                        const BValue& matched_value,
-                                       const ConcreteType& matched_type);
+                                       const Type& matched_type);
 
   // Makes the specified builtin available to the package.
   absl::StatusOr<BValue> DefMapWithBuiltin(const Invocation* parent_node,
                                            NameRef* node, AstNode* arg,
                                            const ParametricEnv& parametric_env);
 
-  // Evaluates a constexpr AST Invocation via the DSLX interpreter.
-  //
-  // Evaluates an Invocation node whose argument values are all known at
-  // compile/interpret time, yielding a constant value that can be inserted
-  // into the IR.
-  //
-  // Args:
-  //  node: The Invocation node to evaluate.
-  //
-  // Returns:
-  //   The XLS (IR) Value containing the result.
-  absl::StatusOr<Value> EvaluateConstFunction(const Invocation* node);
-
   absl::StatusOr<BValue> HandleMap(const Invocation* node);
-
-  absl::StatusOr<BValue> HandleFail(const Invocation* node);
 
   // Builtin invocation handlers.
   absl::Status HandleBuiltinAndReduce(const Invocation* node);
   absl::Status HandleBuiltinArrayRev(const Invocation* node);
   absl::Status HandleBuiltinArraySize(const Invocation* node);
   absl::Status HandleBuiltinArraySlice(const Invocation* node);
-  absl::Status HandleBuiltinBitSlice(const Invocation* node);
   absl::Status HandleBuiltinBitSliceUpdate(const Invocation* node);
   absl::Status HandleBuiltinCheckedCast(const Invocation* node);
   absl::Status HandleBuiltinClz(const Invocation* node);
   absl::Status HandleBuiltinCtz(const Invocation* node);
   absl::Status HandleBuiltinGate(const Invocation* node);
+  absl::Status HandleBuiltinDecode(const Invocation* node);
+  absl::Status HandleBuiltinEncode(const Invocation* node);
   absl::Status HandleBuiltinOneHot(const Invocation* node);
   absl::Status HandleBuiltinOneHotSel(const Invocation* node);
   absl::Status HandleBuiltinPrioritySel(const Invocation* node);
   absl::Status HandleBuiltinOrReduce(const Invocation* node);
   absl::Status HandleBuiltinRev(const Invocation* node);
+  absl::Status HandleBuiltinZip(const Invocation* node);
   absl::Status HandleBuiltinSignex(const Invocation* node);
   absl::Status HandleBuiltinSMulp(const Invocation* node);
   absl::Status HandleBuiltinUpdate(const Invocation* node);
   absl::Status HandleBuiltinUMulp(const Invocation* node);
   absl::Status HandleBuiltinWideningCast(const Invocation* node);
+  absl::Status HandleBuiltinBitCount(const Invocation* node);
+  absl::Status HandleBuiltinElementCount(const Invocation* node);
   absl::Status HandleBuiltinXorReduce(const Invocation* node);
 
   absl::Status HandleBuiltinJoin(const Invocation* node);
+  absl::Status HandleBuiltinToken(const Invocation* node);
   absl::Status HandleBuiltinSend(const Invocation* node);
   absl::Status HandleBuiltinSendIf(const Invocation* node);
   absl::Status HandleBuiltinRecv(const Invocation* node);
@@ -392,44 +477,31 @@ class FunctionConverter {
 
   // Derefences the type definition to a struct definition.
   absl::StatusOr<StructDef*> DerefStruct(TypeDefinition node);
-  absl::StatusOr<StructDef*> DerefStruct(NameRef* name_ref) {
-    return DerefStructOrEnumFromNameRef<StructDef*>(
-        name_ref, [this](TypeDefinition td) { return DerefStruct(td); });
-  }
 
   // Derefences the type definition to a enum definition.
   absl::StatusOr<EnumDef*> DerefEnum(TypeDefinition node);
-  absl::StatusOr<EnumDef*> DerefEnum(NameRef* name_ref) {
-    return DerefStructOrEnumFromNameRef<EnumDef*>(
-        name_ref, [this](TypeDefinition td) { return DerefEnum(td); });
-  }
 
   absl::Status CastToArray(const Cast* node, const ArrayType& output_type);
-  absl::Status CastFromArray(const Cast* node, const ConcreteType& output_type);
+  absl::Status CastFromArray(const Cast* node, const Type& output_type);
 
   // Returns the fully resolved (mangled) name for the callee of the given node,
   // with parametric values mangled in appropriately.
   absl::StatusOr<std::string> GetCalleeIdentifier(const Invocation* node);
 
-  // Contains/returns the pertinent information about a range expression (either
-  // a Range node or the range() builtin).
-  struct RangeData {
-    int64_t start_value;
-    int64_t trip_count;
-    int64_t bit_width;
-  };
   absl::StatusOr<RangeData> GetRangeData(const Expr* iterable);
 
-  template <typename T>
-  absl::StatusOr<T> DerefStructOrEnumFromNameRef(
-      NameRef* name_ref,
-      const std::function<absl::StatusOr<T>(TypeDefinition)>& f) {
-    AnyNameDef any_name_def = name_ref->name_def();
-    const auto* name_def = std::get<const NameDef*>(any_name_def);
-    AstNode* definer = name_def->definer();
-    XLS_ASSIGN_OR_RETURN(TypeDefinition td, ToTypeDefinition(definer));
-    return f(td);
-  }
+  struct AssertionLabelData {
+    // The codegen-level label we'll apply to the corresponding assertion.
+    std::string label;
+
+    // The (more arbitrary text) message we'll display if the assertion fails.
+    std::string message;
+  };
+
+  // Helper that provides the label we'll use for an emitted assertion as well
+  // as the message we'll use in building the IR node.
+  absl::StatusOr<AssertionLabelData> GetAssertionLabel(
+      std::string_view caller_name, const Expr* label_expr, const Span& span);
 
   // Dereferences a type definition to either a struct definition or enum
   // definition.
@@ -445,7 +517,7 @@ class FunctionConverter {
     Colno colno(start_pos.colno());
     // TODO(leary): 2020-12-20 Figure out the fileno based on the module owner
     // of node.
-    return SourceInfo(SourceLocation{fileno_, lineno, colno});
+    return SourceInfo(SourceLocation{ir_fileno_, lineno, colno});
   }
 
   // Defines "node" to map the result of running "ir_func" with "args" -- if
@@ -464,19 +536,9 @@ class FunctionConverter {
 
   absl::Status Visit(const AstNode* node);
 
-  // Creates a predicate that corresponds to reaching the current program point
-  // being converted. Handlers that convert `match` constructs (and similar)
-  // have a notion of implied control flow to the user -- we have to add control
-  // predicates to side-effecting operations (like `fail!()`) that occur in
-  // those positions.
-  //
-  // In other words, control constructs are responsible for squirreling away a
-  // function that conjures the control predicate while they are being
-  // translated (and this is how the conversion process can access that function
-  // when needed).
-  BValue CreateControlPredicate();
-
-  Package* package() const { return package_data_.package; }
+  Package* package() const {
+    return package_data_.conversion_info->package.get();
+  }
 
   // Package that IR is being generated into.
   PackageData& package_data_;
@@ -505,6 +567,11 @@ class FunctionConverter {
   // Function builder being used to create BValues.
   std::unique_ptr<BuilderBase> function_builder_;
 
+  // The in-progress proto describing types of the function.
+  std::optional<PackageInterfaceProto::Function*> function_proto_;
+  // The in-progress proto describing types of the proc.
+  std::optional<PackageInterfaceProto::Proc*> proc_proto_;
+
   // When we have a fail!() operation we implicitly need to thread a token /
   // activation boolean -- the data for this is kept here if necessary.
   std::optional<ImplicitTokenData> implicit_token_data_;
@@ -514,7 +581,7 @@ class FunctionConverter {
   absl::flat_hash_map<std::string, InterpValue> parametric_env_map_;
 
   // File number for use in source positions.
-  Fileno fileno_;
+  xls::Fileno ir_fileno_;
 
   // This is only set for procs; it holds the final recurrent state.
   BValue next_value_;
@@ -524,6 +591,9 @@ class FunctionConverter {
 
   // Uses id_to_members to resolve a proc's [constant] member values.
   ProcConversionData* proc_data_;
+
+  // Used to handle channel array accesses.
+  ChannelScope* channel_scope_;
 
   std::vector<BValue> tokens_;
 

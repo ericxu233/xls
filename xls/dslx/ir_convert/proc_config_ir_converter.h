@@ -20,17 +20,38 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
+#include "absl/types/variant.h"
+#include "xls/common/visitor.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/ast_node_visitor_with_default.h"
+#include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/frontend/proc_id.h"
 #include "xls/dslx/import_data.h"
-#include "xls/dslx/ir_convert/extract_conversion_order.h"
+#include "xls/dslx/ir_convert/channel_scope.h"
+#include "xls/dslx/type_system/parametric_env.h"
 #include "xls/dslx/type_system/type_info.h"
 #include "xls/ir/channel.h"
 #include "xls/ir/package.h"
+#include "xls/ir/value.h"
 
 namespace xls::dslx {
 
-using ProcConfigValue = std::variant<Value, Channel*>;
+using ProcConfigValue =
+    std::variant<Value, Channel*, ChannelArray*, ChannelInterface*>;
 using MemberNameToValue = absl::flat_hash_map<std::string, ProcConfigValue>;
+
+// Converts a `ChannelOrArray` dealt out by a `ChannelScope` into a
+// `ProcConfigValue` that is usable in IR conversion data structures.
+inline ProcConfigValue ChannelOrArrayToProcConfigValue(
+    ChannelOrArray channel_or_array) {
+  return absl::visit(
+      Visitor{
+          [](Channel* chan) -> ProcConfigValue { return chan; },
+          [](ChannelArray* ca) -> ProcConfigValue { return ca; },
+          [](ChannelInterface* ci) -> ProcConfigValue { return ci; },
+      },
+      channel_or_array);
+}
 
 // ProcConversionData holds various information about individual proc instances
 // needed throughout the conversion process, packaged together to avoid
@@ -48,20 +69,22 @@ struct ProcConversionData {
   absl::flat_hash_map<ProcId, MemberNameToValue> id_to_members;
 };
 
-// ProcConfigIrConverter is specialized for converting - you guessed it! - Proc
-// Config functions into IR.  Config functions don't _actually_ lower to IR:
-// instead they define constants and bind channels to Proc members.
+// ProcConfigIrConverter is specialized for converting Proc Config functions
+// into IR. Config functions don't _actually_ lower to IR: instead they define
+// constants and bind channels to Proc members.
 class ProcConfigIrConverter : public AstNodeVisitorWithDefault {
  public:
-  ProcConfigIrConverter(Package* package, Function* f, TypeInfo* type_info,
+  ProcConfigIrConverter(Function* f, TypeInfo* type_info,
                         ImportData* import_data, ProcConversionData* proc_data,
+                        ChannelScope* channel_scope,
                         const ParametricEnv& bindings, const ProcId& proc_id);
 
-  absl::Status HandleBlock(const Block* node) override;
+  absl::Status HandleStatementBlock(const StatementBlock* node) override;
   absl::Status HandleStatement(const Statement* node) override;
   absl::Status HandleChannelDecl(const ChannelDecl* node) override;
   absl::Status HandleColonRef(const ColonRef* node) override;
   absl::Status HandleFunction(const Function* node) override;
+  absl::Status HandleIndex(const Index* node) override;
   absl::Status HandleInvocation(const Invocation* node) override;
   absl::Status HandleLet(const Let* node) override;
   absl::Status HandleNameRef(const NameRef* node) override;
@@ -69,20 +92,23 @@ class ProcConfigIrConverter : public AstNodeVisitorWithDefault {
   absl::Status HandleParam(const Param* node) override;
   absl::Status HandleSpawn(const Spawn* node) override;
   absl::Status HandleStructInstance(const StructInstance* node) override;
+  absl::Status HandleUnrollFor(const UnrollFor* node) override;
   absl::Status HandleXlsTuple(const XlsTuple* node) override;
 
   // Sets the mapping from the elements in the config-ending tuple to the
   // corresponding Proc members.
   absl::Status Finalize();
 
+  const FileTable& file_table() const { return import_data_->file_table(); }
+
  private:
-  Package* package_;
   Function* f_;
   TypeInfo* type_info_;
   ImportData* import_data_;
 
   ProcConversionData* proc_data_;
-  absl::flat_hash_map<std::vector<Proc*>, int> instances_;
+  ChannelScope* channel_scope_;
+  ProcIdFactory proc_id_factory_;
 
   const ParametricEnv& bindings_;
   ProcId proc_id_;

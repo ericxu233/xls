@@ -15,17 +15,17 @@
 #ifndef XLS_DSLX_MANGLE_H_
 #define XLS_DSLX_MANGLE_H_
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
 #include "absl/container/btree_set.h"
 #include "absl/status/statusor.h"
-#include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/type_system/parametric_env.h"
 
 namespace xls::dslx {
 
-enum class CallingConvention {
+enum class CallingConvention : uint8_t {
   // The IR converted parameters are identical to the DSL parameters in their
   // type, number, and name.
   kTypical,
@@ -46,7 +46,7 @@ absl::StatusOr<std::string> MangleDslxName(
     std::string_view module_name, std::string_view function_name,
     CallingConvention convention,
     const absl::btree_set<std::string>& free_keys = {},
-    const ParametricEnv* parametric_env = nullptr);
+    const ParametricEnv* parametric_env = nullptr, std::string_view scope = "");
 }  // namespace xls::dslx
 
 #endif  // XLS_DSLX_MANGLE_H_

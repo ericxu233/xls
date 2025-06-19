@@ -14,14 +14,27 @@
 
 #include "xls/jit/type_layout.h"
 
+#include <cstdint>
 #include <cstring>
 #include <ostream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
+#include "absl/types/span.h"
+#include "xls/common/math_util.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/ir_parser.h"
-#include "xls/ir/value_helpers.h"
+#include "xls/ir/package.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
+#include "xls/ir/value_utils.h"
+#include "xls/jit/type_layout.pb.h"
 
 namespace xls {
 
@@ -42,13 +55,13 @@ static void LeafValueToNativeLayout(const Value& value,
                 element_layout.padded_size - element_layout.data_size);
     return;
   }
-  XLS_CHECK(value.IsToken());
+  CHECK(value.IsToken());
   std::memset(buffer, 0, element_layout.padded_size);
 }
 
 void TypeLayout::ValueToNativeLayout(const Value& value,
                                      uint8_t* buffer) const {
-  XLS_DCHECK(ValueConformsToType(value, type())) << absl::StreamFormat(
+  DCHECK(ValueConformsToType(value, type())) << absl::StreamFormat(
       "Value `%s` is not of type `%s`", value.ToString(), type()->ToString());
 
   if (IsLeafValue(value)) {
@@ -92,7 +105,7 @@ void TypeLayout::ValueToNativeLayout(const Value& value,
       push_frame(value_element);
     }
   }
-  XLS_CHECK_EQ(leaf_index, elements_.size());
+  CHECK_EQ(leaf_index, elements_.size());
 }
 
 Value TypeLayout::NativeLayoutToValueInternal(Type* element_type,
@@ -114,6 +127,7 @@ Value TypeLayout::NativeLayoutToValueInternal(Type* element_type,
   if (element_type->IsTuple()) {
     TupleType* tuple_type = element_type->AsTupleOrDie();
     std::vector<Value> elements;
+    elements.reserve(tuple_type->size());
     for (int64_t i = 0; i < tuple_type->size(); ++i) {
       elements.push_back(NativeLayoutToValueInternal(
           tuple_type->element_type(i), buffer, leaf_index));
@@ -121,9 +135,10 @@ Value TypeLayout::NativeLayoutToValueInternal(Type* element_type,
     return Value::TupleOwned(std::move(elements));
   }
 
-  XLS_CHECK(element_type->IsArray());
+  CHECK(element_type->IsArray());
   ArrayType* array_type = element_type->AsArrayOrDie();
   std::vector<Value> elements;
+  elements.reserve(array_type->size());
   for (int64_t i = 0; i < array_type->size(); ++i) {
     elements.push_back(NativeLayoutToValueInternal(array_type->element_type(),
                                                    buffer, leaf_index));
@@ -132,11 +147,6 @@ Value TypeLayout::NativeLayoutToValueInternal(Type* element_type,
 }
 
 Value TypeLayout::NativeLayoutToValue(const uint8_t* buffer) const {
-#ifdef ABSL_HAVE_MEMORY_SANITIZER
-  // The buffer likely was written by the JIT so it may appear uninitialized to
-  // sanitizers.
-  __msan_unpoison(buffer, size());
-#endif  // ABSL_HAVE_MEMORY_SANITIZER
   int64_t leaf_index = 0;
   return NativeLayoutToValueInternal(type_, buffer, &leaf_index);
 }
@@ -179,6 +189,13 @@ TypeLayoutProto TypeLayout::ToProto() const {
     element_proto->set_padded_size(element.padded_size);
   }
   return proto;
+}
+
+std::vector<uint8_t> TypeLayout::mask() const {
+  std::vector<uint8_t> res(size(), '\0');
+  Value mask = AllOnesOfType(type_);
+  ValueToNativeLayout(mask, res.data());
+  return res;
 }
 
 std::ostream& operator<<(std::ostream& os, ElementLayout layout) {

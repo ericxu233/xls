@@ -29,9 +29,20 @@
 #ifndef XLS_COMMON_SOURCE_LOCATION_H_
 #define XLS_COMMON_SOURCE_LOCATION_H_
 
+#ifdef XLS_USE_ABSL_SOURCE_LOCATION
+#include "absl/types/source_location.h"
+
+// Use absl::SourceLocation
+namespace xabsl {
+using SourceLocation = absl::SourceLocation;
+#define XABSL_LOC ABSL_LOC
+#define XABSL_LOC_CURRENT_DEFAULT_ARG ABSL_LOC_CURRENT_DEFAULT_ARG
+}  // namespace xabsl
+
+#else
 #include <cstdint>
 
-#include "absl/base/config.h"
+// OSS Version of source_location
 
 #define XABSL_HAVE_SOURCE_LOCATION_CURRENT 1
 
@@ -52,14 +63,12 @@ class SourceLocation {
 
  public:
   // Avoid this constructor; it populates the object with dummy values.
-  constexpr SourceLocation()
-      : line_(0),
-        file_name_(nullptr) {}
+  constexpr SourceLocation() : line_(0), file_name_(nullptr) {}
 
   // Wrapper to invoke the private constructor below. This should only be used
   // by the `XABSL_LOC` macro, hence the name.
   static constexpr SourceLocation DoNotInvokeDirectly(std::uint_least32_t line,
-                                                       const char* file_name) {
+                                                      const char* file_name) {
     return SourceLocation(line, file_name);
   }
 
@@ -109,8 +118,7 @@ class SourceLocation {
   // `file_name` must outlive all copies of the `xabsl::SourceLocation` object,
   // so in practice it should be a string literal.
   constexpr SourceLocation(std::uint_least32_t line, const char* file_name)
-      : line_(line),
-        file_name_(file_name) {}
+      : line_(line), file_name_(file_name) {}
 
   friend constexpr int UseUnused() {
     static_assert(SourceLocation(0, nullptr).unused_column_ == 0,
@@ -150,5 +158,6 @@ class SourceLocation {
 #else
 #define XABSL_LOC_CURRENT_DEFAULT_ARG
 #endif
+#endif  // XLS_USE_ABSL_SOURCE_LOCATION
 
 #endif  // XLS_COMMON_SOURCE_LOCATION_H_

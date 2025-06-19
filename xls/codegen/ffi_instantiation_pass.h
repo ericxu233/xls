@@ -17,6 +17,7 @@
 
 #include "absl/status/statusor.h"
 #include "xls/codegen/codegen_pass.h"
+#include "xls/ir/package.h"
 #include "xls/passes/pass_base.h"
 
 namespace xls::verilog {
@@ -30,9 +31,10 @@ class FfiInstantiationPass : public CodegenPass {
   }
   ~FfiInstantiationPass() override = default;
 
-  absl::StatusOr<bool> RunInternal(CodegenPassUnit* unit,
+  absl::StatusOr<bool> RunInternal(Package* package,
                                    const CodegenPassOptions& options,
-                                   PassResults* results) const final;
+                                   PassResults* results,
+                                   CodegenContext& context) const final;
 };
 
 }  // namespace xls::verilog

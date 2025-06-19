@@ -19,14 +19,15 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "xls/common/status/matchers.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
+#include "xls/ir/format_preference.h"
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
-using ::testing::HasSubstr;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 
 // TODO(https://github.com/google/xls/issues/476): Add property-based tests
 // using randomly generated strings and formats. Key properties:
@@ -79,6 +80,18 @@ TEST(FormatStringsTest, ParseFormats) {
   EXPECT_THAT(ParseFormatString(struct_formats_string),
               IsOkAndHolds(struct_formats));
   EXPECT_EQ(OperandsExpectedByFormat(struct_formats), 1);
+}
+TEST(FormatStringsTest, ZeroPaddedFormat) {
+  std::string zero_padded_format_string =
+      R"(x in zero-padded format {{:0b}} = {:0b})";
+
+  std::vector<FormatStep> zero_padded_format = {
+      "x in zero-padded format {{:0b}} = ",
+      FormatPreference::kZeroPaddedBinary};
+
+  EXPECT_THAT(ParseFormatString(zero_padded_format_string),
+              IsOkAndHolds(zero_padded_format));
+  EXPECT_EQ(OperandsExpectedByFormat(zero_padded_format), 1);
 }
 
 TEST(FormatStringsTest, ErrorTests) {

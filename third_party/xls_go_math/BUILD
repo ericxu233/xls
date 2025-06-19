@@ -43,6 +43,7 @@ xls_dslx_opt_ir(
 
 xls_dslx_test(
     name = "fpexp_32_dslx_test",
+    dslx_test_args = {"compare": "jit"},
     library = ":fpexp_32_dslx",
 )
 
@@ -55,13 +56,15 @@ xls_eval_ir_test(
 xls_benchmark_ir(
     name = "fpexp_32_benchmark_ir",
     src = ":fpexp_32.ir",
+    # TODO: Takes >15m for synthesis; too long for routine benchmarks.
+    synthesize = False,
 )
 
 cc_xls_ir_jit_wrapper(
     name = "fpexp_32_jit_wrapper",
     src = ":fpexp_32.opt.ir",
     jit_wrapper_args = {
-        "class_name": "fpexp_32",
+        "class_name": "Fpexp32",
         "namespace": "xls::fp",
     },
 )
@@ -76,16 +79,16 @@ cc_test(
     tags = ["optonly"],
     deps = [
         ":fpexp_32_jit_wrapper",
-        "@com_google_absl//absl/random",
-        "@com_google_absl//absl/status",
         "//xls/common:init_xls",
         "//xls/common:math_util",
         "//xls/common/file:get_runfile_path",
-        "//xls/common/logging",
         "//xls/common/status:status_macros",
-        "//xls/ir:value_helpers",
-        "//xls/ir:value_view_helpers",
-        "//xls/tools:testbench_builder",
+        "//xls/ir:value_utils",
+        "//xls/ir:value_view_utils",
+        "//xls/tests:testbench_builder",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/random",
+        "@com_google_absl//absl/status",
     ],
 )
 
@@ -112,6 +115,7 @@ xls_dslx_opt_ir(
 
 xls_dslx_test(
     name = "fp_sincos_32_dslx_test",
+    dslx_test_args = {"compare": "jit"},
     library = ":fp_sincos_32_dslx",
 )
 
@@ -125,13 +129,15 @@ xls_eval_ir_test(
 xls_benchmark_ir(
     name = "fp_sincos_32_benchmark_ir",
     src = ":fp_sincos_32.ir",
+    # TODO: Hits OOM issues during synthesis; should get this fixed.
+    synthesize = False,
 )
 
 cc_xls_ir_jit_wrapper(
     name = "fp_sincos_32_jit_wrapper",
     src = ":fp_sincos_32.opt.ir",
     jit_wrapper_args = {
-        "class_name": "fp_sincos_32",
+        "class_name": "FpSincos32",
         "namespace": "xls::fp",
     },
 )
@@ -146,15 +152,16 @@ cc_test(
     tags = ["optonly"],
     deps = [
         ":fp_sincos_32_jit_wrapper",
-        "@com_google_absl//absl/random",
-        "@com_google_absl//absl/status",
         "//xls/common:init_xls",
         "//xls/common/file:get_runfile_path",
-        "//xls/common/logging",
         "//xls/common/status:status_macros",
-        "//xls/ir:value_helpers",
-        "//xls/ir:value_view_helpers",
-        "//xls/tools:testbench_builder",
+        "//xls/ir:value_utils",
+        "//xls/ir:value_view_utils",
+        "//xls/tests:testbench_builder",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/random",
+        "@com_google_absl//absl/status",
     ],
 )
 
@@ -174,6 +181,7 @@ xls_dslx_opt_ir(
 
 xls_dslx_test(
     name = "fp_trig_reduce_dslx_test",
+    dslx_test_args = {"compare": "jit"},
     library = ":fp_trig_reduce_dslx_module",
 )
 
@@ -187,13 +195,15 @@ xls_eval_ir_test(
 xls_benchmark_ir(
     name = "fp_trig_reduce_benchmark_ir",
     src = ":fp_trig_reduce.ir",
+    # TODO: Takes >15m for synthesis; too long for routine benchmarks.
+    synthesize = False,
 )
 
 cc_xls_ir_jit_wrapper(
     name = "fp_trig_reduce_jit_wrapper",
     src = ":fp_trig_reduce.opt.ir",
     jit_wrapper_args = {
-        "class_name": "fp_trig_reduce",
+        "class_name": "FpTrigReduce",
         "namespace": "xls::fp",
     },
 )
@@ -208,16 +218,17 @@ cc_test(
     tags = ["optonly"],
     deps = [
         ":fp_trig_reduce_jit_wrapper",
+        "//xls/common:init_xls",
+        "//xls/common/file:get_runfile_path",
+        "//xls/common/status:status_macros",
+        "//xls/ir:value_utils",
+        "//xls/ir:value_view_utils",
+        "//xls/tests:testbench_builder",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/numeric:int128",
         "@com_google_absl//absl/random",
         "@com_google_absl//absl/status",
-        "//xls/common:init_xls",
-        "//xls/common/file:get_runfile_path",
-        "//xls/common/logging",
-        "//xls/common/status:status_macros",
-        "//xls/ir:value_helpers",
-        "//xls/ir:value_view_helpers",
-        "//xls/tools:testbench_builder",
     ],
 )
 
@@ -236,6 +247,7 @@ xls_dslx_opt_ir(
 
 xls_dslx_test(
     name = "fpsqrt_32_dslx_test",
+    dslx_test_args = {"compare": "jit"},
     library = ":fpsqrt_32_dslx",
 )
 
@@ -254,7 +266,7 @@ cc_xls_ir_jit_wrapper(
     name = "fpsqrt_32_jit_wrapper",
     src = ":fpsqrt_32.opt.ir",
     jit_wrapper_args = {
-        "class_name": "fpsqrt_32",
+        "class_name": "Fpsqrt32",
         "namespace": "xls::fp",
     },
 )
@@ -269,15 +281,15 @@ cc_test(
     tags = ["optonly"],
     deps = [
         ":fpsqrt_32_jit_wrapper",
-        "@com_google_absl//absl/random",
-        "@com_google_absl//absl/status",
         "//xls/common:init_xls",
         "//xls/common:math_util",
         "//xls/common/file:get_runfile_path",
-        "//xls/common/logging",
         "//xls/common/status:status_macros",
-        "//xls/ir:value_helpers",
-        "//xls/ir:value_view_helpers",
-        "//xls/tools:testbench_builder",
+        "//xls/ir:value_utils",
+        "//xls/ir:value_view_utils",
+        "//xls/tests:testbench_builder",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/random",
+        "@com_google_absl//absl/status",
     ],
 )

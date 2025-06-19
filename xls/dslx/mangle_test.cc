@@ -20,12 +20,14 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "xls/common/status/matchers.h"
+#include "absl/status/status_matchers.h"
+#include "xls/dslx/interp_value.h"
+#include "xls/dslx/type_system/parametric_env.h"
 
 namespace xls::dslx {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 
 TEST(MangleTest, SimpleModuleFunction) {
   EXPECT_THAT(
@@ -37,6 +39,15 @@ TEST(MangleTest, SimpleModuleFunction) {
   EXPECT_THAT(MangleDslxName("my_mod", "f->func:0",
                              CallingConvention::kProcNext, {}, nullptr),
               IsOkAndHolds("__my_mod__f__func_0_next"));
+}
+
+TEST(MangleTest, ModuleFunctionWithScope) {
+  EXPECT_THAT(MangleDslxName("my_mod", "f", CallingConvention::kTypical, {},
+                             nullptr, "scope"),
+              IsOkAndHolds("__my_mod__scope__f"));
+  EXPECT_THAT(MangleDslxName("my_mod", "f", CallingConvention::kImplicitToken,
+                             {}, nullptr, "scope"),
+              IsOkAndHolds("__itok__my_mod__scope__f"));
 }
 
 TEST(MangleTest, SingleFreeKey) {

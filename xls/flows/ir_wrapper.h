@@ -15,23 +15,28 @@
 #ifndef XLS_FLOWS_IR_WRAPPER_H_
 #define XLS_FLOWS_IR_WRAPPER_H_
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "xls/dslx/create_import_data.h"
-#include "xls/dslx/default_dslx_stdlib_path.h"
 #include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/import_data.h"
-#include "xls/dslx/warning_kind.h"
 #include "xls/interpreter/serial_proc_runtime.h"
 #include "xls/ir/function.h"
+#include "xls/ir/package.h"
 #include "xls/ir/proc.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
 #include "xls/jit/function_jit.h"
+#include "xls/jit/jit_channel_queue.h"
+#include "xls/jit/jit_runtime.h"
 
 namespace xls {
 
@@ -83,6 +88,15 @@ class JitChannelQueueWrapper {
 // A class managing a dslx module and associated path.
 class DslxModuleAndPath {
  public:
+  // Take ownership of the dslx module and create a new object.
+  static absl::StatusOr<DslxModuleAndPath> Create(
+      std::unique_ptr<dslx::Module> module, std::string_view file_path);
+
+  // Parse dslx file from path and create a new object.
+  static absl::StatusOr<DslxModuleAndPath> Create(
+      std::string_view module_name, std::string_view file_path,
+      dslx::ImportData* import_data);
+
   // Gives up ownership the dslx module.
   std::unique_ptr<dslx::Module> GiveUpDslxModule() {
     return std::move(module_);
@@ -104,14 +118,6 @@ class DslxModuleAndPath {
 
   // Set new path of the dslx module.
   void SetFilePath(std::string_view path) { file_path_ = path; }
-
-  // Take ownership of the dslx module and create a new object.
-  static absl::StatusOr<DslxModuleAndPath> Create(
-      std::unique_ptr<dslx::Module> module, std::string_view file_path);
-
-  // Parse dslx file from path and create a new object.
-  static absl::StatusOr<DslxModuleAndPath> Create(std::string_view module_name,
-                                                  std::string_view file_path);
 
  private:
   DslxModuleAndPath() = default;
@@ -174,23 +180,19 @@ class IrWrapper {
   static absl::StatusOr<IrWrapper> Create(
       std::string_view ir_package_name, DslxModuleAndPath top_module,
       std::vector<DslxModuleAndPath> import_modules,
-      Flags flags = Flags::kDefault);
+      dslx::ImportData* import_data, Flags flags = Flags::kDefault);
 
   static absl::StatusOr<IrWrapper> Create(
       std::string_view ir_package_name,
       std::unique_ptr<dslx::Module> top_module,
-      std::string_view top_module_path,
+      std::string_view top_module_path, dslx::ImportData* import_data,
       std::unique_ptr<dslx::Module> other_module = nullptr,
       std::string_view other_module_path = "", Flags flags = Flags::kDefault);
 
  private:
   // Construct this object with a default ImportData.
-  explicit IrWrapper(std::string_view package_name)
-      : import_data_(
-            dslx::CreateImportData(xls::kDefaultDslxStdlibPath,
-                                   /*additional_search_paths=*/{},
-                                   /*enabled_warnings=*/dslx::kAllWarningsSet)),
-        package_(std::make_unique<Package>(package_name)) {}
+  explicit IrWrapper(dslx::ImportData* import_data)
+      : import_data_(import_data) {}
 
   // Pointers to the each of the DSLX modules explicitly given to this wrapper.
   //
@@ -199,7 +201,7 @@ class IrWrapper {
   std::vector<dslx::Module*> other_modules_;
 
   // Holds typechecked DSLX modules.
-  dslx::ImportData import_data_;
+  dslx::ImportData* import_data_;
 
   // IR Package.
   std::unique_ptr<Package> package_;

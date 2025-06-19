@@ -14,27 +14,31 @@
 
 #include "xls/passes/dfe_pass.h"
 
-#include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
-#include "absl/status/status.h"
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/data_structures/union_find.h"
 #include "xls/ir/block.h"
 #include "xls/ir/channel.h"
+#include "xls/ir/channel_ops.h"
+#include "xls/ir/function.h"  // IWYU pragma: keep
 #include "xls/ir/function_base.h"
+#include "xls/ir/instantiation.h"
 #include "xls/ir/node_util.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/ir/package.h"
 #include "xls/ir/proc.h"
+#include "xls/ir/proc_elaboration.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
 #include "xls/passes/pass_base.h"
 
 namespace xls {
@@ -78,95 +82,133 @@ void MarkReachedFunctions(FunctionBase* func,
     }
   }
 }
+
+// Data structure describing the liveness of global constructs in a package.
+struct FunctionBaseLiveness {
+  // The live roots of the package. This does not include FunctionBases which
+  // are live because they are called/instantiated from other FunctionBases.
+  std::vector<FunctionBase*> live_roots;
+
+  // Set of the live global channels. Only set for old-style procs.
+  absl::flat_hash_set<Channel*> live_global_channels;
+};
+
+// Analyzes the package to determine which Procs are live. For
+// old-style procs, this is determined by looking for procs that use external
+// channels (i.e send_only or receive_only) or procs that communicate with other
+// live procs over internal channels. For new-style procs, this is determined by
+// looking at the procs that are instantiated by the top proc.
+//
+// The top proc is always considered live.
+absl::StatusOr<FunctionBaseLiveness> ProcLiveness(Proc* top) {
+  if (top->is_new_style_proc()) {
+    XLS_ASSIGN_OR_RETURN(ProcElaboration elab, ProcElaboration::Elaborate(top));
+    return FunctionBaseLiveness{.live_roots = std::vector<FunctionBase*>(
+                                    elab.procs().begin(), elab.procs().end()),
+                                .live_global_channels = {}};
+  }
+
+  Package* p = top->package();
+
+  std::deque<Proc*> worklist;
+  absl::flat_hash_map<Channel*, std::vector<Proc*>> channel_to_proc;
+  absl::flat_hash_map<Proc*, std::vector<Channel*>> proc_to_channel;
+
+  worklist.push_back(top);
+  for (std::unique_ptr<Proc>& proc : p->procs()) {
+    auto [proc_to_channel_iter, inserted] =
+        proc_to_channel.insert({proc.get(), {}});
+    bool saw_channel = false;
+    for (Node* node : proc->nodes()) {
+      if (!node->Is<ChannelNode>()) {
+        continue;
+      }
+      XLS_ASSIGN_OR_RETURN(Channel * channel, GetChannelUsedByNode(node));
+      channel_to_proc[channel].push_back(proc.get());
+      proc_to_channel_iter->second.push_back(channel);
+
+      if (channel->supported_ops() == ChannelOps::kSendReceive) {
+        continue;
+      }
+      if (!saw_channel) {
+        worklist.push_back(proc.get());
+        saw_channel = true;
+      }
+    }
+  }
+
+  FunctionBaseLiveness liveness;
+  absl::flat_hash_set<Proc*> seen;
+  while (!worklist.empty()) {
+    Proc* proc = worklist.front();
+    liveness.live_roots.push_back(proc);
+    seen.insert(proc);
+
+    for (Channel* channel : proc_to_channel.at(proc)) {
+      liveness.live_global_channels.insert(channel);
+      for (Proc* proc_for_channel : channel_to_proc.at(channel)) {
+        if (!seen.contains(proc_for_channel)) {
+          worklist.push_back(proc_for_channel);
+        }
+      }
+    }
+    worklist.pop_front();
+  }
+
+  return liveness;
+}
+
 }  // namespace
 
 // Starting from the return_value(s), DFS over all nodes. Unvisited
 // nodes, or parameters, are dead.
 absl::StatusOr<bool> DeadFunctionEliminationPass::RunInternal(
-    Package* p, const OptimizationPassOptions& options,
-    PassResults* results) const {
+    Package* p, const OptimizationPassOptions& options, PassResults* results,
+    OptimizationContext& context) const {
   std::optional<FunctionBase*> top = p->GetTop();
   if (!top.has_value()) {
     return false;
   }
 
-  // Mapping from proc->channel_id, where channel_id is a representative value
-  // for all the channel_ids in the UnionFind.
-  absl::flat_hash_map<Proc*, int64_t> representative_channel_ids;
-  representative_channel_ids.reserve(p->procs().size());
-  // Channels in the same proc will be union'd.
-  UnionFind<int64_t> channel_id_union;
-  for (std::unique_ptr<Proc>& proc : p->procs()) {
-    std::optional<int64_t> representative_proc_channel_id;
-    for (Node* node : proc->nodes()) {
-      if (IsChannelNode(node)) {
-        int64_t channel_id;
-        if (node->Is<Send>()) {
-          channel_id = node->As<Send>()->channel_id();
-        } else if (node->Is<Receive>()) {
-          channel_id = node->As<Receive>()->channel_id();
-        } else {
-          return absl::NotFoundError(absl::StrFormat(
-              "No channel associated with node %s", node->GetName()));
-        }
-        channel_id_union.Insert(channel_id);
-        if (representative_proc_channel_id.has_value()) {
-          channel_id_union.Union(representative_proc_channel_id.value(),
-                                 channel_id);
-        } else {
-          representative_proc_channel_id = channel_id;
-          representative_channel_ids.insert({proc.get(), channel_id});
-        }
-      }
-    }
+  FunctionBaseLiveness liveness;
+  if ((*top)->IsProc()) {
+    XLS_ASSIGN_OR_RETURN(liveness, ProcLiveness((*top)->AsProcOrDie()));
+  } else {
+    liveness.live_roots = {*top};
   }
 
   absl::flat_hash_set<FunctionBase*> reached;
-  MarkReachedFunctions(top.value(), &reached);
-  std::optional<int64_t> top_proc_representative_channel_id;
-  if ((*top)->IsProc()) {
-    auto itr = representative_channel_ids.find(top.value()->AsProcOrDie());
-    if (itr != representative_channel_ids.end()) {
-      top_proc_representative_channel_id = channel_id_union.Find(itr->second);
-      for (auto [proc, representative_channel_id] :
-           representative_channel_ids) {
-        if (channel_id_union.Find(representative_channel_id) ==
-            *top_proc_representative_channel_id) {
-          MarkReachedFunctions(proc, &reached);
-        }
-    }
-    }
+  for (FunctionBase* fb : liveness.live_roots) {
+    MarkReachedFunctions(fb, &reached);
   }
 
   // Accumulate a list of FunctionBases to unlink.
   bool changed = false;
   for (FunctionBase* f : p->GetFunctionBases()) {
     if (!reached.contains(f)) {
-      XLS_VLOG(2) << "Removing: " << f->name();
+      VLOG(2) << "Removing: " << f->name();
+      context.Abandon(f);
       XLS_RETURN_IF_ERROR(p->RemoveFunctionBase(f));
       changed = true;
     }
   }
 
-  // Find any channels which are only used by now-removed procs.
-  std::vector<int64_t> channel_ids_to_remove;
-  channel_ids_to_remove.reserve(p->channels().size());
+  // Remove dead channels.
+  std::vector<Channel*> channels_to_remove;
+  channels_to_remove.reserve(p->channels().size());
   for (Channel* channel : p->channels()) {
-    int64_t channel_id = channel->id();
-    if (!top_proc_representative_channel_id.has_value() ||
-        channel_id_union.Find(channel_id) !=
-            *top_proc_representative_channel_id) {
-      channel_ids_to_remove.push_back(channel_id);
+    if (!liveness.live_global_channels.contains(channel)) {
+      channels_to_remove.push_back(channel);
     }
   }
-  // Now remove any channels which are only used by now-removed procs.
-  for (int64_t channel_id : channel_ids_to_remove) {
-    XLS_ASSIGN_OR_RETURN(Channel * channel, p->GetChannel(channel_id));
-    XLS_VLOG(2) << "Removing channel: " << channel->name();
+  for (Channel* channel : channels_to_remove) {
+    VLOG(2) << "Removing channel: " << channel->name();
     XLS_RETURN_IF_ERROR(p->RemoveChannel(channel));
     changed = true;
   }
   return changed;
 }
+
+REGISTER_OPT_PASS(DeadFunctionEliminationPass);
 
 }  // namespace xls

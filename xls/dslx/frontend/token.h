@@ -16,6 +16,7 @@
 #define XLS_DSLX_FRONTEND_TOKEN_H_
 
 #include <cstdint>
+#include <cstdio>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -75,8 +76,10 @@ namespace xls::dslx {
   X(kHat, HAT, "^")                                                    \
   X(kFatArrow, FAT_ARROW, "=>")                                        \
   X(kDoubleDot, DOUBLE_DOT, "..")                                      \
+  X(kDoubleDotEquals, DOUBLE_DOT_EQUALS, "..=")                        \
   X(kEllipsis, ELLIPSIS, "...")                                        \
   X(kHash, HASH, "#")                                                  \
+  X(kString, STRING, "string")                                         \
   /* When in whitespace/comment mode; e.g. for syntax highlighting. */ \
   X(kWhitespace, WHITESPACE, "whitespace")                             \
   X(kComment, COMMENT, "comment")
@@ -86,8 +89,6 @@ namespace xls::dslx {
 enum class TokenKind : uint8_t { XLS_DSLX_TOKEN_KINDS(XLS_FIRST_COMMA) };
 
 std::string TokenKindToString(TokenKind kind);
-
-absl::StatusOr<TokenKind> TokenKindFromString(std::string_view s);
 
 inline std::ostream& operator<<(std::ostream& os, TokenKind kind) {
   os << TokenKindToString(kind);
@@ -180,7 +181,7 @@ class Token {
 
   std::string ToString() const;
 
-  std::string ToRepr() const;
+  std::string ToRepr(const FileTable& file_table) const;
 
  private:
   TokenKind kind_;

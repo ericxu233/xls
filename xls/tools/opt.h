@@ -21,12 +21,15 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
-
-// TODO(meheff): 2021-10-04 Remove this header.
+#include "xls/ir/package.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_metrics.pb.h"
+#include "xls/passes/pass_pipeline.pb.h"
 
 namespace xls::tools {
 
@@ -37,31 +40,39 @@ struct OptOptions {
   std::string_view top;
   std::string ir_dump_path = "";
   std::optional<std::string> ir_path = std::nullopt;
-  std::optional<std::vector<std::string>> run_only_passes = std::nullopt;
   std::vector<std::string> skip_passes;
   std::optional<int64_t> convert_array_index_to_select = std::nullopt;
-  bool inline_procs;
+  std::optional<int64_t> split_next_value_selects = std::nullopt;
   std::vector<RamRewrite> ram_rewrites = {};
-  bool use_context_narrowing_analysis;
+  bool use_context_narrowing_analysis = false;
+  bool optimize_for_best_case_throughput = false;
+  bool enable_resource_sharing = false;
+  bool force_resource_sharing = false;
+  std::string area_model = "v";
+  std::variant<std::nullopt_t, std::string_view, PassPipelineProto>
+      pass_pipeline = std::nullopt;
+  std::optional<int64_t> bisect_limit;
+  bool debug_optimizations = false;
 };
+
+// Metadata which can be optionally returned from
+// the optimizer.
+struct OptMetadata {
+  PassPipelineMetricsProto metrics;
+};
+
+// Helper used in the opt_main tool, optimizes the given IR for a particular
+// top-level entity (e.g., function, proc, etc) at the given opt level and
+// modifies the package in place.
+absl::Status OptimizeIrForTop(Package* package, const OptOptions& options,
+                              OptMetadata* metadata = nullptr);
 
 // Helper used in the opt_main tool, optimizes the given IR for a particular
 // top-level entity (e.g., function, proc, etc) at the given opt level and
 // returns the resulting optimized IR.
 absl::StatusOr<std::string> OptimizeIrForTop(std::string_view ir,
-                                             const OptOptions& options);
-
-// Convenience wrapper around the above that builds an OptOptions appropriately.
-// Analagous to calling opt_main with each argument being a flag.
-absl::StatusOr<std::string> OptimizeIrForTop(
-    std::string_view input_path, int64_t opt_level, std::string_view top,
-    std::string_view ir_dump_path,
-    absl::Span<const std::string> run_only_passes,
-    absl::Span<const std::string> skip_passes,
-    int64_t convert_array_index_to_select, bool inline_procs,
-    std::string_view ram_rewrites_pb,
-    bool use_context_narrowing_analysis);
-
+                                             const OptOptions& options,
+                                             OptMetadata* metadata = nullptr);
 }  // namespace xls::tools
 
 #endif  // XLS_TOOLS_OPT_H_

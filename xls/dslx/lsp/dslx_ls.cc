@@ -22,25 +22,32 @@
 
 #include <unistd.h>
 
+#include <cstdlib>
 #include <filesystem>  // NOLINT
 #include <iostream>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <system_error>  // NOLINT
 #include <utility>
 #include <vector>
 
 #include "absl/flags/flag.h"
-#include "external/verible/common/lsp/json-rpc-dispatcher.h"
-#include "external/verible/common/lsp/lsp-protocol.h"
-#include "external/verible/common/lsp/lsp-text-buffer.h"
-#include "external/verible/common/lsp/message-stream-splitter.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_split.h"
+#include "nlohmann/json.hpp"
+#include "verible/common/lsp/json-rpc-dispatcher.h"
+#include "verible/common/lsp/lsp-protocol.h"
+#include "verible/common/lsp/lsp-text-buffer.h"
+#include "verible/common/lsp/message-stream-splitter.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/init_xls.h"
 #include "xls/dslx/default_dslx_stdlib_path.h"
 #include "xls/dslx/lsp/language_server_adapter.h"
+#include "xls/dslx/lsp/lsp_uri.h"
 
-ABSL_FLAG(std::string, stdlib_path, xls::kDefaultDslxStdlibPath,
+ABSL_FLAG(std::string, stdlib_path, std::string(xls::kDefaultDslxStdlibPath),
           "Path to DSLX standard library files.");
 
 static constexpr char kDslxPath[] = "DSLX_PATH";
@@ -51,13 +58,11 @@ ABSL_FLAG(std::string, dslx_path,
 namespace xls::dslx {
 namespace {
 
-namespace fs = std::filesystem;
-
-using verible::lsp::BufferCollection;
-using verible::lsp::EditTextBuffer;
-using verible::lsp::InitializeResult;
-using verible::lsp::JsonRpcDispatcher;
-using verible::lsp::MessageStreamSplitter;
+using ::verible::lsp::BufferCollection;
+using ::verible::lsp::EditTextBuffer;
+using ::verible::lsp::InitializeResult;
+using ::verible::lsp::JsonRpcDispatcher;
+using ::verible::lsp::MessageStreamSplitter;
 
 // The "initialize" method requests server capabilities.
 InitializeResult InitializeServer(const nlohmann::json& params) {
@@ -67,11 +72,21 @@ InitializeResult InitializeServer(const nlohmann::json& params) {
       {"change", 2},        // Incremental updates
   };
   capabilities["documentSymbolProvider"] = true;
+  capabilities["inlayHintProvider"] = true;
   capabilities["definitionProvider"] = {
       {"dynamicRegistration", false},
       {"linkSupport", true},
   };
-  capabilities["documentRangeFormattingProvider"] = true;
+  capabilities["documentLinkProvider"] = {
+      {"dynamicRegistration", false},
+      {"tooltipSupport", false},
+  };
+  capabilities["renameProvider"] = {
+      {"dynamicRegistration", false},
+      {"prepareSupport", true},
+  };
+  capabilities["documentHighlightProvider"] = true;
+  capabilities["documentFormattingProvider"] = true;
   return InitializeResult{
       .capabilities = std::move(capabilities),
       .serverInfo =
@@ -83,7 +98,7 @@ InitializeResult InitializeServer(const nlohmann::json& params) {
 }
 
 // On text change: attempt to parse the buffer and emit diagnostics if needed.
-void TextChangeHandler(const std::string& file_uri,
+void TextChangeHandler(const LspUri& file_uri,
                        const EditTextBuffer& text_buffer,
                        verible::lsp::JsonRpcDispatcher& dispatcher,
                        LanguageServerAdapter& adapter) {
@@ -91,26 +106,81 @@ void TextChangeHandler(const std::string& file_uri,
     // Note: this returns a status, but we don't need to surface it from here.
     adapter.Update(file_uri, file_content).IgnoreError();
   });
-  verible::lsp::PublishDiagnosticsParams params{
-      .uri = file_uri,
-      .diagnostics = adapter.GenerateParseDiagnostics(file_uri),
-  };
-  dispatcher.SendNotification("textDocument/publishDiagnostics", params);
+
+  // For now we brute force evaluate all the files in the DAG that may be
+  // sensitive to the update. We'll need to be smarter as we observe scaling
+  // issues (e.g. only evaluate sensitive files if the original file went from
+  // being an import-time error to having no import-time error).
+  std::vector<LspUri> sensitive_uris =
+      adapter.import_sensitivity().GatherAllSensitiveToChangeIn(file_uri);
+  for (const LspUri& sensitive_uri : sensitive_uris) {
+    // Note to all dependent files that an update has occurred.
+    // We don't need to do this for the file that we updated directly.
+    if (sensitive_uri != file_uri) {
+      adapter.Update(sensitive_uri, std::nullopt).IgnoreError();
+    }
+
+    verible::lsp::PublishDiagnosticsParams params{
+        .uri = std::string{sensitive_uri.GetStringView()},
+        .diagnostics = adapter.GenerateParseDiagnostics(sensitive_uri),
+    };
+    dispatcher.SendNotification("textDocument/publishDiagnostics", params);
+  }
+}
+
+// Attempt to canonicalize "original_path" and return that if successful.
+// If it can not be resolved as absolute path or relative to CWD, attempt
+// to resolve relative to the elements in "search_path".
+// If all fails, return as-is (don't crash to not bring down the LS).
+static std::filesystem::path FailSafeCanonicalize(
+    const std::vector<std::filesystem::path>& search_path,
+    const std::filesystem::path& original_path) {
+  std::error_code ec;
+  std::filesystem::path canonicalized =
+      std::filesystem::canonical(original_path, ec);
+  if (!ec) {
+    return canonicalized;
+  }
+  for (const std::filesystem::path& path : search_path) {
+    const std::filesystem::path possible_path = path / original_path;
+    if (std::filesystem::exists(possible_path, ec)) {
+      std::filesystem::path canonicalized =
+          std::filesystem::canonical(possible_path, ec);
+      if (!ec) {
+        return canonicalized;
+      }
+    }
+  }
+  LspLog() << "Error: " << original_path << ": " << ec.message() << "\n";
+  return original_path;
 }
 
 absl::Status RealMain() {
   const std::string stdlib_path = absl::GetFlag(FLAGS_stdlib_path);
   const std::string dslx_path = absl::GetFlag(FLAGS_dslx_path);
-  const std::vector<fs::path> dslx_paths = absl::StrSplit(dslx_path, ':');
+  const std::vector<std::filesystem::path> dslx_paths =
+      absl::StrSplit(dslx_path, ':');
 
-  LspLog() << "XLS testing language server"
-           << "\n";
-  LspLog() << "Path configuration:\n\tstdlib=" << stdlib_path << "\n"
-           << "\tdsxl_path=" << dslx_path << "\n"
-           << "\tcwd=" << fs::current_path().string() << "\n";
+  const std::filesystem::path stdlib_realpath =
+      FailSafeCanonicalize(dslx_paths, stdlib_path);
+
+  LspLog() << "XLS testing language server" << "\n";
+  LspLog() << "Path configuration:\n"
+           << "\tstdlib=" << stdlib_path << "\n"
+           << "\tstdlib_realpath=" << stdlib_realpath.string() << "\n"
+           << "\tdslx_path=" << dslx_path << "\n"
+           << "\tcwd=" << std::filesystem::current_path().string() << "\n";
+
+  std::vector<LspUri> dslx_path_uris;
+  dslx_path_uris.reserve(dslx_paths.size());
+  for (const std::filesystem::path& path : dslx_paths) {
+    dslx_path_uris.push_back(LspUri::FromFilesystemPath(path));
+  }
+
+  const LspUri stdlib_uri = LspUri::FromFilesystemPath(stdlib_path);
 
   // Adapter that interfaces between dslx parsing and LSP
-  LanguageServerAdapter language_server_adapter(stdlib_path, dslx_paths);
+  LanguageServerAdapter language_server_adapter(stdlib_uri, dslx_path_uris);
 
   // The dispatcher receives json rpc requests
   // (https://www.jsonrpc.org/specification) which are passed in
@@ -160,34 +230,92 @@ absl::Status RealMain() {
         if (buffer == nullptr) {
           return;  // buffer got deleted. No interest.
         }
-        TextChangeHandler(uri, *buffer, dispatcher, language_server_adapter);
+        TextChangeHandler(LspUri(uri), *buffer, dispatcher,
+                          language_server_adapter);
       });
 
   dispatcher.AddRequestHandler(
       "textDocument/documentSymbol",
       [&](const verible::lsp::DocumentSymbolParams& params) {
         return language_server_adapter.GenerateDocumentSymbols(
-            params.textDocument.uri);
+            LspUri(std::string{params.textDocument.uri}));
       });
 
   dispatcher.AddRequestHandler(
       "textDocument/definition",
       [&](const verible::lsp::DefinitionParams& params) {
-        return language_server_adapter.FindDefinitions(params.textDocument.uri,
-                                                       params.position);
+        auto values = language_server_adapter.FindDefinitions(
+            LspUri(std::string{params.textDocument.uri}), params.position);
+        if (values.ok()) {
+          return *values;
+        }
+        LspLog() << "could not find definition(s); status: " << values.status()
+                 << "\n";
+        return std::vector<verible::lsp::Location>{};
       });
 
   dispatcher.AddRequestHandler(
-      "textDocument/rangeFormatting",
+      "textDocument/formatting",
       [&](const verible::lsp::DocumentFormattingParams& params) {
-        auto text_edits_or = language_server_adapter.FormatRange(
-            params.textDocument.uri, params.range);
-        if (text_edits_or.ok()) {
-          return text_edits_or.value();
+        auto values = language_server_adapter.FormatDocument(
+            LspUri(std::string{params.textDocument.uri}));
+        if (values.ok()) {
+          return *values;
         }
-        LspLog() << "could not format requested range: "
-                 << text_edits_or.status() << "\n";
+        LspLog() << "could not format document; status: " << values.status()
+                 << "\n";
         return std::vector<verible::lsp::TextEdit>{};
+      });
+
+  dispatcher.AddRequestHandler(
+      "textDocument/documentLink",
+      [&](const verible::lsp::DocumentLinkParams& params) {
+        return language_server_adapter.ProvideImportLinks(
+            LspUri(std::string{params.textDocument.uri}));
+      });
+
+  dispatcher.AddRequestHandler(
+      "textDocument/rename", [&](const verible::lsp::RenameParams& params) {
+        auto edit = language_server_adapter.Rename(
+            LspUri(std::string{params.textDocument.uri}), params.position,
+            params.newName);
+        if (!edit.ok()) {
+          LspLog() << "could not determine rename edit; status: "
+                   << edit.status() << "\n";
+          return nlohmann::json();
+        }
+        if (edit->has_value()) {
+          nlohmann::json o;
+          verible::lsp::to_json(o, edit->value());
+          return o;
+        }
+        return nlohmann::json();
+      });
+
+  dispatcher.AddRequestHandler(
+      "textDocument/inlayHint",
+      [&](const verible::lsp::InlayHintParams& params) {
+        auto inlay_hints = language_server_adapter.InlayHint(
+            LspUri(std::string{params.textDocument.uri}), params.range);
+        if (inlay_hints.ok()) {
+          return *std::move(inlay_hints);
+        }
+        LspLog() << "could not determine inlay hints; status: "
+                 << inlay_hints.status() << "\n";
+        return std::vector<verible::lsp::InlayHint>{};
+      });
+
+  dispatcher.AddRequestHandler(
+      "textDocument/documentHighlight",
+      [&](const verible::lsp::DocumentHighlightParams& params) {
+        auto highlights = language_server_adapter.DocumentHighlight(
+            LspUri(std::string{params.textDocument.uri}), params.position);
+        if (highlights.ok()) {
+          return *highlights;
+        }
+        LspLog() << "could not perform document highlight(s); status: "
+                 << highlights.status() << "\n";
+        return std::vector<verible::lsp::DocumentHighlight>{};
       });
 
   // Main loop. Feeding the stream-splitter that then calls the dispatcher.

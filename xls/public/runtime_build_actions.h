@@ -28,16 +28,16 @@
 // compiler remaining stable, users should not depend on the precise output of
 // these actions remaining stable, they will evolve as the XLS system evolves.
 
-#include <filesystem>
-#include <optional>
+#include <filesystem>  // NOLINT
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "xls/codegen/module_signature.h"
+#include "xls/codegen/codegen_result.h"
 #include "xls/public/ir.h"
-#include "xls/scheduling/pipeline_schedule.pb.h"
+#include "xls/scheduling/scheduling_result.h"
 #include "xls/tools/codegen_flags.pb.h"
 #include "xls/tools/scheduling_options_flags.pb.h"
 
@@ -52,6 +52,15 @@ namespace xls {
 // command line flag option that indicates what DSL stdlib path to use instead.
 std::string_view GetDefaultDslxStdlibPath();
 
+struct ConvertDslxToIrOptions {
+  std::string_view dslx_stdlib_path;
+  absl::Span<const std::filesystem::path> additional_search_paths;
+  absl::Span<const std::string_view> enable_warnings;
+  absl::Span<const std::string_view> disable_warnings;
+  bool warnings_as_errors = true;
+  std::vector<std::string>* warnings_out = nullptr;
+};
+
 // Converts the specified DSLX text into XLS IR text.
 //
 // Args:
@@ -65,15 +74,13 @@ std::string_view GetDefaultDslxStdlibPath();
 //  additional_search_paths: Additional filesystem paths to search for imported
 //    modules.
 absl::StatusOr<std::string> ConvertDslxToIr(
-    std::string_view dslx, std::string_view path,
-    std::string_view module_name, std::string_view dslx_stdlib_path,
-    absl::Span<const std::filesystem::path> additional_search_paths);
+    std::string_view dslx, std::string_view path, std::string_view module_name,
+    const ConvertDslxToIrOptions& options);
 
 // As above, but uses a filesystem path to retrieve the DSLX module contents.
 // "path" should end with ".x" suffix, the path will determine the module name.
 absl::StatusOr<std::string> ConvertDslxPathToIr(
-    const std::filesystem::path& path, std::string_view dslx_stdlib_path,
-    absl::Span<const std::filesystem::path> additional_search_paths);
+    const std::filesystem::path& path, const ConvertDslxToIrOptions& options);
 
 // Optimizes the generated XLS IR with the given top-level entity (e.g.,
 // function, proc, etc).
@@ -104,8 +111,8 @@ absl::StatusOr<std::string> ProtoToDslx(std::string_view proto_def,
                                         std::string_view binding_name);
 
 struct ScheduleAndCodegenResult {
-  verilog::ModuleGeneratorResult module_generator_result;
-  std::optional<PipelineScheduleProto> pipeline_schedule_proto = std::nullopt;
+  SchedulingResult scheduling_result;
+  verilog::CodegenResult codegen_result;
 };
 
 // Schedules and codegen a given package.

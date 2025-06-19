@@ -14,16 +14,28 @@
 
 #include "xls/scheduling/extract_stage.h"
 
-#include <iostream>
-#include <ostream>
 #include <string>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_format.h"
 #include "xls/common/status/matchers.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/channel.h"
+#include "xls/ir/channel_ops.h"
+#include "xls/ir/function.h"
+#include "xls/ir/function_builder.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/node.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/op.h"
+#include "xls/ir/proc.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
+#include "xls/scheduling/pipeline_schedule.h"
 #include "xls/scheduling/run_pipeline_schedule.h"
 #include "xls/scheduling/scheduling_options.h"
 
@@ -31,6 +43,7 @@ namespace xls {
 namespace {
 
 namespace m = xls::op_matchers;
+using ::testing::AllOf;
 
 class ExtractStageTest : public IrTestBase {};
 

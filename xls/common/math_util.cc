@@ -14,8 +14,11 @@
 
 #include "xls/common/math_util.h"
 
+#include <cstdint>
 #include <functional>
 #include <vector>
+
+#include "absl/types/span.h"
 
 namespace xls {
 namespace {

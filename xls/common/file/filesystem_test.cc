@@ -14,7 +14,9 @@
 
 #include "xls/common/file/filesystem.h"
 
-#include <filesystem>
+#include <unistd.h>
+
+#include <filesystem>  // NOLINT
 #include <fstream>
 #include <ios>
 #include <string>
@@ -23,6 +25,7 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "xls/common/file/filesystem_test.pb.h"
 #include "xls/common/file/temp_directory.h"
@@ -32,8 +35,8 @@
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::AnyOf;
 using ::testing::Contains;
 using ::testing::Eq;
@@ -427,7 +430,7 @@ TEST(FilesystemTest, GetDirectoryEntriesGivesRelativePathsWhenPathIsRelative) {
 TEST(FilesystemTest, GetRealPath) {
 #ifndef __linux__
   GTEST_SKIP() << "Skipping as procfs only available on linux";
-#endif  /* __linux__ */
+#endif /* __linux__ */
   XLS_ASSERT_OK_AND_ASSIGN(std::filesystem::path link_path,
                            GetRealPath("/proc/self/exe"));
   XLS_ASSERT_OK_AND_ASSIGN(std::filesystem::path real_path,

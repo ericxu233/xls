@@ -15,14 +15,17 @@
 #ifndef XLS_NOC_SIMULATION_FLIT_H_
 #define XLS_NOC_SIMULATION_FLIT_H_
 
+#include <cstdint>
 #include <string>
 
 #include "absl/container/inlined_vector.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
+#include "xls/ir/format_preference.h"
 #include "xls/noc/simulation/common.h"
 
 // This file contains classes used to store and build objects related to

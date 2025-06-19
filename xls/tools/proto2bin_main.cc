@@ -13,23 +13,24 @@
 // limitations under the License.
 
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
 #include "xls/common/logging/log_lines.h"
-#include "xls/common/logging/logging.h"
-#include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/contrib/xlscc/hls_block.pb.h"
 #include "xls/ir/ram_rewrite.pb.h"
 
-const char kUsage[] = R"(
+static constexpr std::string_view kUsage = R"(
 Simplified utility to convert a textproto to a binary proto.  Used
 to to provide binary protos to xls rules and command line
 interfaces that utilize binary protos for configuration (ex. xlscc).
@@ -59,19 +60,18 @@ absl::StatusOr<std::unique_ptr<google::protobuf::Message>> MakeProtoForMessageTy
 absl::Status RealMain(std::string_view textproto_path,
                       std::string_view message_type,
                       std::string_view output_path) {
-  XLS_LOG(INFO) << absl::StrFormat(
-      "Converting type %s textproto %s to binproto %s", message_type,
-      textproto_path, output_path);
+  LOG(INFO) << absl::StrFormat("Converting type %s textproto %s to binproto %s",
+                               message_type, textproto_path, output_path);
 
   XLS_ASSIGN_OR_RETURN(std::unique_ptr<google::protobuf::Message> proto,
                        MakeProtoForMessageType(message_type));
 
-  XLS_CHECK_OK(ParseTextProtoFile(textproto_path, proto.get()));
+  CHECK_OK(ParseTextProtoFile(textproto_path, proto.get()));
 
-  XLS_VLOG(1) << "Proto contents:";
+  VLOG(1) << "Proto contents:";
   XLS_VLOG_LINES(1, proto->DebugString());
 
-  XLS_CHECK_OK(SetProtobinFile(output_path, *proto));
+  CHECK_OK(SetProtobinFile(output_path, *proto));
 
   return absl::OkStatus();
 }
@@ -84,18 +84,18 @@ int main(int argc, char** argv) {
       xls::InitXls(kUsage, argc, argv);
 
   if (positional_arguments.size() != 1) {
-    XLS_LOG(QFATAL) << absl::StreamFormat(
-        "Expected invocation: %s TEXT_PROTO_FILE", argv[0]);
+    LOG(QFATAL) << absl::StreamFormat("Expected invocation: %s TEXT_PROTO_FILE",
+                                      argv[0]);
   }
 
   std::string_view text_proto_path = positional_arguments[0];
 
   if (absl::GetFlag(FLAGS_message).empty()) {
-    XLS_LOG(QFATAL) << "--message (proto message type) required.";
+    LOG(QFATAL) << "--message (proto message type) required.";
   }
 
   if (absl::GetFlag(FLAGS_output).empty()) {
-    XLS_LOG(QFATAL) << "--output (binary proto output file path) required.";
+    LOG(QFATAL) << "--output (binary proto output file path) required.";
   }
 
   return xls::ExitStatus(xls::RealMain(text_proto_path,

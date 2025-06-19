@@ -19,12 +19,14 @@
 #include <vector>
 
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "google/protobuf/text_format.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/synthesis/synthesis.pb.h"
 #include "xls/synthesis/synthesis_client.h"
 
@@ -33,7 +35,7 @@ ABSL_FLAG(int, port, 10000, "Server port to connect to");
 ABSL_FLAG(double, ghz, 1.0, "The target frequency for synthesis (GHz)");
 ABSL_FLAG(std::string, top, "main", "Name of the top module to synthesize");
 
-static constexpr char kUsage[] = R"(
+static constexpr std::string_view kUsage = R"(
 A test client in C++ for using the synthesis server.
 The default port matches that used by the Yosys synth server.
 
@@ -60,12 +62,12 @@ int main(int argc, char** argv) {
 
   // Check that input Verilog is provided, and get it
   if (positional_arguments.size() != 1) {
-    XLS_LOG(QFATAL) << absl::StrCat("Expected invocation: ", argv[0],
-                                    " [flags] VERILOG_FILE\n");
+    LOG(QFATAL) << absl::StrCat("Expected invocation: ", argv[0],
+                                " [flags] VERILOG_FILE\n");
   }
   std::string_view vpath = positional_arguments[0];
   absl::StatusOr<std::string> verilog_contents = xls::GetFileContents(vpath);
-  XLS_QCHECK_OK(verilog_contents.status());
+  QCHECK_OK(verilog_contents.status());
   request.set_module_text(verilog_contents.value());
 
   // Use the client to perform the RPC
@@ -74,7 +76,10 @@ int main(int argc, char** argv) {
 
   // Examine the response
   if (compile_response_status.ok()) {
-    std::cout << compile_response_status.value().DebugString() << '\n';
+    std::string compile_response_text;
+    google::protobuf::TextFormat::PrintToString(compile_response_status.value(),
+                                      &compile_response_text);
+    std::cout << compile_response_text << '\n';
   }
   return xls::ExitStatus(compile_response_status.status());
 }

@@ -12,41 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <cstdlib>
-#include <ctime>
+#include <filesystem>  // NOLINT
 #include <iostream>
 #include <memory>
 #include <optional>
-#include <ostream>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <vector>
 
+#include "gtest/gtest.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_replace.h"
+#include "xls/codegen/codegen_options.h"
+#include "xls/codegen/codegen_result.h"
 #include "xls/codegen/combinational_generator.h"
-#include "xls/codegen/module_signature.h"
+#include "xls/codegen/vast/vast.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/get_runfile_path.h"
 #include "xls/common/file/temp_directory.h"
-#include "xls/common/logging/logging.h"
+#include "xls/common/source_location.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/subprocess.h"
 #include "xls/contrib/xlscc/unit_tests/unit_test.h"
 #include "xls/interpreter/function_interpreter.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/events.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_builder.h"
-#include "xls/ir/ir_test_base.h"
 #include "xls/ir/nodes.h"
 #include "xls/ir/value.h"
 #include "xls/passes/optimization_pass_pipeline.h"
+#include "xls/simulation/default_verilog_simulator.h"
 #include "xls/simulation/module_simulator.h"
-#include "xls/simulation/verilog_simulators.h"
+#include "xls/simulation/verilog_simulator.h"
 
 ABSL_FLAG(int, sample_count, 1, "number of samples to generate.");
 ABSL_FLAG(int, seed, 1, "seed for pseudo-randomizer");
@@ -58,7 +65,8 @@ namespace xlscc {
 
 class GeneratedTester : public XlsccTestBase {
  public:
-  GeneratedTester() = default;
+  GeneratedTester()
+      : verilog_simulator_(xls::verilog::GetDefaultVerilogSimulator()) {}
   void TestBody() override {}
 
   absl::Status RunExisting(const std::filesystem::path& cc_filename,
@@ -69,8 +77,9 @@ class GeneratedTester : public XlsccTestBase {
     XLS_ASSIGN_OR_RETURN(xls::SubprocessResult result_value,
                          xls::InvokeSubprocess({std::string(exec_filename)}));
 
-    std::string stripped_result =
-        absl::StrReplaceAll(result_value.stdout, {{"0b", ""}});
+    std::string stripped_result = absl::StrReplaceAll(
+        result_value.stdout_content, {{"0b", ""}, {".", ""}});
+    std::reverse(stripped_result.begin(), stripped_result.end());
     absl::InlinedVector<bool, 1> expected_in;
     expected_in.reserve(stripped_result.size());
     for (char& ch : stripped_result) {
@@ -79,7 +88,7 @@ class GeneratedTester : public XlsccTestBase {
     auto expected = xls::Value(xls::Bits(expected_in));
     XLS_ASSIGN_OR_RETURN(auto calc_result, RunIntTest(expected, test_content));
     if (calc_result != expected) {
-      std::cout << expected << " " << calc_result << std::endl;
+      std::cout << "ac: " << expected << " xls: " << calc_result << '\n';
       return absl::InternalError("test failed");
     }
     return absl::OkStatus();
@@ -104,21 +113,21 @@ class GeneratedTester : public XlsccTestBase {
 
   absl::StatusOr<xls::Value> RunSimulated(
       const absl::flat_hash_map<std::string, xls::Value>& args) {
-    XLS_CHECK_EQ(package_->functions().size(), 1);
+    CHECK_EQ(package_->functions().size(), 1);
     std::optional<xls::FunctionBase*> top = package_->GetTop();
-    XLS_CHECK(top.has_value());
-    XLS_CHECK(top.value()->IsFunction());
+    CHECK(top.has_value());
+    CHECK(top.value()->IsFunction());
 
     XLS_ASSIGN_OR_RETURN(
-        xls::verilog::ModuleGeneratorResult result,
+        xls::verilog::CodegenResult result,
         xls::verilog::GenerateCombinationalModule(
             top.value(),
             xls::verilog::CodegenOptions().use_system_verilog(false)));
 
-    XLS_VLOG(3) << "Verilog text:\n" << result.verilog_text;
+    VLOG(3) << "Verilog text:\n" << result.verilog_text;
     xls::verilog::ModuleSimulator simulator(
         result.signature, result.verilog_text, xls::verilog::FileType::kVerilog,
-        &xls::verilog::GetDefaultVerilogSimulator());
+        verilog_simulator_.get());
     XLS_ASSIGN_OR_RETURN(xls::Value actual, simulator.RunFunction(args));
     return actual;
   }
@@ -171,7 +180,7 @@ class GeneratedTester : public XlsccTestBase {
 
     // Get the path that includes the ac_datatypes folder, so that the
     //  ac_datatypes headers can be included with the form:
-    // #include "external/com_github_hlslibs_ac_types/include/include/foo.h"
+    // #include "ac_datatypes/include/include/foo.h"
     auto ac_int_dir = std::filesystem::path(ac_int_path);
     ac_int_dir = ac_int_dir.parent_path().parent_path();
     std::string ac_include = std::string("-I") + ac_int_dir.string();
@@ -193,12 +202,14 @@ class GeneratedTester : public XlsccTestBase {
         RunAndExpectEqGenerated(expected, cpp_source, loc, argv));
     return result;
   }
+
+  std::unique_ptr<xls::verilog::VerilogSimulator> verilog_simulator_;
 };
 
 TEST_F(GeneratedTester, Simple) {
   xlscc::GeneratedTester tester;
   int seed = absl::GetFlag(FLAGS_seed);
-  int sample_count = absl::GetFlag(FLAGS_sample_count);
+  std::string input_path = absl::GetFlag(FLAGS_input_path);
   std::string crash_path = absl::GetFlag(FLAGS_crash_path);
   bool run_failed = absl::GetFlag(FLAGS_run_failed);
 
@@ -207,33 +218,29 @@ TEST_F(GeneratedTester, Simple) {
   std::string temp_dir;
   if (temp_dir_class.ok()) {
     temp_dir = temp_dir_class.value().path();
-    XLS_LOG(INFO) << "using temp directory: " << temp_dir;
+    LOG(INFO) << "using temp directory: " << temp_dir;
   } else {
-    XLS_LOG(QFATAL) << "Failed to create temp directory: ";
+    LOG(QFATAL) << "Failed to create temp directory: ";
   }
 
   std::srand(seed);
 
   if (!run_failed) {
     if (!crash_path.empty()) {
-      std::error_code error;
-      std::filesystem::create_directory(crash_path, error);
-      if (error) {
-        XLS_LOG(WARNING) << "failed to create crash path: " << crash_path;
+      if (!std::filesystem::create_directory(crash_path)) {
+        LOG(WARNING) << "failed to create crash path: " << crash_path;
       }
     } else {
       crash_path = temp_dir;
     }
-    for (int i = seed; i < sample_count; i++) {
-      XLS_ASSERT_OK_AND_ASSIGN(
-          std::filesystem::path exec_filename,
-          xls::GetXlsRunfilePath("xls/contrib/xlscc/sample_fuzz_" +
-                                 std::to_string(i)));
+    XLS_ASSERT_OK_AND_ASSIGN(
+        std::filesystem::path exec_filename,
+        xls::GetXlsRunfilePath(input_path + std::to_string(seed)));
 
-      std::filesystem::path cc_filepath = exec_filename.string() + ".cc";
-      absl::Status status = RunExisting(cc_filepath, exec_filename);
-      XLS_EXPECT_OK(status) << "failed test case: " << std::to_string(i);
-    }
+    std::filesystem::path cc_filepath = exec_filename.string() + ".cc";
+    absl::Status status = RunExisting(cc_filepath, exec_filename);
+    XLS_EXPECT_OK(status) << "failed test case: " << std::to_string(seed) << " "
+                          << cc_filepath;
   } else {
     absl::StatusOr<std::vector<std::filesystem::path>> files =
         xls::GetDirectoryEntries(crash_path);
@@ -246,9 +253,9 @@ TEST_F(GeneratedTester, Simple) {
         exe_path = exe_path.substr(0, exe_path.size() - 3);
         absl::Status test_result = tester.RunExisting(file, exe_path);
         if (!test_result.ok()) {
-          std::cout << "test failed: " << file << std::endl;
+          std::cout << "test failed: " << file << '\n';
         } else {
-          std::cout << "test succeeded: " << file << std::endl;
+          std::cout << "test succeeded: " << file << '\n';
         }
       }
     }

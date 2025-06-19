@@ -15,15 +15,13 @@
 #ifndef XLS_SCHEDULING_SCHEDULING_PASS_H_
 #define XLS_SCHEDULING_SCHEDULING_PASS_H_
 
-#include <optional>
-#include <string>
-#include <string_view>
+#include <variant>
+#include <vector>
 
 #include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
-#include "absl/strings/str_split.h"
-#include "xls/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/fdo/synthesizer.h"
+#include "xls/ir/function_base.h"
 #include "xls/ir/package.h"
 #include "xls/passes/pass_base.h"
 #include "xls/scheduling/pipeline_schedule.h"
@@ -36,25 +34,42 @@ namespace xls {
 
 // Data structure operated on by scheduling passes. Contains the IR and the
 // associated schedule.
-template <typename IrT = Package*>
-struct SchedulingUnit {
-  IrT ir;
-  std::optional<PipelineSchedule> schedule;
+class SchedulingContext {
+ public:
+  // Create a SchedulingContext that operates only on `f`.
+  static SchedulingContext CreateForSingleFunction(FunctionBase* f);
+  // Create a SchedulingContext that operates on all functions and procs in `p`.
+  static SchedulingContext CreateForWholePackage(Package* p);
 
-  // Methods required by CompoundPassBase.
-  std::string DumpIr() const {
-    // Dump the IR followed by the schedule. The schedule is commented out
-    // ('//') so the output is parsable.
-    std::string out = ir->DumpIr();
-    if (schedule.has_value()) {
-      absl::StrAppend(&out, "\n\n// Pipeline Schedule\n");
-      for (auto line : absl::StrSplit(schedule->ToString(), '\n')) {
-        absl::StrAppend(&out, "// ", line, "\n");
-      }
-    }
-    return out;
+  SchedulingContext() = delete;
+
+  const PackagePipelineSchedules& schedules() const { return schedules_; }
+  PackagePipelineSchedules& schedules() { return schedules_; }
+
+  // Gets list of FunctionBases to be operated on by scheduling passes.
+  absl::StatusOr<std::vector<FunctionBase*>> GetSchedulableFunctions() const;
+  // Returns true if every function in `GetSchedulableFunctions()` has a
+  // schedule in `schedules()`.
+  bool IsScheduled() const;
+
+  const TransformMetrics& transform_metrics() const {
+    return ir_->transform_metrics();
   }
-  std::string name() const { return ir->name(); }
+
+ protected:
+  explicit SchedulingContext(Package* p)
+      : schedulable_unit_(p), ir_(p), schedules_({}) {}
+  explicit SchedulingContext(FunctionBase* fb_to_schedule)
+      : schedulable_unit_(fb_to_schedule),
+        ir_(fb_to_schedule->package()),
+        schedules_({}) {}
+
+ private:
+  // If FunctionBase, only schedule the FunctionBase, else schedule the whole
+  // package.
+  std::variant<Package*, FunctionBase*> schedulable_unit_;
+  Package* ir_;
+  PackagePipelineSchedules schedules_;
 };
 
 // Options passed to each scheduling pass.
@@ -67,38 +82,12 @@ struct SchedulingPassOptions : public PassOptionsBase {
   const synthesis::Synthesizer* synthesizer = nullptr;
 };
 
-using SchedulingPassResults = PassResults;
-using SchedulingPass =
-    PassBase<SchedulingUnit<>, SchedulingPassOptions, SchedulingPassResults>;
+using SchedulingPass = PassBase<SchedulingPassOptions, SchedulingContext>;
 using SchedulingCompoundPass =
-    CompoundPassBase<SchedulingUnit<>, SchedulingPassOptions,
-                     SchedulingPassResults>;
+    CompoundPassBase<SchedulingPassOptions, SchedulingContext>;
 using SchedulingInvariantChecker = SchedulingCompoundPass::InvariantChecker;
-
-// Abstract base class for scheduling passes operating at function/proc scope.
-// The derived classes must define RunOnFunctionBaseInternal.
-class SchedulingOptimizationFunctionBasePass : public SchedulingPass {
- public:
-  SchedulingOptimizationFunctionBasePass(std::string_view short_name,
-                                         std::string_view long_name)
-      : SchedulingPass(short_name, long_name) {}
-
-  // Runs the pass on a single function/proc.
-  absl::StatusOr<bool> RunOnFunctionBase(SchedulingUnit<FunctionBase*>* s,
-                                         const SchedulingPassOptions& options,
-                                         SchedulingPassResults* results) const;
-
- protected:
-  // Iterates over each function and proc in the package calling
-  // RunOnFunctionBase.
-  absl::StatusOr<bool> RunInternal(
-      SchedulingUnit<>* s, const SchedulingPassOptions& options,
-      SchedulingPassResults* results) const override;
-
-  virtual absl::StatusOr<bool> RunOnFunctionBaseInternal(
-      SchedulingUnit<FunctionBase*>* s, const SchedulingPassOptions& options,
-      SchedulingPassResults* results) const = 0;
-};
+using SchedulingFunctionBasePass =
+    FunctionBasePass<SchedulingPassOptions, SchedulingContext>;
 
 }  // namespace xls
 

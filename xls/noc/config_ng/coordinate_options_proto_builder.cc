@@ -14,13 +14,16 @@
 
 #include "xls/noc/config_ng/coordinate_options_proto_builder.h"
 
-#include "xls/common/logging/logging.h"
+#include <cstdint>
+
+#include "absl/log/die_if_null.h"
+#include "xls/noc/config_ng/topology_options_network_config_builder.pb.h"
 
 namespace xls::noc {
 
 CoordinateOptionsProtoBuilder::CoordinateOptionsProtoBuilder(
     CoordinateOptionsProto* proto_ptr)
-    : proto_ptr_(XLS_DIE_IF_NULL(proto_ptr)) {}
+    : proto_ptr_(ABSL_DIE_IF_NULL(proto_ptr)) {}
 
 CoordinateOptionsProtoBuilder::CoordinateOptionsProtoBuilder(
     CoordinateOptionsProto* proto_ptr,

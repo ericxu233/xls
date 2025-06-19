@@ -28,14 +28,14 @@ editor to handle `.x` files by using it.
 
 Follow the
 [XLS build setup instructions](https://google.github.io/xls/#building-from-source)
-so that the pre-requisites are available for building binaries via Bazel. Then,
+so that the prerequisites are available for building binaries via Bazel. Then,
 build the following `dslx_ls` binary and place it in your `PATH`:
 
-```
-~/xls$ bazel build -c opt //xls/dslx/lsp:dslx_ls
-~/xls$ mkdir ~/bin/
-~/xls$ cp -iv bazel-bin/xls/dslx/lsp/dslx_ls ~/bin/
-~/xls$ export PATH=$HOME/bin:$PATH
+```sh
+$ bazel build -c opt //xls/dslx/lsp:dslx_ls
+$ mkdir ~/bin/
+$ cp -iv bazel-bin/xls/dslx/lsp/dslx_ls ~/bin/
+$ export PATH=$HOME/bin:$PATH
 ```
 
 Now that the language server binary is available in your `PATH`, you must
@@ -46,7 +46,7 @@ configure your editor to find/use it for `.x` files.
 First we must install `vim-plug` -- follow the latest instructions at
 `https://github.com/junegunn/vim-plug`; e.g.:
 
-```
+```sh
 $ curl -fLo ~/.vim/autoload/plug.vim --create-dirs \
     https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
 ```
@@ -79,10 +79,10 @@ let g:lsp_diagnostics_signs_enabled = 1
 au BufRead,BufNewFile *.x set filetype=dslx
 ```
 
-Run vim and execute `:PlugInstall` to get the new LSP plugins. After that
-completes successfully, quit Vim (famously, via `:q`).
+Start Vim and execute `:PlugInstall` to get the new LSP plugins. After that
+completes successfully, quit Vim (via `:q`).
 
-Open `foo.x` in vim and then paste the following contents:
+Open `foo.x` in Vim and then paste the following contents:
 
 ```
 fn main() -> u8 { u8:256 }
@@ -135,7 +135,7 @@ piggy-backing on the Rust major mode.
 ```
 
 Additional details on Emacs enablement may be available in the
-[Verible editor hook-up documentation](https://github.com/chipsalliance/verible/blob/master/verilog/tools/ls/README.md#hooking-up-to-editor).
+[Verible editor hook-up documentation](https://github.com/chipsalliance/verible/blob/master/verible/verilog/tools/ls/README.md#hooking-up-to-editor).
 
 ## Sublime Text
 
@@ -153,7 +153,7 @@ corner as `dslx`.
 ### Install LSP package
 
 Instructions for installing the LSP package are given in the
-[Verible documentation](https://github.com/chipsalliance/verible/blob/master/verilog/tools/ls/README.md#sublime).
+[Verible documentation](https://github.com/chipsalliance/verible/blob/master/verible/verilog/tools/ls/README.md#sublime).
 
 ### Add DSLX to LSP settings
 
@@ -181,5 +181,5 @@ is out of range for a `u8`.
 
 ## Other Editors
 
-For non-Vim editors, see the instructions provided by
-[our sister project, Verible](https://github.com/chipsalliance/verible/blob/master/verilog/tools/ls/README.md#hooking-up-to-editor).
+For other editors, see the instructions provided by
+[our sister project, Verible](https://github.com/chipsalliance/verible/blob/master/verible/verilog/tools/ls/README.md#hooking-up-to-editor).

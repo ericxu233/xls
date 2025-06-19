@@ -22,7 +22,7 @@
 // output may wish to guess earlier/later output values would be very
 // bad.
 
-import std
+import std;
 
 const M = u32:2147483647;
 
@@ -67,16 +67,16 @@ pub fn rng_new(seed: u32) -> State { State { seed: rng_sanitize_seed(seed) } }
 #[test]
 fn rng_next_test() {
     let r = rng_new(rng_deterministic_seed());
-    const expected = u64[20]:[
+    const EXPECTED = u64[20]:[
         0x002698ad4b48ead0, 0x1bfb1e0316f2d5de, 0x173a623c9725b477, 0x0a447a02823ad868,
         0x1df74948b3fbea7e, 0x1bc8b594bcf01a39, 0x07b767ca9520e99a, 0x05e28b4320bfd20e,
         0x0105906a24823f57, 0x1a1e7d14a6d24384, 0x2a7326df322e084d, 0x120bc9cc3fac4ec7,
         0x2c8f193a1b46a9c5, 0x2b9c95743bbe3f90, 0x0dcfc5b1d0398b46, 0x006ba47b3448bea3,
         0x3fe4fbf9a522891b, 0x23e1a50ad6aebca3, 0x1b263d39ea62be44, 0x13581d282e643b0e,
     ];
-    for (i, r): (u8, State) in range(u8:0, u8:20) {
+    for (i, r): (u8, State) in u8:0..u8:20 {
         let (new_r, got) = rng_next64(r);
-        let want = expected[i];
+        let want = EXPECTED[i];
         assert_eq(want, got);
         new_r
     }(r);

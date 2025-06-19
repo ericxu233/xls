@@ -19,33 +19,37 @@
 #include <memory>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
-#include "absl/flags/flag.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/memory/memory.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
-#include "absl/strings/str_split.h"
-#include "xls/common/logging/logging.h"
+#include "absl/types/span.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/netlist/cell_library.h"
 #include "xls/netlist/function_parser.h"
 #include "xls/netlist/netlist.h"
 #include "xls/solvers/z3_utils.h"
-#include "../z3/src/api/z3_api.h"
+#include "z3/src/api/z3_api.h"
 
 namespace xls {
 namespace solvers {
 namespace z3 {
 
-using netlist::CellLibraryEntry;
-using netlist::StateTable;
-using netlist::StateTableSignal;
-using netlist::function::Ast;
-using netlist::rtl::Cell;
-using netlist::rtl::Module;
-using netlist::rtl::NetRef;
+using ::xls::netlist::CellLibraryEntry;
+using ::xls::netlist::StateTable;
+using ::xls::netlist::StateTableSignal;
+using ::xls::netlist::function::Ast;
+using ::xls::netlist::rtl::Cell;
+using ::xls::netlist::rtl::Module;
+using ::xls::netlist::rtl::NetRef;
 
 absl::StatusOr<std::unique_ptr<NetlistTranslator>>
 NetlistTranslator::CreateAndTranslate(
@@ -158,7 +162,7 @@ absl::Status NetlistTranslator::Translate() {
   while (!active_wires.empty()) {
     NetRef ref = active_wires.front();
     active_wires.pop_front();
-    XLS_VLOG(2) << "Processing wire " << ref->name();
+    VLOG(2) << "Processing wire " << ref->name();
 
     // Check every connected cell to see if all of its inputs are now
     // available.
@@ -177,7 +181,7 @@ absl::Status NetlistTranslator::Translate() {
 
       cell_inputs[cell].erase(ref);
       if (cell_inputs[cell].empty()) {
-        XLS_VLOG(2) << "Processing cell " << cell->name();
+        VLOG(2) << "Processing cell " << cell->name();
         XLS_RETURN_IF_ERROR(TranslateCell(*cell));
 
         for (const auto& output : cell->outputs()) {
@@ -215,9 +219,8 @@ absl::Status NetlistTranslator::TranslateCell(const Cell& cell) {
       for (const auto& cell_output : cell.outputs()) {
         if (cell_output.name == module_output->name()) {
           if (translated_.contains(cell_output.netref)) {
-            XLS_LOG(INFO) << "Skipping translation of "
-                          << cell_output.netref->name()
-                          << "; already translated.";
+            LOG(INFO) << "Skipping translation of "
+                      << cell_output.netref->name() << "; already translated.";
           } else {
             translated_[cell_output.netref] = translation;
           }
@@ -345,9 +348,8 @@ NetlistTranslator::TranslateStateTable(const Cell& cell) {
       const StateTableSignal signal = kv.second;
       if (signal != StateTableSignal::kHigh &&
           signal != StateTableSignal::kLow) {
-        XLS_VLOG(1) << "Non-high or -low input signal encountered: "
-                    << cell.name() << ":" << input_name << ": "
-                    << static_cast<int>(signal);
+        VLOG(1) << "Non-high or -low input signal encountered: " << cell.name()
+                << ":" << input_name << ": " << static_cast<int>(signal);
         continue;
       }
 
@@ -369,9 +371,9 @@ NetlistTranslator::TranslateStateTable(const Cell& cell) {
 
       if (signal != StateTableSignal::kHigh &&
           signal != StateTableSignal::kLow) {
-        XLS_LOG(WARNING) << "Non-high or -low output signal encountered: "
-                         << cell.name() << ":" << output_name << ": "
-                         << static_cast<int>(signal);
+        LOG(WARNING) << "Non-high or -low output signal encountered: "
+                     << cell.name() << ":" << output_name << ": "
+                     << static_cast<int>(signal);
         continue;
       }
 
@@ -425,7 +427,7 @@ NetlistTranslator::ValueCone NetlistTranslator::GetValueCone(
   value_cone.node = translated_[ref];
   value_cone.ref = ref;
   value_cone.parent_cell = parent_cell;
-  XLS_CHECK(parent_cell != nullptr) << ref->name() << " has no parent?!";
+  CHECK(parent_cell != nullptr) << ref->name() << " has no parent?!";
   for (const auto& input : parent_cell->inputs()) {
     // Ick
     if (input.netref->name() == "input_valid" ||
@@ -444,14 +446,13 @@ NetlistTranslator::ValueCone NetlistTranslator::GetValueCone(
 void NetlistTranslator::PrintValueCone(const ValueCone& value_cone,
                                        Z3_model model, int level) {
   std::string prefix(level * 2, ' ');
-  std::cerr << prefix << value_cone.ref->name() << ": " << std::endl;
+  std::cerr << prefix << value_cone.ref->name() << ": " << '\n';
   std::cerr << prefix << "Parent: "
             << (value_cone.parent_cell == nullptr
                     ? "<null>"
                     : value_cone.parent_cell->name())
-            << std::endl;
-  std::cerr << prefix << QueryNode(ctx_, model, value_cone.node, true)
-            << std::endl;
+            << '\n';
+  std::cerr << prefix << QueryNode(ctx_, model, value_cone.node, true) << '\n';
   for (const NetlistTranslator::ValueCone& parent : value_cone.parents) {
     PrintValueCone(parent, model, level + 1);
   }

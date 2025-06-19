@@ -15,30 +15,39 @@
 #include "xls/interpreter/block_evaluator.h"
 
 #include <cstdint>
+#include <iterator>
+#include <memory>
 #include <optional>
 #include <random>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/random/bit_gen_ref.h"
 #include "absl/random/distributions.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
-#include "xls/common/logging/vlog_is_on.h"
+#include "xls/codegen/module_signature.pb.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/block.h"
+#include "xls/ir/block_elaboration.h"
+#include "xls/ir/elaboration.h"
+#include "xls/ir/instantiation.h"
 #include "xls/ir/node.h"
 #include "xls/ir/nodes.h"
 #include "xls/ir/register.h"
 #include "xls/ir/value.h"
-#include "xls/ir/value_helpers.h"
+#include "xls/ir/value_utils.h"
 
 namespace xls {
 namespace {
@@ -156,19 +165,22 @@ ConvertInputsToUint64(const absl::flat_hash_map<std::string, Value>& inputs,
 
 absl::StatusOr<absl::flat_hash_map<std::string, Value>>
 BlockEvaluator::EvaluateCombinationalBlock(
-    Block* block, const absl::flat_hash_map<std::string, Value>& inputs) const {
+    Block* block, const absl::flat_hash_map<std::string, Value>& inputs,
+    BlockEvaluator::OutputPortSampleTime sample_time) const {
   std::vector<absl::flat_hash_map<std::string, Value>> outputs;
-  XLS_ASSIGN_OR_RETURN(outputs, EvaluateSequentialBlock(block, {inputs}));
+  XLS_ASSIGN_OR_RETURN(outputs,
+                       EvaluateSequentialBlock(block, {inputs}, sample_time));
   XLS_RET_CHECK_EQ(outputs.size(), 1);
   return std::move(outputs[0]);
 }
 
 absl::StatusOr<absl::flat_hash_map<std::string, uint64_t>>
 BlockEvaluator::EvaluateCombinationalBlock(
-    Block* block,
-    const absl::flat_hash_map<std::string, uint64_t>& inputs) const {
+    Block* block, const absl::flat_hash_map<std::string, uint64_t>& inputs,
+    BlockEvaluator::OutputPortSampleTime sample_time) const {
   std::vector<absl::flat_hash_map<std::string, uint64_t>> outputs;
-  XLS_ASSIGN_OR_RETURN(outputs, EvaluateSequentialBlock(block, {inputs}));
+  XLS_ASSIGN_OR_RETURN(outputs,
+                       EvaluateSequentialBlock(block, {inputs}, sample_time));
   XLS_RET_CHECK_EQ(outputs.size(), 1);
   return std::move(outputs[0]);
 }
@@ -176,19 +188,13 @@ BlockEvaluator::EvaluateCombinationalBlock(
 absl::StatusOr<std::vector<absl::flat_hash_map<std::string, Value>>>
 BlockEvaluator::EvaluateSequentialBlock(
     Block* block,
-    absl::Span<const absl::flat_hash_map<std::string, Value>> inputs) const {
-  // Initial register state is zero for all registers.
-  absl::flat_hash_map<std::string, Value> reg_state;
-  for (Register* reg : block->GetRegisters()) {
-    reg_state[reg->name()] = ZeroOfType(reg->type());
-  }
-
+    absl::Span<const absl::flat_hash_map<std::string, Value>> inputs,
+    BlockEvaluator::OutputPortSampleTime sample_time) const {
+  XLS_ASSIGN_OR_RETURN(auto continuation, NewContinuation(block, sample_time));
   std::vector<absl::flat_hash_map<std::string, Value>> outputs;
   for (const absl::flat_hash_map<std::string, Value>& input_set : inputs) {
-    XLS_ASSIGN_OR_RETURN(BlockRunResult result,
-                         EvaluateBlock(input_set, reg_state, block));
-    outputs.push_back(std::move(result.outputs));
-    reg_state = std::move(result.reg_state);
+    XLS_RETURN_IF_ERROR(continuation->RunOneCycle(input_set));
+    outputs.push_back(continuation->output_ports());
   }
   return std::move(outputs);
 }
@@ -196,7 +202,8 @@ BlockEvaluator::EvaluateSequentialBlock(
 absl::StatusOr<std::vector<absl::flat_hash_map<std::string, uint64_t>>>
 BlockEvaluator::EvaluateSequentialBlock(
     Block* block,
-    absl::Span<const absl::flat_hash_map<std::string, uint64_t>> inputs) const {
+    absl::Span<const absl::flat_hash_map<std::string, uint64_t>> inputs,
+    BlockEvaluator::OutputPortSampleTime sample_time) const {
   std::vector<absl::flat_hash_map<std::string, Value>> input_values;
   for (const absl::flat_hash_map<std::string, uint64_t>& input_set : inputs) {
     absl::flat_hash_map<std::string, Value> input_value_set;
@@ -206,8 +213,8 @@ BlockEvaluator::EvaluateSequentialBlock(
   }
 
   std::vector<absl::flat_hash_map<std::string, Value>> output_values;
-  XLS_ASSIGN_OR_RETURN(output_values,
-                       EvaluateSequentialBlock(block, input_values));
+  XLS_ASSIGN_OR_RETURN(
+      output_values, EvaluateSequentialBlock(block, input_values, sample_time));
 
   std::vector<absl::flat_hash_map<std::string, uint64_t>> outputs;
   for (const absl::flat_hash_map<std::string, Value>& output_value_set :
@@ -247,12 +254,12 @@ absl::Status ChannelSource::SetBlockInputs(
     absl::BitGenRef random_engine, std::optional<verilog::ResetProto> reset) {
   // Don't send inputs when reset is asserted, if we don't care about the
   // behavior of the block when inputs are sent during reset.
-  if (reset_behavior_ == kAttendReady ||
+  if (reset_behavior_ == BehaviorDuringReset::kAttendReady ||
       !IsResetAsserted(inputs, std::move(reset))) {
     if (is_valid_) {
       // Continue to output valid and data, while waiting for the ready signal.
-      XLS_CHECK_GE(current_index_, 0);
-      XLS_CHECK_LT(current_index_, data_sequence_.size());
+      CHECK_GE(current_index_, 0);
+      CHECK_LT(current_index_, data_sequence_.size());
 
       inputs[data_name_] = data_sequence_.at(current_index_);
       inputs[valid_name_] = Value(UBits(1, 1));
@@ -265,8 +272,8 @@ absl::Status ChannelSource::SetBlockInputs(
       if (send_next_data) {
         ++current_index_;
 
-        XLS_CHECK_GE(current_index_, 0);
-        XLS_CHECK_LT(current_index_, data_sequence_.size());
+        CHECK_GE(current_index_, 0);
+        CHECK_LT(current_index_, data_sequence_.size());
 
         inputs[data_name_] = data_sequence_.at(current_index_);
         inputs[valid_name_] = Value(UBits(1, 1));
@@ -280,7 +287,7 @@ absl::Status ChannelSource::SetBlockInputs(
   // If stalling, randomly send all ones or zeros with valid bit set to zero.
   XLS_ASSIGN_OR_RETURN(const InputPort* port, block_->GetInputPort(data_name_));
 
-  bool send_one_during_stall = std::bernoulli_distribution(0.5)(random_engine);
+  bool send_one_during_stall = absl::Bernoulli(random_engine, 0.5);
 
   inputs[data_name_] = send_one_during_stall ? AllOnesOfType(port->GetType())
                                              : ZeroOfType(port->GetType());
@@ -315,7 +322,7 @@ absl::Status ChannelSink::SetBlockInputs(
   inputs[ready_name_] =
       signalled_ready ? Value(UBits(1, 1)) : Value(UBits(0, 1));
 
-  if (reset_behavior_ == kAttendValid ||
+  if (reset_behavior_ == BehaviorDuringReset::kAttendValid ||
       !IsResetAsserted(inputs, std::move(reset))) {
     is_ready_ = signalled_ready;
   } else {
@@ -392,15 +399,12 @@ BlockEvaluator::EvaluateChannelizedSequentialBlock(
   std::minstd_rand random_engine;
   random_engine.seed(seed);
 
-  // Initial register state is zero for all registers.
-  absl::flat_hash_map<std::string, Value> reg_state;
-  for (Register* reg : block->GetRegisters()) {
-    reg_state[reg->name()] = ZeroOfType(reg->type());
-  }
-
   int64_t max_cycle_count = inputs.size();
 
   BlockIOResults block_io_results;
+  XLS_ASSIGN_OR_RETURN(
+      auto continuation,
+      NewContinuation(block, OutputPortSampleTime::kAtLastPosEdgeClock));
   for (int64_t cycle = 0; cycle < max_cycle_count; ++cycle) {
     absl::flat_hash_map<std::string, Value> input_set = inputs.at(cycle);
 
@@ -416,38 +420,42 @@ BlockEvaluator::EvaluateChannelizedSequentialBlock(
           sink.SetBlockInputs(cycle, input_set, random_engine, reset));
     }
 
-    if (XLS_VLOG_IS_ON(3)) {
-      XLS_VLOG(3) << absl::StrFormat("Inputs Cycle %d", cycle);
-      for (auto [name, val] : input_set) {
-        XLS_VLOG(3) << absl::StrFormat("%s: %s", name, val.ToString());
+    if (VLOG_IS_ON(3)) {
+      VLOG(3) << absl::StrFormat("Inputs Cycle %d", cycle);
+      for (const auto& [name, val] : input_set) {
+        VLOG(3) << absl::StrFormat("%s: %s", name, val.ToString());
       }
     }
 
-    // Block results
-    XLS_ASSIGN_OR_RETURN(BlockRunResult result,
-                         EvaluateBlock(input_set, reg_state, block));
+    XLS_RETURN_IF_ERROR(continuation->RunOneCycle(input_set));
 
     // Sources get ready
     for (ChannelSource& src : channel_sources) {
-      XLS_RETURN_IF_ERROR(src.GetBlockOutputs(cycle, result.outputs));
+      XLS_RETURN_IF_ERROR(
+          src.GetBlockOutputs(cycle, continuation->output_ports()));
     }
 
     // Sinks get data/valid
     for (ChannelSink& sink : channel_sinks) {
-      XLS_RETURN_IF_ERROR(sink.GetBlockOutputs(cycle, result.outputs));
+      XLS_RETURN_IF_ERROR(
+          sink.GetBlockOutputs(cycle, continuation->output_ports()));
     }
 
-    if (XLS_VLOG_IS_ON(3)) {
-      XLS_VLOG(3) << absl::StrFormat("Outputs Cycle %d", cycle);
-      for (auto [name, val] : result.outputs) {
-        XLS_VLOG(3) << absl::StrFormat("%s: %s", name, val.ToString());
+    if (VLOG_IS_ON(3)) {
+      VLOG(3) << absl::StrFormat("Outputs Cycle %d", cycle);
+      for (const auto& [name, val] : continuation->output_ports()) {
+        VLOG(3) << absl::StrFormat("%s: %s", name, val.ToString());
       }
     }
 
-    reg_state = std::move(result.reg_state);
-
     block_io_results.inputs.push_back(std::move(input_set));
-    block_io_results.outputs.push_back(std::move(result.outputs));
+    block_io_results.outputs.push_back(continuation->output_ports());
+    absl::c_copy(
+        continuation->events().assert_msgs,
+        std::back_inserter(block_io_results.interpreter_events.assert_msgs));
+    absl::c_copy(
+        continuation->events().trace_msgs,
+        std::back_inserter(block_io_results.interpreter_events.trace_msgs));
   }
 
   return block_io_results;
@@ -495,7 +503,39 @@ BlockEvaluator::EvaluateChannelizedSequentialBlockWithUint64(
                          ConvertInputsToUint64(input_value_set, block));
     block_io_result_as_uint64.inputs.push_back(std::move(input_set));
   }
+  block_io_result_as_uint64.interpreter_events =
+      std::move(block_io_result.interpreter_events);
   return block_io_result_as_uint64;
+}
+
+absl::StatusOr<std::unique_ptr<BlockContinuation>>
+BlockEvaluator::NewContinuation(
+    Block* block,
+    const absl::flat_hash_map<std::string, Value>& initial_registers,
+    BlockEvaluator::OutputPortSampleTime sample_time) const {
+  XLS_ASSIGN_OR_RETURN(BlockElaboration elaboration,
+                       BlockElaboration::Elaborate(block));
+  return MakeNewContinuation(std::move(elaboration), initial_registers,
+                             sample_time);
+}
+
+absl::StatusOr<std::unique_ptr<BlockContinuation>>
+BlockEvaluator::NewContinuation(
+    Block* block, BlockEvaluator::OutputPortSampleTime sample_time) const {
+  XLS_ASSIGN_OR_RETURN(BlockElaboration elaboration,
+                       BlockElaboration::Elaborate(block));
+  absl::flat_hash_map<std::string, Value> regs;
+  regs.reserve(block->GetRegisters().size());
+  for (BlockInstance* inst : elaboration.instances()) {
+    if (!inst->block().has_value()) {
+      continue;
+    }
+    for (const auto reg : inst->block().value()->GetRegisters()) {
+      regs[absl::StrCat(inst->RegisterPrefix(), reg->name())] =
+          ZeroOfType(reg->type());
+    }
+  }
+  return MakeNewContinuation(std::move(elaboration), regs, sample_time);
 }
 
 }  // namespace xls

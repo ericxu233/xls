@@ -14,9 +14,12 @@
 
 #include "xls/passes/range_query_engine.h"
 
-#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <ostream>
 #include <sstream>
@@ -24,30 +27,59 @@
 #include <utility>
 #include <vector>
 
-#include "absl/container/inlined_vector.h"
+#include "absl/algorithm/container.h"
+#include "absl/hash/hash.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 #include "xls/common/math_util.h"
+#include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/data_structures/leaf_type_tree.h"
-#include "xls/ir/abstract_node_evaluator.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
 #include "xls/ir/dfs_visitor.h"
-#include "xls/ir/function_base.h"
 #include "xls/ir/interval.h"
-#include "xls/ir/interval_set.h"
 #include "xls/ir/interval_ops.h"
+#include "xls/ir/interval_set.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
 #include "xls/ir/nodes.h"
+#include "xls/ir/op.h"
 #include "xls/ir/ternary.h"
-#include "xls/ir/value_helpers.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
+#include "xls/ir/value_utils.h"
 #include "xls/passes/query_engine.h"
 
 namespace xls {
 
-enum class Tonicity { Monotone, Antitone, Unknown };
+namespace {
+
+IntervalSetTree UnconstrainedIntervalSetTree(Type* type) {
+  return *IntervalSetTree::CreateFromFunction(
+      type, [](Type* leaf_type) -> absl::StatusOr<IntervalSet> {
+        return IntervalSet::Maximal(leaf_type->GetFlatBitCount());
+      });
+}
+
+IntervalSetTree EmptyIntervalSetTree(Type* type) {
+  return *IntervalSetTree::CreateFromFunction(
+      type, [](Type* leaf_type) -> absl::StatusOr<IntervalSet> {
+        return IntervalSet(leaf_type->GetFlatBitCount());
+      });
+}
+
+IntervalSetTree ZeroIntervalSetTree(Type* type) {
+  return *IntervalSetTree::CreateFromFunction(
+      type, [](Type* leaf_type) -> absl::StatusOr<IntervalSet> {
+        return IntervalSet::Precise(UBits(0, leaf_type->GetFlatBitCount()));
+      });
+}
+
+}  // namespace
 
 class RangeQueryVisitor : public DfsVisitor {
  public:
@@ -79,6 +111,9 @@ class RangeQueryVisitor : public DfsVisitor {
   // precision of the analysis.
   static constexpr int64_t kMaxResIntervalSetSize = 64;
 
+  // What size we should minimize interval sets to by default.
+  static constexpr int64_t kDefaultIntervalSize = 16;
+
   // The maximum number of points covered by an interval set that can be
   // iterated over in an analysis.
   static constexpr int64_t kMaxIterationSize = 1024;
@@ -89,15 +124,40 @@ class RangeQueryVisitor : public DfsVisitor {
     return engine_->GetIntervalSetTree(node);
   }
 
+  // Wrapper around GetIntervalSetTreeView. Returns std::nullopt if there is no
+  // existing tree (indicating the node is unconstrained).
+  std::optional<IntervalSetTreeView> MaybeGetIntervalSetTreeView(Node* node) {
+    if (engine_->HasExplicitIntervals(node)) {
+      absl::StatusOr<IntervalSetTreeView> view =
+          engine_->GetIntervalSetTreeView(node);
+      CHECK_OK(view) << node << " has explicit intervals but no tree-view!";
+      return *view;
+    }
+    return std::nullopt;
+  }
+
+  // Wrapper that avoids copying interval-sets.
+  absl::StatusOr<std::optional<std::reference_wrapper<const IntervalSet>>>
+  GetIntervalSet(Node* node) const {
+    if (!engine_->HasExplicitIntervals(node)) {
+      return std::nullopt;
+    }
+    XLS_ASSIGN_OR_RETURN(IntervalSetTreeView view,
+                         engine_->GetIntervalSetTreeView(node));
+    XLS_RET_CHECK(node->GetType()->IsBits());
+    return std::ref(view.Get({}));
+  }
+
   // Wrapper around engine_->SetIntervalSetTree that modifies rf_ if necessary.
   void SetIntervalSetTree(Node* node, const IntervalSetTree& interval_sets) {
     if (!engine_->interval_sets_.contains(node)) {
-      engine_->SetIntervalSetTree(node, interval_sets);
       for (const IntervalSet& set : interval_sets.elements()) {
         if (!set.IsMaximal()) {
           rf_ = ReachedFixpoint::Changed;
+          break;
         }
       }
+      engine_->SetIntervalSetTree(node, interval_sets);
       return;
     }
 
@@ -113,105 +173,37 @@ class RangeQueryVisitor : public DfsVisitor {
       rf_ = ReachedFixpoint::Changed;
     }
   }
+  void SetIntervalSetTree(Node* node, IntervalSetTree&& interval_sets) {
+    if (!engine_->interval_sets_.contains(node)) {
+      for (const IntervalSet& set : interval_sets.elements()) {
+        if (!set.IsMaximal()) {
+          rf_ = ReachedFixpoint::Changed;
+          break;
+        }
+      }
+      engine_->SetIntervalSetTree(node, std::move(interval_sets));
+      return;
+    }
 
-  // Handles an operation that is variadic and has an implementation given by
-  // the given function which has the given tonicities for each argument.
-  //
-  // The function may return `std::nullopt` to indicate that some
-  // exception has occurred, like an integer overflow, which invalidates the
-  // analysis. When that happens, this function will return without any side
-  // effects having occurred.
-  //
-  // `Tonicity::Unknown` is not currently supported.
-  //
-  // CHECK fails if `op->operands().size()` is not equal to `tonicities.size()`.
-  absl::Status HandleVariadicOp(
-      std::function<std::optional<Bits>(absl::Span<const Bits>)> impl,
-      absl::Span<const Tonicity> tonicities, Node* op);
+    // In the event of a hash collision, it is possible that this could report
+    // having reached a fixed point when it hasn't actually. However, this is
+    // fairly harmless and very unlikely.
+    size_t hash_before =
+        absl::Hash<IntervalSetTree>()(engine_->interval_sets_.at(node));
+    engine_->SetIntervalSetTree(node, std::move(interval_sets));
+    size_t hash_after =
+        absl::Hash<IntervalSetTree>()(engine_->interval_sets_.at(node));
+    if (!(hash_before == hash_after)) {
+      rf_ = ReachedFixpoint::Changed;
+    }
+  }
 
-  // Handles an operation that is monotone, unary (and whose argument is given
-  // by `op->operand(0)`), and has an implementation given by the given
-  // function. The function may return `std::nullopt` to indicate that some
-  // exception has occurred, like an integer overflow, which invalidates the
-  // analysis. When that happens, this function will return without any side
-  // effects having occurred.
-  //
-  // An operation is monotone iff `bits_ops::ULessThanOrEqual(x, y)`
-  // implies `bits_ops::ULessThanOrEqual(impl(x), impl(y))`.
-  absl::Status HandleMonotoneUnaryOp(
-      std::function<std::optional<Bits>(const Bits&)> impl, Node* op);
-
-  // Handles an operation that is antitone, unary (and whose argument is given
-  // by `op->operand(0)`), and has an implementation given by the given
-  // function. The function may return `std::nullopt` to indicate that some
-  // exception has occurred, like an integer overflow, which invalidates the
-  // analysis. When that happens, this function will return without any side
-  // effects having occurred.
-  //
-  // An operation is antitone iff `bits_ops::ULessThanOrEqual(x, y)`
-  // implies `bits_ops::ULessThanOrEqual(impl(y), impl(x))`.
-  absl::Status HandleAntitoneUnaryOp(
-      std::function<std::optional<Bits>(const Bits&)> impl, Node* op);
-
-  // Handles an operation that is binary (and whose arguments are given by
-  // `op->operand(0)` and `op->operand(1)`), monotone in both arguments, and
-  // has an implementation given by the given function. The function may return
-  // `std::nullopt` to indicate that some exception has occurred, like an
-  // integer overflow, which invalidates the analysis. When that happens, this
-  // function will return without any side effects having occurred.
-  //
-  // A binary operation is monotone-monotone iff for every `k`,
-  // `bits_ops::ULessThanOrEqual(x, y)`
-  // implies `bits_ops::ULessThanOrEqual(impl(x, k), impl(y, k))`
-  // and `bits_ops::ULessThanOrEqual(impl(k, x), impl(k, y))`.
-  absl::Status HandleMonotoneMonotoneBinOp(
-      std::function<std::optional<Bits>(const Bits&, const Bits&)> impl,
-      Node* op);
-
-  // Handles an operation that is binary (and whose arguments are given by
-  // `op->operand(0)` and `op->operand(1)`), monotone in the first argument
-  // and antitone in the second argument, and has an implementation given by
-  // the given function. The function may return `std::nullopt` to indicate
-  // that some exception has occurred, like an integer overflow, which
-  // invalidates the analysis. When that happens, this function will return
-  // without any side effects having occurred.
-  //
-  // A binary operation is monotone-antitone iff for every `k`,
-  // `bits_ops::ULessThanOrEqual(x, y)`
-  // implies `bits_ops::ULessThanOrEqual(impl(x, k), impl(y, k))`
-  // and `bits_ops::ULessThanOrEqual(impl(k, y), impl(k, x))`.
-  absl::Status HandleMonotoneAntitoneBinOp(
-      std::function<std::optional<Bits>(const Bits&, const Bits&)> impl,
-      Node* op);
-
-  // Analyze whether elements of the two given interval sets must be equal, must
-  // not be equal, or may be either.
-  //
-  // If the given interval sets are precise and identical, returns `true`.
-  // If the given interval sets are disjoint, returns `false`.
-  // In all other cases, returns `std::nullopt`.
-  static std::optional<bool> AnalyzeEq(const IntervalSet& lhs,
-                                       const IntervalSet& rhs);
-
-  // Analyze whether elements of the two given interval sets must be less than,
-  // must not be less than, or may be either.
-  //
-  // If `lhs` is disjoint from `rhs` and `lhs.ConvexHull() < rhs.ConvexHull()`,
-  // returns `true`.
-  // If `lhs` is disjoint from `rhs` and `rhs.ConvexHull() < lhs.ConvexHull()`,
-  // returns `false`.
-  // In all other cases, returns `std::nullopt`.
-  static std::optional<bool> AnalyzeLt(const IntervalSet& lhs,
-                                       const IntervalSet& rhs);
-
-  // An interval set covering exactly the binary representation of `false`.
-  static IntervalSet FalseIntervalSet();
-
-  // An interval set covering exactly the binary representation of `true`.
-  static IntervalSet TrueIntervalSet();
-
-  // Returns an interval set tree which has empty ranges for all elements,
-  static IntervalSetTree EmptyIntervalSetTree(Type* type);
+  absl::Status SetIntervalSet(Node* node, IntervalSet is) {
+    XLS_RET_CHECK(node->GetType()->IsBits());
+    SetIntervalSetTree(node, IntervalSetTree::CreateSingleElementTree(
+                                 node->GetType(), std::move(is)));
+    return absl::OkStatus();
+  }
 
   absl::Status HandleAdd(BinOp* add) override;
   absl::Status HandleAfterAll(AfterAll* after_all) override;
@@ -259,6 +251,8 @@ class RangeQueryVisitor : public DfsVisitor {
   absl::Status HandleOrReduce(BitwiseReductionOp* or_reduce) override;
   absl::Status HandleOutputPort(OutputPort* output_port) override;
   absl::Status HandleParam(Param* param) override;
+  absl::Status HandleStateRead(StateRead* state_read) override;
+  absl::Status HandleNext(Next* next) override;
   absl::Status HandleReceive(Receive* receive) override;
   absl::Status HandleRegisterRead(RegisterRead* reg_read) override;
   absl::Status HandleRegisterWrite(RegisterWrite* reg_write) override;
@@ -297,109 +291,6 @@ class RangeQueryVisitor : public DfsVisitor {
   ReachedFixpoint rf_;
 };
 
-struct MergeInterval {
-  int64_t start;
-  int64_t end;
-
-  friend bool operator<(const MergeInterval& lhs, const MergeInterval& rhs) {
-    std::pair<int64_t, int64_t> lhs_pair{lhs.start, lhs.end};
-    std::pair<int64_t, int64_t> rhs_pair{rhs.start, rhs.end};
-    return lhs_pair < rhs_pair;
-  }
-};
-
-struct BitsWithIndex {
-  Bits bits;
-  int64_t index;
-
-  friend bool operator<(const BitsWithIndex& lhs, const BitsWithIndex& rhs) {
-    if (bits_ops::ULessThan(lhs.bits, rhs.bits)) {
-      return true;
-    }
-    if (bits_ops::UEqual(lhs.bits, rhs.bits)) {
-      return lhs.index < rhs.index;
-    }
-    return false;
-  }
-};
-
-// Given a set of `Bits` (all the same bit-width) and a desired size for that
-// set, reduce the number of elements in the set to the desired size by
-// computing a way to merge together small elements of the set. Returns a list
-// of ranges in the input vector that should be merged (i.e.: each range should
-// be compacted down to a single point by whatever processes the output of
-// this function).
-static std::vector<MergeInterval> ReduceByMerging(
-    absl::Span<Bits const> elements, int64_t desired_size) {
-  if (elements.size() <= desired_size) {
-    return {};
-  }
-
-  std::vector<BitsWithIndex> elements_with_index;
-
-  {
-    int64_t i = 0;
-    for (const Bits& element : elements) {
-      elements_with_index.push_back(BitsWithIndex{element, i});
-      ++i;
-    }
-  }
-
-  std::sort(elements_with_index.begin(), elements_with_index.end());
-
-  std::vector<int64_t> indexes_to_merge;
-  indexes_to_merge.reserve(elements.size() - desired_size);
-  for (int64_t i = 0; i < elements.size() - desired_size; ++i) {
-    indexes_to_merge.push_back(elements_with_index[i].index);
-  }
-  std::sort(indexes_to_merge.begin(), indexes_to_merge.end());
-
-  // Merge contiguous runs of indices into intervals
-  std::vector<MergeInterval> result;
-  for (int64_t i = 0; i < indexes_to_merge.size(); ++i) {
-    int64_t range_start = indexes_to_merge[i];
-    while (((i + 1) < indexes_to_merge.size()) &&
-           ((indexes_to_merge[i] + 1) == indexes_to_merge[i + 1])) {
-      ++i;
-    }
-    int64_t range_end = indexes_to_merge[i];
-    result.push_back({range_start, range_end});
-  }
-
-  return result;
-}
-
-IntervalSet MinimizeIntervals(IntervalSet intervals, int64_t size) {
-  intervals.Normalize();
-
-  if (intervals.NumberOfIntervals() <= 1) {
-    return intervals;
-  }
-
-  std::vector<Bits> gap_vector;
-  for (int64_t i = 0; i < intervals.NumberOfIntervals() - 1; ++i) {
-    const Bits& x = intervals.Intervals()[i].UpperBound();
-    const Bits& y = intervals.Intervals()[i + 1].LowerBound();
-    gap_vector.push_back(bits_ops::Sub(y, x));
-  }
-
-  std::vector<MergeInterval> merges = ReduceByMerging(gap_vector, size - 1);
-
-  IntervalSet result = intervals;
-
-  for (const auto& m : merges) {
-    Interval merged = intervals.Intervals()[m.start];
-    for (int64_t i = m.start; i <= m.end + 1; ++i) {
-      merged = Interval::ConvexHull(merged, intervals.Intervals()[i]);
-    }
-    result.AddInterval(merged);
-  }
-
-  result.Normalize();
-
-  return result;
-}
-
 absl::StatusOr<ReachedFixpoint> RangeQueryEngine::PopulateWithGivens(
     RangeDataProvider& givens) {
   RangeQueryVisitor visitor(this, givens);
@@ -411,37 +302,51 @@ IntervalSetTree RangeQueryEngine::GetIntervalSetTree(Node* node) const {
   if (interval_sets_.contains(node)) {
     return interval_sets_.at(node);
   }
-
-  if (node->GetType()->IsTuple() || node->GetType()->IsArray()) {
-    IntervalSetTree result(node->GetType());
-    int64_t i = 0;
-    for (Type* type : result.leaf_types()) {
-      int64_t size = type->GetFlatBitCount();
-      result.elements()[i] = IntervalSet::Maximal(size);
-      ++i;
-    }
-    return result;
-  }
-
-  int64_t size = node->GetType()->GetFlatBitCount();
-  IntervalSetTree result(node->GetType());
-  result.Set({}, IntervalSet::Maximal(size));
-  return result;
+  return UnconstrainedIntervalSetTree(node->GetType());
 }
 
 void RangeQueryEngine::SetIntervalSetTree(
     Node* node, const IntervalSetTree& interval_sets) {
-  IntervalSetTree old_ist = GetIntervalSetTree(node);
-  IntervalSetTree new_ist =
-      LeafTypeTree<IntervalSet>::Zip<IntervalSet, IntervalSet>(
-          IntervalSet::Intersect, old_ist, interval_sets);
+  auto [it, inserted] = interval_sets_.try_emplace(node, interval_sets);
+  MutableIntervalSetTreeView ist = it->second.AsMutableView();
+
+  if (!inserted) {
+    // We already had information for `node`; merge with `interval_sets`.
+    leaf_type_tree::SimpleUpdateFrom<IntervalSet, IntervalSet>(
+        ist, interval_sets.AsView(),
+        [](IntervalSet& lhs, const IntervalSet& rhs) {
+          lhs = IntervalSet::Intersect(lhs, rhs);
+        });
+  }
+
   if (node->GetType()->IsBits()) {
     interval_ops::KnownBits bits =
-        interval_ops::ExtractKnownBits(new_ist.Get({}), /*source=*/node);
+        interval_ops::ExtractKnownBits(ist.Get({}), /*source=*/node);
     known_bits_[node] = bits.known_bits;
     known_bit_values_[node] = bits.known_bit_values;
   }
-  interval_sets_[node] = new_ist;
+}
+
+void RangeQueryEngine::SetIntervalSetTree(Node* node,
+                                          IntervalSetTree&& interval_sets) {
+  auto [it, inserted] = interval_sets_.try_emplace(node, interval_sets);
+  MutableIntervalSetTreeView ist = it->second.AsMutableView();
+
+  if (!inserted) {
+    // We already had information for `node`; merge with `interval_sets`.
+    leaf_type_tree::SimpleUpdateFrom<IntervalSet, IntervalSet>(
+        ist, interval_sets.AsView(),
+        [](IntervalSet& lhs, const IntervalSet& rhs) {
+          lhs = IntervalSet::Intersect(lhs, rhs);
+        });
+  }
+
+  if (node->GetType()->IsBits()) {
+    interval_ops::KnownBits bits =
+        interval_ops::ExtractKnownBits(ist.Get({}), /*source=*/node);
+    known_bits_[node] = bits.known_bits;
+    known_bit_values_[node] = bits.known_bit_values;
+  }
 }
 
 void RangeQueryEngine::InitializeNode(Node* node) {
@@ -449,207 +354,6 @@ void RangeQueryEngine::InitializeNode(Node* node) {
     known_bits_[node] = Bits(node->GetType()->GetFlatBitCount());
     known_bit_values_[node] = Bits(node->GetType()->GetFlatBitCount());
   }
-}
-
-absl::Status RangeQueryVisitor::HandleVariadicOp(
-    std::function<std::optional<Bits>(absl::Span<const Bits>)> impl,
-    absl::Span<const Tonicity> tonicities, Node* op) {
-  XLS_CHECK_EQ(op->operands().size(), tonicities.size());
-
-  std::vector<IntervalSet> operands;
-  operands.reserve(op->operands().size());
-
-  {
-    int64_t i = 0;
-    for (Node* operand : op->operands()) {
-      IntervalSet interval_set = GetIntervalSetTree(operand).Get({});
-
-      // TODO(taktoa): we could choose the minimized interval sets more
-      // carefully, since `MinimizeIntervals` is minimizing optimally for each
-      // interval set without the knowledge that other interval sets exist.
-      // For example, we could call `ConvexHull` greedily on the sets
-      // that have the smallest difference between convex hull size and size.
-
-      // Limit exponential growth after 12 parameters. 5^12 = 244 million
-      interval_set = MinimizeIntervals(interval_set, (i < 12) ? 5 : 1);
-      operands.push_back(interval_set);
-      ++i;
-    }
-  }
-
-  std::vector<int64_t> radix;
-  radix.reserve(operands.size());
-  for (const IntervalSet& interval_set : operands) {
-    radix.push_back(interval_set.NumberOfIntervals());
-  }
-
-  IntervalSet result_intervals(op->BitCountOrDie());
-
-  absl::Status early_status = absl::OkStatus();
-
-  // Each iteration of this do-while loop explores a different choice of
-  // intervals from each interval set associated with a parameter.
-  bool returned_early = MixedRadixIterate(
-      radix, [&](const std::vector<int64_t>& indexes) -> bool {
-        std::vector<Bits> lower_bounds;
-        lower_bounds.reserve(indexes.size());
-        std::vector<Bits> upper_bounds;
-        upper_bounds.reserve(indexes.size());
-        for (int64_t i = 0; i < indexes.size(); ++i) {
-          Interval interval = operands[i].Intervals()[indexes[i]];
-          switch (tonicities[i]) {
-            case Tonicity::Monotone: {
-              // The essential property of a unary monotone function `f` is that
-              // the codomain of `f` applied to `[x, y]` is `[f(x), f(y)]`.
-              // For example, the cubing function applied to `[5, 8]` gives a
-              // codomain of `[125, 512]`.
-              lower_bounds.push_back(interval.LowerBound());
-              upper_bounds.push_back(interval.UpperBound());
-              break;
-            }
-            case Tonicity::Antitone: {
-              // The essential property of a unary antitone function `f` is that
-              // the codomain of `f` applied to `[x, y]` is `[f(y), f(x)]`.
-              // For example, the negation function applied to `[10, 20]` gives
-              // a codomain of `[-20, -10]`.
-              lower_bounds.push_back(interval.UpperBound());
-              upper_bounds.push_back(interval.LowerBound());
-              break;
-            }
-            case Tonicity::Unknown: {
-              early_status =
-                  absl::InternalError("Tonicity::Unknown not yet supported");
-              return true;
-            }
-          }
-        }
-        std::optional<Bits> lower = impl(lower_bounds);
-        std::optional<Bits> upper = impl(upper_bounds);
-        if (!lower.has_value() || !upper.has_value()) {
-          return true;
-        }
-        result_intervals.AddInterval(Interval(lower.value(), upper.value()));
-        return false;
-      });
-
-  if (returned_early) {
-    return early_status;
-  }
-
-  result_intervals = MinimizeIntervals(result_intervals);
-
-  LeafTypeTree<IntervalSet> result(op->GetType());
-  result.Set({}, result_intervals);
-  SetIntervalSetTree(op, result);
-
-  return absl::OkStatus();
-}
-
-absl::Status RangeQueryVisitor::HandleMonotoneUnaryOp(
-    std::function<std::optional<Bits>(const Bits&)> impl, Node* op) {
-  return HandleVariadicOp(
-      [impl](absl::Span<const Bits> bits) -> std::optional<Bits> {
-        XLS_CHECK_EQ(bits.size(), 1);
-        return impl(bits[0]);
-      },
-      std::vector<Tonicity>(1, Tonicity::Monotone), op);
-}
-
-absl::Status RangeQueryVisitor::HandleAntitoneUnaryOp(
-    std::function<std::optional<Bits>(const Bits&)> impl, Node* op) {
-  return HandleVariadicOp(
-      [impl](absl::Span<const Bits> bits) -> std::optional<Bits> {
-        XLS_CHECK_EQ(bits.size(), 1);
-        return impl(bits[0]);
-      },
-      std::vector<Tonicity>(1, Tonicity::Antitone), op);
-}
-
-absl::Status RangeQueryVisitor::HandleMonotoneMonotoneBinOp(
-    std::function<std::optional<Bits>(const Bits&, const Bits&)> impl,
-    Node* op) {
-  return HandleVariadicOp(
-      [impl](absl::Span<const Bits> bits) -> std::optional<Bits> {
-        XLS_CHECK_EQ(bits.size(), 2);
-        return impl(bits[0], bits[1]);
-      },
-      {Tonicity::Monotone, Tonicity::Monotone}, op);
-}
-
-absl::Status RangeQueryVisitor::HandleMonotoneAntitoneBinOp(
-    std::function<std::optional<Bits>(const Bits&, const Bits&)> impl,
-    Node* op) {
-  return HandleVariadicOp(
-      [impl](absl::Span<const Bits> bits) -> std::optional<Bits> {
-        XLS_CHECK_EQ(bits.size(), 2);
-        return impl(bits[0], bits[1]);
-      },
-      {Tonicity::Monotone, Tonicity::Antitone}, op);
-}
-
-std::optional<bool> RangeQueryVisitor::AnalyzeEq(const IntervalSet& lhs,
-                                                 const IntervalSet& rhs) {
-  XLS_CHECK(lhs.IsNormalized());
-  XLS_CHECK(rhs.IsNormalized());
-
-  bool is_precise = lhs.IsPrecise() && rhs.IsPrecise();
-
-  // TODO(taktoa): This way of checking disjointness is efficient but
-  // unfortunately fails when there are abutting intervals; it shouldn't be too
-  // hard to make a Disjoint static method on IntervalSet that doesn't have this
-  // issue. Luckily this only results in a loss of precision, not incorrectness.
-
-  IntervalSet combined = IntervalSet::Combine(lhs, rhs);
-  bool is_disjoint = (lhs.Intervals().size() + rhs.Intervals().size()) ==
-                     combined.Intervals().size();
-
-  if (is_precise && (lhs.Intervals() == rhs.Intervals())) {
-    return true;
-  }
-  if (is_disjoint) {
-    return false;
-  }
-  return std::nullopt;
-}
-
-std::optional<bool> RangeQueryVisitor::AnalyzeLt(const IntervalSet& lhs,
-                                                 const IntervalSet& rhs) {
-  if (std::optional<Interval> lhs_hull = lhs.ConvexHull()) {
-    if (std::optional<Interval> rhs_hull = rhs.ConvexHull()) {
-      if (Interval::Disjoint(*lhs_hull, *rhs_hull)) {
-        if (*lhs_hull < *rhs_hull) {
-          return true;
-        }
-        if (*rhs_hull < *lhs_hull) {
-          return false;
-        }
-      }
-    }
-  }
-  return std::nullopt;
-}
-
-IntervalSet RangeQueryVisitor::FalseIntervalSet() {
-  IntervalSet result(1);
-  result.AddInterval(Interval(UBits(0, 1), UBits(0, 1)));
-  result.Normalize();
-  return result;
-}
-
-IntervalSet RangeQueryVisitor::TrueIntervalSet() {
-  IntervalSet result(1);
-  result.AddInterval(Interval(UBits(1, 1), UBits(1, 1)));
-  result.Normalize();
-  return result;
-}
-
-IntervalSetTree RangeQueryVisitor::EmptyIntervalSetTree(Type* type) {
-  LeafTypeTree<IntervalSet> result(type);
-  for (int64_t i = 0; i < result.elements().size(); ++i) {
-    result.elements()[i] =
-        IntervalSet(result.leaf_types()[i]->GetFlatBitCount());
-  }
-  return result;
 }
 
 // Helper to just pull result straight from givens if possible.
@@ -661,21 +365,33 @@ IntervalSetTree RangeQueryVisitor::EmptyIntervalSetTree(Type* type) {
     engine_->InitializeNode(node); \
   } while (false)
 
+#define ASSIGN_INTERVAL_SET_REF_OR_RETURN(target, source)                      \
+  XLS_ASSIGN_OR_RETURN(auto __##target##_TEMPORARY, GetIntervalSet(source));   \
+  IntervalSet __memory_##target##_TEMPORARY;                                   \
+  if (!__##target##_TEMPORARY) {                                               \
+    __memory_##target##_TEMPORARY =                                            \
+        IntervalSet::Maximal(source->GetType()->GetFlatBitCount());            \
+  }                                                                            \
+  const IntervalSet& target =                                                  \
+      __##target##_TEMPORARY.value_or(std::ref(__memory_##target##_TEMPORARY)) \
+          .get()
+
 absl::Status RangeQueryVisitor::HandleAdd(BinOp* add) {
   INITIALIZE_OR_SKIP(add);
-  return HandleMonotoneMonotoneBinOp(
-      [](const Bits& lhs, const Bits& rhs) -> std::optional<Bits> {
-        int64_t padded_size = std::max(lhs.bit_count(), rhs.bit_count()) + 1;
-        Bits padded_lhs = bits_ops::ZeroExtend(lhs, padded_size);
-        Bits padded_rhs = bits_ops::ZeroExtend(rhs, padded_size);
-        Bits padded_result = bits_ops::Add(padded_lhs, padded_rhs);
-        // If the MSB is 1, then we overflowed.
-        if (padded_result.msb()) {
-          return std::nullopt;
-        }
-        return bits_ops::Add(lhs, rhs);
-      },
-      add);
+  Node* lhs = add->operand(0);
+  Node* rhs = add->operand(1);
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, lhs);
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, rhs);
+  // Special case UMulp arguments.
+  if (lhs->Is<TupleIndex>() && rhs->Is<TupleIndex>() &&
+      lhs->As<TupleIndex>()->index() != rhs->As<TupleIndex>()->index() &&
+      lhs->operand(0) == rhs->operand(0) &&
+      lhs->operand(0)->op() == Op::kUMulp) {
+    return SetIntervalSet(
+        add, interval_ops::UMul(l, r, add->GetType()->GetFlatBitCount()));
+  }
+
+  return SetIntervalSet(add, interval_ops::Add(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleAfterAll(AfterAll* after_all) {
@@ -693,56 +409,54 @@ absl::Status RangeQueryVisitor::HandleMinDelay(MinDelay* min_delay) {
 absl::Status RangeQueryVisitor::HandleAndReduce(
     BitwiseReductionOp* and_reduce) {
   INITIALIZE_OR_SKIP(and_reduce);
-  IntervalSet intervals = GetIntervalSetTree(and_reduce->operand(0)).Get({});
-
-  LeafTypeTree<IntervalSet> result(and_reduce->GetType());
-  bool result_valid = false;
-
-  // Unless the intervals cover max, the and_reduce of the input must be 0.
-  if (!intervals.CoversMax()) {
-    result.Set({}, FalseIntervalSet());
-    result_valid = true;
-  }
-
-  // If the intervals are known to only cover max, then the result must be 1.
-  if (std::optional<Interval> hull = intervals.ConvexHull()) {
-    Bits max = Bits::AllOnes(intervals.BitCount());
-    if (hull.value() == Interval(max, max)) {
-      result.Set({}, TrueIntervalSet());
-      result_valid = true;
-    }
-  }
-
-  if (result_valid) {
-    SetIntervalSetTree(and_reduce, result);
-  }
-
-  return absl::OkStatus();
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(arg, and_reduce->operand(0));
+  return SetIntervalSet(and_reduce, interval_ops::AndReduce(arg));
 }
 
 absl::Status RangeQueryVisitor::HandleArray(Array* array) {
   INITIALIZE_OR_SKIP(array);
-  std::vector<LeafTypeTree<IntervalSet>> children;
+  std::vector<IntervalSetTreeView> children;
+  std::vector<std::unique_ptr<IntervalSetTree>> temp_storage;
+  children.reserve(array->operand_count());
   for (Node* element : array->operands()) {
-    children.push_back(GetIntervalSetTree(element));
+    std::optional<IntervalSetTreeView> child =
+        MaybeGetIntervalSetTreeView(element);
+    if (!child.has_value()) {
+      temp_storage.push_back(std::make_unique<IntervalSetTree>(
+          UnconstrainedIntervalSetTree(element->GetType())));
+      child = temp_storage.back()->AsView();
+    }
+    children.push_back(*child);
   }
-  SetIntervalSetTree(array,
-                     LeafTypeTree<IntervalSet>(array->GetType(), children));
+
+  XLS_ASSIGN_OR_RETURN(IntervalSetTree result,
+                       leaf_type_tree::CreateArray<IntervalSet>(
+                           array->GetType()->AsArrayOrDie(), children));
+  SetIntervalSetTree(array, std::move(result));
   return absl::OkStatus();
 }
 
 absl::Status RangeQueryVisitor::HandleArrayConcat(ArrayConcat* array_concat) {
   INITIALIZE_OR_SKIP(array_concat);
-  std::vector<LeafTypeTree<IntervalSet>> elements;
-  for (Node* element : array_concat->operands()) {
-    LeafTypeTree<IntervalSet> concatee = GetIntervalSetTree(element);
-    const int64_t arr_size = element->GetType()->AsArrayOrDie()->size();
-    for (int32_t i = 0; i < arr_size; ++i) {
-      elements.push_back(concatee.CopySubtree({i}));
-    }
-  }
-  SetIntervalSetTree(array_concat, LeafTypeTree<IntervalSet>(
-                                       array_concat->GetType(), elements));
+  std::vector<IntervalSetTreeView> children;
+  std::vector<std::unique_ptr<IntervalSetTree>> temp_storage;
+  children.reserve(array_concat->operand_count());
+  absl::c_transform(
+      array_concat->operands(), std::back_inserter(children), [&](Node* n) {
+        std::optional<IntervalSetTreeView> view =
+            MaybeGetIntervalSetTreeView(n);
+        if (!view.has_value()) {
+          temp_storage.push_back(std::make_unique<IntervalSetTree>(
+              UnconstrainedIntervalSetTree(n->GetType())));
+          view = temp_storage.back()->AsView();
+        }
+        return *view;
+      });
+
+  XLS_ASSIGN_OR_RETURN(IntervalSetTree result,
+                       leaf_type_tree::ConcatArray<IntervalSet>(
+                           array_concat->GetType()->AsArrayOrDie(), children));
+  SetIntervalSetTree(array_concat, std::move(result));
   return absl::OkStatus();
 }
 
@@ -754,7 +468,9 @@ absl::Status RangeQueryVisitor::HandleAssert(Assert* assert_op) {
 
 absl::Status RangeQueryVisitor::HandleBitSlice(BitSlice* bit_slice) {
   INITIALIZE_OR_SKIP(bit_slice);
-  return absl::OkStatus();  // TODO(taktoa): implement
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(a, bit_slice->operand(0));
+  return SetIntervalSet(bit_slice, interval_ops::BitSlice(a, bit_slice->start(),
+                                                          bit_slice->width()));
 }
 
 absl::Status RangeQueryVisitor::HandleBitSliceUpdate(BitSliceUpdate* update) {
@@ -764,10 +480,13 @@ absl::Status RangeQueryVisitor::HandleBitSliceUpdate(BitSliceUpdate* update) {
 
 absl::Status RangeQueryVisitor::HandleConcat(Concat* concat) {
   INITIALIZE_OR_SKIP(concat);
-  return HandleVariadicOp(
-      bits_ops::Concat,
-      std::vector<Tonicity>(concat->operands().size(), Tonicity::Monotone),
-      concat);
+  std::vector<IntervalSet> args;
+  args.reserve(concat->operand_count());
+  for (Node* arg : concat->operands()) {
+    ASSIGN_INTERVAL_SET_REF_OR_RETURN(a, arg);
+    args.push_back(a);
+  }
+  return SetIntervalSet(concat, interval_ops::Concat(args));
 }
 
 absl::Status RangeQueryVisitor::HandleCountedFor(CountedFor* counted_for) {
@@ -783,7 +502,12 @@ absl::Status RangeQueryVisitor::HandleCover(Cover* cover) {
 
 absl::Status RangeQueryVisitor::HandleDecode(Decode* decode) {
   INITIALIZE_OR_SKIP(decode);
-  return absl::OkStatus();  // TODO(taktoa): implement
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(a, decode->operand(0));
+
+  return SetIntervalSet(decode,
+                        interval_ops::MinimizeIntervals(
+                            interval_ops::Decode(a, decode->BitCountOrDie()),
+                            kDefaultIntervalSize));
 }
 
 absl::Status RangeQueryVisitor::HandleDynamicBitSlice(
@@ -806,55 +530,53 @@ absl::Status RangeQueryVisitor::HandleEncode(Encode* encode) {
 absl::Status RangeQueryVisitor::HandleEq(CompareOp* eq) {
   INITIALIZE_OR_SKIP(eq);
 
-  if (!eq->operand(0)->GetType()->IsBits()) {
-    // TODO(meheff): 2022/09/06 Add support for non-bits types.
-    return absl::OkStatus();
+  if (eq->operand(0)->GetType()->GetFlatBitCount() == 0) {
+    // Empty types are always equal.
+    return SetIntervalSet(eq, IntervalSet::Precise(UBits(1, 1)));
   }
 
-  IntervalSet lhs_intervals = GetIntervalSetTree(eq->operand(0)).Get({});
-  IntervalSet rhs_intervals = GetIntervalSetTree(eq->operand(1)).Get({});
-
-  std::optional<bool> analysis = AnalyzeEq(lhs_intervals, rhs_intervals);
-  if (analysis.has_value()) {
-    LeafTypeTree<IntervalSet> result(eq->GetType());
-    if (analysis == std::optional<bool>(true)) {
-      result.Set({}, TrueIntervalSet());
-    } else if (analysis == std::optional<bool>(false)) {
-      result.Set({}, FalseIntervalSet());
-    }
-    SetIntervalSetTree(eq, result);
+  std::optional<IntervalSetTreeView> lhs_intervals =
+      MaybeGetIntervalSetTreeView(eq->operand(0));
+  std::optional<IntervalSetTreeView> rhs_intervals =
+      MaybeGetIntervalSetTreeView(eq->operand(1));
+  if (!lhs_intervals.has_value() || !rhs_intervals.has_value()) {
+    // One input is unconstrained, so we know nothing about the result.
+    return SetIntervalSet(eq, IntervalSet::Maximal(1));
   }
-  return absl::OkStatus();
+  XLS_RET_CHECK_EQ(lhs_intervals->type(), rhs_intervals->type());
+
+  IntervalSet res(/*bit_count=*/1);
+  for (int64_t i = 0; i < lhs_intervals->size(); ++i) {
+    res = IntervalSet::Combine(res,
+                               interval_ops::Eq(lhs_intervals->elements()[i],
+                                                rhs_intervals->elements()[i]));
+  }
+  return SetIntervalSet(eq, std::move(res));
 }
 
 absl::Status RangeQueryVisitor::HandleGate(Gate* gate) {
   INITIALIZE_OR_SKIP(gate);
-  IntervalSet cond_intervals = GetIntervalSetTree(gate->operand(0)).Get({});
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(cond_intervals, gate->operand(0));
 
-  // `cond` true passes through the data operand.
-  LeafTypeTree<IntervalSet> result =
-      cond_intervals.CoversOne()
-          ? GetIntervalSetTree(gate->operand(1))  // data operand
-          : EmptyIntervalSetTree(gate->GetType());
-
-  if (cond_intervals.CoversZero()) {
-    // `cond` false produces a zero value.
-    for (int64_t i = 0; i < result.size(); ++i) {
-      IntervalSet& set = result.elements()[i];
-      Type* type = result.leaf_types()[i];
-      XLS_RET_CHECK(type->IsBits());
-      Bits zero = Bits(type->AsBitsOrDie()->bit_count());
-      set.AddInterval(Interval(zero, zero));
-      set.Normalize();
-    }
+  std::optional<IntervalSetTreeView> value =
+      MaybeGetIntervalSetTreeView(gate->operand(1));
+  std::optional<IntervalSetTree> temp_value;
+  if (!value.has_value()) {
+    temp_value = UnconstrainedIntervalSetTree(gate->operand(1)->GetType());
+    value = temp_value->AsView();
   }
-  SetIntervalSetTree(gate, result);
+
+  SetIntervalSetTree(gate, leaf_type_tree::Map<IntervalSet, IntervalSet>(
+                               *value, [&](const IntervalSet& is) {
+                                 return interval_ops::Gate(cond_intervals, is);
+                               }));
   return absl::OkStatus();
 }
 
 absl::Status RangeQueryVisitor::HandleIdentity(UnOp* identity) {
   INITIALIZE_OR_SKIP(identity);
-  return HandleMonotoneUnaryOp([](const Bits& b) { return b; }, identity);
+  SetIntervalSetTree(identity, GetIntervalSetTree(identity->operand(0)));
+  return absl::OkStatus();
 }
 
 absl::Status RangeQueryVisitor::HandleInstantiationInput(
@@ -884,16 +606,18 @@ absl::Status RangeQueryVisitor::HandleLiteral(Literal* literal) {
   XLS_ASSIGN_OR_RETURN(
       LeafTypeTree<Value> v_ltt,
       ValueToLeafTypeTree(literal->value(), literal->GetType()));
-  SetIntervalSetTree(literal, v_ltt.Map<IntervalSet>([](const Value& value) {
-    IntervalSet interval_set(value.GetFlatBitCount());
-    if (value.IsBits()) {
-      return IntervalSet::Precise(value.bits());
-    }
-    if (value.IsToken()) {
-      return IntervalSet::Precise(Bits(0));
-    }
-    XLS_LOG(FATAL) << "Invalid value kind in HandleLiteral";
-  }));
+  SetIntervalSetTree(literal,
+                     leaf_type_tree::Map<IntervalSet, Value>(
+                         v_ltt.AsView(), [](const Value& value) {
+                           IntervalSet interval_set(value.GetFlatBitCount());
+                           if (value.IsBits()) {
+                             return IntervalSet::Precise(value.bits());
+                           }
+                           if (value.IsToken()) {
+                             return IntervalSet::Precise(Bits(0));
+                           }
+                           LOG(FATAL) << "Invalid value kind in HandleLiteral";
+                         }));
   return absl::OkStatus();
 }
 
@@ -905,11 +629,17 @@ absl::Status RangeQueryVisitor::HandleMap(Map* map) {
 absl::Status RangeQueryVisitor::HandleArrayIndex(ArrayIndex* array_index) {
   INITIALIZE_OR_SKIP(array_index);
 
-  IntervalSetTree array_interval_set_tree =
-      GetIntervalSetTree(array_index->array());
-
   if (array_index->indices().empty()) {
-    SetIntervalSetTree(array_index, array_interval_set_tree);
+    SetIntervalSetTree(array_index, GetIntervalSetTree(array_index->array()));
+    return absl::OkStatus();
+  }
+
+  std::optional<IntervalSetTreeView> array_interval_set_tree =
+      MaybeGetIntervalSetTreeView(array_index->array());
+  if (!array_interval_set_tree.has_value()) {
+    // The array is unconstrained, so we can't tell what values we might get.
+    SetIntervalSetTree(array_index,
+                       UnconstrainedIntervalSetTree(array_index->GetType()));
     return absl::OkStatus();
   }
 
@@ -926,18 +656,20 @@ absl::Status RangeQueryVisitor::HandleArrayIndex(ArrayIndex* array_index) {
     ArrayType* array_type = array_index->array()->GetType()->AsArrayOrDie();
     for (Node* index : array_index->indices()) {
       dimension.push_back(array_type->size());
-      index_intervals.push_back(GetIntervalSetTree(index).Get({}));
+      std::optional<IntervalSetTreeView> index_view =
+          MaybeGetIntervalSetTreeView(index);
+      if (index_view.has_value()) {
+        index_intervals.push_back(index_view->Get({}));
+      } else {
+        index_intervals.push_back(IntervalSet::Maximal(index->BitCountOrDie()));
+      }
       absl::StatusOr<ArrayType*> array_type_status =
           array_type->element_type()->AsArray();
       array_type = array_type_status.ok() ? *array_type_status : nullptr;
     }
   }
 
-  IntervalSetTree result(array_index->GetType());
-  result = LeafTypeTree<Type*>(result.type(), result.leaf_types())
-               .Map<IntervalSet>([](Type* type) -> IntervalSet {
-                 return IntervalSet(type->GetFlatBitCount());
-               });
+  IntervalSetTree result = EmptyIntervalSetTree(array_index->GetType());
 
   // Returns true if the given interval set covers the given index value for an
   // array of dimension `dim`. Includes handling of OOB conditions.
@@ -968,162 +700,402 @@ absl::Status RangeQueryVisitor::HandleArrayIndex(ArrayIndex* array_index) {
         return false;
       }
     }
-    result = IntervalSetTree::Zip<IntervalSet, IntervalSet>(
-        IntervalSet::Combine, result,
-        array_interval_set_tree.CopySubtree(indexes));
+    leaf_type_tree::SimpleUpdateFrom<IntervalSet, IntervalSet>(
+        result.AsMutableView(), array_interval_set_tree->AsView(indexes),
+        [](IntervalSet& lhs, const IntervalSet& rhs) {
+          lhs = IntervalSet::Combine(lhs, rhs);
+        });
     return false;
   });
 
-  SetIntervalSetTree(array_index, result);
-
+  SetIntervalSetTree(array_index, std::move(result));
   return absl::OkStatus();
 }
 
 absl::Status RangeQueryVisitor::HandleArraySlice(ArraySlice* slice) {
   INITIALIZE_OR_SKIP(slice);
-  return absl::OkStatus();  // TODO(taktoa): implement
+
+  std::optional<IntervalSetTreeView> array_interval_set_tree =
+      MaybeGetIntervalSetTreeView(slice->array());
+  if (!array_interval_set_tree.has_value()) {
+    // The array is unconstrained, so we can't tell what values might be in our
+    // slice.
+    SetIntervalSetTree(slice, UnconstrainedIntervalSetTree(slice->GetType()));
+    return absl::OkStatus();
+  }
+
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(start_interval, slice->start());
+
+  IntervalSetTree result = EmptyIntervalSetTree(slice->GetType());
+  absl::Status status;
+  start_interval.ForEachElement([&](const Bits& v) -> bool {
+    // XLS arrays can't be bigger than this anyway.
+    int64_t start = v.FitsInUint64() ? v.ToUint64().value()
+                                     : std::numeric_limits<int64_t>::max();
+    if (start < 0) {
+      // Overflows, clamp back to max int.
+      start = std::numeric_limits<int64_t>::max();
+    }
+    auto slice_ltt = leaf_type_tree::SliceArray<IntervalSet>(
+        slice->GetType()->AsArrayOrDie(), array_interval_set_tree->AsView(),
+        start);
+    if (!slice_ltt.ok()) {
+      status.Update(slice_ltt.status());
+      return true;
+    }
+    leaf_type_tree::SimpleUpdateFrom<IntervalSet, IntervalSet>(
+        result.AsMutableView(), slice_ltt->AsView(),
+        [](IntervalSet& lhs, const IntervalSet& rhs) {
+          lhs = IntervalSet::Combine(lhs, rhs);
+        });
+    return start >= slice->array()->GetType()->AsArrayOrDie()->size();
+  });
+  XLS_RETURN_IF_ERROR(status);
+
+  SetIntervalSetTree(slice, std::move(result));
+  return absl::OkStatus();
 }
 
 absl::Status RangeQueryVisitor::HandleArrayUpdate(ArrayUpdate* update) {
   INITIALIZE_OR_SKIP(update);
-  return absl::OkStatus();  // TODO(taktoa): implement
+
+  // Record IntervalSets for all indices, and check if they are all precise, all
+  // unconstrained, or something else.
+  std::vector<std::optional<IntervalSet>> indices;
+  indices.reserve(update->indices().size());
+  bool all_indices_unconstrained = true;
+  bool all_indices_precise = true;
+  Type* indexed_type = update->array_to_update()->GetType();
+  for (Node* index : update->indices()) {
+    ASSIGN_INTERVAL_SET_REF_OR_RETURN(index_intervals, index);
+
+    if (index_intervals.IsMaximal()) {
+      all_indices_precise = false;
+      if (index_intervals.BitCount() <
+          Bits::MinBitCountUnsigned(indexed_type->AsArrayOrDie()->size() - 1)) {
+        // Since the interval can only address 2**bit_count items and the array
+        // is more than that long the index is constrained.
+        all_indices_unconstrained = false;
+        indices.push_back(index_intervals);
+      } else {
+        indices.push_back(std::nullopt);
+      }
+    } else {
+      if (absl::StatusOr<uint64_t> index_lb =
+              index_intervals.LowerBound()->ToUint64();
+          !index_lb.ok() ||
+          *index_lb >=
+              static_cast<uint64_t>(indexed_type->AsArrayOrDie()->size())) {
+        // Definitely an out-of-bounds access, so no change.
+        SetIntervalSetTree(update,
+                           GetIntervalSetTree(update->array_to_update()));
+        return absl::OkStatus();
+      }
+
+      all_indices_unconstrained = false;
+      if (!index_intervals.IsPrecise()) {
+        all_indices_precise = false;
+      }
+      indices.push_back(index_intervals);
+    }
+
+    indexed_type = indexed_type->AsArrayOrDie()->element_type();
+  }
+
+  std::optional<IntervalSetTreeView> update_value =
+      MaybeGetIntervalSetTreeView(update->update_value());
+  std::optional<IntervalSetTree> temp_update_value;
+  if (!update_value.has_value() && all_indices_unconstrained) {
+    // The update is fully unconstrained, so we can't tell what values could
+    // be in the array anymore.
+    SetIntervalSetTree(update, UnconstrainedIntervalSetTree(update->GetType()));
+    return absl::OkStatus();
+  }
+
+  IntervalSetTree result = GetIntervalSetTree(update->array_to_update());
+
+  if (all_indices_precise) {
+    // We know exactly which element is being updated, so we can just replace
+    // its possible values with the possible values from `update_value`.
+    std::vector<int64_t> precise_index;
+    precise_index.reserve(indices.size());
+    for (const std::optional<IntervalSet>& index : indices) {
+      precise_index.push_back(
+          static_cast<int64_t>(*index->GetPreciseValue()->ToUint64()));
+    }
+    if (update_value.has_value()) {
+      XLS_RETURN_IF_ERROR(leaf_type_tree::ReplaceElements(
+          result.AsMutableView(precise_index), update_value->AsView()));
+    } else {
+      // The update value is unconstrained, so remove all constraints on the
+      // updated element.
+      leaf_type_tree::ForEach(
+          result.AsMutableView(precise_index),
+          [&](IntervalSet& is) { is = IntervalSet::Maximal(is.BitCount()); });
+    }
+  } else {
+    XLS_RETURN_IF_ERROR(leaf_type_tree::ForEachSubArray<IntervalSet>(
+        result.AsMutableView(), indices.size(),
+        [&](MutableIntervalSetTreeView element_tree,
+            absl::Span<const int64_t> index) {
+          for (int64_t i = 0; i < index.size(); ++i) {
+            if (indices[i].has_value() &&
+                (!UBits(index[i], 64)
+                      .FitsInNBitsUnsigned(indices[i]->BitCount()) ||
+                 !indices[i]->Covers(
+                     UBits(index[i], indices[i]->BitCount())))) {
+              // This isn't an index we could possibly be updating, so we make
+              // no changes.
+              return absl::OkStatus();
+            }
+          }
+
+          // We might be updating this element, so add the possible values from
+          // `update_value`.
+          if (update_value.has_value()) {
+            leaf_type_tree::SimpleUpdateFrom<IntervalSet, IntervalSet>(
+                element_tree, update_value->AsView(),
+                [](IntervalSet& lhs, const IntervalSet& rhs) {
+                  lhs = IntervalSet::Combine(lhs, rhs);
+                });
+          } else {
+            // The update value is unconstrained, so remove all constraints on
+            // this element.
+            leaf_type_tree::ForEach(element_tree, [&](IntervalSet& is) {
+              is = IntervalSet::Maximal(is.BitCount());
+            });
+          }
+          return absl::OkStatus();
+        }));
+  }
+  SetIntervalSetTree(update, std::move(result));
+  return absl::OkStatus();
 }
 
 absl::Status RangeQueryVisitor::HandleNaryAnd(NaryOp* and_op) {
   INITIALIZE_OR_SKIP(and_op);
-  return absl::OkStatus();  // TODO(taktoa): implement
+  IntervalSet result =
+      IntervalSet::Precise(Bits::AllOnes(and_op->BitCountOrDie()));
+  for (Node* operand : and_op->operands()) {
+    ASSIGN_INTERVAL_SET_REF_OR_RETURN(operand_intervals, operand);
+    result = interval_ops::And(result, operand_intervals);
+  }
+  return SetIntervalSet(and_op, std::move(result));
 }
 
 absl::Status RangeQueryVisitor::HandleNaryNand(NaryOp* nand_op) {
   INITIALIZE_OR_SKIP(nand_op);
-  return absl::OkStatus();  // TODO(taktoa): implement
+  IntervalSet result =
+      IntervalSet::Precise(Bits::AllOnes(nand_op->BitCountOrDie()));
+  for (Node* operand : nand_op->operands()) {
+    ASSIGN_INTERVAL_SET_REF_OR_RETURN(operand_intervals, operand);
+    result = interval_ops::And(result, operand_intervals);
+  }
+  return SetIntervalSet(nand_op, interval_ops::Not(result));
 }
 
 absl::Status RangeQueryVisitor::HandleNaryNor(NaryOp* nor_op) {
   INITIALIZE_OR_SKIP(nor_op);
-  return absl::OkStatus();  // TODO(taktoa): implement
+  IntervalSet result = IntervalSet::Precise(Bits(nor_op->BitCountOrDie()));
+  for (Node* operand : nor_op->operands()) {
+    ASSIGN_INTERVAL_SET_REF_OR_RETURN(operand_intervals, operand);
+    result = interval_ops::Or(result, operand_intervals);
+  }
+  return SetIntervalSet(nor_op, interval_ops::Not(result));
 }
 
 absl::Status RangeQueryVisitor::HandleNaryOr(NaryOp* or_op) {
   INITIALIZE_OR_SKIP(or_op);
-  return absl::OkStatus();  // TODO(taktoa): implement
+  IntervalSet result = IntervalSet::Precise(Bits(or_op->BitCountOrDie()));
+  for (Node* operand : or_op->operands()) {
+    ASSIGN_INTERVAL_SET_REF_OR_RETURN(operand_intervals, operand);
+    result = interval_ops::Or(result, operand_intervals);
+  }
+  return SetIntervalSet(or_op, std::move(result));
 }
 
 absl::Status RangeQueryVisitor::HandleNaryXor(NaryOp* xor_op) {
   INITIALIZE_OR_SKIP(xor_op);
-  return absl::OkStatus();  // TODO(taktoa): implement
+  IntervalSet result = IntervalSet::Precise(Bits(xor_op->BitCountOrDie()));
+  for (Node* operand : xor_op->operands()) {
+    ASSIGN_INTERVAL_SET_REF_OR_RETURN(operand_intervals, operand);
+    result = interval_ops::Xor(result, operand_intervals);
+  }
+  return SetIntervalSet(xor_op, std::move(result));
 }
 
 absl::Status RangeQueryVisitor::HandleNe(CompareOp* ne) {
   INITIALIZE_OR_SKIP(ne);
 
-  if (!ne->operand(0)->GetType()->IsBits()) {
-    // TODO(meheff): 2022/09/06 Add support for non-bits types.
-    return absl::OkStatus();
+  if (ne->operand(0)->GetType()->GetFlatBitCount() == 0) {
+    // Empty types are always equal.
+    return SetIntervalSet(ne, IntervalSet::Precise(UBits(0, 1)));
   }
 
-  IntervalSet lhs_intervals = GetIntervalSetTree(ne->operand(0)).Get({});
-  IntervalSet rhs_intervals = GetIntervalSetTree(ne->operand(1)).Get({});
-
-  std::optional<bool> analysis = AnalyzeEq(lhs_intervals, rhs_intervals);
-  if (analysis.has_value()) {
-    LeafTypeTree<IntervalSet> result(ne->GetType());
-    if (analysis == std::optional<bool>(false)) {
-      result.Set({}, TrueIntervalSet());
-    } else if (analysis == std::optional<bool>(true)) {
-      result.Set({}, FalseIntervalSet());
-    }
-    SetIntervalSetTree(ne, result);
+  std::optional<IntervalSetTreeView> lhs_intervals =
+      MaybeGetIntervalSetTreeView(ne->operand(0));
+  std::optional<IntervalSetTreeView> rhs_intervals =
+      MaybeGetIntervalSetTreeView(ne->operand(1));
+  if (!lhs_intervals.has_value() || !rhs_intervals.has_value()) {
+    // One input is unconstrained, so we know nothing about the result.
+    return SetIntervalSet(ne, IntervalSet::Maximal(1));
   }
-  return absl::OkStatus();
+  XLS_RET_CHECK_EQ(lhs_intervals->type(), rhs_intervals->type());
+
+  IntervalSet res(/*bit_count=*/1);
+  for (int64_t i = 0; i < lhs_intervals->size(); ++i) {
+    res = IntervalSet::Combine(res,
+                               interval_ops::Ne(lhs_intervals->elements()[i],
+                                                rhs_intervals->elements()[i]));
+  }
+  return SetIntervalSet(ne, std::move(res));
 }
 
 absl::Status RangeQueryVisitor::HandleNeg(UnOp* neg) {
   INITIALIZE_OR_SKIP(neg);
-  return HandleAntitoneUnaryOp(bits_ops::Negate, neg);
+
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(arg, neg->operand(0));
+  return SetIntervalSet(neg, interval_ops::Neg(arg));
 }
 
 absl::Status RangeQueryVisitor::HandleNot(UnOp* not_op) {
   INITIALIZE_OR_SKIP(not_op);
-  return absl::OkStatus();  // TODO(taktoa): implement
+
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(arg, not_op->operand(0));
+  return SetIntervalSet(not_op, interval_ops::Not(arg));
 }
 
 absl::Status RangeQueryVisitor::HandleOneHot(OneHot* one_hot) {
   INITIALIZE_OR_SKIP(one_hot);
-  return absl::OkStatus();  // TODO(taktoa): implement
+
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(arg, one_hot->operand(0));
+  return SetIntervalSet(one_hot,
+                        interval_ops::OneHot(arg, one_hot->priority()));
 }
 
 absl::Status RangeQueryVisitor::HandleOneHotSel(OneHotSelect* sel) {
   INITIALIZE_OR_SKIP(sel);
-  return absl::OkStatus();  // TODO(taktoa): implement
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(selector_intervals, sel->selector());
+
+  // If the selector is always zero, then so is the result.
+  if (selector_intervals.IsPrecise() && selector_intervals.CoversZero()) {
+    SetIntervalSetTree(sel, ZeroIntervalSetTree(sel->GetType()));
+    return absl::OkStatus();
+  }
+
+  IntervalSetTree result = EmptyIntervalSetTree(sel->GetType());
+
+  for (int64_t i = 0; i < sel->cases().size(); ++i) {
+    TernaryVector case_pattern(sel->cases().size(), TernaryValue::kUnknown);
+    case_pattern[i] = TernaryValue::kKnownOne;
+    if (!interval_ops::CoversTernary(selector_intervals, case_pattern)) {
+      // This case isn't possible, so it won't contribute to the result.
+      continue;
+    }
+
+    case_pattern[i] = TernaryValue::kKnownZero;
+    const bool can_miss_case =
+        interval_ops::CoversTernary(selector_intervals, case_pattern);
+
+    std::optional<IntervalSetTreeView> case_i =
+        MaybeGetIntervalSetTreeView(sel->cases()[i]);
+    if (!case_i.has_value()) {
+      result = UnconstrainedIntervalSetTree(sel->GetType());
+      break;
+    }
+
+    // TODO(epastor): Make more precise by only or-ing cases that can actually
+    // occur together; independent cases should be added independently where
+    // possible.
+    leaf_type_tree::SimpleUpdateFrom<IntervalSet, IntervalSet>(
+        result.AsMutableView(), *case_i,
+        [can_miss_case](IntervalSet& lhs, const IntervalSet& rhs) {
+          if (can_miss_case) {
+            IntervalSet new_possibilities = rhs;
+            new_possibilities.AddInterval(
+                Interval::Precise(UBits(0, new_possibilities.BitCount())));
+            new_possibilities.Normalize();
+
+            if (lhs.IsEmpty()) {
+              lhs = std::move(new_possibilities);
+            } else {
+              lhs = interval_ops::Or(lhs, new_possibilities);
+            }
+          } else {
+            if (lhs.IsEmpty()) {
+              lhs = rhs;
+            } else {
+              lhs = interval_ops::Or(lhs, rhs);
+            }
+          }
+        });
+  }
+
+  for (IntervalSet& intervals : result.elements()) {
+    intervals =
+        interval_ops::MinimizeIntervals(intervals, kDefaultIntervalSize);
+  }
+  SetIntervalSetTree(sel, std::move(result));
+  return absl::OkStatus();
 }
 
 absl::Status RangeQueryVisitor::HandlePrioritySel(PrioritySelect* sel) {
   INITIALIZE_OR_SKIP(sel);
-  IntervalSet selector_intervals = GetIntervalSetTree(sel->selector()).Get({});
-  LeafTypeTree<IntervalSet> result(sel->GetType());
-  for (int64_t i = 0; i < result.elements().size(); ++i) {
-    // Initialize all interval sets to empty
-    result.elements()[i] =
-        IntervalSet(result.leaf_types()[i]->GetFlatBitCount());
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(selector_intervals, sel->selector());
+
+  std::optional<IntervalSetTreeView> default_value =
+      MaybeGetIntervalSetTreeView(sel->default_value());
+  std::optional<IntervalSetTree> default_value_storage;
+  if (!default_value.has_value()) {
+    default_value_storage = UnconstrainedIntervalSetTree(sel->GetType());
+    default_value = default_value_storage->AsView();
   }
-  if (selector_intervals.CoversZero()) {  // possible to see default
-    LeafTypeTree<IntervalSet> all_zero_default(sel->GetType());
-    for (int64_t i = 0; i < all_zero_default.elements().size(); ++i) {
-      // Set all intervals to zero, the default.
-      all_zero_default.elements()[i] = IntervalSet::Precise(
-          UBits(0, all_zero_default.leaf_types()[i]->GetFlatBitCount()));
-    }
-    result = LeafTypeTree<IntervalSet>::Zip<IntervalSet, IntervalSet>(
-        IntervalSet::Combine, result, all_zero_default);
+
+  // Initialize all interval sets to empty - or to the default value if the
+  // selector could be zero.
+  IntervalSetTree result;
+  if (!selector_intervals.CoversZero()) {
+    result = EmptyIntervalSetTree(sel->GetType());
+  } else if (default_value_storage.has_value()) {
+    result = *std::move(default_value_storage);
+  } else {
+    result = leaf_type_tree::Clone(*default_value);
   }
-  auto combine = [&](Node* node) {
-    LeafTypeTree<IntervalSet> tree = GetIntervalSetTree(node);
-    result = LeafTypeTree<IntervalSet>::Zip<IntervalSet, IntervalSet>(
-        IntervalSet::Combine, result, tree);
-  };
+
+  TernaryVector case_pattern(sel->cases().size(), TernaryValue::kUnknown);
   for (int64_t i = 0; i < sel->cases().size(); ++i) {
     // TODO(vmirian): Make implementation more efficient by considering only the
     // ranges of interest.
-    if (selector_intervals.IsTrueWhenMaskWith(
-            bits_ops::ShiftLeftLogical(UBits(1, sel->cases().size()), i))) {
-      combine(sel->cases()[i]);
+    case_pattern[i] = TernaryValue::kKnownOne;
+    if (i > 0) {
+      case_pattern[i - 1] = TernaryValue::kKnownZero;
+    }
+    if (interval_ops::CoversTernary(selector_intervals, case_pattern)) {
+      std::optional<IntervalSetTreeView> case_i =
+          MaybeGetIntervalSetTreeView(sel->cases()[i]);
+      if (!case_i.has_value()) {
+        result = UnconstrainedIntervalSetTree(result.type());
+        break;
+      }
+      leaf_type_tree::SimpleUpdateFrom<IntervalSet, IntervalSet>(
+          result.AsMutableView(), *case_i,
+          [](IntervalSet& lhs, const IntervalSet& rhs) {
+            lhs = IntervalSet::Combine(lhs, rhs);
+          });
     }
   }
   for (IntervalSet& intervals : result.elements()) {
-    intervals = MinimizeIntervals(intervals);
+    intervals =
+        interval_ops::MinimizeIntervals(intervals, kDefaultIntervalSize);
   }
-  SetIntervalSetTree(sel, result);
+  SetIntervalSetTree(sel, std::move(result));
   return absl::OkStatus();
 }
 
 absl::Status RangeQueryVisitor::HandleOrReduce(BitwiseReductionOp* or_reduce) {
   INITIALIZE_OR_SKIP(or_reduce);
-  IntervalSet intervals = GetIntervalSetTree(or_reduce->operand(0)).Get({});
-
-  LeafTypeTree<IntervalSet> result(or_reduce->GetType());
-  bool result_valid = false;
-
-  // Unless the intervals cover 0, the or_reduce of the input must be 1.
-  if (!intervals.CoversZero()) {
-    result.Set({}, TrueIntervalSet());
-    result_valid = true;
-  }
-
-  // If the intervals are known to only cover 0, then the result must be 0.
-  if (std::optional<Interval> hull = intervals.ConvexHull()) {
-    Bits zero = Bits(1);
-    if (hull.value() == Interval(zero, zero)) {
-      result.Set({}, FalseIntervalSet());
-      result_valid = true;
-    }
-  }
-
-  if (result_valid) {
-    SetIntervalSetTree(or_reduce, result);
-  }
-
-  return absl::OkStatus();
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(arg, or_reduce->operand(0));
+  return SetIntervalSet(or_reduce, interval_ops::OrReduce(arg));
 }
 
 absl::Status RangeQueryVisitor::HandleOutputPort(OutputPort* output_port) {
@@ -1134,6 +1106,18 @@ absl::Status RangeQueryVisitor::HandleOutputPort(OutputPort* output_port) {
 absl::Status RangeQueryVisitor::HandleParam(Param* param) {
   INITIALIZE_OR_SKIP(param);
   // We don't know anything about params.
+  return absl::OkStatus();
+}
+
+absl::Status RangeQueryVisitor::HandleStateRead(StateRead* state_read) {
+  INITIALIZE_OR_SKIP(state_read);
+  // We don't know anything about state element values.
+  return absl::OkStatus();
+}
+
+absl::Status RangeQueryVisitor::HandleNext(Next* next) {
+  INITIALIZE_OR_SKIP(next);
+  // Next values return nothing, represented with an empty tuple.
   return absl::OkStatus();
 }
 
@@ -1159,37 +1143,52 @@ absl::Status RangeQueryVisitor::HandleReverse(UnOp* reverse) {
 
 absl::Status RangeQueryVisitor::HandleSDiv(BinOp* div) {
   INITIALIZE_OR_SKIP(div);
-  return absl::OkStatus();  // TODO(taktoa): implement: signed
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, div->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, div->operand(1));
+  return SetIntervalSet(div, interval_ops::SDiv(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleSGe(CompareOp* ge) {
   INITIALIZE_OR_SKIP(ge);
-  return absl::OkStatus();  // TODO(taktoa): implement: signed
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, ge->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, ge->operand(1));
+  return SetIntervalSet(ge, interval_ops::SGe(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleSGt(CompareOp* gt) {
   INITIALIZE_OR_SKIP(gt);
-  return absl::OkStatus();  // TODO(taktoa): implement: signed
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, gt->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, gt->operand(1));
+  return SetIntervalSet(gt, interval_ops::SGt(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleSLe(CompareOp* le) {
   INITIALIZE_OR_SKIP(le);
-  return absl::OkStatus();  // TODO(taktoa): implement: signed
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, le->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, le->operand(1));
+  return SetIntervalSet(le, interval_ops::SLe(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleSLt(CompareOp* lt) {
   INITIALIZE_OR_SKIP(lt);
-  return absl::OkStatus();  // TODO(taktoa): implement: signed
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, lt->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, lt->operand(1));
+  return SetIntervalSet(lt, interval_ops::SLt(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleSMod(BinOp* mod) {
   INITIALIZE_OR_SKIP(mod);
-  return absl::OkStatus();  // TODO(taktoa): implement: signed
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, mod->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, mod->operand(1));
+  return SetIntervalSet(mod, interval_ops::SMod(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleSMul(ArithOp* mul) {
   INITIALIZE_OR_SKIP(mul);
-  return absl::OkStatus();  // TODO(taktoa): implement: signed
+
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, mul->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, mul->operand(1));
+  return SetIntervalSet(mul, interval_ops::SMul(l, r, mul->width()));
 }
 
 absl::Status RangeQueryVisitor::HandleSMulp(PartialProductOp* mul) {
@@ -1199,49 +1198,53 @@ absl::Status RangeQueryVisitor::HandleSMulp(PartialProductOp* mul) {
 
 absl::Status RangeQueryVisitor::HandleSel(Select* sel) {
   INITIALIZE_OR_SKIP(sel);
-  IntervalSet selector_intervals = GetIntervalSetTree(sel->selector()).Get({});
-  bool default_possible = false;
-  absl::btree_set<uint64_t> selector_values;
-  for (const Interval& interval : selector_intervals.Intervals()) {
-    uint64_t num_cases = sel->cases().size();
-    interval.ForEachElement([&](const Bits& bits) -> bool {
-      uint64_t value = *bits.ToUint64();
-      // If part of the interval is outside of the valid selector range, then
-      // we assume that the remainder of the interval is also out of range.
-      if (value >= num_cases) {
-        default_possible = true;
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(selector_intervals, sel->selector());
+
+  // Initialize all interval sets to empty
+  IntervalSetTree result = EmptyIntervalSetTree(sel->GetType());
+  absl::Status status = absl::OkStatus();
+  const uint64_t num_cases = sel->cases().size();
+  selector_intervals.ForEachElement([&](const Bits& bits) -> bool {
+    // Selects can't have a cases size of more than uint64_MAX.
+    uint64_t i = bits.ToUint64().value_or(std::numeric_limits<uint64_t>::max());
+    std::optional<IntervalSetTreeView> selected_case;
+    bool finished = false;
+    if (i < num_cases) {
+      selected_case = MaybeGetIntervalSetTreeView(sel->cases()[i]);
+    } else {
+      // Would select the default case; handle it, then end, since all later
+      // selectors will also select the default case.
+      if (!sel->default_value().has_value()) {
+        status = absl::InternalError(
+            "Reached default case for a Select that has no default case");
         return true;
       }
-      selector_values.insert(value);
-      return false;
-    });
-  }
-  // TODO(taktoa): check if sel->cases().size() is greater than the number of
-  // representable values in the type of the selector, and set default_possible
-  // false in that case.
-  LeafTypeTree<IntervalSet> result(sel->GetType());
-  for (int64_t i = 0; i < result.elements().size(); ++i) {
-    // Initialize all interval sets to empty
-    result.elements()[i] =
-        IntervalSet(result.leaf_types()[i]->GetFlatBitCount());
-  }
-  auto combine = [&](Node* node) {
-    LeafTypeTree<IntervalSet> tree = GetIntervalSetTree(node);
-    result = LeafTypeTree<IntervalSet>::Zip<IntervalSet, IntervalSet>(
-        IntervalSet::Combine, result, tree);
-  };
-  for (int64_t i = 0; i < sel->cases().size(); ++i) {
-    if (selector_values.contains(i)) {
-      combine(sel->cases()[i]);
+      selected_case = MaybeGetIntervalSetTreeView(*sel->default_value());
+      finished = true;
     }
-  }
-  if (default_possible && sel->default_value().has_value()) {
-    combine(sel->default_value().value());
-  }
+
+    if (!selected_case.has_value()) {
+      // Unconstrained case, so the result is unconstrained.
+      result = UnconstrainedIntervalSetTree(result.type());
+
+      // No need to check further cases.
+      return true;
+    }
+
+    leaf_type_tree::SimpleUpdateFrom<IntervalSet, IntervalSet>(
+        result.AsMutableView(), *selected_case,
+        [](IntervalSet& lhs, const IntervalSet& rhs) {
+          lhs = IntervalSet::Combine(lhs, rhs);
+        });
+    return finished;
+  });
+  XLS_RETURN_IF_ERROR(status);
+
   for (IntervalSet& intervals : result.elements()) {
-    intervals = MinimizeIntervals(intervals);
+    intervals =
+        interval_ops::MinimizeIntervals(intervals, kDefaultIntervalSize);
   }
-  SetIntervalSetTree(sel, result);
+  SetIntervalSetTree(sel, std::move(result));
   return absl::OkStatus();
 }
 
@@ -1252,38 +1255,37 @@ absl::Status RangeQueryVisitor::HandleSend(Send* send) {
 
 absl::Status RangeQueryVisitor::HandleShll(BinOp* shll) {
   INITIALIZE_OR_SKIP(shll);
-  return absl::OkStatus();  // TODO(taktoa): implement
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(a, shll->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(b, shll->operand(1));
+  return SetIntervalSet(shll, interval_ops::Shll(a, b));
 }
 
 absl::Status RangeQueryVisitor::HandleShra(BinOp* shra) {
   INITIALIZE_OR_SKIP(shra);
-  return absl::OkStatus();  // TODO(taktoa): implement
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(a, shra->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(b, shra->operand(1));
+  return SetIntervalSet(shra, interval_ops::Shra(a, b));
 }
 
 absl::Status RangeQueryVisitor::HandleShrl(BinOp* shrl) {
   INITIALIZE_OR_SKIP(shrl);
-  return absl::OkStatus();  // TODO(taktoa): implement
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(a, shrl->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(b, shrl->operand(1));
+  return SetIntervalSet(shrl, interval_ops::Shrl(a, b));
 }
 
 absl::Status RangeQueryVisitor::HandleSignExtend(ExtendOp* sign_ext) {
   INITIALIZE_OR_SKIP(sign_ext);
-  return HandleMonotoneUnaryOp(
-      [sign_ext](const Bits& bits) -> Bits {
-        return bits_ops::SignExtend(bits, sign_ext->new_bit_count());
-      },
-      sign_ext);
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(arg, sign_ext->operand(0));
+  return SetIntervalSet(
+      sign_ext, interval_ops::SignExtend(arg, sign_ext->new_bit_count()));
 }
 
 absl::Status RangeQueryVisitor::HandleSub(BinOp* sub) {
   INITIALIZE_OR_SKIP(sub);
-  return HandleMonotoneAntitoneBinOp(
-      [](const Bits& lhs, const Bits& rhs) -> std::optional<Bits> {
-        if (bits_ops::ULessThanOrEqual(rhs, lhs)) {
-          return bits_ops::Sub(lhs, rhs);
-        }
-        return std::nullopt;
-      },
-      sub);
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, sub->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, sub->operand(1));
+  return SetIntervalSet(sub, interval_ops::Sub(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleTrace(Trace* trace_op) {
@@ -1294,135 +1296,92 @@ absl::Status RangeQueryVisitor::HandleTrace(Trace* trace_op) {
 
 absl::Status RangeQueryVisitor::HandleTuple(Tuple* tuple) {
   INITIALIZE_OR_SKIP(tuple);
-  std::vector<LeafTypeTree<IntervalSet>> children;
+  std::vector<IntervalSetTreeView> children;
+  std::vector<std::unique_ptr<IntervalSetTree>> temp_storage;
   for (Node* element : tuple->operands()) {
-    children.push_back(GetIntervalSetTree(element));
+    std::optional<IntervalSetTreeView> child =
+        MaybeGetIntervalSetTreeView(element);
+    if (!child.has_value()) {
+      temp_storage.push_back(std::make_unique<IntervalSetTree>(
+          UnconstrainedIntervalSetTree(element->GetType())));
+      child = temp_storage.back()->AsView();
+    }
+    children.push_back(*child);
   }
-  SetIntervalSetTree(tuple,
-                     LeafTypeTree<IntervalSet>(tuple->GetType(), children));
+  CHECK(tuple->GetType()->IsTuple());
+  XLS_ASSIGN_OR_RETURN(IntervalSetTree result,
+                       leaf_type_tree::CreateTuple<IntervalSet>(
+                           tuple->GetType()->AsTupleOrDie(), children));
+  SetIntervalSetTree(tuple, std::move(result));
   return absl::OkStatus();
 }
 
 absl::Status RangeQueryVisitor::HandleTupleIndex(TupleIndex* index) {
   INITIALIZE_OR_SKIP(index);
-  LeafTypeTree<IntervalSet> arg = GetIntervalSetTree(index->operand(0));
-  SetIntervalSetTree(index, arg.CopySubtree({index->index()}));
+  if (std::optional<IntervalSetTreeView> view =
+          MaybeGetIntervalSetTreeView(index->operand(0));
+      view.has_value()) {
+    SetIntervalSetTree(index,
+                       leaf_type_tree::Clone(view->AsView({index->index()})));
+  }
+  // If we don't have any explicit ranges for the tuple there's nothing for the
+  // index either.
   return absl::OkStatus();
 }
 
 absl::Status RangeQueryVisitor::HandleUDiv(BinOp* div) {
   INITIALIZE_OR_SKIP(div);
-  // I (taktoa) verified on 8 bit unsigned integers that UDiv is antitone in
-  // its second argument.
-  return HandleMonotoneAntitoneBinOp(
-      [](const Bits& lhs, const Bits& rhs) -> std::optional<Bits> {
-        return bits_ops::UDiv(lhs, rhs);
-      },
-      div);
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, div->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, div->operand(1));
+  return SetIntervalSet(div, interval_ops::UDiv(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleUGe(CompareOp* ge) {
   INITIALIZE_OR_SKIP(ge);
-  IntervalSet lhs_intervals = GetIntervalSetTree(ge->operand(0)).Get({});
-  IntervalSet rhs_intervals = GetIntervalSetTree(ge->operand(1)).Get({});
 
-  std::optional<bool> analysis = AnalyzeLt(rhs_intervals, lhs_intervals);
-  if (AnalyzeEq(lhs_intervals, rhs_intervals) == std::optional<bool>(true)) {
-    analysis = true;
-  }
-  if (analysis.has_value()) {
-    LeafTypeTree<IntervalSet> result(ge->GetType());
-    if (analysis == std::optional<bool>(true)) {
-      result.Set({}, TrueIntervalSet());
-    } else if (analysis == std::optional<bool>(false)) {
-      result.Set({}, FalseIntervalSet());
-    }
-    SetIntervalSetTree(ge, result);
-  }
-  return absl::OkStatus();
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, ge->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, ge->operand(1));
+  return SetIntervalSet(ge, interval_ops::UGe(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleUGt(CompareOp* gt) {
   INITIALIZE_OR_SKIP(gt);
-  IntervalSet lhs_intervals = GetIntervalSetTree(gt->operand(0)).Get({});
-  IntervalSet rhs_intervals = GetIntervalSetTree(gt->operand(1)).Get({});
 
-  std::optional<bool> analysis = AnalyzeLt(rhs_intervals, lhs_intervals);
-  if (analysis.has_value()) {
-    LeafTypeTree<IntervalSet> result(gt->GetType());
-    if (analysis == std::optional<bool>(true)) {
-      result.Set({}, TrueIntervalSet());
-    } else if (analysis == std::optional<bool>(false)) {
-      result.Set({}, FalseIntervalSet());
-    }
-    SetIntervalSetTree(gt, result);
-  }
-  return absl::OkStatus();
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, gt->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, gt->operand(1));
+  return SetIntervalSet(gt, interval_ops::UGt(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleULe(CompareOp* le) {
   INITIALIZE_OR_SKIP(le);
-  IntervalSet lhs_intervals = GetIntervalSetTree(le->operand(0)).Get({});
-  IntervalSet rhs_intervals = GetIntervalSetTree(le->operand(1)).Get({});
 
-  std::optional<bool> analysis = AnalyzeLt(lhs_intervals, rhs_intervals);
-  if (AnalyzeEq(lhs_intervals, rhs_intervals) == std::optional<bool>(true)) {
-    analysis = true;
-  }
-  if (analysis.has_value()) {
-    LeafTypeTree<IntervalSet> result(le->GetType());
-    if (analysis == std::optional<bool>(true)) {
-      result.Set({}, TrueIntervalSet());
-    } else if (analysis == std::optional<bool>(false)) {
-      result.Set({}, FalseIntervalSet());
-    }
-    SetIntervalSetTree(le, result);
-  }
-  return absl::OkStatus();
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, le->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, le->operand(1));
+  return SetIntervalSet(le, interval_ops::ULe(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleULt(CompareOp* lt) {
   INITIALIZE_OR_SKIP(lt);
-  IntervalSet lhs_intervals = GetIntervalSetTree(lt->operand(0)).Get({});
-  IntervalSet rhs_intervals = GetIntervalSetTree(lt->operand(1)).Get({});
 
-  std::optional<bool> analysis = AnalyzeLt(lhs_intervals, rhs_intervals);
-  if (analysis.has_value()) {
-    LeafTypeTree<IntervalSet> result(lt->GetType());
-    if (analysis == std::optional<bool>(true)) {
-      result.Set({}, TrueIntervalSet());
-    } else if (analysis == std::optional<bool>(false)) {
-      result.Set({}, FalseIntervalSet());
-    }
-    SetIntervalSetTree(lt, result);
-  }
-  return absl::OkStatus();
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, lt->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, lt->operand(1));
+  return SetIntervalSet(lt, interval_ops::ULt(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleUMod(BinOp* mod) {
   INITIALIZE_OR_SKIP(mod);
-  return absl::OkStatus();  // TODO(taktoa): implement
+
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, mod->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, mod->operand(1));
+  return SetIntervalSet(mod, interval_ops::UMod(l, r));
 }
 
 absl::Status RangeQueryVisitor::HandleUMul(ArithOp* mul) {
   INITIALIZE_OR_SKIP(mul);
-  // NB this is only monotone given we are checking for the overflow condition
-  // inside the lambda. Otherwise it would not be monotonic.  Only provably
-  // non-overflowing multiplies can be handled properly.
-  // TODO(allight) 2023-08-10 google/xls#1098 We should consider replacing
-  // potentially overflowing multiplies with multiply followed by truncate,
-  // after which this code will work well automatically.
-  return HandleMonotoneMonotoneBinOp(
-      [mul](const Bits& x, const Bits& y) -> std::optional<Bits> {
-        int64_t bit_count = mul->GetType()->GetFlatBitCount();
-        Bits result = bits_ops::UMul(x, y);
-        if (result.FitsInNBitsUnsigned(bit_count)) {
-          return bits_ops::ZeroExtend(bits_ops::DropLeadingZeroes(result),
-                                      bit_count);
-        }
-        return std::nullopt;
-      },
-      mul);
+
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(l, mul->operand(0));
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(r, mul->operand(1));
+  return SetIntervalSet(mul, interval_ops::UMul(l, r, mul->width()));
 }
 
 absl::Status RangeQueryVisitor::HandleUMulp(PartialProductOp* mul) {
@@ -1433,47 +1392,19 @@ absl::Status RangeQueryVisitor::HandleUMulp(PartialProductOp* mul) {
 absl::Status RangeQueryVisitor::HandleXorReduce(
     BitwiseReductionOp* xor_reduce) {
   INITIALIZE_OR_SKIP(xor_reduce);
-  // XorReduce determines the parity of the number of 1s in a bitstring.
-  // Incrementing a bitstring always outputs in a bitstring with a different
-  // parity of 1s (since even + 1 = odd and odd + 1 = even). Therefore, this
-  // analysis cannot return anything but unknown when an interval is imprecise.
-  // When the given set of intervals only contains precise intervals, we can
-  // check whether they all have the same parity of 1s, and return 1 or 0 if
-  // they are all the same, or unknown otherwise.
-  IntervalSet input_intervals =
-      GetIntervalSetTree(xor_reduce->operand(0)).Get({});
-  std::optional<Bits> output;
-  for (const Interval& interval : input_intervals.Intervals()) {
-    if (!interval.IsPrecise()) {
-      return absl::OkStatus();
-    }
-    Bits value = interval.LowerBound();  // guaranteed to be same as upper bound
-    Bits reduced = bits_ops::XorReduce(value);
-    if (output.has_value()) {
-      if (output.value() != reduced) {
-        return absl::OkStatus();
-      }
-    }
-    output = reduced;
-  }
-  if (output.has_value()) {
-    LeafTypeTree<IntervalSet> result(xor_reduce->GetType());
-    result.Set({}, IntervalSet::Precise(output.value()));
-    SetIntervalSetTree(xor_reduce, result);
-  }
-  return absl::OkStatus();
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(arg, xor_reduce->operand(0));
+  return SetIntervalSet(xor_reduce, interval_ops::XorReduce(arg));
 }
 
 absl::Status RangeQueryVisitor::HandleZeroExtend(ExtendOp* zero_ext) {
   INITIALIZE_OR_SKIP(zero_ext);
-  return HandleMonotoneUnaryOp(
-      [zero_ext](const Bits& bits) -> Bits {
-        return bits_ops::ZeroExtend(bits, zero_ext->new_bit_count());
-      },
-      zero_ext);
+  ASSIGN_INTERVAL_SET_REF_OR_RETURN(arg, zero_ext->operand(0));
+  return SetIntervalSet(
+      zero_ext, interval_ops::ZeroExtend(arg, zero_ext->new_bit_count()));
 }
 
 #undef INITIALIZE_OR_SKIP
+#undef ASSIGN_INTERVAL_SET_REF_OR_RETURN
 
 // Recursive helper function which writes the given IntervalSetTree to the given
 // output stream.
@@ -1504,6 +1435,85 @@ static void IntervalSetTreeToStream(const IntervalSetTree& tree, Type* type,
   } else {
     os << absl::StreamFormat("%s%s", indent, tree.Get(index).ToString());
   }
+}
+
+Bits RangeQueryEngine::MaxUnsignedValue(Node* n) const {
+  CHECK(n->GetType()->IsBits()) << n;
+  // If modifications to the function mean we don't have a tree we just fall
+  // back to the bit-based version.
+  if (!HasExplicitIntervals(n)) {
+    return QueryEngine::MaxUnsignedValue(n);
+  }
+  std::optional<Interval> hull =
+      GetIntervalSetTreeView(n)->Get({}).ConvexHull();
+  return hull ? hull->UpperBound() : Bits::AllOnes(n->BitCountOrDie());
+}
+
+Bits RangeQueryEngine::MinUnsignedValue(Node* n) const {
+  CHECK(n->GetType()->IsBits()) << n;
+  // If modifications to the function mean we don't have a tree we just fall
+  // back to the bit-based version.
+  if (!HasExplicitIntervals(n)) {
+    return QueryEngine::MinUnsignedValue(n);
+  }
+  std::optional<Interval> hull =
+      GetIntervalSetTreeView(n)->Get({}).ConvexHull();
+  return hull ? hull->LowerBound() : Bits(n->BitCountOrDie());
+}
+
+std::optional<int64_t> RangeQueryEngine::KnownLeadingOnes(Node* n) const {
+  if (!n->GetType()->IsBits()) {
+    return std::nullopt;
+  }
+  if (!HasExplicitIntervals(n)) {
+    return 0;
+  }
+  std::optional<Bits> lower_bound =
+      GetIntervalSetTreeView(n)->Get({}).LowerBound();
+  if (!lower_bound) {
+    return 0;
+  }
+  return lower_bound->CountLeadingOnes();
+}
+
+std::optional<int64_t> RangeQueryEngine::KnownLeadingZeros(Node* n) const {
+  if (!n->GetType()->IsBits()) {
+    return std::nullopt;
+  }
+  if (!HasExplicitIntervals(n)) {
+    return 0;
+  }
+  std::optional<Bits> upper_bound =
+      GetIntervalSetTreeView(n)->Get({}).UpperBound();
+  if (!upper_bound) {
+    return 0;
+  }
+  return upper_bound->CountLeadingZeros();
+}
+
+std::optional<int64_t> RangeQueryEngine::KnownLeadingSignBits(Node* n) const {
+  if (!n->GetType()->IsBits() || n->BitCountOrDie() == 0) {
+    return std::nullopt;
+  }
+  if (!HasExplicitIntervals(n)) {
+    // Sign bit is always equal to itself
+    return 1;
+  }
+  std::optional<IntervalSet> interval = GetIntervalSetTreeView(n)->Get({});
+  if (!interval || interval->IsEmpty()) {
+    return 1;
+  }
+  if (!interval->UpperBound()->msb()) {
+    // All values have sign bit of 0
+    return KnownLeadingZeros(n);
+  }
+  if (interval->LowerBound()->msb()) {
+    // All values have sign bit of 1.
+    return KnownLeadingOnes(n);
+  }
+  // Need an extra bit since the sign bit is always equal to itself.
+  return 1 + n->BitCountOrDie() -
+         interval_ops::MinimumSignedBitCount(*interval);
 }
 
 std::string IntervalSetTreeToString(const IntervalSetTree& tree) {

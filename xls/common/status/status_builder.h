@@ -15,18 +15,19 @@
 #ifndef XLS_COMMON_STATUS_STATUS_BUILDER_H_
 #define XLS_COMMON_STATUS_STATUS_BUILDER_H_
 
-#include <limits>
+#include <algorithm>
 #include <memory>
 #include <ostream>
 #include <sstream>
-#include <string>
 #include <string_view>
 #include <utility>
 
+#include "absl/base/attributes.h"
 #include "absl/base/log_severity.h"
+#include "absl/log/log_sink.h"
 #include "absl/status/status.h"
 #include "absl/time/time.h"
-#include "xls/common/logging/log_sink.h"
+#include "absl/types/span.h"
 #include "xls/common/source_location.h"
 
 // The xabsl namespace has types that are anticipated to become available in
@@ -142,14 +143,12 @@ class ABSL_MUST_USE_RESULT StatusBuilder {
   // logging mutator functions.  Returns `*this` to allow method chaining.
   // If period is absl::ZeroDuration() or less, then this is equivalent to
   // calling the Log() method.
-  StatusBuilder& LogEvery(absl::LogSeverity level,
-                          absl::Duration period) &;
-  StatusBuilder&& LogEvery(absl::LogSeverity level,
-                           absl::Duration period) &&;
+  StatusBuilder& LogEvery(absl::LogSeverity level, absl::Duration period) &;
+  StatusBuilder&& LogEvery(absl::LogSeverity level, absl::Duration period) &&;
 
   // Mutates the builder so that the result status will be VLOGged (without a
   // stack trace) when this builder is converted to a Status.  `verbose_level`
-  // indicates the verbosity level that would be passed to XLS_VLOG().  This
+  // indicates the verbosity level that would be passed to VLOG().  This
   // overrides the logging settings from earlier calls to any of the logging
   // mutator functions.  Returns `*this` to allow method chaining.
   StatusBuilder& VLog(int verbose_level) &;
@@ -168,8 +167,8 @@ class ABSL_MUST_USE_RESULT StatusBuilder {
   // time this builder is converted to a status. Has no effect if this builder
   // is not configured to log by calling any of the LogXXX methods. Returns
   // `*this` to allow method chaining.
-  StatusBuilder& AlsoOutputToSink(xls::LogSink* sink) &;
-  StatusBuilder&& AlsoOutputToSink(xls::LogSink* sink) &&;
+  StatusBuilder& AlsoOutputToSink(absl::LogSink* sink) &;
+  StatusBuilder&& AlsoOutputToSink(absl::LogSink* sink) &&;
 
   // Appends to the extra message that will be added to the original status.  By
   // default, the extra message is added to the original message and includes a
@@ -268,13 +267,13 @@ class ABSL_MUST_USE_RESULT StatusBuilder {
   // Style guide exception for Ref qualified methods and rvalue refs.  This
   // allows us to avoid a copy in the common case.
   template <typename Adaptor>
-  auto With(Adaptor&& adaptor) & -> decltype(
-      std::forward<Adaptor>(adaptor)(*this)) {
+  auto With(
+      Adaptor&& adaptor) & -> decltype(std::forward<Adaptor>(adaptor)(*this)) {
     return std::forward<Adaptor>(adaptor)(*this);
   }
   template <typename Adaptor>
-  auto With(Adaptor&& adaptor) && -> decltype(
-      std::forward<Adaptor>(adaptor)(std::move(*this))) {
+  auto With(Adaptor&& adaptor) && -> decltype(std::forward<Adaptor>(adaptor)(
+                                      std::move(*this))) {
     return std::forward<Adaptor>(adaptor)(std::move(*this));
   }
 
@@ -400,7 +399,7 @@ class ABSL_MUST_USE_RESULT StatusBuilder {
 
     // If not nullptr, specifies the log sink where log output should be also
     // sent to.  Only used when `logging_mode != LoggingMode::kDisabled`.
-    xls::LogSink* sink = nullptr;
+    absl::LogSink* sink = nullptr;
   };
 
   // The status that the result will be based on.
@@ -412,6 +411,18 @@ class ABSL_MUST_USE_RESULT StatusBuilder {
   // nullptr if the result status will be OK.  Extra fields moved to the heap to
   // minimize stack space.
   std::unique_ptr<Rep> rep_;
+
+ private:
+  // Update this status to include the given source location (if supported by
+  // Status implementation).
+  //
+  // This is only for internal use by the StatusBuilder.
+  static void AddSourceLocation(absl::Status& status, SourceLocation loc);
+  // Get the current source-location set for the given status.
+  //
+  // This is only for internal use by the StatusBuilder.
+  static absl::Span<const SourceLocation> GetSourceLocations(
+      const absl::Status& status);
 };
 
 // Implicitly converts `builder` to `Status` and write it to `os`.
@@ -614,7 +625,7 @@ inline StatusBuilder&& StatusBuilder::EmitStackTrace() && {
   return std::move(EmitStackTrace());
 }
 
-inline StatusBuilder& StatusBuilder::AlsoOutputToSink(xls::LogSink* sink) & {
+inline StatusBuilder& StatusBuilder::AlsoOutputToSink(absl::LogSink* sink) & {
   if (status_.ok()) {
     return *this;
   }
@@ -624,7 +635,7 @@ inline StatusBuilder& StatusBuilder::AlsoOutputToSink(xls::LogSink* sink) & {
   rep_->sink = sink;
   return *this;
 }
-inline StatusBuilder&& StatusBuilder::AlsoOutputToSink(xls::LogSink* sink) && {
+inline StatusBuilder&& StatusBuilder::AlsoOutputToSink(absl::LogSink* sink) && {
   return std::move(AlsoOutputToSink(sink));
 }
 
@@ -658,13 +669,17 @@ inline absl::StatusCode StatusBuilder::code() const { return status_.code(); }
 
 inline StatusBuilder::operator absl::Status() const& {
   if (rep_ == nullptr) {
-    return status_;
+    absl::Status result = status_;
+    StatusBuilder::AddSourceLocation(result, loc_);
+    return result;
   }
   return StatusBuilder(*this).CreateStatusAndConditionallyLog();
 }
 inline StatusBuilder::operator absl::Status() && {
   if (rep_ == nullptr) {
-    return std::move(status_);
+    absl::Status result = std::move(status_);
+    StatusBuilder::AddSourceLocation(result, loc_);
+    return result;
   }
   return std::move(*this).CreateStatusAndConditionallyLog();
 }

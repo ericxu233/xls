@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -23,6 +24,10 @@
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
+#include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/escaping.h"
@@ -31,9 +36,9 @@
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
 #include "xls/common/casts.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/change_listener.h"
 #include "xls/ir/dfs_visitor.h"
 #include "xls/ir/format_strings.h"
 #include "xls/ir/function.h"
@@ -42,30 +47,34 @@
 #include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/ir/package.h"
-#include "xls/ir/proc.h"
 #include "xls/ir/register.h"
 #include "xls/ir/source_location.h"
 #include "xls/ir/type.h"
-#include "xls/ir/verifier.h"
+#include "xls/ir/verify_node.h"
 
 namespace xls {
 
 Node::Node(Op op, Type* type, const SourceInfo& loc, std::string_view name,
            FunctionBase* function_base)
     : function_base_(function_base),
-      id_(function_base_->package()->GetNextNodeId()),
+      id_(function_base_->package()->GetNextNodeIdAndIncrement()),
       op_(op),
       type_(type),
       loc_(loc),
-      name_(name.empty() ? "" : function_base_->UniquifyNodeName(name)) {}
+      name_(name.empty() ? nullptr
+                         : std::make_unique<std::string>(
+                               function_base_->UniquifyNodeName(name))) {}
 
 void Node::AddOperand(Node* operand) {
-  XLS_VLOG(3) << " Adding operand " << operand->GetName() << " as #"
-              << operands_.size() << " operand of " << GetName();
+  VLOG(3) << " Adding operand " << operand->GetName() << " as #"
+          << operands_.size() << " operand of " << GetName();
   operands_.push_back(operand);
   operand->AddUser(this);
-  XLS_VLOG(3) << " " << operand->GetName()
-              << " user now: " << operand->GetUsersString();
+  VLOG(3) << " " << operand->GetName()
+          << " user now: " << operand->GetUsersString();
+  for (ChangeListener* listener : GetChangeListeners(function_base_)) {
+    listener->OperandAdded(this);
+  }
 }
 
 void Node::AddOperands(absl::Span<Node* const> operands) {
@@ -82,15 +91,41 @@ void Node::AddOptionalOperand(std::optional<Node*> operand) {
 
 absl::Status Node::AddNodeToFunctionAndReplace(
     std::unique_ptr<Node> replacement) {
+  VLOG(3) << " Adding node " << replacement->GetName() << " to replace "
+          << GetName();
   Node* replacement_ptr = function_base()->AddNode(std::move(replacement));
   XLS_RETURN_IF_ERROR(VerifyNode(replacement_ptr));
   return ReplaceUsesWith(replacement_ptr);
 }
 
-void Node::AddUser(Node* user) { users_.insert(user); }
+void Node::AddUser(Node* user) {
+  absl::InlinedVector<Node*, 2>::iterator it;
+  if (users_.size() < kSmallUserCount) {
+    // Perform a linear search for the insertion point.
+    it = users_.begin();
+    auto less = NodeIdLessThan();
+    while (it != users_.end() && less(*it, user)) {
+      ++it;
+    }
+  } else {
+    it = absl::c_lower_bound(users_, user, NodeIdLessThan());
+  }
+  if (it == users_.end() || (*it)->id() != user->id()) {
+    users_.insert(it, user);
+  }
+}
 
 void Node::RemoveUser(Node* user) {
-  XLS_CHECK_EQ(users_.erase(user), 1) << GetName();
+  absl::InlinedVector<Node*, 2>::iterator it;
+  if (users_.size() < kSmallUserCount) {
+    it = absl::c_find_if(users_,
+                         [user](Node* x) { return x->id() == user->id(); });
+  } else {
+    it = absl::c_lower_bound(users_, user, NodeIdLessThan());
+  }
+  if (it != users_.end() && (*it)->id() == user->id()) {
+    users_.erase(it);
+  }
 }
 
 absl::Status Node::VisitSingleNode(DfsVisitor* visitor) {
@@ -224,6 +259,13 @@ absl::Status Node::VisitSingleNode(DfsVisitor* visitor) {
     case Op::kParam:
       XLS_RETURN_IF_ERROR(visitor->HandleParam(down_cast<Param*>(this)));
       break;
+    case Op::kStateRead:
+      XLS_RETURN_IF_ERROR(
+          visitor->HandleStateRead(down_cast<StateRead*>(this)));
+      break;
+    case Op::kNext:
+      XLS_RETURN_IF_ERROR(visitor->HandleNext(down_cast<Next*>(this)));
+      break;
     case Op::kRegisterRead:
       XLS_RETURN_IF_ERROR(
           visitor->HandleRegisterRead(down_cast<RegisterRead*>(this)));
@@ -345,35 +387,62 @@ absl::Status Node::VisitSingleNode(DfsVisitor* visitor) {
   return absl::OkStatus();
 }
 
+// A stack frame for the DFS visitor.
+struct DfsStackFrame {
+  // The node to visit after `operand_it` has reached node->operands().end().
+  Node* node;
+  // Iterator pointing to the next operand of `node` to visit.
+  decltype(std::declval<Node>().operands())::const_iterator operand_it;
+};
+
 absl::Status Node::Accept(DfsVisitor* visitor) {
   if (visitor->IsVisited(this)) {
     return absl::OkStatus();
   }
-  if (visitor->IsTraversing(this)) {
-    std::vector<std::string> cycle_names = {GetName()};
-    Node* node = this;
-    do {
-      bool broke = false;
-      for (Node* operand : node->operands()) {
-        if (visitor->IsTraversing(operand)) {
-          node = operand;
-          broke = true;
-          break;
-        }
+  std::vector<DfsStackFrame> stack{
+      DfsStackFrame{.node = this, .operand_it = operands().begin()}};
+  while (!stack.empty()) {
+    auto& [current, current_operand_it] = stack.back();
+    visitor->SetTraversing(current);
+    bool saw_unvisited_operand = false;
+    while (current_operand_it != current->operands().end()) {
+      Node* operand = *current_operand_it;
+      ++current_operand_it;
+      if (visitor->IsVisited(operand)) {
+        continue;
       }
-      XLS_CHECK(broke);
-      cycle_names.push_back(node->GetName());
-    } while (node != this);
-    return absl::InternalError(absl::StrFormat(
-        "Cycle detected: [%s]", absl::StrJoin(cycle_names, " -> ")));
+      if (visitor->IsTraversing(operand)) {
+        // Found a cycle, make a useful error message.
+        std::vector<std::string> cycle_names = {operand->GetName()};
+        Node* node = operand;
+        do {
+          bool broke = false;
+          for (Node* node_operand : node->operands()) {
+            if (visitor->IsTraversing(node_operand)) {
+              node = node_operand;
+              broke = true;
+              break;
+            }
+          }
+          CHECK(broke);
+          cycle_names.push_back(node->GetName());
+        } while (node != operand);
+        return absl::InternalError(absl::StrFormat(
+            "Cycle detected: [%s]", absl::StrJoin(cycle_names, " -> ")));
+      }
+      saw_unvisited_operand = true;
+      stack.push_back(DfsStackFrame{.node = operand,
+                                    .operand_it = operand->operands().begin()});
+      break;
+    }
+    if (!saw_unvisited_operand) {
+      visitor->UnsetTraversing(current);
+      visitor->MarkVisited(current);
+      XLS_RETURN_IF_ERROR(current->VisitSingleNode(visitor));
+      stack.pop_back();
+    }
   }
-  visitor->SetTraversing(this);
-  for (Node* operand : operands()) {
-    XLS_RETURN_IF_ERROR(operand->Accept(visitor));
-  }
-  visitor->UnsetTraversing(this);
-  visitor->MarkVisited(this);
-  return VisitSingleNode(visitor);
+  return absl::OkStatus();
 }
 
 bool Node::IsDefinitelyEqualTo(const Node* other) const {
@@ -404,20 +473,43 @@ bool Node::IsDefinitelyEqualTo(const Node* other) const {
 }
 
 std::string Node::GetName() const {
-  if (!name_.empty()) {
-    return name_;
+  if (name_ == nullptr) {
+    // Return a generated name based on the id.
+    return absl::StrFormat("%s.%d", OpToString(op()), id());
   }
-  // Return a generated name based on the id.
-  return absl::StrFormat("%s.%d", OpToString(op()), id());
+  return *name_;
+}
+
+std::string_view Node::GetNameView() const {
+  if (name_ == nullptr) {
+    return "";
+  }
+  return *name_;
 }
 
 void Node::SetName(std::string_view name) {
-  name_ = function_base()->UniquifyNodeName(name);
+  if (name.empty()) {
+    name_.reset();
+  } else {
+    name_ =
+        std::make_unique<std::string>(function_base()->UniquifyNodeName(name));
+  }
+}
+
+void Node::SetNameDirectly(std::string_view name) {
+  if (name.empty()) {
+    name_.reset();
+  } else {
+    name_ = std::make_unique<std::string>(name);
+  }
 }
 
 void Node::ClearName() {
-  XLS_CHECK(!Is<Param>());
-  name_ = "";
+  // Ports and parameters are observable and require names.
+  CHECK(!Is<Param>());
+  CHECK(!Is<InputPort>());
+  CHECK(!Is<OutputPort>());
+  name_.reset();
 }
 
 void Node::SetLoc(const SourceInfo& loc) { loc_ = loc; }
@@ -435,8 +527,29 @@ std::string Node::ToStringInternal(bool include_operand_types) const {
   }
   switch (op_) {
     case Op::kParam:
-      args.push_back(GetName());
+      args.push_back(absl::StrFormat("name=%s", GetName()));
       break;
+    case Op::kStateRead: {
+      const StateRead* state_read = As<StateRead>();
+      args = {absl::StrFormat("state_element=%s",
+                              state_read->state_element()->name())};
+      if (state_read->predicate().has_value()) {
+        args.push_back(absl::StrFormat("predicate=%s",
+                                       (*state_read->predicate())->GetName()));
+      }
+      break;
+    }
+    case Op::kNext: {
+      const Next* next = As<Next>();
+      args = {absl::StrFormat("param=%s", next->state_read()->GetName()),
+              absl::StrFormat("value=%s", next->value()->GetName())};
+      std::optional<Node*> predicate = next->predicate();
+      if (predicate.has_value()) {
+        args.push_back(
+            absl::StrFormat("predicate=%s", (*predicate)->GetName()));
+      }
+      break;
+    }
     case Op::kLiteral:
       args.push_back(
           absl::StrFormat("value=%s", As<Literal>()->value().ToHumanString()));
@@ -497,6 +610,8 @@ std::string Node::ToStringInternal(bool include_operand_types) const {
       args = {operand(0)->GetName()};
       args.push_back(
           absl::StrFormat("cases=[%s]", absl::StrJoin(sel->cases(), ", ")));
+      args.push_back(
+          absl::StrFormat("default=%v", sel->default_value()->GetName()));
       break;
     }
     case Op::kSel: {
@@ -517,7 +632,7 @@ std::string Node::ToStringInternal(bool include_operand_types) const {
         args.push_back(absl::StrFormat("predicate=%s",
                                        send->predicate().value()->GetName()));
       }
-      args.push_back(absl::StrFormat("channel_id=%d", send->channel_id()));
+      args.push_back(absl::StrFormat("channel=%s", send->channel_name()));
       break;
     }
     case Op::kReceive: {
@@ -527,7 +642,7 @@ std::string Node::ToStringInternal(bool include_operand_types) const {
         args.push_back(absl::StrFormat(
             "predicate=%s", receive->predicate().value()->GetName()));
       }
-      args.push_back(absl::StrFormat("channel_id=%d", receive->channel_id()));
+      args.push_back(absl::StrFormat("channel=%s", receive->channel_name()));
       if (receive->is_blocking() == false) {
         // Default blocking=true so we only need to push is !is_blocking().
         args.push_back("blocking=false");
@@ -553,8 +668,9 @@ std::string Node::ToStringInternal(bool include_operand_types) const {
     case Op::kArrayIndex: {
       const ArrayIndex* index = As<ArrayIndex>();
       args = {operand(0)->GetName()};
-      args.push_back(absl::StrFormat("indices=[%s]",
-                                     absl::StrJoin(index->indices(), ", ")));
+      args.push_back(absl::StrFormat(
+          "indices=[%s]%s", absl::StrJoin(index->indices(), ", "),
+          index->assumed_in_bounds() ? ", assumed_in_bounds=true" : ""));
       break;
     }
     case Op::kArraySlice: {
@@ -565,8 +681,9 @@ std::string Node::ToStringInternal(bool include_operand_types) const {
       const ArrayUpdate* update = As<ArrayUpdate>();
       args = {update->array_to_update()->GetName(),
               update->update_value()->GetName()};
-      args.push_back(absl::StrFormat("indices=[%s]",
-                                     absl::StrJoin(update->indices(), ", ")));
+      args.push_back(absl::StrFormat(
+          "indices=[%s]%s", absl::StrJoin(update->indices(), ", "),
+          update->assumed_in_bounds() ? ", assumed_in_bounds=true" : ""));
       break;
     }
     case Op::kAssert:
@@ -585,15 +702,24 @@ std::string Node::ToStringInternal(bool include_operand_types) const {
           absl::CEscape(StepsToXlsFormatString(trace->format()))));
       args.push_back(absl::StrFormat("data_operands=[%s]",
                                      absl::StrJoin(trace->args(), ", ")));
+      if (trace->verbosity() > 0) {
+        args.push_back(absl::StrFormat("verbosity=%d", trace->verbosity()));
+      }
       break;
     }
     case Op::kCover:
       args.push_back(absl::StrFormat("label=\"%s\"", As<Cover>()->label()));
       break;
     case Op::kInputPort:
-    case Op::kOutputPort:
+    case Op::kOutputPort: {
+      const PortNode* port_node = As<PortNode>();
       args.push_back(absl::StrFormat("name=%s", GetName()));
+      if (port_node->system_verilog_type().has_value()) {
+        args.push_back(absl::StrFormat("sv_type=\"%s\"",
+                                       *port_node->system_verilog_type()));
+      }
       break;
+    }
     case Op::kRegisterRead:
       args.push_back(absl::StrFormat(
           "register=%s", As<RegisterRead>()->GetRegister()->name()));
@@ -647,7 +773,16 @@ std::string Node::GetUsersString() const {
 }
 
 bool Node::HasUser(const Node* target) const {
-  return users_.contains(const_cast<Node*>(target));
+  if (users_.size() < kSmallUserCount) {
+    for (const Node* user : users_) {
+      if (user->id() == target->id()) {
+        return true;
+      }
+    }
+    return false;
+  }
+  return absl::c_binary_search(users_, const_cast<Node*>(target),
+                               NodeIdLessThan());
 }
 
 bool Node::IsDead() const {
@@ -675,15 +810,15 @@ int64_t Node::OperandInstanceCount(const Node* target) const {
 }
 
 void Node::SetId(int64_t id) {
-  // The data structure (btree) containing the users of each node is sorted by
+  // The data structure (vector) containing the users of each node is sorted by
   // node id. To avoid violating invariants of the data structure, remove this
-  // node from all users lists, change id, then read to users list.
+  // node from all users lists, change id, then re-add to users list.
   for (Node* operand : operands()) {
-    operand->users_.erase(this);
+    operand->RemoveUser(this);
   }
   id_ = id;
   for (Node* operand : operands()) {
-    operand->users_.insert(this);
+    operand->AddUser(this);
   }
   package()->set_next_node_id(std::max(id + 1, package()->next_node_id()));
 }
@@ -701,19 +836,23 @@ bool Node::ReplaceOperand(Node* old_operand, Node* new_operand) {
   if (this == new_operand) {
     return true;
   }
-  bool did_replace = false;
+  ++package()->transform_metrics().operands_replaced;
+  std::vector<int64_t> replaced_operands;
   for (int64_t i = 0; i < operand_count(); ++i) {
     if (operands_[i] == old_operand) {
-      if (!did_replace && new_operand != nullptr) {
+      if (replaced_operands.empty() && new_operand != nullptr) {
         // Now we know we're definitely using this new operand.
         new_operand->AddUser(this);
       }
-      did_replace = true;
+      replaced_operands.push_back(i);
       operands_[i] = new_operand;
     }
   }
   old_operand->RemoveUser(this);
-  return did_replace;
+  for (ChangeListener* listener : GetChangeListeners(function_base_)) {
+    listener->OperandChanged(this, old_operand, replaced_operands);
+  }
+  return !replaced_operands.empty();
 }
 
 absl::Status Node::ReplaceOperandNumber(int64_t operand_no, Node* new_operand,
@@ -724,43 +863,82 @@ absl::Status Node::ReplaceOperandNumber(int64_t operand_no, Node* new_operand,
         << "old operand type: " << old_operand->GetType()->ToString()
         << " new operand type: " << new_operand->GetType()->ToString();
   }
+  ++package()->transform_metrics().operands_replaced;
 
   // AddUser is idempotent so even if the new operand is already used by this
   // node in another operand slot, it is safe to call.
   new_operand->AddUser(this);
   operands_[operand_no] = new_operand;
 
-  for (Node* operand : operands()) {
-    if (operand == old_operand) {
-      return absl::OkStatus();
-    }
+  if (absl::c_none_of(operands(), [old_operand](Node* operand) {
+        return operand == old_operand;
+      })) {
+    // old_operand is no longer an operand of this node.
+    old_operand->RemoveUser(this);
   }
-  // old_operand is no longer an operand of this node.
-  old_operand->RemoveUser(this);
+  for (ChangeListener* listener : GetChangeListeners(function_base_)) {
+    listener->OperandChanged(this, old_operand, operand_no);
+  }
   return absl::OkStatus();
 }
 
-absl::Status Node::ReplaceUsesWith(Node* replacement) {
+absl::Status Node::RemoveOptionalOperand(int64_t operand_no) {
+  XLS_RET_CHECK_LE(operand_no, operands_.size() - 1);
+  Node* old_operand = operands_[operand_no];
+  ++package()->transform_metrics().operands_removed;
+
+  operands_.erase(operands_.begin() + operand_no);
+
+  if (absl::c_none_of(operands(), [old_operand](Node* operand) {
+        return operand == old_operand;
+      })) {
+    // old_operand is no longer an operand of this node.
+    old_operand->RemoveUser(this);
+  }
+  for (ChangeListener* listener : GetChangeListeners(function_base_)) {
+    listener->OperandRemoved(this, old_operand);
+  }
+  return absl::OkStatus();
+}
+
+absl::Status Node::ReplaceUsesWith(Node* replacement,
+                                   const std::function<bool(Node*)>& filter,
+                                   bool replace_implicit_uses) {
   XLS_RET_CHECK(replacement != nullptr);
   XLS_RET_CHECK(GetType() == replacement->GetType())
       << "type was: " << GetType()->ToString()
       << " replacement: " << replacement->GetType()->ToString();
+  ++package()->transform_metrics().nodes_replaced;
+  bool all_replaced = true;
   std::vector<Node*> orig_users(users().begin(), users().end());
   for (Node* user : orig_users) {
-    XLS_RET_CHECK(user->ReplaceOperand(this, replacement));
+    if (filter(user)) {
+      XLS_RET_CHECK(user->ReplaceOperand(this, replacement));
+    } else {
+      all_replaced = false;
+    }
   }
 
-  // Handle replacement of nodes which have special positions within the
-  // enclosed FunctionBase (function return value, proc next state, etc).
-  XLS_RETURN_IF_ERROR(ReplaceImplicitUsesWith(replacement).status());
+  if (replace_implicit_uses) {
+    // Handle replacement of nodes which have special positions within the
+    // enclosed FunctionBase (function return value, proc next state, etc).
+    XLS_RETURN_IF_ERROR(ReplaceImplicitUsesWith(replacement).status());
+  } else if (function_base()->HasImplicitUse(this)) {
+    all_replaced = false;
+  }
 
   // If the replacement does not have an assigned name but this node does, move
-  // the name over to preserve the name. If this is a parameter node then don't
-  // move the name because we cannot clear the name of a parameter node.
-  if (!Is<Param>() && HasAssignedName() && !replacement->HasAssignedName()) {
+  // the name over to preserve the name. If this is a parameter, port, or
+  // state-read node then don't move the name because we cannot clear the name
+  // of these nodes.
+  //
+  // We also don't replace the name if some use was filtered out and not
+  // updated.
+  if (all_replaced && !Is<Param>() && !Is<PortNode>() && !Is<StateRead>() &&
+      HasAssignedName() && !replacement->HasAssignedName()) {
     // Do not use SetName because we do not want the name to be uniqued which
     // would add a suffix because (clearly) the name already exists.
-    replacement->name_ = name_;
+    replacement->SetNameDirectly(*name_);
     ClearName();
   }
   return absl::OkStatus();
@@ -768,27 +946,29 @@ absl::Status Node::ReplaceUsesWith(Node* replacement) {
 
 absl::StatusOr<bool> Node::ReplaceImplicitUsesWith(Node* replacement) {
   bool changed = false;
+  // Only functions have implicitly-used nodes, for their return value.
   if (function_base()->IsFunction()) {
     Function* function = function_base()->AsFunctionOrDie();
     if (this == function->return_value()) {
       XLS_RETURN_IF_ERROR(function->set_return_value(replacement));
       changed = true;
     }
-  } else if (function_base()->IsProc()) {
-    Proc* proc = function_base()->AsProcOrDie();
-    if (this == proc->NextToken()) {
-      XLS_RETURN_IF_ERROR(proc->SetNextToken(replacement));
-      changed = true;
-    }
-    for (int64_t index : proc->GetNextStateIndices(this)) {
-      XLS_RETURN_IF_ERROR(proc->SetNextStateElement(index, replacement));
-      changed = true;
-    }
-  } else {
-    XLS_RET_CHECK(function_base()->IsBlock());
-    // Blocks have no implicit uses.
   }
   return changed;
+}
+
+void Node::SwapOperands(int64_t a, int64_t b) {
+  // Operand/user chains already set up properly.
+  Node* old_a = operands_[a];
+  Node* old_b = operands_[b];
+  operands_[b] = old_a;
+  for (ChangeListener* listener : GetChangeListeners(function_base_)) {
+    listener->OperandChanged(this, old_b, b);
+  }
+  operands_[a] = old_b;
+  for (ChangeListener* listener : GetChangeListeners(function_base_)) {
+    listener->OperandChanged(this, old_a, a);
+  }
 }
 
 bool Node::OpIn(absl::Span<const Op> choices) const {

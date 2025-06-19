@@ -25,7 +25,6 @@
 #include "xls/common/status/matchers.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/channel.h"
-#include "xls/ir/channel.pb.h"
 #include "xls/ir/channel_ops.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/instantiation.h"
@@ -200,12 +199,14 @@ TEST(IrMatchersTest, PrioritySelect) {
   auto pred = fb.Param("pred", p.GetBitsType(2));
   auto x = fb.Param("x", p.GetBitsType(32));
   auto y = fb.Param("y", p.GetBitsType(32));
-  fb.PrioritySelect(pred, {x, y});
+  auto z = fb.Param("z", p.GetBitsType(32));
+  fb.PrioritySelect(pred, {x, y}, z);
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
 
   EXPECT_THAT(f->return_value(), m::PrioritySelect());
   EXPECT_THAT(f->return_value(),
-              m::PrioritySelect(m::Name("pred"), {m::Name("x"), m::Name("y")}));
+              m::PrioritySelect(m::Name("pred"), {m::Name("x"), m::Name("y")},
+                                m::Name("z")));
 }
 
 TEST(IrMatchersTest, OneHotSelectDoesNotMatchPrioritySelect) {
@@ -218,7 +219,7 @@ TEST(IrMatchersTest, OneHotSelectDoesNotMatchPrioritySelect) {
   fb.OneHotSelect(pred, {x, y});
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
 
-  EXPECT_THAT(f->return_value(), Not(m::PrioritySelect()));
+  EXPECT_THAT(f->return_value(), ::testing::Not(m::PrioritySelect()));
 }
 
 TEST(IrMatchersTest, PrioritySelectDoesNotMatchOneHotSelect) {
@@ -228,10 +229,11 @@ TEST(IrMatchersTest, PrioritySelectDoesNotMatchOneHotSelect) {
   auto pred = fb.Param("pred", p.GetBitsType(2));
   auto x = fb.Param("x", p.GetBitsType(32));
   auto y = fb.Param("y", p.GetBitsType(32));
-  fb.PrioritySelect(pred, {x, y});
+  auto z = fb.Param("z", p.GetBitsType(32));
+  fb.PrioritySelect(pred, {x, y}, z);
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
 
-  EXPECT_THAT(f->return_value(), Not(m::OneHotSelect()));
+  EXPECT_THAT(f->return_value(), ::testing::Not(m::OneHotSelect()));
 }
 
 TEST(IrMatchersTest, Select) {
@@ -342,35 +344,57 @@ TEST(IrMatchersTest, SendOps) {
       p.CreateStreamingChannel(
           "ch42", ChannelOps ::kSendReceive, p.GetBitsType(32), {},
           /*fifo_config=*/std::nullopt, FlowControl::kReadyValid,
-          ChannelStrictness::kProvenMutuallyExclusive, ChannelMetadataProto(),
-          42));
+          ChannelStrictness::kProvenMutuallyExclusive, 42));
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * ch123,
       p.CreateStreamingChannel(
           "ch123", ChannelOps::kSendReceive, p.GetBitsType(32), {},
           /*fifo_config=*/std::nullopt, FlowControl::kReadyValid,
-          ChannelStrictness::kProvenMutuallyExclusive, ChannelMetadataProto(),
-          123));
+          ChannelStrictness::kProvenMutuallyExclusive, 123));
 
-  ProcBuilder b("proc", "my_token", &p);
+  ProcBuilder b("test_proc", &p);
+  auto my_token = b.StateElement("my_token", Value::Token());
   auto state = b.StateElement("my_state", Value(UBits(333, 32)));
-  auto send = b.Send(ch42, b.GetTokenParam(), state);
-  auto send_if =
-      b.SendIf(ch123, b.GetTokenParam(), b.Literal(UBits(1, 1)), {state});
-  XLS_ASSERT_OK(
-      b.Build(b.AfterAll({send, send_if}), {b.GetStateParam(0)}).status());
+  auto send = b.Send(ch42, my_token, state);
+  auto send_if = b.SendIf(ch123, my_token, b.Literal(UBits(1, 1)), {state});
+  XLS_ASSERT_OK(b.Build({b.AfterAll({send, send_if}), state}).status());
 
   EXPECT_THAT(send.node(), m::Send());
-  EXPECT_THAT(send.node(), m::Send(m::Channel(42)));
-  EXPECT_THAT(send.node(), m::Send(m::Name("my_token"), {m::Name("my_state")},
-                                   m::Channel(42)));
+  EXPECT_THAT(send.node(), m::Send(m::Channel("ch42")));
+  EXPECT_THAT(send.node(), m::Send(m::Name("my_token"), m::Name("my_state"),
+                                   m::Channel("ch42")));
   EXPECT_THAT(send.node(), m::Send(m::ChannelWithType("bits[32]")));
 
   EXPECT_THAT(send_if.node(), m::Send());
-  EXPECT_THAT(send_if.node(), m::Send(m::Channel(123)));
-  EXPECT_THAT(send_if.node(),
-              m::Send(m::Name("my_token"), {m::Name("my_state")}, m::Literal(),
-                      m::Channel(123)));
+  EXPECT_THAT(send_if.node(), m::Send(m::Channel("ch123")));
+  EXPECT_THAT(send_if.node(), m::Send(m::Name("my_token"), m::Name("my_state"),
+                                      m::Literal(), m::Channel("ch123")));
+  EXPECT_THAT(send_if.node(), m::Send(m::ChannelWithType("bits[32]")));
+}
+
+TEST(IrMatchersTest, ProcScopedChannels) {
+  Package p("p");
+  ProcBuilder b(NewStyleProc(), "test_proc", &p);
+  auto my_token = b.StateElement("my_token", Value::Token());
+  auto state = b.StateElement("my_state", Value(UBits(333, 32)));
+  XLS_ASSERT_OK_AND_ASSIGN(ChannelWithInterfaces ch42,
+                           b.AddChannel("ch42", p.GetBitsType(32)));
+  XLS_ASSERT_OK_AND_ASSIGN(SendChannelInterface * ch123,
+                           b.AddOutputChannel("ch123", p.GetBitsType(32)));
+  auto send = b.Send(ch42.send_interface, my_token, state);
+  auto send_if = b.SendIf(ch123, my_token, b.Literal(UBits(1, 1)), {state});
+  XLS_ASSERT_OK(b.Build({b.AfterAll({send, send_if}), state}).status());
+
+  EXPECT_THAT(send.node(), m::Send());
+  EXPECT_THAT(send.node(), m::Send(m::Channel("ch42")));
+  EXPECT_THAT(send.node(), m::Send(m::Name("my_token"), m::Name("my_state"),
+                                   m::Channel("ch42")));
+  EXPECT_THAT(send.node(), m::Send(m::ChannelWithType("bits[32]")));
+
+  EXPECT_THAT(send_if.node(), m::Send());
+  EXPECT_THAT(send_if.node(), m::Send(m::Channel("ch123")));
+  EXPECT_THAT(send_if.node(), m::Send(m::Name("my_token"), m::Name("my_state"),
+                                      m::Literal(), m::Channel("ch123")));
   EXPECT_THAT(send_if.node(), m::Send(m::ChannelWithType("bits[32]")));
 }
 
@@ -381,28 +405,26 @@ TEST(IrMatchersTest, ReceiveOps) {
       p.CreateStreamingChannel(
           "ch42", ChannelOps ::kSendReceive, p.GetBitsType(32), {},
           /*fifo_config=*/std::nullopt, FlowControl::kReadyValid,
-          ChannelStrictness::kProvenMutuallyExclusive, ChannelMetadataProto(),
-          42));
+          ChannelStrictness::kProvenMutuallyExclusive, 42));
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * ch123,
       p.CreateStreamingChannel(
           "ch123", ChannelOps::kSendReceive, p.GetBitsType(32), {},
           /*fifo_config=*/std::nullopt, FlowControl::kReadyValid,
-          ChannelStrictness::kProvenMutuallyExclusive, ChannelMetadataProto(),
-          123));
+          ChannelStrictness::kProvenMutuallyExclusive, 123));
 
-  ProcBuilder b("proc", "my_token", &p);
+  ProcBuilder b("test_proc", &p);
+  auto my_token = b.StateElement("my_token", Value::Token());
   auto state = b.StateElement("my_state", Value(UBits(333, 32)));
-  auto receive = b.Receive(ch42, b.GetTokenParam());
-  auto receive_if =
-      b.ReceiveIf(ch123, b.GetTokenParam(), b.Literal(UBits(1, 1)));
-  XLS_ASSERT_OK(b.Build(b.AfterAll({b.TupleIndex(receive, 0),
-                                    b.TupleIndex(receive_if, 0)}),
-                        {state})
+  auto receive = b.Receive(ch42, my_token);
+  auto receive_if = b.ReceiveIf(ch123, my_token, b.Literal(UBits(1, 1)));
+  XLS_ASSERT_OK(b.Build({b.AfterAll({b.TupleIndex(receive, 0),
+                                     b.TupleIndex(receive_if, 0)}),
+                         state})
                     .status());
 
   EXPECT_THAT(receive.node(), m::Receive());
-  EXPECT_THAT(receive.node(), m::Receive(m::Channel(42)));
+  EXPECT_THAT(receive.node(), m::Receive(m::Channel("ch42")));
   EXPECT_THAT(receive.node(),
               m::Receive(m::Name("my_token"), m::Channel("ch42")));
   EXPECT_THAT(receive.node(), m::Receive(m::Name("my_token"),
@@ -410,7 +432,7 @@ TEST(IrMatchersTest, ReceiveOps) {
   EXPECT_THAT(receive.node(), m::Receive(m::ChannelWithType("bits[32]")));
 
   EXPECT_THAT(receive_if.node(), m::Receive());
-  EXPECT_THAT(receive_if.node(), m::Receive(m::Channel(123)));
+  EXPECT_THAT(receive_if.node(), m::Receive(m::Channel("ch123")));
   EXPECT_THAT(receive_if.node(), m::Receive(m::Name("my_token"), m::Literal(),
                                             m::Channel("ch123")));
   EXPECT_THAT(receive_if.node(),
@@ -418,10 +440,8 @@ TEST(IrMatchersTest, ReceiveOps) {
   EXPECT_THAT(receive_if.node(), m::Receive(m::ChannelWithType("bits[32]")));
 
   // Mismatch conditions.
-  EXPECT_THAT(Explain(receive.node(), m::Receive(m::Channel(444))),
-              HasSubstr("has incorrect id (42), expected: 444"));
   EXPECT_THAT(Explain(receive.node(), m::Receive(m::Channel("foobar"))),
-              HasSubstr("has incorrect name (ch42), expected: foobar"));
+              HasSubstr("ch42 has incorrect name, expected: foobar."));
   EXPECT_THAT(
       Explain(receive.node(),
               m::Receive(m::Channel(ChannelKind::kSingleValue))),
@@ -528,37 +548,61 @@ TEST(IrMatchersTest, FunctionBaseMatcher) {
       StreamingChannel * ch1,
       p.CreateStreamingChannel("ch1", ChannelOps::kSendOnly,
                                p.GetBitsType(32)));
-  ProcBuilder pb("test_proc", "tok", &p);
-  BValue rcv = pb.Receive(ch0, pb.GetTokenParam());
+  ProcBuilder pb("test_proc", &p);
+  BValue tok = pb.StateElement("tok", Value::Token());
+  BValue rcv = pb.Receive(ch0, tok);
   BValue rcv_token = pb.TupleIndex(rcv, 0);
   BValue rcv_data = pb.TupleIndex(rcv, 1);
   BValue f_of_data = pb.Invoke({rcv_data, rcv_data}, f);
   BValue send_token = pb.Send(ch1, rcv_token, f_of_data);
-  XLS_ASSERT_OK(pb.Build(send_token, {}).status());
+  XLS_ASSERT_OK(pb.Build({send_token}).status());
+
+  BlockBuilder bb("test_block", &p);
+  BValue a = bb.InputPort("x", p.GetBitsType(32));
+  BValue b = bb.InputPort("y", p.GetBitsType(32));
+  bb.OutputPort("out", bb.Add(a, b));
+  XLS_ASSERT_OK(bb.Build());
 
   // Match FunctionBases.
   EXPECT_THAT(
       p.GetFunctionBases(),
-      UnorderedElementsAre(m::FunctionBase("f"), m::FunctionBase("test_proc")));
+      UnorderedElementsAre(m::FunctionBase("f"), m::FunctionBase("test_proc"),
+                           m::FunctionBase("test_block")));
   EXPECT_THAT(p.GetFunctionBases(),
               UnorderedElementsAre(m::FunctionBase(HasSubstr("f")),
-                                   m::FunctionBase(HasSubstr("test"))));
-  EXPECT_THAT(p.GetFunctionBases(), Not(Contains(m::FunctionBase("foobar"))));
-
-  // Match Function and Proc.
+                                   m::FunctionBase(HasSubstr("test_pr")),
+                                   m::FunctionBase(HasSubstr("test_b"))));
   EXPECT_THAT(p.GetFunctionBases(),
-              UnorderedElementsAre(m::Function("f"), m::Proc("test_proc")));
+              ::testing::Not(Contains(m::FunctionBase("foobar"))));
+
+  // Match Function, Proc and Block.
+  EXPECT_THAT(p.GetFunctionBases(),
+              UnorderedElementsAre(m::Function("f"), m::Proc("test_proc"),
+                                   m::Block("test_block")));
   EXPECT_THAT(p.GetFunctionBases(),
               UnorderedElementsAre(m::Function(HasSubstr("f")),
-                                   m::Proc(HasSubstr("test"))));
-  EXPECT_THAT(p.GetFunctionBases(), Not(Contains(m::Function("test_proc"))));
+                                   m::Proc(HasSubstr("test_p")),
+                                   m::Block(HasSubstr("test_b"))));
+  EXPECT_THAT(p.GetFunctionBases(),
+              ::testing::Not(Contains(m::Function("test_proc"))));
   EXPECT_THAT(p.GetFunctionBases(),
               Not(Contains(m::Function(HasSubstr("proc")))));
-  EXPECT_THAT(p.GetFunctionBases(), Not(Contains(m::Proc("f"))));
-  EXPECT_THAT(p.GetFunctionBases(), Not(Contains(m::Proc(HasSubstr("f")))));
+  EXPECT_THAT(p.GetFunctionBases(),
+              Not(Contains(m::Function(HasSubstr("block")))));
+  EXPECT_THAT(p.GetFunctionBases(), ::testing::Not(Contains(m::Proc("f"))));
+  EXPECT_THAT(p.GetFunctionBases(),
+              ::testing::Not(Contains(m::Proc(HasSubstr("f")))));
+  EXPECT_THAT(p.GetFunctionBases(),
+              ::testing::Not(Contains(m::Proc(HasSubstr("block")))));
+  EXPECT_THAT(p.GetFunctionBases(), ::testing::Not(Contains(m::Block("f"))));
+  EXPECT_THAT(p.GetFunctionBases(),
+              ::testing::Not(Contains(m::Block(HasSubstr("f")))));
+  EXPECT_THAT(p.GetFunctionBases(),
+              ::testing::Not(Contains(m::Block(HasSubstr("proc")))));
 
   EXPECT_THAT(p.procs(), UnorderedElementsAre(m::Proc("test_proc")));
   EXPECT_THAT(p.functions(), UnorderedElementsAre(m::Function("f")));
+  EXPECT_THAT(p.blocks(), UnorderedElementsAre(m::Block("test_block")));
 }
 
 TEST(IrMatchersTest, MinDelayMatcher) {
@@ -626,7 +670,7 @@ TEST(IrMatchersTest, InstantiationMatcher) {
   BValue x = bb.InputPort("x", u32);
   BValue y = bb.InputPort("y", u32);
 
-  bb.InstantiationInput(add0, "a", x);
+  BValue a = bb.InstantiationInput(add0, "a", x);
   bb.InstantiationInput(add0, "b", y);
   BValue x_plus_y = bb.InstantiationOutput(add0, "result");
   bb.OutputPort("x_plus_y", x_plus_y);
@@ -651,6 +695,62 @@ TEST(IrMatchersTest, InstantiationMatcher) {
   EXPECT_THAT(Explain(block->GetInstantiations().at(0),
                       m::Instantiation(InstantiationKind::kExtern)),
               HasSubstr("add0 has incorrect kind, expected: extern"));
+
+  EXPECT_THAT(
+      block->nodes(),
+      AllOf(
+          Contains(m::InstantiationOutput()),
+          Contains(m::InstantiationOutput("result")),
+          Contains(m::InstantiationOutput(HasSubstr("res"))),
+          Contains(m::InstantiationOutput("result", m::Instantiation("add0"))),
+          Contains(m::InstantiationInput(m::InputPort("x"))),
+          Contains(m::InstantiationInput(m::InputPort(HasSubstr("x")))),
+          Contains(m::InstantiationInput(m::InputPort("x"), "a")),
+          Contains(m::InstantiationInput(m::InputPort("x"), "a",
+                                         m::Instantiation("add0")))));
+  EXPECT_THAT(a.node(), ::testing::Not(m::InstantiationInput(
+                            m::InputPort("x"), HasSubstr("b"),
+                            m::Instantiation("add0"))));
+
+  EXPECT_THAT(Explain(a.node(), m::InstantiationInput(m::InputPort("y"))),
+              HasSubstr("x has incorrect name, expected: y."));
+  EXPECT_THAT(Explain(a.node(), m::InstantiationInput(m::InputPort("x"), "b")),
+              HasSubstr("a has incorrect name, expected: b."));
+  EXPECT_THAT(
+      Explain(a.node(), m::InstantiationInput(m::InputPort("x"), "a",
+                                              m::Instantiation("add1"))),
+      HasSubstr("add0 has incorrect name, expected: add1."));
+}
+
+TEST(IrMatchersTest, ArrayIndex) {
+  Package p("p");
+  FunctionBuilder fb("ArrayIndex", &p);
+  BValue foo = fb.Param("foo", p.GetArrayType(10, p.GetBitsType(32)));
+  BValue bar = fb.Param("bar", p.GetBitsType(32));
+  BValue assumed_in_bounds =
+      fb.ArrayIndex(foo, {bar}, /*assumed_in_bounds=*/true);
+  BValue not_assumed_in_bounds =
+      fb.ArrayIndex(foo, {bar}, /*assumed_in_bounds=*/false);
+  fb.Tuple({assumed_in_bounds, not_assumed_in_bounds});
+  XLS_ASSERT_OK(fb.Build().status());
+  EXPECT_THAT(assumed_in_bounds.node(),
+              m::ArrayIndex(m::Param("foo"), {m::Param("bar")}));
+  EXPECT_THAT(not_assumed_in_bounds.node(),
+              m::ArrayIndex(m::Param("foo"), {m::Param("bar")}));
+  EXPECT_THAT(
+      assumed_in_bounds.node(),
+      m::ArrayIndex(m::Param("foo"), {m::Param("bar")}, m::AssumedInBounds()));
+  EXPECT_THAT(Explain(assumed_in_bounds.node(),
+                      m::ArrayIndex(m::Param("foo"), {m::Param("bar")},
+                                    m::NotAssumedInBounds())),
+              HasSubstr("Unexpected value of assumed_in_bounds"));
+  EXPECT_THAT(not_assumed_in_bounds.node(),
+              m::ArrayIndex(m::Param("foo"), {m::Param("bar")},
+                            m::NotAssumedInBounds()));
+  EXPECT_THAT(Explain(not_assumed_in_bounds.node(),
+                      m::ArrayIndex(m::Param("foo"), {m::Param("bar")},
+                                    m::AssumedInBounds())),
+              HasSubstr("Unexpected value of assumed_in_bounds"));
 }
 
 }  // namespace

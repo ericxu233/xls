@@ -18,13 +18,16 @@
 #include <cstdint>
 #include <ostream>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
 #include "xls/common/casts.h"
-#include "xls/common/logging/logging.h"
 #include "xls/ir/xls_type.pb.h"
 
 namespace xls {
@@ -69,6 +72,8 @@ class Type {
   ArrayType* AsArrayOrDie();
   const ArrayType* AsArrayOrDie() const;
   absl::StatusOr<ArrayType*> AsArray();
+
+  absl::StatusOr<TupleType*> AsTuple();
 
   bool IsToken() const { return kind_ == TypeKind::kToken; }
   TokenType* AsTokenOrDie();
@@ -228,45 +233,79 @@ class FunctionType {
   Type* return_type_;
 };
 
+// Represents a type that is an instantiation with input and output ports.
+class InstantiationType {
+ public:
+  explicit InstantiationType(
+      absl::flat_hash_map<std::string, Type*> input_types,
+      absl::flat_hash_map<std::string, Type*> output_types)
+      : input_types_(std::move(input_types)),
+        output_types_(std::move(output_types)) {}
+
+  InstantiationType(const InstantiationType&) = default;
+  InstantiationType(InstantiationType&&) = default;
+  InstantiationType& operator=(const InstantiationType&) = default;
+  InstantiationType& operator=(InstantiationType&&) = default;
+
+  absl::StatusOr<Type*> GetInputPortType(std::string_view name) const;
+  absl::StatusOr<Type*> GetOutputPortType(std::string_view name) const;
+
+  const absl::flat_hash_map<std::string, Type*>& input_types() const {
+    return input_types_;
+  }
+  const absl::flat_hash_map<std::string, Type*>& output_types() const {
+    return output_types_;
+  }
+
+  bool operator==(const InstantiationType& o) const {
+    return input_types_ == o.input_types_ && output_types_ == o.output_types_;
+  }
+  bool operator!=(const InstantiationType& it) const { return !(*this == it); }
+
+ private:
+  absl::flat_hash_map<std::string, Type*> input_types_;
+  absl::flat_hash_map<std::string, Type*> output_types_;
+};
+
 // -- Inlines
 
 inline const BitsType* Type::AsBitsOrDie() const {
-  XLS_CHECK_EQ(kind(), TypeKind::kBits) << ToString();
+  CHECK_EQ(kind(), TypeKind::kBits) << ToString();
   return down_cast<const BitsType*>(this);
 }
 
 inline BitsType* Type::AsBitsOrDie() {
-  XLS_CHECK_EQ(kind(), TypeKind::kBits) << ToString();
+  CHECK_EQ(kind(), TypeKind::kBits) << ToString();
   return down_cast<BitsType*>(this);
 }
 
 inline const TupleType* Type::AsTupleOrDie() const {
-  XLS_CHECK_EQ(kind(), TypeKind::kTuple);
+  CHECK_EQ(kind(), TypeKind::kTuple);
   return down_cast<const TupleType*>(this);
 }
 
 inline TupleType* Type::AsTupleOrDie() {
-  XLS_CHECK_EQ(kind(), TypeKind::kTuple);
+  CHECK_EQ(kind(), TypeKind::kTuple);
   return down_cast<TupleType*>(this);
 }
 
 inline const ArrayType* Type::AsArrayOrDie() const {
-  XLS_CHECK_EQ(kind(), TypeKind::kArray);
+  CHECK_EQ(kind(), TypeKind::kArray);
   return down_cast<const ArrayType*>(this);
 }
 
 inline ArrayType* Type::AsArrayOrDie() {
-  XLS_CHECK_EQ(kind(), TypeKind::kArray);
+  CHECK_EQ(kind(), TypeKind::kArray);
   return down_cast<ArrayType*>(this);
 }
 
 inline const TokenType* Type::AsTokenOrDie() const {
-  XLS_CHECK_EQ(kind(), TypeKind::kToken);
+  CHECK_EQ(kind(), TypeKind::kToken);
   return down_cast<const TokenType*>(this);
 }
 
 inline TokenType* Type::AsTokenOrDie() {
-  XLS_CHECK_EQ(kind(), TypeKind::kToken);
+  CHECK_EQ(kind(), TypeKind::kToken);
   return down_cast<TokenType*>(this);
 }
 

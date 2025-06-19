@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import std
-import xls.examples.protobuf.varint_decode
+import std;
+import xls.examples.protobuf.varint_decode;
 
 // Convenience for use with map().
 fn not(x: bool) -> bool { !x }
@@ -82,7 +82,7 @@ pub proc varint_streaming_u32_decode<
     zero!<MyState>()
   }
 
-  next(tok: token, state: State<INPUT_BYTES, INPUT_BYTES_WIDTH>) {
+  next(state: State<INPUT_BYTES, INPUT_BYTES_WIDTH>) {
     trace_fmt!("state={}", state);
 
     const_assert!(INPUT_BYTES >= OUTPUT_WORDS);
@@ -114,12 +114,12 @@ pub proc varint_streaming_u32_decode<
     // Get a new input once we've processed the entire work chunk.
     let do_input = state.len == InputIdx:0;
     let (input_tok, (input_data, input_len)) = recv_if(
-      tok, bytes_in, do_input, (u8[INPUT_BYTES]:[u8:0, ...], InputIdx:0));
+      join(), bytes_in, do_input, (u8[INPUT_BYTES]:[u8:0, ...], InputIdx:0));
 
     trace_fmt!("input_data={} input_len={}, do_input={}", input_data, input_len, do_input);
 
     let do_drop = state.drop_count != InputIdx:0;
-    if do_input && do_drop { fail!("input_and_drop", ()) } else { () };
+    assert!(!(do_input && do_drop), "input_and_drop");
 
     // Each iteration, we either shift by 1 or BIG_SHIFT. Do the shifts now and select later.
     let work_chunk_shl_1 = byte_array_shl<u32:1>(state.work_chunk, u8:0);
@@ -239,21 +239,21 @@ proc varint_streaming_u32_decode_test {
 
   config (terminator: chan<bool> out) {
     let (bytes_s, bytes_r) =
-      chan<(u8[TEST_INPUT_BYTES], uN[TEST_INPUT_BYTES_WIDTH])>;
+      chan<(u8[TEST_INPUT_BYTES], uN[TEST_INPUT_BYTES_WIDTH])>("bytes");
     let (words_s, words_r) =
-      chan<(u32[TEST_OUTPUT_WORDS], uN[TEST_OUTPUT_WORDS_WIDTH])>;
+      chan<(u32[TEST_OUTPUT_WORDS], uN[TEST_OUTPUT_WORDS_WIDTH])>("words");
     spawn varint_streaming_u32_decode<TEST_INPUT_BYTES,
                                       TEST_OUTPUT_WORDS,
                                       TEST_BIG_SHIFT>(bytes_r, words_s);
     (bytes_s, words_r, terminator)
   }
 
-  next(tok: token, st:()) {
+  next(st:()) {
     // Pump in a bunch of small numbers.
     let tok = for (_, tok): (u32, token) in u32:0..u32:100 {
       send(tok, bytes_out,
         (u8[7]:[u8:0, u8:1, u8:0, u8:1, u8:0, u8:1, u8:0], u3:7))
-    }(tok);
+    }(join());
     let tok = for (_, tok): (u32, token) in u32:0..u32:100 {
       let (tok, (recv_bytes, bytes_recvd)) = recv(tok, words_in);
       assert_eq(recv_bytes, u32[3]:[u32:0, u32:1, u32:0]);

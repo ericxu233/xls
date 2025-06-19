@@ -23,9 +23,12 @@
 #include <string_view>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "google/protobuf/io/zero_copy_stream.h"
 #include "google/protobuf/message.h"
+#include "xls/common/status/status_macros.h"
 
 namespace xls {
 
@@ -39,10 +42,10 @@ namespace xls {
 // Example:
 //
 //    // Ensures `filename` exists.
-//    XLS_CHECK_OK(FileExists(filename));
+//    CHECK_OK(FileExists(filename));
 //
 //    // Ensures `filename` doesn't exist (and no other errors occurred).
-//    XLS_CHECK(absl::IsNotFound(FileExists(filename)));
+//    CHECK(absl::IsNotFound(FileExists(filename)));
 //
 //    // To handle the possibility of an error:
 //    absl::Status status = FileExists(filename);
@@ -96,6 +99,21 @@ absl::StatusOr<std::string> GetFileContents(
 //  * StatusCode::kUnknown (a Write or Open error occurred)
 absl::Status SetFileContents(const std::filesystem::path& file_name,
                              std::string_view content);
+
+// Writes the data provided in `content` to the file `file_name`, overwriting
+// any existing content. Fails if directory does not exist.
+//
+// NOTE: Will return OK iff all of the data in `content` was written.
+// May write some of the data and return an error.
+//
+// The file update should be atomic.
+//
+// Typical return codes (not guaranteed exhaustive):
+//  * StatusCode::kOk
+//  * StatusCode::kPermissionDenied (file not writable)
+//  * StatusCode::kUnknown (a Write or Open error occurred)
+absl::Status SetFileContentsAtomically(const std::filesystem::path& file_name,
+                                       std::string_view content);
 
 // Writes the contents of data into the file file_name, appending to any
 // existing content.
@@ -159,12 +177,9 @@ absl::Status ParseTextProtoFile(const std::filesystem::path& file_name,
 template <typename T>
 inline absl::StatusOr<T> ParseTextProtoFile(
     const std::filesystem::path& file_name) {
-  absl::StatusOr<T> v_or = T();
-  absl::Status status = ParseTextProtoFile(file_name, &v_or.value());
-  if (!status.ok()) {
-    v_or = status;
-  }
-  return v_or;
+  T proto_message;
+  XLS_RETURN_IF_ERROR(ParseTextProtoFile(file_name, &proto_message));
+  return proto_message;
 }
 
 // Parses a single binary protobuf from the given string which is assumed to
@@ -217,8 +232,23 @@ absl::Status ParseProtobinFile(const std::filesystem::path& file_name,
 absl::Status SetProtobinFile(const std::filesystem::path& file_name,
                              const google::protobuf::Message& proto);
 
+// Writes the protobuf provided to the stream `output_stream` in a protobuf text
+// format, including the standard header.
+//
+// NOTE: Will return OK iff the protobuf could be converted to string and all of
+// that data in was written.  May write some data and return an error.
+//
+// Typical return codes (not guaranteed exhaustive):
+//  * StatusCode::kOk
+//  * StatusCode::kFailedPrecondition (the proto couldn't be converted to
+//    string)
+absl::Status PrintTextProtoToStream(
+    const google::protobuf::Message& proto,
+    google::protobuf::io::ZeroCopyOutputStream* output_stream);
+
 // Writes the protobuf provided to the file `filename` in a protobuf text
-// format, overwriting any existing content in the file.
+// format, including the standard header. Overwrites any existing content in the
+// file.
 //
 // NOTE: Will return OK iff the protobuf could be converted to string and all of
 // that data in was written.  May write some data and return an error.

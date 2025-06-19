@@ -15,19 +15,21 @@
 #ifndef XLS_DATA_STRUCTURES_GRAPH_COLORING_H_
 #define XLS_DATA_STRUCTURES_GRAPH_COLORING_H_
 
+#include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/log_message.h"
-#include "xls/common/logging/logging.h"
-#include "../z3/src/api/c++/z3++.h"
+#include "z3/src/api/c++/z3++.h"
 
 namespace xls {
 
@@ -51,7 +53,7 @@ absl::flat_hash_set<V> FindMaximalIndependentSet(
   static_assert(!std::is_pointer<V>::value,
                 "To avoid nondetermistic behavior V cannot be a pointer type");
 
-  XLS_CHECK(!vertices.empty());
+  CHECK(!vertices.empty());
 
   absl::flat_hash_set<V> result;  // named S in the book
   absl::btree_set<V> available(vertices.begin(), vertices.end());  // named X
@@ -207,7 +209,7 @@ std::vector<absl::flat_hash_set<V>> Z3Coloring(
 
   s.minimize(k);
 
-  XLS_CHECK(s.check() == z3::sat);
+  CHECK(s.check() == z3::sat);
 
   z3::model model = s.get_model();
 

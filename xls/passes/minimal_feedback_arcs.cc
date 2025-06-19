@@ -24,22 +24,23 @@
 #include "absl/container/btree_map.h"
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
-#include "xls/common/logging/logging.h"
-#include "xls/common/logging/vlog_is_on.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/channel.h"
 #include "xls/ir/channel_ops.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
 #include "xls/ir/node_util.h"
 #include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/ir/package.h"
+#include "xls/ir/topo_sort.h"
 #include "xls/passes/token_provenance_analysis.h"
 
 namespace xls {
@@ -47,7 +48,7 @@ namespace {
 // Get channel_id for send_receive channels. If node is not a send/receive, or
 // if the channel used by node is not send_receive, returns nullopt.
 std::optional<int64_t> GetInternalChannelId(Node* node) {
-  if (!IsChannelNode(node)) {
+  if (!node->Is<ChannelNode>()) {
     return std::nullopt;
   }
   absl::StatusOr<Channel*> ch = GetChannelUsedByNode(node);
@@ -176,7 +177,7 @@ absl::StatusOr<InterProcConnectivityGraph> MakeInterProcConnectivityGraph(
   // FunctionBase. Now, add edges between sends and receives on the same
   // channel. If there are multiple sends or receives on the same channel, add
   // an edge from every send to each receive.
-  for (auto [channel_id, send_nodes] : channel_id_to_internal_send) {
+  for (const auto& [channel_id, send_nodes] : channel_id_to_internal_send) {
     auto itr = channel_id_to_internal_receive.find(channel_id);
     if (itr == channel_id_to_internal_receive.end()) {
       XLS_ASSIGN_OR_RETURN(Channel * channel, p->GetChannel(channel_id));
@@ -285,8 +286,8 @@ std::vector<Node*> GreedyFAS(InterProcConnectivityGraph& graph) {
         predecessor_edges.begin(), predecessor_edges.end(),
         [&successor_edges](const auto& lhs, const auto& rhs) {
           // We should only see internal channel ops at this point.
-          XLS_CHECK(GetInternalChannelId(lhs.first).has_value());
-          XLS_CHECK(GetInternalChannelId(rhs.first).has_value());
+          CHECK(GetInternalChannelId(lhs.first).has_value());
+          CHECK(GetInternalChannelId(rhs.first).has_value());
 
           // outdegree is size of the successor set.
           int64_t lhs_outdegree = successor_edges.at(lhs.first).size();
@@ -301,7 +302,7 @@ std::vector<Node*> GreedyFAS(InterProcConnectivityGraph& graph) {
           return lhs_degree < rhs_degree;
         });
     if (max_itr != predecessor_edges.end()) {
-      XLS_CHECK(GetInternalChannelId(max_itr->first).has_value());
+      CHECK(GetInternalChannelId(max_itr->first).has_value());
       removed_nodes.insert(max_itr->first);
       s1.push_back(max_itr->first);
       successor_edges.erase(max_itr->first);
@@ -325,22 +326,22 @@ absl::StatusOr<absl::flat_hash_set<Channel*>> MinimalFeedbackArcs(
   // arrangement.
   StableEdgeMap successors_copy = graph.successor_edges;
 
-  if (XLS_VLOG_IS_ON(3)) {
-    XLS_VLOG(3) << "Predecessors:";
+  if (VLOG_IS_ON(3)) {
+    VLOG(3) << "Predecessors:";
     for (const auto& [key, values] : graph.predecessor_edges) {
-      XLS_VLOG(3) << absl::StreamFormat("\t%v: {%s}", *key,
-                                        absl::StrJoin(values, ", "));
+      VLOG(3) << absl::StreamFormat("\t%v: {%s}", *key,
+                                    absl::StrJoin(values, ", "));
     }
-    XLS_VLOG(3) << "Successors:";
+    VLOG(3) << "Successors:";
     for (const auto& [key, values] : successors_copy) {
-      XLS_VLOG(3) << absl::StreamFormat("\t%v: {%s}", *key,
-                                        absl::StrJoin(values, ", "));
+      VLOG(3) << absl::StreamFormat("\t%v: {%s}", *key,
+                                    absl::StrJoin(values, ", "));
     }
   }
 
   std::vector<Node*> arrangement = GreedyFAS(graph);
-  XLS_VLOG(3) << absl::StreamFormat("Arrangement s: [%s]\n",
-                                    absl::StrJoin(arrangement, ", "));
+  VLOG(3) << absl::StreamFormat("Arrangement s: [%s]\n",
+                                absl::StrJoin(arrangement, ", "));
 
   // The feedback nodes are those that have successors that occur earlier in the
   // arrangement. Add those nodes' associated channels to the result set.
@@ -355,20 +356,20 @@ absl::StatusOr<absl::flat_hash_set<Channel*>> MinimalFeedbackArcs(
     if (itr == successors_copy.end()) {
       continue;
     }
-    XLS_VLOG(5) << absl::StreamFormat("successors to %v are {%s}\n", *node,
-                                      absl::StrJoin(itr->second, ", "));
+    VLOG(5) << absl::StreamFormat("successors to %v are {%s}\n", *node,
+                                  absl::StrJoin(itr->second, ", "));
     // Find internal channel operations that have already been seen and add them
     // to the result set.
     for (Node* successor : itr->second) {
-      XLS_RET_CHECK(IsChannelNode(successor));
+      XLS_RET_CHECK(successor->Is<ChannelNode>());
       XLS_ASSIGN_OR_RETURN(Channel * ch, GetChannelUsedByNode(successor));
       if (seen.contains(successor)) {
         result.insert(ch);
       }
     }
   }
-  XLS_VLOG(3) << absl::StreamFormat("minimal feedback arc set: {%s}\n",
-                                    absl::StrJoin(result, ", "));
+  VLOG(3) << absl::StreamFormat("minimal feedback arc set: {%s}\n",
+                                absl::StrJoin(result, ", "));
   return result;
 }
 }  // namespace xls

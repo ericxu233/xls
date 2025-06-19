@@ -15,10 +15,12 @@
 #ifndef XLS_DSLX_FRONTEND_AST_NODE_H_
 #define XLS_DSLX_FRONTEND_AST_NODE_H_
 
+#include <cstdint>
 #include <optional>
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -29,27 +31,31 @@ namespace xls::dslx {
 // Enum with an entry for each leaf type in the AST class hierarchy -- this is
 // primarily for convenience in tasks like serialization, for most purposes
 // visitors should be used (e.g. AstNodeVisitor, ExprVisitor).
-enum class AstNodeKind {
+enum class AstNodeKind : uint8_t {
+  // keep-sorted start
+  kAllOnesMacro,
   kArray,
   kAttr,
   kBinop,
-  kBlock,
   kBuiltinNameDef,
   kCast,
   kChannelDecl,
   kColonRef,
-  kConstantDef,
-  kConstRef,
+  kConditional,
   kConstAssert,
+  kConstantDef,
   kEnumDef,
   kFor,
   kFormatMacro,
   kFunction,
+  kFunctionRef,
+  kImpl,
   kImport,
   kIndex,
   kInstantiation,
   kInvocation,
   kJoin,
+  kLambda,
   kLet,
   kMatch,
   kMatchArm,
@@ -61,6 +67,7 @@ enum class AstNodeKind {
   kParam,
   kParametricBinding,
   kProc,
+  kProcDef,
   kProcMember,
   kQuickCheck,
   kRange,
@@ -68,16 +75,18 @@ enum class AstNodeKind {
   kRecvIf,
   kRecvIfNonBlocking,
   kRecvNonBlocking,
+  kRestOfTuple,
   kSend,
   kSendIf,
   kSlice,
   kSpawn,
   kSplatStructInstance,
   kStatement,
+  kStatementBlock,
   kString,
   kStructDef,
   kStructInstance,
-  kConditional,
+  kStructMember,
   kTestFunction,
   kTestProc,
   kTupleIndex,
@@ -86,10 +95,14 @@ enum class AstNodeKind {
   kTypeRef,
   kUnop,
   kUnrollFor,
+  kUse,
+  kUseTreeEntry,
+  kVerbatimNode,
   kWidthSlice,
   kWildcardPattern,
   kXlsTuple,
   kZeroMacro,
+  // keep-sorted end
 };
 
 std::string_view AstNodeKindToString(AstNodeKind kind);
@@ -144,14 +157,40 @@ class AstNode {
 
   Module* owner() const { return owner_; }
 
-  // Marks this node as the parent of all its child nodes.
+  // Marks this node as the parent of all its child nodes as given by
+  // `GetChildren()`.
   void SetParentage();
+
+  // Warning: try to avoid using this in any new code!
+  //
+  // Sometimes the frontend currently desugars AST nodes into other AST node
+  // constructs (which is not ideal, it's an AST and ideally shouldn't be
+  // treated like an IR if that can be avoided). When we do this, we may need to
+  // set a parent relationship that was not in the original source text, which
+  // is why we call this "non lexical". (In the more typical case, as we parse
+  // we can just call `SetParentage()` to have lexical parent relationships
+  // arise.)
+  void SetParentNonLexical(AstNode* parent) { parent_ = parent; }
+
+  void SetEnclosing(AstNode* enclosing) { enclosing_ = enclosing; }
+  AstNode* GetEnclosing() const { return enclosing_; }
 
  private:
   void set_parent(AstNode* parent) { parent_ = parent; }
 
   Module* owner_;
+
+  // Parent in terms of the symmetrical relationship established by
+  // `GetChildren()`.
   AstNode* parent_ = nullptr;
+
+  // Note of an "enclosing" node which can be different from the "immediate
+  // parent" that claims this node via `GetChildren()`. This is useful for
+  // constructs that have a meaningful construct somewhere above in the AST but
+  // it's difficult to distinguish which by simply traversing `parent()` links
+  // upwards, e.g. `Conditional` nest else-if ladders under a primordial
+  // `Condition` that started the if-else ladder.
+  AstNode* enclosing_ = nullptr;
 };
 
 // Visits transitively from the root down using post-order visitation (visit

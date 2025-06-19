@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <list>
 #include <memory>
 #include <optional>
@@ -27,19 +28,18 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/block.h"
 #include "xls/ir/call_graph.h"
 #include "xls/ir/channel.h"
-#include "xls/ir/channel.pb.h"
 #include "xls/ir/channel_ops.h"
 #include "xls/ir/fileno.h"
 #include "xls/ir/function.h"
@@ -49,16 +49,14 @@
 #include "xls/ir/nodes.h"
 #include "xls/ir/proc.h"
 #include "xls/ir/source_location.h"
+#include "xls/ir/transform_metrics.pb.h"
 #include "xls/ir/type.h"
 #include "xls/ir/value.h"
-#include "xls/ir/value_helpers.h"
-#include "xls/ir/xls_type.pb.h"
+#include "xls/ir/value_utils.h"
 
 namespace xls {
 
-Package::Package(std::string_view name) : name_(name) {
-  owned_types_.insert(&token_type_);
-}
+Package::Package(std::string_view name) : name_(name) {}
 
 Package::~Package() = default;
 
@@ -120,7 +118,7 @@ absl::StatusOr<Block*> Package::GetTopAsBlock() const {
 }
 
 absl::StatusOr<FunctionBase*> Package::GetFunctionBaseByName(
-    std::string_view name) {
+    std::string_view name) const {
   std::vector<FunctionBase*> fbs = GetFunctionBases();
   int64_t count = std::count_if(
       fbs.begin(), fbs.end(),
@@ -161,7 +159,7 @@ Block* Package::AddBlock(std::unique_ptr<Block> block) {
   return blocks_.back().get();
 }
 
-// Private helpers for Package::AddPackage().
+// Private helpers for Package::ImportFromPackage().
 namespace {
 // Helper class that tracks names in a package and resolves name collisions.
 class NameCollisionResolver {
@@ -186,8 +184,9 @@ class NameCollisionResolver {
       new_name = absl::StrCat(old_name, "_", suffix);
       ++suffix;
     } while (Collides(new_name));
-    names_.insert(new_name);
     name_updates_[old_name] = new_name;
+    std::string& new_name_ref = storage_.emplace_back(new_name);
+    names_.insert(new_name_ref);
     return new_name;
   }
 
@@ -196,6 +195,9 @@ class NameCollisionResolver {
   // for collisions and resolve them.
   absl::flat_hash_set<std::string_view> names_;
   absl::flat_hash_map<std::string, std::string> name_updates_;
+  // Storage for string_views inside names_ that have been created in
+  // ResolveName.
+  std::deque<std::string> storage_;
 };
 
 // Get a set of all names defined within a package.
@@ -219,11 +221,11 @@ absl::flat_hash_set<std::string_view> AllPackageNames(const Package& package) {
 }
 
 // Adds channels from other_package to this_package, potentially changing the
-// channel id. Returns channels ID mapping from old id -> new id.
-absl::StatusOr<absl::flat_hash_map<int64_t, int64_t>> AddChannelsFromPackage(
-    Package* this_package, const Package* other_package,
-    NameCollisionResolver* name_resolver) {
-  absl::flat_hash_map<int64_t, int64_t> channel_id_updates;
+// channel id. Returns channel name mapping from old name -> new name.
+absl::StatusOr<absl::flat_hash_map<std::string, std::string>>
+AddChannelsFromPackage(Package* this_package, const Package* other_package,
+                       NameCollisionResolver* name_resolver) {
+  absl::flat_hash_map<std::string, std::string> channel_updates;
   // Channels can collide in two ways: by name, and by id. First we resolve name
   // collisions, and then we call the various Create*Channel() functions, which
   // will give a new channel id. We keep track of this new id to update
@@ -232,9 +234,9 @@ absl::StatusOr<absl::flat_hash_map<int64_t, int64_t>> AddChannelsFromPackage(
     std::string channel_name = name_resolver->ResolveName(channel->name());
     XLS_ASSIGN_OR_RETURN(Channel * new_channel,
                          this_package->CloneChannel(channel, channel_name));
-    channel_id_updates[channel->id()] = new_channel->id();
+    channel_updates[channel->name()] = new_channel->name();
   }
-  return channel_id_updates;
+  return channel_updates;
 }
 
 // Add FunctionBases (function, proc, and block) from other_package to
@@ -243,7 +245,7 @@ absl::StatusOr<absl::flat_hash_map<const FunctionBase*, FunctionBase*>>
 AddFunctionBasesFromPackage(
     Package* this_package, const Package* other_package,
     NameCollisionResolver* name_resolver,
-    const absl::flat_hash_map<int64_t, int64_t>& channel_remapping) {
+    const absl::flat_hash_map<std::string, std::string>& channel_remapping) {
   std::vector<FunctionBase*> other_function_bases =
       other_package->GetFunctionBases();
 
@@ -298,24 +300,24 @@ AddFunctionBasesFromPackage(
 }
 }  // namespace
 
-absl::StatusOr<Package::PackageMergeResult> Package::AddPackage(
+absl::StatusOr<Package::PackageMergeResult> Package::ImportFromPackage(
     const Package* other) {
   // Helper that keeps track of old -> new name mapping, resolving collisions if
   // needed.
   NameCollisionResolver name_resolver(AllPackageNames(*this));
 
   // First, merge channels.
-  // Returns a mapping of channel ids from old id -> new id
-  XLS_ASSIGN_OR_RETURN(auto channel_id_updates,
+  // Returns a mapping of channel ids from old name -> new name
+  XLS_ASSIGN_OR_RETURN(auto channel_updates,
                        AddChannelsFromPackage(this, other, &name_resolver));
 
   // Next, merge in functions, procs, and blocks.
   XLS_ASSIGN_OR_RETURN(auto call_mapping,
                        AddFunctionBasesFromPackage(this, other, &name_resolver,
-                                                   channel_id_updates));
+                                                   channel_updates));
   return Package::PackageMergeResult{
       .name_updates = name_resolver.name_updates(),
-      .channel_id_updates = std::move(channel_id_updates)};
+      .channel_updates = std::move(channel_updates)};
 }
 
 absl::StatusOr<Function*> Package::GetFunction(
@@ -362,6 +364,34 @@ absl::StatusOr<Block*> Package::GetBlock(std::string_view block_name) const {
                     [](std::string* out, const std::unique_ptr<Block>& block) {
                       absl::StrAppend(out, block->name());
                     })));
+}
+
+std::optional<Function*> Package::TryGetFunction(
+    std::string_view func_name) const {
+  for (auto& f : functions_) {
+    if (f->name() == func_name) {
+      return f.get();
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<Proc*> Package::TryGetProc(std::string_view proc_name) const {
+  for (auto& p : procs_) {
+    if (p->name() == proc_name) {
+      return p.get();
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<Block*> Package::TryGetBlock(std::string_view block_name) const {
+  for (auto& block : blocks_) {
+    if (block->name() == block_name) {
+      return block.get();
+    }
+  }
+  return std::nullopt;
 }
 
 std::vector<FunctionBase*> Package::GetFunctionBases() const {
@@ -451,177 +481,6 @@ std::string Package::SourceLocationToString(const SourceLocation& loc) {
           ? fileno_to_filename_.at(loc.fileno())
           : unknown;
   return absl::StrFormat("%s:%d", filename, loc.lineno().value());
-}
-
-absl::StatusOr<Type*> Package::MapTypeFromOtherPackage(
-    Type* other_package_type) {
-  // Package already owns this type.
-  if (IsOwnedType(other_package_type)) {
-    return other_package_type;
-  }
-
-  if (other_package_type->IsBits()) {
-    const BitsType* bits = other_package_type->AsBitsOrDie();
-    return GetBitsType(bits->bit_count());
-  }
-  if (other_package_type->IsArray()) {
-    const ArrayType* array = other_package_type->AsArrayOrDie();
-    XLS_ASSIGN_OR_RETURN(Type * elem_type,
-                         MapTypeFromOtherPackage(array->element_type()));
-    return GetArrayType(array->size(), elem_type);
-  }
-  if (other_package_type->IsTuple()) {
-    const TupleType* tuple = other_package_type->AsTupleOrDie();
-    std::vector<Type*> member_types;
-    member_types.reserve(tuple->size());
-    for (auto* elem_type : tuple->element_types()) {
-      XLS_ASSIGN_OR_RETURN(Type * new_elem_type,
-                           MapTypeFromOtherPackage(elem_type));
-      member_types.push_back(new_elem_type);
-    }
-    return GetTupleType(member_types);
-  }
-  if (other_package_type->IsToken()) {
-    return GetTokenType();
-  }
-  return absl::InternalError("Unsupported type.");
-}
-
-BitsType* Package::GetBitsType(int64_t bit_count) {
-  if (bit_count_to_type_.find(bit_count) != bit_count_to_type_.end()) {
-    return &bit_count_to_type_.at(bit_count);
-  }
-  auto it = bit_count_to_type_.emplace(bit_count, BitsType(bit_count));
-  BitsType* new_type = &(it.first->second);
-  owned_types_.insert(new_type);
-  return new_type;
-}
-
-ArrayType* Package::GetArrayType(int64_t size, Type* element_type) {
-  ArrayKey key{size, element_type};
-  if (array_types_.find(key) != array_types_.end()) {
-    return &array_types_.at(key);
-  }
-  XLS_CHECK(IsOwnedType(element_type))
-      << "Type is not owned by package: " << *element_type;
-  auto it = array_types_.emplace(key, ArrayType(size, element_type));
-  ArrayType* new_type = &(it.first->second);
-  owned_types_.insert(new_type);
-  return new_type;
-}
-
-TupleType* Package::GetTupleType(absl::Span<Type* const> element_types) {
-  TypeVec key(element_types.begin(), element_types.end());
-  if (tuple_types_.find(key) != tuple_types_.end()) {
-    return &tuple_types_.at(key);
-  }
-  for (const Type* element_type : element_types) {
-    XLS_CHECK(IsOwnedType(element_type))
-        << "Type is not owned by package: " << *element_type;
-  }
-  auto it = tuple_types_.emplace(key, TupleType(element_types));
-  TupleType* new_type = &(it.first->second);
-  owned_types_.insert(new_type);
-  return new_type;
-}
-
-TokenType* Package::GetTokenType() { return &token_type_; }
-
-FunctionType* Package::GetFunctionType(absl::Span<Type* const> args_types,
-                                       Type* return_type) {
-  std::string key = FunctionType(args_types, return_type).ToString();
-  if (function_types_.find(key) != function_types_.end()) {
-    return &function_types_.at(key);
-  }
-  for (Type* t : args_types) {
-    XLS_CHECK(IsOwnedType(t))
-        << "Parameter type is not owned by package: " << t->ToString();
-  }
-  auto it = function_types_.emplace(key, FunctionType(args_types, return_type));
-  FunctionType* new_type = &(it.first->second);
-  owned_function_types_.insert(new_type);
-  return new_type;
-}
-
-absl::StatusOr<Type*> Package::GetTypeFromProto(const TypeProto& proto) {
-  if (!proto.has_type_enum()) {
-    return absl::InvalidArgumentError("Missing type_enum field in TypeProto.");
-  }
-  if (proto.type_enum() == TypeProto::BITS) {
-    if (!proto.has_bit_count() || proto.bit_count() < 0) {
-      return absl::InvalidArgumentError(
-          "Missing or invalid bit_count field in TypeProto.");
-    }
-    return GetBitsType(proto.bit_count());
-  }
-  if (proto.type_enum() == TypeProto::TUPLE) {
-    std::vector<Type*> elements;
-    for (const TypeProto& element_proto : proto.tuple_elements()) {
-      XLS_ASSIGN_OR_RETURN(Type * element, GetTypeFromProto(element_proto));
-      elements.push_back(element);
-    }
-    return GetTupleType(elements);
-  }
-  if (proto.type_enum() == TypeProto::ARRAY) {
-    if (!proto.has_array_size() || proto.array_size() < 0) {
-      return absl::InvalidArgumentError(
-          "Missing or invalid array_size field in TypeProto.");
-    }
-    if (!proto.has_array_element()) {
-      return absl::InvalidArgumentError(
-          "Missing array_element field in TypeProto.");
-    }
-    XLS_ASSIGN_OR_RETURN(Type * element_type,
-                         GetTypeFromProto(proto.array_element()));
-    return GetArrayType(proto.array_size(), element_type);
-  }
-  if (proto.type_enum() == TypeProto::TOKEN) {
-    return GetTokenType();
-  }
-  return absl::InvalidArgumentError(absl::StrFormat(
-      "Invalid type_enum value in TypeProto: %d", proto.type_enum()));
-}
-
-absl::StatusOr<FunctionType*> Package::GetFunctionTypeFromProto(
-    const FunctionTypeProto& proto) {
-  std::vector<Type*> param_types;
-  for (const TypeProto& param_proto : proto.parameters()) {
-    XLS_ASSIGN_OR_RETURN(Type * param_type, GetTypeFromProto(param_proto));
-    param_types.push_back(param_type);
-  }
-  if (!proto.has_return_type()) {
-    return absl::InvalidArgumentError(
-        "Missing return_type field in FunctionTypeProto.");
-  }
-  XLS_ASSIGN_OR_RETURN(Type * return_type,
-                       GetTypeFromProto(proto.return_type()));
-  return GetFunctionType(param_types, return_type);
-}
-
-Type* Package::GetTypeForValue(const Value& value) {
-  switch (value.kind()) {
-    case ValueKind::kBits:
-      return GetBitsType(value.bits().bit_count());
-    case ValueKind::kTuple: {
-      std::vector<Type*> element_types;
-      for (const Value& value : value.elements()) {
-        element_types.push_back(GetTypeForValue(value));
-      }
-      return GetTupleType(element_types);
-    }
-    case ValueKind::kArray: {
-      // No element type can be inferred for 0-element arrays.
-      // TODO(google/xls#917): Remove this check when empty arrays are
-      // supported.
-      XLS_CHECK(!value.empty());
-      return GetArrayType(value.size(), GetTypeForValue(value.elements()[0]));
-    }
-    case ValueKind::kToken:
-      return GetTokenType();
-    case ValueKind::kInvalid:
-      break;
-  }
-  XLS_LOG(FATAL) << "Invalid value for type extraction.";
 }
 
 Fileno Package::GetOrCreateFileno(std::string_view filename) {
@@ -743,17 +602,12 @@ std::string Package::DumpIr() const {
                     absl::StrJoin(attribute_strings, ", "), attribute_suffix,
                     top_prefix, fb->DumpIr(), "\n");
   };
-  for (auto& function : functions()) {
-    append_ir_with_attributes(function.get());
-  }
-  for (auto& proc : procs()) {
-    append_ir_with_attributes(proc.get());
-  }
-  for (auto& block : blocks()) {
-    append_ir_with_attributes(block.get());
+  // Our parser relies on everything being in post-order. Ensure that here.
+  for (FunctionBase* fb : FunctionsInPostOrder(this)) {
+    append_ir_with_attributes(fb);
   }
   // We don't include the trailing newline, drop it here.
-  XLS_CHECK(out.back() == '\n');
+  CHECK_EQ(out.back(), '\n');
   out.pop_back();
   return out;
 }
@@ -781,15 +635,6 @@ std::vector<std::string> Package::GetFunctionNames() const {
   return names;
 }
 
-bool Package::HasFunctionWithName(std::string_view target) const {
-  for (const std::unique_ptr<Function>& function : functions_) {
-    if (function->name() == target) {
-      return true;
-    }
-  }
-  return false;
-}
-
 namespace {
 
 absl::Status VerifyValuesAreType(absl::Span<const Value> values, Type* type) {
@@ -807,28 +652,45 @@ absl::Status VerifyValuesAreType(absl::Span<const Value> values, Type* type) {
 
 absl::StatusOr<StreamingChannel*> Package::CreateStreamingChannel(
     std::string_view name, ChannelOps supported_ops, Type* type,
-    absl::Span<const Value> initial_values,
-    std::optional<FifoConfig> fifo_config, FlowControl flow_control,
-    ChannelStrictness strictness, const ChannelMetadataProto& metadata,
+    absl::Span<const Value> initial_values, ChannelConfig channel_config,
+    FlowControl flow_control, ChannelStrictness strictness,
+    std::optional<int64_t> id) {
+  return CreateStreamingChannelInProc(name, supported_ops, type,
+                                      /*proc=*/nullptr, initial_values,
+                                      channel_config, flow_control, strictness,
+                                      id);
+}
+
+absl::StatusOr<StreamingChannel*> Package::CreateStreamingChannelInProc(
+    std::string_view name, ChannelOps supported_ops, Type* type, Proc* proc,
+    absl::Span<const Value> initial_values, ChannelConfig channel_config,
+    FlowControl flow_control, ChannelStrictness strictness,
     std::optional<int64_t> id) {
   XLS_RETURN_IF_ERROR(VerifyValuesAreType(initial_values, type));
   int64_t actual_id = id.has_value() ? id.value() : next_channel_id_;
   auto channel = std::make_unique<StreamingChannel>(
-      name, actual_id, supported_ops, type, initial_values, fifo_config,
-      flow_control, strictness, metadata);
+      name, actual_id, supported_ops, type, initial_values, channel_config,
+      flow_control, strictness);
   StreamingChannel* channel_ptr = channel.get();
-  XLS_RETURN_IF_ERROR(AddChannel(std::move(channel)));
+  XLS_RETURN_IF_ERROR(AddChannel(std::move(channel), proc));
   return channel_ptr;
 }
 
 absl::StatusOr<SingleValueChannel*> Package::CreateSingleValueChannel(
     std::string_view name, ChannelOps supported_ops, Type* type,
-    const ChannelMetadataProto& metadata, std::optional<int64_t> id) {
+    std::optional<int64_t> id) {
+  return Package::CreateSingleValueChannelInProc(name, supported_ops, type,
+                                                 /*proc=*/nullptr, id);
+}
+
+absl::StatusOr<SingleValueChannel*> Package::CreateSingleValueChannelInProc(
+    std::string_view name, ChannelOps supported_ops, Type* type, Proc* proc,
+    std::optional<int64_t> id) {
   int64_t actual_id = id.has_value() ? id.value() : next_channel_id_;
-  auto channel = std::make_unique<SingleValueChannel>(
-      name, actual_id, supported_ops, type, metadata);
+  auto channel = std::make_unique<SingleValueChannel>(name, actual_id,
+                                                      supported_ops, type);
   SingleValueChannel* channel_ptr = channel.get();
-  XLS_RETURN_IF_ERROR(AddChannel(std::move(channel)));
+  XLS_RETURN_IF_ERROR(AddChannel(std::move(channel), proc));
   return channel_ptr;
 }
 
@@ -841,11 +703,14 @@ absl::Status Package::RemoveChannel(Channel* channel) {
   // TODO(https://github.com/google/xls/issues/411) 2012/04/24 Avoid iterating
   // through all the nodes after channels are mapped to send/receive nodes.
   for (const auto& proc : procs()) {
+    if (proc->is_new_style_proc()) {
+      continue;
+    }
     for (Node* node : proc->nodes()) {
       if ((node->Is<Send>() &&
-           node->As<Send>()->channel_id() == channel->id()) ||
+           node->As<Send>()->channel_name() == channel->name()) ||
           (node->Is<Receive>() &&
-           node->As<Receive>()->channel_id() == channel->id())) {
+           node->As<Receive>()->channel_name() == channel->name())) {
         return absl::InternalError(absl::StrFormat(
             "Channel %s (id=%d) cannot be removed because it "
             "is used by node %v in %v",
@@ -858,26 +723,30 @@ absl::Status Package::RemoveChannel(Channel* channel) {
   channel_vec_.erase(it);
 
   // Remove from channel map.
-  XLS_RET_CHECK(channels_.contains(channel->id()));
-  channels_.erase(channel->id());
+  XLS_RET_CHECK(channels_.contains(channel->name()));
+  channels_.erase(channel->name());
 
   return absl::OkStatus();
 }
 
-absl::Status Package::AddChannel(std::unique_ptr<Channel> channel) {
-  int64_t id = channel->id();
-  auto [channel_it, inserted] = channels_.insert({id, std::move(channel)});
+absl::Status Package::AddChannel(std::unique_ptr<Channel> channel, Proc* proc) {
+  if (proc != nullptr) {
+    next_channel_id_ = std::max(next_channel_id_, channel->id() + 1);
+    return proc->AddChannel(std::move(channel)).status();
+  }
+  std::string name{channel->name()};
+  auto [channel_it, inserted] = channels_.insert({name, std::move(channel)});
   if (!inserted) {
     return absl::InternalError(
-        absl::StrFormat("Channel already exists with id %d.", id));
+        absl::StrFormat("Channel already exists with name `%s`.", name));
   }
   Channel* channel_ptr = channel_it->second.get();
 
-  // Verify the channel name is unique.
+  // Verify the channel id is unique.
   for (Channel* ch : channel_vec_) {
-    if (ch->name() == channel_ptr->name()) {
-      return absl::InvalidArgumentError(absl::StrFormat(
-          "Channel already exists with name \"%s\"", ch->name()));
+    if (ch->id() == channel_ptr->id()) {
+      return absl::InvalidArgumentError(
+          absl::StrFormat("Channel already exists with id %d", ch->id()));
     }
   }
 
@@ -893,37 +762,50 @@ absl::Status Package::AddChannel(std::unique_ptr<Channel> channel) {
   std::sort(channel_vec_.begin(), channel_vec_.end(),
             [](Channel* a, Channel* b) { return a->id() < b->id(); });
 
-  next_channel_id_ = std::max(next_channel_id_, id + 1);
+  next_channel_id_ = std::max(next_channel_id_, channel_ptr->id() + 1);
   return absl::OkStatus();
 }
 
 absl::StatusOr<Channel*> Package::GetChannel(int64_t id) const {
-  if (channels_.find(id) == channels_.end()) {
-    return absl::NotFoundError(absl::StrFormat(
-        "No channel with id %d (package has %d channels: %s).", id,
-        channels_.size(), absl::StrJoin(GetChannelNames(), ", ")));
+  XLS_RET_CHECK(!ChannelsAreProcScoped());
+  for (Channel* ch : channels()) {
+    if (ch->id() == id) {
+      return ch;
+    }
   }
-  return channels_.at(id).get();
+  return absl::NotFoundError(absl::StrFormat("No channel with id %d", id));
 }
 
 std::vector<std::string> Package::GetChannelNames() const {
+  CHECK(!ChannelsAreProcScoped());
   std::vector<std::string> names;
   names.reserve(channels().size());
   for (Channel* ch : channels()) {
-    names.push_back(ch->name());
+    names.push_back(std::string{ch->name()});
   }
   return names;
 }
 
 absl::StatusOr<Channel*> Package::GetChannel(std::string_view name) const {
-  for (Channel* ch : channels()) {
-    if (ch->name() == name) {
-      return ch;
-    }
+  XLS_RET_CHECK(!ChannelsAreProcScoped());
+  auto it = channels_.find(name);
+  if (it != channels_.end()) {
+    return it->second.get();
   }
-  return absl::NotFoundError(absl::StrFormat(
-      "No channel with name '%s' (package has %d channels: %s).", name,
-      channels().size(), absl::StrJoin(GetChannelNames(), ", ")));
+  return absl::NotFoundError(
+      absl::StrFormat("No channel with name `%s`", name));
+}
+
+bool Package::ChannelsAreProcScoped() const {
+  if (!channels_.empty()) {
+    return false;
+  }
+  if (procs_.empty()) {
+    return false;
+  }
+  // The verifier checks that all procs are the same style so just check the
+  // first proc.
+  return procs_.front()->is_new_style_proc();
 }
 
 absl::StatusOr<Channel*> Package::CloneChannel(
@@ -934,7 +816,7 @@ absl::StatusOr<Channel*> Package::CloneChannel(
   switch (channel->kind()) {
     case ChannelKind::kSingleValue: {
       if (overrides.initial_values().has_value() ||
-          overrides.fifo_depth().has_value() ||
+          overrides.channel_config().has_value() ||
           overrides.flow_control().has_value()) {
         return absl::InvalidArgumentError(
             "Cannot clone single value channel with streaming channel "
@@ -945,8 +827,7 @@ absl::StatusOr<Channel*> Package::CloneChannel(
           this->CreateSingleValueChannel(
               name,
               overrides.supported_ops().value_or(channel->supported_ops()),
-              new_channel_type,
-              overrides.metadata().value_or(channel->metadata())));
+              new_channel_type));
       return new_channel;
     }
     case ChannelKind::kStreaming: {
@@ -957,17 +838,11 @@ absl::StatusOr<Channel*> Package::CloneChannel(
                             "be cast to StreamingChannel",
                             channel->name()));
       }
-      std::optional<FifoConfig> fifo_config;
-      if (!overrides.fifo_depth().has_value()) {
-        fifo_config = streaming_channel->fifo_config();
-      }
-      if (overrides.fifo_depth().has_value() &&
-          overrides.fifo_depth()->has_value()) {
-        fifo_config = streaming_channel->fifo_config();
-        if (!fifo_config.has_value()) {
-          fifo_config.emplace();
-        }
-        fifo_config->depth = **overrides.fifo_depth();
+      ChannelConfig channel_config;
+      if (overrides.channel_config().has_value()) {
+        channel_config = *overrides.channel_config();
+      } else {
+        channel_config = streaming_channel->channel_config();
       }
       XLS_ASSIGN_OR_RETURN(
           auto new_channel,
@@ -976,12 +851,11 @@ absl::StatusOr<Channel*> Package::CloneChannel(
               overrides.supported_ops().value_or(channel->supported_ops()),
               new_channel_type,
               overrides.initial_values().value_or(channel->initial_values()),
-              fifo_config,
+              channel_config,
               overrides.flow_control().value_or(
                   streaming_channel->GetFlowControl()),
               overrides.strictness().value_or(
-                  streaming_channel->GetStrictness()),
-              overrides.metadata().value_or(channel->metadata())));
+                  streaming_channel->GetStrictness())));
       return new_channel;
     }
   }
@@ -1000,6 +874,57 @@ absl::StatusOr<FunctionBase*> FindTop(Package* p,
         absl::StrFormat("Top entity not set for package: %s.", p->name()));
   }
   return top.value();
+}
+
+/* static */ TransformMetrics TransformMetrics::FromProto(
+    const TransformMetricsProto& proto) {
+  TransformMetrics ret;
+  ret.nodes_added = proto.nodes_added();
+  ret.nodes_removed = proto.nodes_removed();
+  ret.nodes_replaced = proto.nodes_replaced();
+  ret.operands_replaced = proto.operands_replaced();
+  ret.operands_removed = proto.operands_removed();
+  return ret;
+}
+
+TransformMetrics TransformMetrics::operator+(
+    const TransformMetrics& other) const {
+  return TransformMetrics{
+      .nodes_added = nodes_added + other.nodes_added,
+      .nodes_removed = nodes_removed + other.nodes_removed,
+      .nodes_replaced = nodes_replaced + other.nodes_replaced,
+      .operands_replaced = operands_replaced + other.operands_replaced,
+      .operands_removed = operands_removed + other.operands_removed,
+  };
+}
+
+TransformMetrics TransformMetrics::operator-(
+    const TransformMetrics& other) const {
+  return TransformMetrics{
+      .nodes_added = nodes_added - other.nodes_added,
+      .nodes_removed = nodes_removed - other.nodes_removed,
+      .nodes_replaced = nodes_replaced - other.nodes_replaced,
+      .operands_replaced = operands_replaced - other.operands_replaced,
+      .operands_removed = operands_removed - other.operands_removed,
+  };
+}
+
+std::string TransformMetrics::ToString() const {
+  return absl::StrFormat(
+      "{ nodes added: %d, nodes removed: %d, nodes replaced: %d, operands "
+      "replaced: %d, operands removed: %d }",
+      nodes_added, nodes_removed, nodes_replaced, operands_replaced,
+      operands_removed);
+}
+
+TransformMetricsProto TransformMetrics::ToProto() const {
+  TransformMetricsProto ret;
+  ret.set_nodes_added(nodes_added);
+  ret.set_nodes_removed(nodes_removed);
+  ret.set_nodes_replaced(nodes_replaced);
+  ret.set_operands_replaced(operands_replaced);
+  ret.set_operands_removed(operands_removed);
+  return ret;
 }
 
 }  // namespace xls

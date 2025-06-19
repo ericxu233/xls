@@ -16,7 +16,6 @@
 #define XLS_DSLX_INTERP_VALUE_H_
 
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -26,84 +25,27 @@
 #include <variant>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
+#include "xls/dslx/channel_direction.h"
+#include "xls/dslx/dslx_builtins.h"
 #include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/value_format_descriptor.h"
 #include "xls/ir/bits.h"
+#include "xls/ir/format_preference.h"
 #include "xls/ir/value.h"
 
 namespace xls::dslx {
-
-#define XLS_DSLX_BUILTIN_EACH(X)          \
-  X("add_with_carry", kAddWithCarry)      \
-  X("and_reduce", kAndReduce)             \
-  X("array_rev", kArrayRev)               \
-  X("array_size", kArraySize)             \
-  X("assert_eq", kAssertEq)               \
-  X("assert_lt", kAssertLt)               \
-  X("bit_slice", kBitSlice)               \
-  X("bit_slice_update", kBitSliceUpdate)  \
-  X("checked_cast", kCheckedCast)         \
-  X("clz", kClz)                          \
-  X("cover!", kCover)                     \
-  X("ctz", kCtz)                          \
-  X("gate!", kGate)                       \
-  X("enumerate", kEnumerate)              \
-  X("fail!", kFail)                       \
-  X("map", kMap)                          \
-  X("one_hot", kOneHot)                   \
-  X("one_hot_sel", kOneHotSel)            \
-  X("or_reduce", kOrReduce)               \
-  X("priority_sel", kPriorityhSel)        \
-  X("range", kRange)                      \
-  X("rev", kRev)                          \
-  X("widening_cast", kWideningCast)       \
-  X("select", kSelect)                    \
-  X("signex", kSignex)                    \
-  X("smulp", kSMulp)                      \
-  X("slice", kSlice)                      \
-  X("trace!", kTrace)                     \
-  X("umulp", kUMulp)                      \
-  X("update", kUpdate)                    \
-  X("xor_reduce", kXorReduce)             \
-  X("join", kJoin)                        \
-  /* send/recv routines */                \
-  X("send", kSend)                        \
-  X("send_if", kSendIf)                   \
-  X("recv", kRecv)                        \
-  X("recv_if", kRecvIf)                   \
-  X("recv_nonblocking", kRecvNonBlocking) \
-  X("recv_if_nonblocking", kRecvIfNonBlocking)
-
-// Enum that represents all the DSLX builtin functions.
-//
-// Functions can be held in values, either as user defined ones or builtin ones
-// (represented via this enumerated value).
-enum class Builtin {
-#define ENUMIFY(__str, __enum, ...) __enum,
-  XLS_DSLX_BUILTIN_EACH(ENUMIFY)
-#undef ENUMIFY
-};
-
-absl::StatusOr<Builtin> BuiltinFromString(std::string_view name);
-
-std::string BuiltinToString(Builtin builtin);
-
-static const Builtin kAllBuiltins[] = {
-#define ELEMIFY(__str, __enum, ...) Builtin::__enum,
-    XLS_DSLX_BUILTIN_EACH(ELEMIFY)
-#undef ELEMIFY
-};
 
 // Tags a value to denote its payload.
 //
 // Note this goes beyond InterpValue::Payload annotating things like whether the
 // bits should be interpreted as signed or unsigned, which can change the
 // behavior of interpreted operators like '<'.
-enum class InterpValueTag {
+enum class InterpValueTag : uint8_t {
   kUBits,
   kSBits,
   kTuple,
@@ -111,7 +53,7 @@ enum class InterpValueTag {
   kEnum,
   kFunction,
   kToken,
-  kChannel,
+  kChannelReference,
 };
 
 std::string TagToString(InterpValueTag tag);
@@ -133,7 +75,24 @@ class InterpValue {
     Function* function;
   };
   using FnData = std::variant<Builtin, UserFnData>;
-  using Channel = std::deque<InterpValue>;
+
+  // An immutable reference to a channel object.
+  class ChannelReference {
+   public:
+    ChannelReference(ChannelDirection direction,
+                     std::optional<int64_t> channel_instance_id)
+        : direction_(direction), channel_instance_id_(channel_instance_id) {}
+    ChannelDirection GetDirection() const { return direction_; }
+
+    // An optional unique identifier of the particular channel instance this
+    // refers to in the proc hierarchy. This value is only present for use cases
+    // where the hierarchy is elaborated such as the bytecode interpreter.
+    std::optional<int64_t> GetChannelId() const { return channel_instance_id_; }
+
+   private:
+    ChannelDirection direction_;
+    std::optional<int64_t> channel_instance_id_;
+  };
 
   // Factories
 
@@ -143,6 +102,7 @@ class InterpValue {
 
   static InterpValue MakeZeroValue(bool is_signed, int64_t bit_count);
   static InterpValue MakeMaxValue(bool is_signed, int64_t bit_count);
+  static InterpValue MakeMinValue(bool is_signed, int64_t bit_count);
 
   static InterpValue MakeUnit() { return MakeTuple({}); }
   static InterpValue MakeU8(uint8_t value) {
@@ -176,9 +136,13 @@ class InterpValue {
         std::move(bits));
   }
   static InterpValue MakeTuple(std::vector<InterpValue> members);
-  static InterpValue MakeChannel() {
-    return InterpValue(InterpValueTag::kChannel, std::make_shared<Channel>());
+  static InterpValue MakeChannelReference(
+      ChannelDirection direction,
+      std::optional<int64_t> channel_instance_id = std::nullopt) {
+    return InterpValue(InterpValueTag::kChannelReference,
+                       ChannelReference(direction, channel_instance_id));
   }
+
   static absl::StatusOr<InterpValue> MakeArray(
       std::vector<InterpValue> elements);
   static InterpValue MakeBool(bool value) {
@@ -198,7 +162,7 @@ class InterpValue {
     return InterpValue(InterpValueTag::kFunction, b);
   }
   static InterpValue MakeFunction(FnData fn_data) {
-    return InterpValue(InterpValueTag::kFunction, std::move(fn_data));
+    return InterpValue(InterpValueTag::kFunction, fn_data);
   }
 
   static InterpValue MakeToken() {
@@ -219,8 +183,6 @@ class InterpValue {
   bool IsBuiltinFunction() const {
     return IsFunction() && std::holds_alternative<Builtin>(GetFunctionOrDie());
   }
-  bool IsChannel() const { return tag_ == InterpValueTag::kChannel; }
-
   bool IsTraceBuiltin() const {
     return IsBuiltinFunction() &&
            std::get<Builtin>(GetFunctionOrDie()) == Builtin::kTrace;
@@ -234,7 +196,7 @@ class InterpValue {
   }
 
   bool IsSigned() const {
-    XLS_CHECK(IsBits() || IsEnum());
+    CHECK(IsBits() || IsEnum());
     if (IsEnum()) {
       EnumData enum_data = std::get<EnumData>(payload_);
       return enum_data.is_signed;
@@ -267,9 +229,8 @@ class InterpValue {
   absl::StatusOr<int64_t> GetBitValueSigned() const;
 
   // Returns true iff the value HasBits and the bits values fits in a
-  // (u)int64_t.
+  // uint64_t.
   bool FitsInUint64() const;
-  bool FitsInInt64() const;
 
   // Returns true if the value HasBits and the (unsigned/signed) value fits in
   // 'n' bits.
@@ -288,13 +249,13 @@ class InterpValue {
   absl::StatusOr<InterpValue> SignExt(int64_t new_bit_count) const;
   absl::StatusOr<InterpValue> Concat(const InterpValue& other) const;
 
-  // Performs an add of two uN[N]s and returns a 2-tuple of:
-  //
-  //  `(carry: bool, sum: uN[N])`
-  absl::StatusOr<InterpValue> AddWithCarry(const InterpValue& other) const;
-
   absl::StatusOr<InterpValue> Add(const InterpValue& other) const;
   absl::StatusOr<InterpValue> Sub(const InterpValue& other) const;
+
+  std::optional<InterpValue> Decrement() const;
+  std::optional<InterpValue> Increment() const;
+
+  absl::StatusOr<InterpValue> IncrementZeroExtendIfOverflow() const;
 
   absl::StatusOr<InterpValue> Mul(const InterpValue& other) const;
   absl::StatusOr<InterpValue> Shl(const InterpValue& other) const;
@@ -305,6 +266,7 @@ class InterpValue {
   absl::StatusOr<InterpValue> BitwiseOr(const InterpValue& other) const;
   absl::StatusOr<InterpValue> BitwiseAnd(const InterpValue& other) const;
   absl::StatusOr<InterpValue> ArithmeticNegate() const;
+  absl::StatusOr<InterpValue> CeilOfLog2() const;
   absl::StatusOr<InterpValue> FloorDiv(const InterpValue& other) const;
   absl::StatusOr<InterpValue> FloorMod(const InterpValue& other) const;
   absl::StatusOr<InterpValue> Index(const InterpValue& other) const;
@@ -314,12 +276,18 @@ class InterpValue {
   absl::StatusOr<InterpValue> Slice(const InterpValue& start,
                                     const InterpValue& length) const;
   absl::StatusOr<InterpValue> Flatten() const;
+  absl::StatusOr<InterpValue> Decode(int64_t new_bit_count) const;
+  absl::StatusOr<InterpValue> Encode() const;
   absl::StatusOr<InterpValue> OneHot(bool lsb_prio) const;
 
   absl::StatusOr<InterpValue> Lt(const InterpValue& other) const;
   absl::StatusOr<InterpValue> Le(const InterpValue& other) const;
   absl::StatusOr<InterpValue> Gt(const InterpValue& other) const;
   absl::StatusOr<InterpValue> Ge(const InterpValue& other) const;
+
+  absl::StatusOr<InterpValue> Min(const InterpValue& other) const;
+
+  absl::StatusOr<InterpValue> Max(const InterpValue& other) const;
 
   // Performs the signed comparison defined by "method".
   //
@@ -347,8 +315,13 @@ class InterpValue {
     absl::Format(&sink, "%s", v.ToString());
   }
 
+  // Formats this value using the given format description.
+  //
+  // Returns an error status if the descriptor does not correspond to the
+  // type appropriately.
   absl::StatusOr<std::string> ToFormattedString(
-      const ValueFormatDescriptor& fmt_desc, int64_t indentation = 0) const;
+      const ValueFormatDescriptor& fmt_desc, bool include_type_prefix = false,
+      int64_t indentation = 0) const;
 
   InterpValueTag tag() const { return tag_; }
 
@@ -371,9 +344,9 @@ class InterpValue {
   const FnData& GetFunctionOrDie() const { return *GetFunction().value(); }
   absl::StatusOr<Bits> GetBits() const;
   const Bits& GetBitsOrDie() const;
-  absl::StatusOr<std::shared_ptr<Channel>> GetChannel() const;
-  std::shared_ptr<Channel> GetChannelOrDie() const {
-    return std::get<std::shared_ptr<Channel>>(payload_);
+  absl::StatusOr<ChannelReference> GetChannelReference() const;
+  ChannelReference GetChannelReferenceOrDie() const {
+    return std::get<ChannelReference>(payload_);
   }
 
   // For enum values, returns the enum that the bit pattern is interpreted by is
@@ -432,36 +405,26 @@ class InterpValue {
  private:
   friend struct InterpValuePickler;
 
-  // Formats this tuple value using the given struct format description.
-  //
-  // Returns an error status if the struct descriptor does not correspond to the
-  // tuple structure appropriately.
-  //
-  // Precondition: IsTuple()
+  // Specializations of ToFormattedString for handling specific types.
   absl::StatusOr<std::string> ToStructString(
-      const StructFormatDescriptor& fmt_desc, int64_t indentation) const;
-
-  // As above but for tuple values (that are not participating in a struct
-  // type).
+      const ValueFormatDescriptor& fmt_desc, bool include_type_prefix,
+      int64_t indentation) const;
   absl::StatusOr<std::string> ToTupleString(
-      const TupleFormatDescriptor& fmt_desc, int64_t indentation) const;
-
-  // As above but for array values.
+      const ValueFormatDescriptor& fmt_desc, bool include_type_prefix,
+      int64_t indentation) const;
   absl::StatusOr<std::string> ToArrayString(
-      const ArrayFormatDescriptor& fmt_desc, int64_t indentation) const;
-
-  // As above but for enum values.
+      const ValueFormatDescriptor& fmt_desc, bool include_type_prefix,
+      int64_t indentation) const;
   absl::StatusOr<std::string> ToEnumString(
-      const EnumFormatDescriptor& fmt_desc) const;
+      const ValueFormatDescriptor& fmt_desc) const;
 
   // Note: currently InterpValues are not scoped to a lifetime, so we use a
   // shared_ptr for referring to token data for identity purposes.
   //
   // TODO(leary): 2020-02-10 When all Python bindings are eliminated we can more
   // easily make an interpreter scoped lifetime that InterpValues can live in.
-  using Payload =
-      std::variant<Bits, EnumData, std::vector<InterpValue>, FnData,
-                   std::shared_ptr<TokenData>, std::shared_ptr<Channel>>;
+  using Payload = std::variant<Bits, EnumData, std::vector<InterpValue>, FnData,
+                               std::shared_ptr<TokenData>, ChannelReference>;
 
   InterpValue(InterpValueTag tag, Payload payload)
       : tag_(tag), payload_(std::move(payload)) {}
@@ -476,13 +439,6 @@ class InterpValue {
   InterpValueTag tag_;
   Payload payload_;
 };
-
-// Retrieves the module associated with the function_value if it is user
-// defined.
-//
-// Check-fails if function_value is not a function-typed value.
-std::optional<Module*> GetFunctionValueOwner(
-    const InterpValue& function_value);
 
 template <typename H>
 H AbslHashValue(H state, const InterpValue::UserFnData& v) {

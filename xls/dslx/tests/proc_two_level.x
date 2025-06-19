@@ -22,8 +22,8 @@ proc doubler {
 
     init { () }
 
-    next(tok: token, state: ()) {
-        let (tok, input) = recv(tok, r);
+    next(state: ()) {
+        let (tok, input) = recv(join(), r);
         let tok = send(tok, s, input * u32:2);
     }
 }
@@ -36,16 +36,16 @@ proc strange_mather {
     factor: u32;
 
     config(r: chan<u32> in, s: chan<u32> out, factor: u32) {
-        let (doubler_input_s, doubler_input_r) = chan<u32>;
-        let (doubler_output_s, doubler_output_r) = chan<u32>;
+        let (doubler_input_s, doubler_input_r) = chan<u32>("doubler_input");
+        let (doubler_output_s, doubler_output_r) = chan<u32>("doubler_output");
         spawn doubler(doubler_input_r, doubler_output_s);
         (r, s, doubler_input_s, doubler_output_r, factor)
     }
 
     init { u32:0 }
 
-    next(tok: token, acc: u32) {
-        let (tok, input) = recv(tok, r);
+    next(acc: u32) {
+        let (tok, input) = recv(join(), r);
 
         let tok = send(tok, doubler_input_s, input);
         let (tok, double_input) = recv(tok, doubler_output_r);
@@ -62,16 +62,16 @@ proc test_proc {
     r: chan<u32> in;
 
     config(terminator: chan<bool> out) {
-        let (input_s, input_r) = chan<u32>;
-        let (output_s, output_r) = chan<u32>;
+        let (input_s, input_r) = chan<u32>("input");
+        let (output_s, output_r) = chan<u32>("output");
         spawn strange_mather(input_r, output_s, u32:2);
         (terminator, input_s, output_r)
     }
 
     init { () }
 
-    next(tok: token, state: ()) {
-        let tok = send(tok, s, u32:1);
+    next(state: ()) {
+        let tok = send(join(), s, u32:1);
         let (tok, res) = recv(tok, r);
         assert_eq(res, u32:0);
         trace!(res);

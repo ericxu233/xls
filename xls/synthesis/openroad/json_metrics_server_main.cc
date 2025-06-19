@@ -12,33 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <stdlib.h>  // NOLINT (for setenv)
+
 #include <cmath>
-#include <cstdlib>
+#include <cstdint>
+#include <filesystem>  // NOLINT
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
 
-#include "absl/status/statusor.h"
+#include "absl/flags/flag.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "grpcpp/grpcpp.h"
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/server_context.h"
+#include "grpcpp/support/status.h"
 #include "libs/json11/json11.hpp"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/temp_directory.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/synthesis/credentials.h"
 #include "xls/synthesis/synthesis.pb.h"
 #include "xls/synthesis/synthesis_service.grpc.pb.h"
 
-const char kUsage[] = R"(
+static constexpr std::string_view kUsage = R"(
 Launches a XLS synthesis server which generates OpenROAD metrics JSON via a
 provided command and parses that JSON to create synthesis responses.
 
@@ -144,8 +149,7 @@ class JsonMetricsSynthesisServiceImpl : public SynthesisService::Service {
 
 void RealMain() {
   int port = absl::GetFlag(FLAGS_port);
-  std::string server_address = absl::StrCat("0.0.0.0:", port);
-  std::string metrics_command = absl::GetFlag(FLAGS_metrics_command);
+  const std::string server_address = absl::StrCat("0.0.0.0:", port);
   JsonMetricsSynthesisServiceImpl service(absl::GetFlag(FLAGS_metrics_command));
 
   ::grpc::ServerBuilder builder;
@@ -153,7 +157,7 @@ void RealMain() {
   builder.AddListeningPort(server_address, creds);
   builder.RegisterService(&service);
   std::unique_ptr<::grpc::Server> server(builder.BuildAndStart());
-  XLS_LOG(INFO) << "Serving on port: " << port;
+  LOG(INFO) << "Serving on port: " << port;
   server->Wait();
 }
 

@@ -15,7 +15,7 @@
 // DSLX implementation of a fused multiply-accumulate module, calculating
 // `acc = a * b + acc`
 // This is, effectively, an FMA unit that stores its result between ticks.
-import apfloat
+import apfloat;
 
 type APFloat = apfloat::APFloat;
 
@@ -25,21 +25,17 @@ pub proc fmac<EXP_SZ: u32, SFD_SZ: u32> {
     reset: chan<bool> in;
     output: chan<APFloat<EXP_SZ, SFD_SZ>> out;
 
-    init {
-        apfloat::zero<EXP_SZ, SFD_SZ>(false)
-    }
-
-    config(input_a: chan<APFloat<EXP_SZ, SFD_SZ>> in,
-        input_b: chan<APFloat<EXP_SZ, SFD_SZ>> in,
-        reset: chan<bool> in,
-        output: chan<APFloat<EXP_SZ, SFD_SZ>> out) {
+    config(input_a: chan<APFloat<EXP_SZ, SFD_SZ>> in, input_b: chan<APFloat<EXP_SZ, SFD_SZ>> in,
+           reset: chan<bool> in, output: chan<APFloat<EXP_SZ, SFD_SZ>> out) {
         (input_a, input_b, reset, output)
     }
 
-    next(tok: token, acc: APFloat<EXP_SZ, SFD_SZ>) {
-        let (tok0, a) = recv(tok, input_a);
-        let (tok1, b) = recv(tok, input_b);
-        let (tok2, do_reset) = recv(tok, reset);
+    init { apfloat::zero<EXP_SZ, SFD_SZ>(false) }
+
+    next(acc: APFloat<EXP_SZ, SFD_SZ>) {
+        let (tok0, a) = recv(join(), input_a);
+        let (tok1, b) = recv(join(), input_b);
+        let (tok2, do_reset) = recv(join(), reset);
 
         let acc = apfloat::fma<EXP_SZ, SFD_SZ>(a, b, acc);
         let zero = apfloat::zero<EXP_SZ, SFD_SZ>(false);

@@ -16,23 +16,26 @@
 
 #include "xls/synthesis/yosys/yosys_util.h"
 
-#include <filesystem>
+#include <cstdint>
+#include <filesystem>  // NOLINT
 #include <string>
+#include <utility>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/get_runfile_path.h"
 #include "xls/common/status/matchers.h"
-#include "xls/common/status/status_macros.h"
 
 namespace xls {
 namespace synthesis {
 namespace {
 
-using status_testing::StatusIs;
-using testing::HasSubstr;
-using testing::UnorderedElementsAre;
+using ::absl_testing::StatusIs;
+using ::testing::HasSubstr;
+using ::testing::UnorderedElementsAre;
 
 TEST(YosysUtilTest, GetMaxFrequency) {
   XLS_ASSERT_OK_AND_ASSIGN(
@@ -88,15 +91,177 @@ Used module:     \shll_1
 2.50. Executing CHECK pass (checking for obvious problems).
 checking module __input__fun..
 found and reported 0 problems.
-  )";
+  )
+
+XLS marker: statistics section starts here
+
+@t=12s: 9. Printing statistics.
+
+=== __input__fun ===
+
+   Number of wires:                 11
+   Number of wire bits:            578
+   Number of public wires:          11
+   Number of public wire bits:     578
+   Number of memories:               0
+   Number of memory bits:            0
+   Number of processes:              0
+   Number of cells:                224
+     CCU2C                          32
+     TRELLIS_FF                    192
+
+   Chip area for module '\__input__fun': 1074.385620
+     of which used for sequential elements: 37.324800 (3.47%)
+)";
   XLS_ASSERT_OK_AND_ASSIGN(YosysSynthesisStatistics stats,
                            ParseYosysOutput(input));
   EXPECT_THAT(stats.cell_histogram,
               UnorderedElementsAre(std::pair(std::string("CCU2C"), 32),
                                    std::pair(std::string("TRELLIS_FF"), 192)));
+  EXPECT_THAT(stats.area, 1074.385620);
+  EXPECT_THAT(stats.sequential_area, 37.324800);
 }
 
-TEST(YosysUtilTest, ParseYosysOutputTopModuleMissing) {
+TEST(YosysUtilTest, ParseYosysOutputWithoutAreaStats) {
+  std::string input = R"(
+2.1.1. Analyzing design hierarchy..
+Top module:  \__input__fun
+Used module:     \shll_1
+
+2.49. Printing statistics.
+
+=== __input__dummy ===
+
+   Number of wires:                  0
+   Number of wire bits:              0
+   Number of public wires:           0
+   Number of public wire bits:       0
+   Number of memories:               0
+   Number of memory bits:            0
+   Number of processes:              0
+   Number of cells:                  0
+     CCU2C                           0
+     TRELLIS_FF                      0
+
+=== __input__fun ===
+
+   Number of wires:                 11
+   Number of wire bits:            578
+   Number of public wires:          11
+   Number of public wire bits:     578
+   Number of memories:               0
+   Number of memory bits:            0
+   Number of processes:              0
+   Number of cells:                224
+     CCU2C                          32
+     TRELLIS_FF                    192
+
+2.50. Executing CHECK pass (checking for obvious problems).
+checking module __input__fun..
+found and reported 0 problems.
+  )
+
+XLS marker: statistics section starts here
+
+@t=12s: 9. Printing statistics.
+
+=== __input__fun ===
+
+   Number of wires:                 11
+   Number of wire bits:            578
+   Number of public wires:          11
+   Number of public wire bits:     578
+   Number of memories:               0
+   Number of memory bits:            0
+   Number of processes:              0
+   Number of cells:                224
+     CCU2C                          32
+     TRELLIS_FF                    192
+
+)";
+  XLS_ASSERT_OK_AND_ASSIGN(YosysSynthesisStatistics stats,
+                           ParseYosysOutput(input));
+  EXPECT_THAT(stats.cell_histogram,
+              UnorderedElementsAre(std::pair(std::string("CCU2C"), 32),
+                                   std::pair(std::string("TRELLIS_FF"), 192)));
+  EXPECT_THAT(stats.area, -1);
+  EXPECT_THAT(stats.sequential_area, -1);
+}
+
+TEST(YosysUtilTest, ParseYosysOutputWithUnknownAreaCell) {
+  std::string input = R"(
+2.1.1. Analyzing design hierarchy..
+Top module:  \__input__fun
+Used module:     \shll_1
+
+2.49. Printing statistics.
+
+=== __input__dummy ===
+
+   Number of wires:                  0
+   Number of wire bits:              0
+   Number of public wires:           0
+   Number of public wire bits:       0
+   Number of memories:               0
+   Number of memory bits:            0
+   Number of processes:              0
+   Number of cells:                  0
+     CCU2C                           0
+     TRELLIS_FF                      0
+
+=== __input__fun ===
+
+   Number of wires:                 11
+   Number of wire bits:            578
+   Number of public wires:          11
+   Number of public wire bits:     578
+   Number of memories:               0
+   Number of memory bits:            0
+   Number of processes:              0
+   Number of cells:                224
+     CCU2C                          32
+     TRELLIS_FF                    192
+
+2.50. Executing CHECK pass (checking for obvious problems).
+checking module __input__fun..
+found and reported 0 problems.
+  )
+
+XLS marker: statistics section starts here
+
+@t=12s: 9. Printing statistics.
+
+=== __input__fun ===
+
+   Number of wires:                 11
+   Number of wire bits:            578
+   Number of public wires:          11
+   Number of public wire bits:     578
+   Number of memories:               0
+   Number of memory bits:            0
+   Number of processes:              0
+   Number of cells:                224
+     CCU2C                          32
+     TRELLIS_FF                    192
+
+   Area for cell type CCU2C is unknown!
+
+   Chip area for module '\__input__fun': 1074.385620
+     of which used for sequential elements: 37.324800 (3.47%)
+
+)";
+  XLS_ASSERT_OK_AND_ASSIGN(YosysSynthesisStatistics stats,
+                           ParseYosysOutput(input));
+  EXPECT_THAT(stats.cell_histogram,
+              UnorderedElementsAre(std::pair(std::string("CCU2C"), 32),
+                                   std::pair(std::string("TRELLIS_FF"), 192)));
+  EXPECT_THAT(stats.cell_type_with_unknown_area,
+              UnorderedElementsAre(std::string("CCU2C")));
+  EXPECT_THAT(stats.area, 1074.385620);
+  EXPECT_THAT(stats.sequential_area, 37.324800);
+}
+
+TEST(YosysUtilTest, ParseYosysOutputNoXLSMarker) {
   std::string input = R"(
 2.1.1. Analyzing design hierarchy..
 Used module:     \shll_1
@@ -135,9 +300,10 @@ found and reported 0 problems.
   )";
   auto result = ParseYosysOutput(input);
   EXPECT_THAT(result,
-              StatusIs(absl::StatusCode::kFailedPrecondition,
+              StatusIs(absl::StatusCode::kInternal,
                        HasSubstr("ParseYosysOutput could not find the term "
-                                 "\"Top module\" in the yosys output")));
+                                 "\"XLS marker: statistics section starts here"
+                                 "\" in the yosys output")));
 }
 
 TEST(YosysUtilTest, ParseYosysOutputNoStatsToParse) {
@@ -155,7 +321,16 @@ Used module:     \shll_1
 2.50. Executing CHECK pass (checking for obvious problems).
 checking module __input__fun..
 found and reported 0 problems.
-  )";
+  )
+
+XLS marker: statistics section starts here
+
+@t=12s: 9. Printing statistics.
+
+=== __input__fun ===
+
+   Number of bugs in yosys_util:                 0
+";
   auto result = ParseYosysOutput(input);
   EXPECT_THAT(result,
               StatusIs(absl::StatusCode::kInternal,
@@ -166,7 +341,7 @@ found and reported 0 problems.
 TEST(YosysUtilTest, ParseSTAOutput) {
   std::string input = R"(
 op_clk period_min = 47.22 fmax = 21179.00
-worst slack 22.95
+worst slack max 22.95
 tns 0.00
 Startpoint: op0 (input port clocked by op_clk)
 Endpoint: _13_ (falling edge-triggered flip-flop clocked by op_clk')

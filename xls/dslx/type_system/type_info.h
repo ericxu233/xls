@@ -14,23 +14,29 @@
 
 // Support for carrying information from the type inferencing phase.
 
-#ifndef XLS_DSLX_TYPE_INFO_H_
-#define XLS_DSLX_TYPE_INFO_H_
+#ifndef XLS_DSLX_TYPE_SYSTEM_TYPE_INFO_H_
+#define XLS_DSLX_TYPE_SYSTEM_TYPE_INFO_H_
 
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
-#include "xls/dslx/interp_value.h"
+#include "xls/common/status/ret_check.h"
 #include "xls/dslx/frontend/ast.h"
-#include "xls/dslx/type_system/concrete_type.h"
+#include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/interp_value.h"
 #include "xls/dslx/type_system/parametric_env.h"
+#include "xls/dslx/type_system/type.h"
 
 namespace xls::dslx {
 
@@ -56,18 +62,64 @@ struct SliceData {
   absl::flat_hash_map<ParametricEnv, StartAndWidth> bindings_to_start_width;
 };
 
+// For a given invocation, this is the data we record on the parametric callee
+// -- "callee_bindings" notes what the parametric environment is for the callee
+// and "derived_type_info" holds the type information that is specific to that
+// parametric instantiation.
+struct InvocationCalleeData {
+  ParametricEnv callee_bindings;
+  TypeInfo* derived_type_info;
+};
+
 // Parametric instantiation information related to an invocation AST node.
 struct InvocationData {
-  // Invocation/Spawn AST node.
-  const Invocation* node;
-  // Map from symbolic bindings in the caller to the corresponding symbolic
-  // bindings in the callee for this invocation.
-  absl::flat_hash_map<ParametricEnv, ParametricEnv> parametric_env_map;
-  // Type information that is specialized for a particular parametric
-  // instantiation of an invocation.
-  absl::flat_hash_map<ParametricEnv, TypeInfo*> instantiations;
+ public:
+  InvocationData(const Invocation* node, const Function* callee,
+                 const Function* caller,
+                 absl::flat_hash_map<ParametricEnv, InvocationCalleeData>
+                     env_to_callee_data);
+
+  const Invocation* node() const { return node_; }
+  const Function* callee() const { return callee_; }
+  const Function* caller() const { return caller_; }
+
+  const absl::flat_hash_map<ParametricEnv, InvocationCalleeData>&
+  env_to_callee_data() const {
+    return env_to_callee_data_;
+  }
+
+  // Adds information for this invocation node when invoked in the environment
+  // "caller_env" -- it associates that caller environment with the given
+  // "callee_data" (which describes what the callee parametric bindings are and
+  // whether there is a derivative type information to start using to resolve
+  // types in the callee for that invocation).
+  //
+  // Returns an error if the `caller_env` is invalid
+  absl::Status Add(ParametricEnv caller_env, InvocationCalleeData callee_data);
 
   std::string ToString() const;
+
+ private:
+  // Validates that the keys in "env" are a subset of the parametric keys in
+  // "caller()".
+  absl::Status ValidateEnvForCaller(const ParametricEnv& env) const;
+
+  // Invocation/Spawn AST node.
+  const Invocation* node_;
+
+  const Function* callee_;
+
+  // Function containing the above invocation "node". This is held for
+  // "referential integrity" so we can check the validity of the caller
+  // environments in "env_to_callee_data".
+  //
+  // Note that this can be nullptr when the invocation is at the top level, e.g.
+  // in a const binding.
+  const Function* caller_;
+
+  // Map from symbolic bindings in the caller to the corresponding symbolic
+  // bindings in the callee for this invocation.
+  absl::flat_hash_map<ParametricEnv, InvocationCalleeData> env_to_callee_data_;
 };
 
 // Owns "type information" objects created during the type checking process.
@@ -103,6 +155,8 @@ class TypeInfoOwner {
 
 class TypeInfo {
  public:
+  ~TypeInfo();
+
   // Type information can be "differential"; e.g. when we obtain type
   // information for a particular parametric instantiation the type information
   // is backed by the enclosing type information for the module. Therefore, type
@@ -118,7 +172,7 @@ class TypeInfo {
   std::optional<StartAndWidth> GetSliceStartAndWidth(
       Slice* node, const ParametricEnv& parametric_env) const;
 
-  // Notes caller/callee relation of symbolic bindings at an invocation.
+  // Notes caller/callee relation of parametric env at an invocation.
   //
   // This is kept from type inferencing time for convenience purposes (so it
   // doesn't need to be recalculated anywhere; e.g. in the interpreter).
@@ -126,34 +180,33 @@ class TypeInfo {
   // Args:
   //   invocation: The invocation node that (may have) caused parametric
   //     instantiation.
-  //   caller: The caller's symbolic bindings at the point of invocation.
-  //   callee: The callee's computed symbolic bindings for the invocation.
-  void AddInvocationCallBindings(const Invocation* call, ParametricEnv caller,
-                                 ParametricEnv callee);
+  //   callee: The function being invoked.
+  //   caller: The function containing the invocation -- note that this can be
+  //     nullptr if the invocation is at the top level of the module.
+  //   caller_env: The caller's symbolic bindings at the point of invocation.
+  //   callee_env: The callee's computed symbolic bindings for the invocation.
+  //
+  // Returns an error status if internal invariants are violated; e.g. if the
+  // "caller_env" is not a valid env for the "caller".
+  absl::Status AddInvocationTypeInfo(const Invocation& invocation,
+                                     const Function* callee,
+                                     const Function* caller,
+                                     const ParametricEnv& caller_env,
+                                     const ParametricEnv& callee_env,
+                                     TypeInfo* derived_type_info);
 
-  // Adds derived type info for a parametric invocation.
-  //
-  // Parametric invocations have /derived/ type information, where the
-  // parametric expressions are concretized, and have concrete types
-  // corresponding to AST nodes in the instantiated parametric function.
-  //
-  // Args:
-  //   invocation: The invocation the type information has been generated for.
-  //   caller: The caller's symbolic bindings that caused this instantiation to
-  //     occur.
-  //   type_info: The type information that has been determined for this
-  //     instantiation.
-  //
-  // Note that the type_info may be nullptr in special cases, like when mapping
-  // a callee which is not parametric.
-  void SetInvocationTypeInfo(const Invocation* invocation, ParametricEnv caller,
-                             TypeInfo* type_info);
+  // Add data for a non-parametric invocation.
+  absl::Status AddInvocation(const Invocation& invocation,
+                             const Function* callee, const Function* caller);
 
   // Attempts to retrieve "instantiation" type information -- that is, when
   // there's an invocation with parametrics in a caller, it may map to
   // particular type-information for the callee.
   std::optional<TypeInfo*> GetInvocationTypeInfo(
       const Invocation* invocation, const ParametricEnv& caller) const;
+
+  // As above, but returns a NotFound error if the invocation does not have
+  // associated type information.
   absl::StatusOr<TypeInfo*> GetInvocationTypeInfoOrError(
       const Invocation* invocation, const ParametricEnv& caller) const;
 
@@ -166,14 +219,18 @@ class TypeInfo {
   absl::StatusOr<TypeInfo*> GetTopLevelProcTypeInfo(const Proc* p);
 
   // Sets the type associated with the given AST node.
-  void SetItem(const AstNode* key, const ConcreteType& value) {
-    XLS_CHECK_EQ(key->owner(), module_);
+  void SetItem(const AstNode* key, const Type& value) {
+    CHECK_EQ(key->owner(), module_) << key->ToString();
     dict_[key] = value.CloneToUnique();
+  }
+  void SetItem(const AstNode* key, std::unique_ptr<Type> value) {
+    CHECK_EQ(key->owner(), module_);
+    dict_[key] = std::move(value);
   }
 
   // Attempts to resolve AST node 'key' in the node-to-type dictionary.
-  std::optional<ConcreteType*> GetItem(const AstNode* key) const;
-  absl::StatusOr<ConcreteType*> GetItemOrError(const AstNode* key) const;
+  std::optional<Type*> GetItem(const AstNode* key) const;
+  absl::StatusOr<Type*> GetItemOrError(const AstNode* key) const;
 
   // Attempts to resolve AST node 'key' to a type with subtype T; e.g.:
   //
@@ -187,16 +244,54 @@ class TypeInfo {
 
   bool Contains(AstNode* key) const;
 
+  struct TypeSource {
+    TypeInfo* type_info;
+    std::variant<StructDef*, ProcDef*, EnumDef*, TypeAlias*> definition;
+  };
+
+  // Get the actual instructions which provided the given type-definition with
+  // its name.
+  absl::StatusOr<TypeSource> ResolveTypeDefinition(TypeDefinition source);
+  absl::StatusOr<TypeSource> ResolveTypeDefinition(ColonRef* source);
+  absl::StatusOr<TypeSource> ResolveTypeDefinition(UseTreeEntry* source);
+
+  // Find the first annotated sv_type for the given type reference, assuming one
+  // exists
+  absl::StatusOr<std::optional<std::string>> FindSvType(TypeAnnotation* source);
+
   // Import AST node based information.
   //
   // Note that added type information and such will generally be owned by the
   // import cache.
-  void AddImport(Import* import, Module* module, TypeInfo* type_info);
+  void AddImport(ImportSubject import, Module* module, TypeInfo* type_info);
+
+  // Returns information on the imported module (its module AST node and
+  // top-level type information).
   std::optional<const ImportedInfo*> GetImported(Import* import) const;
+  std::optional<ImportedInfo*> GetImported(Import* import);
+
+  std::optional<const ImportedInfo*> GetImported(
+      UseTreeEntry* use_tree_entry) const;
+  std::optional<ImportedInfo*> GetImported(UseTreeEntry* use_tree_entry);
+
+  std::optional<const ImportedInfo*> GetImported(ImportSubject import) const;
+  std::optional<ImportedInfo*> GetImported(ImportSubject import);
+
   absl::StatusOr<const ImportedInfo*> GetImportedOrError(Import* import) const;
-  const absl::flat_hash_map<Import*, ImportedInfo>& imports() const {
-    return imports_;
-  }
+  absl::StatusOr<ImportedInfo*> GetImportedOrError(Import* import);
+
+  // Returns the imported module information associated with the given
+  // use-tree-entry.
+  absl::StatusOr<ImportedInfo*> GetImportedOrError(
+      UseTreeEntry* use_tree_entry);
+  absl::StatusOr<const ImportedInfo*> GetImportedOrError(
+      const UseTreeEntry* use_tree_entry) const;
+
+  // As above but takes the "generic import" variant where it may have resolved
+  // from either a `UseTreeEntry` or an `Import`.
+  absl::StatusOr<ImportedInfo*> GetImportedOrError(ImportSubject import);
+  absl::StatusOr<const ImportedInfo*> GetImportedOrError(
+      ImportSubject import) const;
 
   // Returns the type information for m, if it is available either as this
   // module or an import of this module.
@@ -204,8 +299,8 @@ class TypeInfo {
 
   // Returns whether function "f" requires an implicit token parameter; i.e. it
   // contains a `fail!()` or `cover!()` as determined during type inferencing.
-  std::optional<bool> GetRequiresImplicitToken(const Function* f) const;
-  void NoteRequiresImplicitToken(const Function* f, bool is_required);
+  std::optional<bool> GetRequiresImplicitToken(const Function& f) const;
+  void NoteRequiresImplicitToken(const Function& f, bool is_required);
 
   // Attempts to retrieve the callee's parametric values in an "instantiation".
   // That is, in the case of:
@@ -241,24 +336,59 @@ class TypeInfo {
   std::optional<InterpValue> GetConstExprOption(
       const AstNode* const_expr) const;
 
+  // Storage of unrolled loops by parametric env.
+  void NoteUnrolledLoop(const UnrollFor* loop, const ParametricEnv& env,
+                        Expr* unrolled_expr);
+  std::optional<Expr*> GetUnrolledLoop(const UnrollFor* loop,
+                                       const ParametricEnv& env) const;
+
   // Retrieves a string that shows the module associated with this type info and
   // which imported modules are present, suitable for debugging.
   std::string GetImportsDebugString() const;
 
+  // Returns a string with the tree of type information (e.g. with
+  // what instantiations are present and what the derivated type info pointers
+  // are) suitable for debugging.
+  std::string GetTypeInfoTreeString() const;
+
+  // Returns the invocation-to-instantiation-data mapping that present on the
+  // root type information for this type information tree.
+  //
+  // Implementation note: all instantiation information is only held on the root
+  // type information, which is why `invocations()` is not exposed publicly.
   const absl::flat_hash_map<const Invocation*, InvocationData>&
-      invocations() const {
-    return invocations_;
+  GetRootInvocations() const {
+    return GetRoot()->invocations();
+  }
+
+  // Returns the InvocationData for the given invocation, if present in this
+  // TypeInfo's root.
+  std::optional<const InvocationData> GetInvocationData(
+      const Invocation* invocation) const;
+
+  const absl::flat_hash_map<ImportSubject, ImportedInfo>& GetRootImports()
+      const {
+    return GetRoot()->imports();
   }
 
   // Returns a reference to the underlying mapping that associates an AST node
   // with its deduced type.
-  const absl::flat_hash_map<const AstNode*, std::unique_ptr<ConcreteType>>&
-  dict() const {
+  const absl::flat_hash_map<const AstNode*, std::unique_ptr<Type>>& dict()
+      const {
     return dict_;
   }
 
+  const FileTable& file_table() const;
+  FileTable& file_table();
+
  private:
   friend class TypeInfoOwner;
+
+  const absl::flat_hash_map<const Invocation*, InvocationData>& invocations()
+      const {
+    CHECK(IsRoot());
+    return invocations_;
+  }
 
   // Args:
   //  module: The module that owns the AST nodes referenced in the (member)
@@ -283,16 +413,40 @@ class TypeInfo {
     return const_cast<TypeInfo*>(this)->GetRoot();
   }
 
+  // Returns whether this is the root type information for the module (vs. a
+  // dervied type info for e.g. a parametric instantiation context).
+  bool IsRoot() const { return this == GetRoot(); }
+
+  const absl::flat_hash_map<ImportSubject, ImportedInfo>& imports() const {
+    return imports_;
+  }
+
   Module* module_;
-  absl::flat_hash_map<const AstNode*, std::unique_ptr<ConcreteType>> dict_;
-  absl::flat_hash_map<Import*, ImportedInfo> imports_;
+
+  // Node to type mapping -- this is present on "derived" type info (i.e. for
+  // instantiated parametric type info) as well as the root type information for
+  // a module.
+  absl::flat_hash_map<const AstNode*, std::unique_ptr<Type>> dict_;
+
+  // Node to constexpr-value mapping -- this is also present on "derived" type
+  // info as constexprs take on different values in different parametric
+  // instantiation contexts.
+  absl::flat_hash_map<const AstNode*, std::optional<InterpValue>> const_exprs_;
+
+  // Unrolled versions of `unroll_for!` loops.
+  absl::flat_hash_map<const UnrollFor*,
+                      absl::flat_hash_map<ParametricEnv, Expr*>>
+      unrolled_loops_;
+
+  // The following are only present on the root type info.
+  absl::flat_hash_map<ImportSubject, ImportedInfo> imports_;
   absl::flat_hash_map<const Invocation*, InvocationData> invocations_;
   absl::flat_hash_map<Slice*, SliceData> slices_;
-  absl::flat_hash_map<const AstNode*, std::optional<InterpValue>> const_exprs_;
   absl::flat_hash_map<const Function*, bool> requires_implicit_token_;
 
   // Maps a Proc to the TypeInfo used for its top-level typechecking.
   absl::flat_hash_map<const Proc*, TypeInfo*> top_level_proc_type_info_;
+
   TypeInfo* parent_;  // Note: may be nullptr.
 };
 
@@ -300,22 +454,25 @@ class TypeInfo {
 
 template <typename T>
 inline absl::StatusOr<T*> TypeInfo::GetItemAs(const AstNode* key) const {
-  std::optional<ConcreteType*> t = GetItem(key);
+  static_assert(std::is_base_of<Type, T>::value,
+                "T must be a subclass of Type");
+
+  std::optional<Type*> t = GetItem(key);
   if (!t.has_value()) {
     return absl::NotFoundError(
         absl::StrFormat("No type found for AST node: %s @ %s", key->ToString(),
-                        SpanToString(key->GetSpan())));
+                        SpanToString(key->GetSpan(), file_table())));
   }
-  XLS_DCHECK(t.value() != nullptr);
+  DCHECK(t.value() != nullptr);
   auto* target = dynamic_cast<T*>(t.value());
-  if (target == nullptr) {
-    return absl::FailedPreconditionError(absl::StrFormat(
-        "AST node (%s) @ %s did not have expected ConcreteType subtype.",
-        key->GetNodeTypeName(), SpanToString(key->GetSpan())));
-  }
+  XLS_RET_CHECK(target != nullptr) << absl::StreamFormat(
+      "AST node `%s` @ %s did not have expected `xls::dslx::Type` subtype; "
+      "want: %s got: %s",
+      key->ToString(), SpanToString(key->GetSpan(), file_table()),
+      T::GetDebugName(), t.value()->GetDebugTypeName());
   return target;
 }
 
 }  // namespace xls::dslx
 
-#endif  // XLS_DSLX_TYPE_INFO_H_
+#endif  // XLS_DSLX_TYPE_SYSTEM_TYPE_INFO_H_

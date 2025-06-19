@@ -15,16 +15,18 @@
 #include "xls/netlist/function_parser.h"
 
 #include <cctype>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_macros.h"
 
 namespace xls {
 namespace netlist {
@@ -56,7 +58,7 @@ Token Token::Identifier(const std::string& s, int64_t pos) {
 Scanner::Scanner(std::string function) : function_(function), current_pos_(0) {
   std::string_view stripped = absl::StripAsciiWhitespace(function_);
   if (stripped != function_) {
-    XLS_LOG(WARNING)
+    LOG(WARNING)
         << "Function '" << function_ << "' has leading or trailing spaces. "
         << "Per the Liberty spec, spaces are AND, which are invalid here. "
         << "These spaces will be dropped.";
@@ -149,7 +151,7 @@ absl::StatusOr<Token> Scanner::Peek() {
 
 bool Scanner::IsIdentifierStart(char next_char) {
   // Pin names are [a-z][A-Z][0-9]+
-  return std::isalpha(next_char) != 0|| next_char == '"' || next_char == '_';
+  return std::isalpha(next_char) != 0 || next_char == '"' || next_char == '_';
 }
 
 absl::StatusOr<Token> Scanner::ScanIdentifier() {
@@ -280,7 +282,7 @@ absl::StatusOr<Ast> Parser::ParseInvertNext() {
   // see if we have an odd or even count and apply after processing the
   // following term.
   XLS_ASSIGN_OR_RETURN(Token token, scanner_.Peek());
-  bool do_negate = 0;
+  bool do_negate = false;
   while (token.kind() == Token::Kind::kInvertFollowing) {
     XLS_RETURN_IF_ERROR(scanner_.Pop().status());
     do_negate = !do_negate;

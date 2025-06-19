@@ -14,18 +14,21 @@
 
 #include "xls/noc/config_ng/coordinate.h"
 
+#include <cstdint>
 #include <initializer_list>
 #include <optional>
 
-#include "absl/strings/str_cat.h"
-#include "xls/common/status/status_macros.h"
+#include "absl/log/check.h"
+#include "absl/types/span.h"
+#include "xls/data_structures/inline_bitmap.h"
 #include "xls/ir/bits.h"
+#include "xls/noc/config_ng/dimension_bounds.h"
 
 namespace xls::noc {
 
 Coordinate::Coordinate(std::initializer_list<int64_t> coordinates) {
   for (int64_t coordinate : coordinates) {
-    XLS_CHECK(coordinate >= 0);
+    CHECK_GE(coordinate, 0);
   }
   coordinate_ = coordinates;
 }
@@ -39,14 +42,14 @@ absl::Span<const int64_t> Coordinate::GetCoordinates() const {
 }
 
 int64_t Coordinate::GetCoordinate(const int64_t dimension_index) const {
-  XLS_CHECK(dimension_index >= 0 && dimension_index < GetDimensionCount());
+  CHECK(dimension_index >= 0 && dimension_index < GetDimensionCount());
   return coordinate_[dimension_index];
 }
 
 void Coordinate::SetCoordinate(const int64_t dimension_index,
                                const int64_t value) {
-  XLS_CHECK(value >= 0);
-  XLS_CHECK(dimension_index >= 0 && dimension_index < GetDimensionCount());
+  CHECK_GE(value, 0);
+  CHECK(dimension_index >= 0 && dimension_index < GetDimensionCount());
   coordinate_[dimension_index] = value;
 }
 
@@ -124,8 +127,7 @@ std::optional<int64_t> Coordinate::GetUniqueDifferentDimensionIndex(
       }
     }
   }
-  return dimension_index == -1 ? std::nullopt
-                               : std::optional(dimension_index);
+  return dimension_index == -1 ? std::nullopt : std::optional(dimension_index);
 }
 
 bool Coordinate::operator==(const Coordinate& rhs) const {

@@ -44,8 +44,8 @@
 // last                                         ┌─────┐           ┌─────┐
 // (output channel)     ────────────────────────┘     └───────────┘     └────
 
-import std
-import xls.modules.rle.rle_common as rle_common
+import std;
+import xls.modules.rle.rle_common as rle_common;
 
 type EncInData  = rle_common::PlainData;
 type EncOutData = rle_common::CompressedData;
@@ -82,13 +82,13 @@ pub proc RunLengthEncoder<SYMBOL_WIDTH: u32, COUNT_WIDTH: u32> {
         output_s: chan<EncOutData<SYMBOL_WIDTH, COUNT_WIDTH>> out,
     ) {(input_r, output_s)}
 
-    next (tok: token, state: RunLengthEncoderState<SYMBOL_WIDTH, COUNT_WIDTH>) {
+    next (state: RunLengthEncoderState<SYMBOL_WIDTH, COUNT_WIDTH>) {
         let zero_input = EncInData {
           symbol: bits[SYMBOL_WIDTH]:0,
           last: false
         };
         let (input_tok, input) = recv_if(
-            tok, input_r, !state.prev_last, zero_input);
+            join(), input_r, !state.prev_last, zero_input);
 
         let prev_symbol_valid = state.prev_count != bits[COUNT_WIDTH]:0;
         let symbol_differ = prev_symbol_valid && (
@@ -146,7 +146,7 @@ proc RunLengthEncoder32 {
         ()
     }
 
-    next (tok: token, state: ()) {
+    next (state: ()) {
         ()
     }
 }
@@ -164,8 +164,8 @@ type TestCommonEncOutData =
     EncOutData<TEST_COMMON_SYMBOL_WIDTH, TEST_COMMON_COUNT_WIDTH>;
 
 // Simple transaction without overflow
-const CountSymbolTestSymbolWidth = TEST_COMMON_SYMBOL_WIDTH;
-const CountSymbolTestCountWidth  = TEST_COMMON_COUNT_WIDTH;
+const COUNT_SYMBOL_TEST_SYMBOL_WIDTH = TEST_COMMON_SYMBOL_WIDTH;
+const COUNT_SYMBOL_TEST_COUNT_WIDTH  = TEST_COMMON_COUNT_WIDTH;
 
 type CountSymbolTestStimulus   = TestCommonSymbol;
 type CountSymbolTestSymbol     = TestCommonSymbol;
@@ -181,14 +181,14 @@ proc RunLengthEncoderCountSymbolTest {
 
   init {()}
   config (terminator: chan<bool> out) {
-    let (enc_input_s, enc_input_r) = chan<CountSymbolTestEncInData>;
-    let (enc_output_s, enc_output_r) = chan<CountSymbolTestEncOutData>;
+    let (enc_input_s, enc_input_r) = chan<CountSymbolTestEncInData>("enc_input");
+    let (enc_output_s, enc_output_r) = chan<CountSymbolTestEncOutData>("enc_output");
 
-    spawn RunLengthEncoder<CountSymbolTestSymbolWidth, CountSymbolTestCountWidth>(
+    spawn RunLengthEncoder<COUNT_SYMBOL_TEST_SYMBOL_WIDTH, COUNT_SYMBOL_TEST_COUNT_WIDTH>(
         enc_input_r, enc_output_s);
     (terminator, enc_input_s, enc_output_r)
   }
-  next (tok: token, state:()) {
+  next (state:()) {
     let CountSymbolTestTestStimuli: CountSymbolTestStimulus[4] = [
       CountSymbolTestStimulus:0xA, CountSymbolTestStimulus:0xA,
       CountSymbolTestStimulus:0xA, CountSymbolTestStimulus:0xB,
@@ -202,7 +202,7 @@ proc RunLengthEncoderCountSymbolTest {
       trace_fmt!("Sent {} stimuli, symbol: 0x{:x}, last: {}",
         counter, stimulus.symbol, stimulus.last);
       (tok)
-    }(tok);
+    }(join());
     let CountSymbolTestTestOutput:
         (CountSymbolTestSymbol, CountSymbolTestCount)[2] = [
       (CountSymbolTestSymbol:0xA, CountSymbolTestCount:0x3),
@@ -227,15 +227,15 @@ proc RunLengthEncoderCountSymbolTest {
 }
 
 // Transaction with counter overflow
-const OverflowSymbolWidth = TEST_COMMON_SYMBOL_WIDTH;
-const OverflowCountWidth  = u32:2;
+const OVERFLOW_SYMBOL_WIDTH = TEST_COMMON_SYMBOL_WIDTH;
+const OVERFLOW_COUNT_WIDTH  = u32:2;
 
 type OverflowStimulus   = TestCommonSymbol;
 type OverflowSymbol     = TestCommonSymbol;
-type OverflowCount      = bits[OverflowCountWidth];
+type OverflowCount      = bits[OVERFLOW_COUNT_WIDTH];
 type OverflowEncInData  = TestCommonEncInData;
 type OverflowEncOutData =
-    EncOutData<OverflowSymbolWidth, OverflowCountWidth>;
+    EncOutData<OVERFLOW_SYMBOL_WIDTH, OVERFLOW_COUNT_WIDTH>;
 
 #[test_proc]
 proc RunLengthEncoderOverflowTest {
@@ -245,14 +245,14 @@ proc RunLengthEncoderOverflowTest {
 
   init {()}
   config (terminator: chan<bool> out) {
-    let (enc_input_s, enc_input_r) = chan<OverflowEncInData>;
-    let (enc_output_s, enc_output_r) = chan<OverflowEncOutData>;
+    let (enc_input_s, enc_input_r) = chan<OverflowEncInData>("enc_input");
+    let (enc_output_s, enc_output_r) = chan<OverflowEncOutData>("enc_output");
 
-    spawn RunLengthEncoder<OverflowSymbolWidth, OverflowCountWidth>(
+    spawn RunLengthEncoder<OVERFLOW_SYMBOL_WIDTH, OVERFLOW_COUNT_WIDTH>(
         enc_input_r, enc_output_s);
     (terminator, enc_input_s, enc_output_r)
   }
-  next (tok: token, state:()) {
+  next (state:()) {
     let OverflowTestStimuli: OverflowStimulus[14] = [
       OverflowStimulus:0xB, OverflowStimulus:0xB,
       OverflowStimulus:0x1, OverflowStimulus:0xC,
@@ -272,7 +272,7 @@ proc RunLengthEncoderOverflowTest {
       trace_fmt!("Sent {} stimuli, symbol: 0x{:x}, last: {}",
         counter, stimulus.symbol, stimulus.last);
       (tok)
-    }(tok);
+    }(join());
     let OverflowTestOutput:
         (OverflowSymbol, OverflowCount)[6] = [
       (OverflowSymbol:0xB, OverflowCount:0x2),
@@ -302,8 +302,8 @@ proc RunLengthEncoderOverflowTest {
 
 // Check that RLE encoder will create 2 `last` output packets,
 // when 2 `last` input packets were consumed.
-const LastAfterLastSymbolWidth = TEST_COMMON_SYMBOL_WIDTH;
-const LastAfterLastCountWidth  = TEST_COMMON_COUNT_WIDTH;
+const LAST_AFTER_LAST_SYMBOL_WIDTH = TEST_COMMON_SYMBOL_WIDTH;
+const LAST_AFTER_LAST_COUNT_WIDTH  = TEST_COMMON_COUNT_WIDTH;
 
 type LastAfterLastStimulus   = TestCommonEncInData;
 type LastAfterLastSymbol     = TestCommonSymbol;
@@ -320,14 +320,14 @@ proc RunLengthEncoderLastAfterLastTest {
 
   init {()}
   config (terminator: chan<bool> out) {
-    let (enc_input_s, enc_input_r) = chan<LastAfterLastEncInData>;
-    let (enc_output_s, enc_output_r) = chan<LastAfterLastEncOutData>;
+    let (enc_input_s, enc_input_r) = chan<LastAfterLastEncInData>("enc_input");
+    let (enc_output_s, enc_output_r) = chan<LastAfterLastEncOutData>("enc_output");
 
-    spawn RunLengthEncoder<LastAfterLastSymbolWidth, LastAfterLastCountWidth>(
+    spawn RunLengthEncoder<LAST_AFTER_LAST_SYMBOL_WIDTH, LAST_AFTER_LAST_COUNT_WIDTH>(
         enc_input_r, enc_output_s);
     (terminator, enc_input_s, enc_output_r)
   }
-  next (tok: token, state:()) {
+  next (state:()) {
     let LastAfterLastTestStimuli: LastAfterLastStimulus[2] = [
       LastAfterLastStimulus {symbol: LastAfterLastSymbol:0x1, last: true},
       LastAfterLastStimulus {symbol: LastAfterLastSymbol:0x1, last: true},
@@ -339,7 +339,7 @@ proc RunLengthEncoderLastAfterLastTest {
       trace_fmt!("Sent {} transactions, symbol: 0x{:x}, last: {}",
         counter, stimuli.symbol, stimuli.last);
       (tok)
-    }(tok);
+    }(join());
     let LastAfterLastTestOutput: LastAfterLastOutput[2] = [
       LastAfterLastOutput {
         symbol: LastAfterLastSymbol:0x1,
@@ -367,17 +367,17 @@ proc RunLengthEncoderLastAfterLastTest {
 }
 
 // Check overflow condition trigger on packet with `last`
-const OverflowWithLastSymbolWidth = TEST_COMMON_SYMBOL_WIDTH;
-const OverflowWithLastCountWidth  = u32:2;
+const OVERFLOW_WITH_LAST_SYMBOL_WIDTH = TEST_COMMON_SYMBOL_WIDTH;
+const OVERFLOW_WITH_LAST_COUNT_WIDTH  = u32:2;
 
 type OverflowWithLastStimulus   = TestCommonSymbol;
 type OverflowWithLastSymbol     = TestCommonSymbol;
 type OverflowWithLastCount      =
-    bits[OverflowWithLastCountWidth];
+    bits[OVERFLOW_WITH_LAST_COUNT_WIDTH];
 type OverflowWithLastEncInData  = TestCommonEncInData;
 type OverflowWithLastEncOutData =
-    EncOutData<OverflowWithLastSymbolWidth,
-               OverflowWithLastCountWidth>;
+    EncOutData<OVERFLOW_WITH_LAST_SYMBOL_WIDTH,
+               OVERFLOW_WITH_LAST_COUNT_WIDTH>;
 
 #[test_proc]
 proc RunLengthEncoderOverflowWithLastTest {
@@ -387,16 +387,16 @@ proc RunLengthEncoderOverflowWithLastTest {
 
   init {()}
   config (terminator: chan<bool> out) {
-    let (enc_input_s, enc_input_r) = chan<OverflowWithLastEncInData>;
+    let (enc_input_s, enc_input_r) = chan<OverflowWithLastEncInData>("enc_input");
     let (enc_output_s, enc_output_r) =
-        chan<OverflowWithLastEncOutData>;
+        chan<OverflowWithLastEncOutData>("enc_output");
 
-    spawn RunLengthEncoder<OverflowWithLastSymbolWidth,
-                 OverflowWithLastCountWidth>(
+    spawn RunLengthEncoder<OVERFLOW_WITH_LAST_SYMBOL_WIDTH,
+                 OVERFLOW_WITH_LAST_COUNT_WIDTH>(
         enc_input_r, enc_output_s);
     (terminator, enc_input_s, enc_output_r)
   }
-  next (tok: token, state:()) {
+  next (state:()) {
     let OverflowWithLastTestStimuli: OverflowWithLastStimulus[4] = [
       OverflowWithLastStimulus:0xC, OverflowWithLastStimulus:0xC,
       OverflowWithLastStimulus:0xC, OverflowWithLastStimulus:0xC,
@@ -411,7 +411,7 @@ proc RunLengthEncoderOverflowWithLastTest {
       trace_fmt!("Sent {} stimuli, symbol: 0x{:x}, last: {}",
         counter, stimulus.symbol, stimulus.last);
       (tok)
-    }(tok);
+    }(join());
     let OverflowWithLastTestOutput:
         (OverflowWithLastSymbol, OverflowWithLastCount)[2] = [
       (OverflowWithLastSymbol:0xC, OverflowWithLastCount:0x3),

@@ -12,20 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <cstdio>
 #include <list>
-#include <memory>
 #include <string>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
-#include "absl/strings/str_format.h"
-#include "xls/common/status/matchers.h"
-#include "xls/common/status/status_macros.h"
-#include "xls/contrib/xlscc/translator.h"
+#include "absl/status/status_matchers.h"
+#include "xls/contrib/xlscc/hls_block.pb.h"
 #include "xls/contrib/xlscc/unit_tests/unit_test.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/value.h"
 
 namespace xlscc {
 namespace {
@@ -155,10 +154,9 @@ TEST_F(TranslatorPointerTest, AssignArrayElementByPointer) {
       return arr[3];
     })";
 
-  ASSERT_THAT(
-      SourceToIr(content).status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                    testing::HasSubstr("not pointers")));
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("not pointers")));
 }
 
 TEST_F(TranslatorPointerTest, AddrOfPointer) {
@@ -177,10 +175,10 @@ TEST_F(TranslatorPointerTest, AddrOfPointer) {
       return arr[3];
     })";
 
-  ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kInvalidArgument,
-                  testing::HasSubstr("only supported on array")));
+  ASSERT_THAT(
+      SourceToIr(content).status(),
+      absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                             testing::HasSubstr("only supported on array")));
 }
 
 TEST_F(TranslatorPointerTest, ArraySliceAssignDirect) {
@@ -279,8 +277,8 @@ TEST_F(TranslatorPointerTest, ArraySliceOutOfBounds) {
     })";
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kOutOfRange,
-                                            testing::HasSubstr("slice")));
+              absl_testing::StatusIs(absl::StatusCode::kOutOfRange,
+                                     testing::HasSubstr("slice")));
 }
 
 TEST_F(TranslatorPointerTest, ArraySliceAssignTrueCondition) {
@@ -618,10 +616,9 @@ TEST_F(TranslatorPointerTest, UninitializedPointer) {
       return a[0];
     })";
 
-  ASSERT_THAT(
-      SourceToIr(content).status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
-                                    testing::HasSubstr("Unable to parse")));
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                                     testing::HasSubstr("uninitialized")));
 }
 
 TEST_F(TranslatorPointerTest, Aliasing) {
@@ -664,8 +661,8 @@ TEST_F(TranslatorPointerTest, Nullptr) {
       })";
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                            testing::HasSubstr("nullptr")));
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("nullptr")));
 }
 
 TEST_F(TranslatorPointerTest, PointerInStruct) {
@@ -699,7 +696,7 @@ TEST_F(TranslatorPointerTest, PointerInStruct2) {
   // Default constructor causes lvalue translation
   ASSERT_THAT(
       SourceToIr(content).status(),
-      xls::status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kUnimplemented,
           testing::HasSubstr("Don't know how to create LValue for member")));
 }
@@ -722,7 +719,7 @@ TEST_F(TranslatorPointerTest, PointerInStruct3) {
 
   ASSERT_THAT(
       SourceToIr(content).status(),
-      xls::status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kUnimplemented,
           testing::HasSubstr("Don't know how to create LValue for member")));
 }
@@ -828,7 +825,7 @@ TEST_F(TranslatorPointerTest, ReferenceInNestedStruct) {
 
   ASSERT_THAT(
       SourceToIr(content).status(),
-      xls::status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kUnimplemented,
           testing::HasSubstr("Don't know how to create LValue for member")));
 }
@@ -856,7 +853,7 @@ TEST_F(TranslatorPointerTest, ReferenceInNestedStruct2) {
 
   ASSERT_THAT(
       SourceToIr(content).status(),
-      xls::status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kUnimplemented,
           testing::HasSubstr("Don't know how to create LValue for member")));
 }
@@ -914,7 +911,7 @@ TEST_F(TranslatorPointerTest, ReferenceFuncReturn) {
 
   ASSERT_THAT(
       SourceToIr(content).status(),
-      xls::status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kUnimplemented,
           testing::HasSubstr("Don't know how to handle lvalue return")));
 }
@@ -1056,10 +1053,10 @@ TEST_F(TranslatorPointerTest, PointerToPointer) {
       return **xpp;
     })";
 
-  ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kUnimplemented,
-                  testing::HasSubstr("Don't know how to convert")));
+  ASSERT_THAT(
+      SourceToIr(content).status(),
+      absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                             testing::HasSubstr("Don't know how to convert")));
 }
 
 TEST_F(TranslatorPointerTest, MethodUsingMemberReference) {
@@ -1079,7 +1076,7 @@ TEST_F(TranslatorPointerTest, MethodUsingMemberReference) {
 
   ASSERT_THAT(
       SourceToIr(content).status(),
-      xls::status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kUnimplemented,
           testing::HasSubstr("Don't know how to create LValue for member")));
 }
@@ -1114,7 +1111,7 @@ TEST_F(TranslatorPointerTest, ReferenceReturnWithIO) {
       SourceToIr(content, /*pfunc=*/nullptr, /*clang_argv=*/{},
                  /*io_test_mode=*/true)
           .status(),
-      xls::status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kUnimplemented,
           testing::HasSubstr("eferences to side effecting operations")));
 }
@@ -1142,12 +1139,12 @@ TEST_F(TranslatorPointerTest, PipelinedLoopUsingReference) {
     HLSChannel* ch_in1 = block_spec.add_channels();
     ch_in1->set_name("in");
     ch_in1->set_is_input(true);
-    ch_in1->set_type(FIFO);
+    ch_in1->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out1 = block_spec.add_channels();
     ch_out1->set_name("out");
     ch_out1->set_is_input(false);
-    ch_out1->set_type(FIFO);
+    ch_out1->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -1182,12 +1179,12 @@ TEST_F(TranslatorPointerTest, PipelinedLoopUsingReferenceAndIO) {
     HLSChannel* ch_in1 = block_spec.add_channels();
     ch_in1->set_name("in");
     ch_in1->set_is_input(true);
-    ch_in1->set_type(FIFO);
+    ch_in1->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out1 = block_spec.add_channels();
     ch_out1->set_name("out");
     ch_out1->set_is_input(false);
-    ch_out1->set_type(FIFO);
+    ch_out1->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -1345,7 +1342,7 @@ TEST_F(TranslatorPointerTest, AssignReferenceInTernaryDirect) {
     })";
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kUnimplemented,
                   testing::HasSubstr("Ternaries in lvalues only supported for "
                                      "pointers or references")));
@@ -1384,7 +1381,7 @@ TEST_F(TranslatorPointerTest, SetPointerInMethod) {
 
   ASSERT_THAT(
       SourceToIr(content).status(),
-      xls::status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kUnimplemented,
           testing::HasSubstr("Don't know how to create LValue for member")));
 }

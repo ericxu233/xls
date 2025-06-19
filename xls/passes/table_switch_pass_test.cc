@@ -20,35 +20,46 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/match.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/substitute.h"
 #include "xls/common/status/matchers.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/interpreter/function_interpreter.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/events.h"
 #include "xls/ir/ir_matcher.h"
-#include "xls/ir/ir_parser.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/node.h"
+#include "xls/ir/op.h"
 #include "xls/ir/package.h"
+#include "xls/ir/value.h"
 #include "xls/passes/optimization_pass.h"
 #include "xls/passes/pass_base.h"
+#include "xls/solvers/z3_ir_equivalence_testutils.h"
 
 namespace m = ::xls::op_matchers;
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
+using ::testing::AnyOf;
 
 class TableSwitchPassTest : public IrTestBase {
  protected:
   absl::StatusOr<bool> Run(FunctionBase* f) {
     PassResults results;
+    OptimizationContext context;
     TableSwitchPass pass;
-    return pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results);
+    return pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results,
+                                  context);
   }
 
   // Returns a vector holding the results of the given function when run with
-  // the values from 0 to "max_index" before the table swich pass is applied.
+  // the values from 0 to "max_index" before the table switch pass is applied.
   absl::StatusOr<std::vector<Value>> GetBeforeData(Function* f, int max_index,
                                                    int width = 32) {
     // Run a bunch of data past the intended bounds, just for extra safety.
@@ -115,11 +126,101 @@ fn main(index: bits[32]) -> bits[32] {
   XLS_ASSERT_OK_AND_ASSIGN(std::vector<Value> before_data,
                            GetBeforeData(f, kNumLiterals));
 
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f);
   ASSERT_THAT(Run(f), IsOkAndHolds(true));
   XLS_ASSERT_OK_AND_ASSIGN(Value array,
                            Value::UBitsArray({1, 2, 3, 4, 5, 6, 0}, 32));
   EXPECT_THAT(f->return_value(), m::ArrayIndex(m::Literal(array),
                                                /*indices=*/{m::Param()}));
+
+  XLS_ASSERT_OK(CompareBeforeAfter(f, before_data));
+}
+
+// Verifies that an N-deep tree is converted into a table lookup; smoke test.
+TEST_F(TableSwitchPassTest, SimplePrioritySelectLookup) {
+  constexpr int kNumLiterals = 7;
+  const std::string program = R"(
+fn main(index: bits[32]) -> bits[32] {
+  literal.0: bits[32] = literal(value=0)
+  literal.1: bits[32] = literal(value=1)
+  literal.2: bits[32] = literal(value=2)
+  literal.3: bits[32] = literal(value=3)
+  literal.4: bits[32] = literal(value=4)
+  literal.5: bits[32] = literal(value=5)
+  literal.6: bits[32] = literal(value=6)
+  eq.10: bits[1] = eq(index, literal.0)
+  eq.11: bits[1] = eq(index, literal.1)
+  eq.12: bits[1] = eq(index, literal.2)
+  eq.13: bits[1] = eq(index, literal.3)
+  eq.14: bits[1] = eq(index, literal.4)
+  eq.15: bits[1] = eq(index, literal.5)
+  concat.16: bits[6] = concat(eq.15, eq.14, eq.13, eq.12, eq.11, eq.10)
+  ret priority_sel.17: bits[32] = priority_sel(concat.16, cases=[literal.1, literal.2, literal.3, literal.4, literal.5, literal.6], default=literal.0)
+})";
+
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(program, p.get()));
+  // Capture the behavior before the transformation.
+  XLS_ASSERT_OK_AND_ASSIGN(std::vector<Value> before_data,
+                           GetBeforeData(f, kNumLiterals));
+
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  XLS_ASSERT_OK_AND_ASSIGN(Value array,
+                           Value::UBitsArray({1, 2, 3, 4, 5, 6, 0}, 32));
+  EXPECT_THAT(f->return_value(),
+              m::ArrayIndex(m::Literal(array),
+                            /*indices=*/{m::Param("index")}));
+
+  XLS_ASSERT_OK(CompareBeforeAfter(f, before_data));
+}
+
+// Verifies that chained is converted into a table lookup; smoke test.
+TEST_F(TableSwitchPassTest, ChainedPrioritySelectLookup) {
+  constexpr int kNumLiterals = 7;
+  const std::string program = R"(
+fn main(index: bits[32]) -> bits[32] {
+  literal.0: bits[32] = literal(value=0)
+  literal.1: bits[32] = literal(value=1)
+  literal.2: bits[32] = literal(value=2)
+  literal.3: bits[32] = literal(value=3)
+  literal.4: bits[32] = literal(value=4)
+  literal.5: bits[32] = literal(value=5)
+  literal.6: bits[32] = literal(value=6)
+  literal.7: bits[32] = literal(value=7)
+  literal.8: bits[32] = literal(value=8)
+  literal.9: bits[32] = literal(value=9)
+  eq.10: bits[1] = eq(index, literal.0)
+  eq.11: bits[1] = eq(index, literal.1)
+  eq.12: bits[1] = eq(index, literal.2)
+  eq.13: bits[1] = eq(index, literal.3)
+  concat.14: bits[4] = concat(eq.13, eq.12, eq.11, eq.10)
+  priority_sel.15: bits[32] = priority_sel(concat.14, cases=[literal.1, literal.2, literal.3, literal.4], default=literal.0)
+  eq.16: bits[1] = eq(index, literal.4)
+  eq.17: bits[1] = eq(index, literal.5)
+  concat.18: bits[2] = concat(eq.17, eq.16)
+  priority_sel.19: bits[32] = priority_sel(concat.18, cases=[literal.5, literal.6], default=priority_sel.15)
+  eq.20: bits[1] = eq(index, literal.6)
+  priority_sel.21: bits[32] = priority_sel(eq.20, cases=[literal.7], default=priority_sel.19)
+  eq.22: bits[1] = eq(index, literal.7)
+  eq.23: bits[1] = eq(index, literal.8)
+  concat.24: bits[2] = concat(eq.23, eq.22)
+  ret priority_sel.25: bits[32] = priority_sel(concat.24, cases=[literal.8, literal.9], default=priority_sel.21)
+})";
+
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(program, p.get()));
+  // Capture the behavior before the transformation.
+  XLS_ASSERT_OK_AND_ASSIGN(std::vector<Value> before_data,
+                           GetBeforeData(f, kNumLiterals));
+
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value array, Value::UBitsArray({1, 2, 3, 4, 5, 6, 7, 8, 9, 0}, 32));
+  EXPECT_THAT(f->return_value(),
+              m::ArrayIndex(m::Literal(array),
+                            /*indices=*/{m::Param("index")}));
 
   XLS_ASSERT_OK(CompareBeforeAfter(f, before_data));
 }
@@ -157,6 +258,45 @@ fn main(index: bits[32]) -> bits[32] {
   XLS_ASSERT_OK_AND_ASSIGN(std::vector<Value> before_data,
                            GetBeforeData(f, kNumLiterals));
 
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  XLS_ASSERT_OK_AND_ASSIGN(Value array,
+                           Value::UBitsArray({0, 1, 2, 3, 4, 6, 5}, 32));
+  EXPECT_THAT(f->return_value(), m::ArrayIndex(m::Literal(array),
+                                               /*indices=*/{m::Param()}));
+  XLS_ASSERT_OK(CompareBeforeAfter(f, before_data));
+}
+
+// This test verifies that table switching works if the selects are in
+// lowest-to-highest selection order (in terms of dependencies).
+TEST_F(TableSwitchPassTest, SimplePrioritySelectHandlesLowHighOrder) {
+  constexpr int kNumLiterals = 7;
+
+  const std::string program = R"(
+fn main(index: bits[32]) -> bits[32] {
+  literal.0: bits[32] = literal(value=0)
+  literal.1: bits[32] = literal(value=1)
+  literal.2: bits[32] = literal(value=2)
+  literal.3: bits[32] = literal(value=3)
+  literal.4: bits[32] = literal(value=4)
+  literal.5: bits[32] = literal(value=5)
+  literal.6: bits[32] = literal(value=6)
+  eq.10: bits[1] = eq(index, literal.0)
+  eq.11: bits[1] = eq(index, literal.1)
+  eq.12: bits[1] = eq(index, literal.2)
+  eq.13: bits[1] = eq(index, literal.3)
+  eq.14: bits[1] = eq(index, literal.4)
+  eq.15: bits[1] = eq(index, literal.5)
+  concat.16: bits[6] = concat(eq.15, eq.14, eq.13, eq.12, eq.11, eq.10)
+  ret priority_sel.17: bits[32] = priority_sel(concat.16, cases=[literal.0, literal.1, literal.2, literal.3, literal.4, literal.6], default=literal.5)
+}
+)";
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(program, p.get()));
+  XLS_ASSERT_OK_AND_ASSIGN(std::vector<Value> before_data,
+                           GetBeforeData(f, kNumLiterals));
+
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f);
   ASSERT_THAT(Run(f), IsOkAndHolds(true));
   XLS_ASSERT_OK_AND_ASSIGN(Value array,
                            Value::UBitsArray({0, 1, 2, 3, 4, 6, 5}, 32));
@@ -201,11 +341,63 @@ fn main(index: bits[32]) -> bits[32] {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(program, p.get()));
   PassResults results;
+  OptimizationContext context;
   TableSwitchPass pass;
   XLS_ASSERT_OK_AND_ASSIGN(std::vector<Value> before_data,
                            GetBeforeData(f, kNumLiterals));
-  ASSERT_THAT(pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results),
-              IsOkAndHolds(true));
+
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f);
+  ASSERT_THAT(
+      pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results, context),
+      IsOkAndHolds(true));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value array,
+      Value::UBitsArray({3335, 2, 889798, 436, 1235, 555, 434}, 32));
+  EXPECT_THAT(f->return_value(), m::ArrayIndex(m::Literal(array),
+                                               /*indices=*/{m::Param()}));
+}
+
+// This test verifies that the values of the literals themselves don't matter.
+TEST_F(TableSwitchPassTest, SimplePrioritySelectIgnoresLiterals) {
+  constexpr int kNumLiterals = 7;
+  const std::string program = R"(
+fn main(index: bits[32]) -> bits[32] {
+  literal.0: bits[32] = literal(value=0)
+  literal.1: bits[32] = literal(value=1)
+  literal.2: bits[32] = literal(value=2)
+  literal.3: bits[32] = literal(value=3)
+  literal.4: bits[32] = literal(value=4)
+  literal.5: bits[32] = literal(value=5)
+  literal.6: bits[32] = literal(value=6)
+  literal.50: bits[32] = literal(value=434)
+  literal.51: bits[32] = literal(value=3335)
+  literal.52: bits[32] = literal(value=2)
+  literal.53: bits[32] = literal(value=889798)
+  literal.54: bits[32] = literal(value=436)
+  literal.55: bits[32] = literal(value=1235)
+  literal.56: bits[32] = literal(value=555)
+  eq.10: bits[1] = eq(index, literal.0)
+  eq.11: bits[1] = eq(index, literal.1)
+  eq.12: bits[1] = eq(index, literal.2)
+  eq.13: bits[1] = eq(index, literal.3)
+  eq.14: bits[1] = eq(index, literal.4)
+  eq.15: bits[1] = eq(index, literal.5)
+  concat.16: bits[6] = concat(eq.10, eq.11, eq.12, eq.13, eq.14, eq.15)
+  ret priority_sel.17: bits[32] = priority_sel(concat.16, cases=[literal.56, literal.55, literal.54, literal.53, literal.52, literal.51], default=literal.50)
+}
+)";
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(program, p.get()));
+  PassResults results;
+  OptimizationContext context;
+  TableSwitchPass pass;
+  XLS_ASSERT_OK_AND_ASSIGN(std::vector<Value> before_data,
+                           GetBeforeData(f, kNumLiterals));
+
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f);
+  ASSERT_THAT(
+      pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results, context),
+      IsOkAndHolds(true));
   XLS_ASSERT_OK_AND_ASSIGN(
       Value array,
       Value::UBitsArray({3335, 2, 889798, 436, 1235, 555, 434}, 32));
@@ -228,9 +420,33 @@ fn main(index: bits[32]) -> bits[32] {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(program, p.get()));
   PassResults results;
+  OptimizationContext context;
   TableSwitchPass pass;
-  EXPECT_THAT(pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results),
-              IsOkAndHolds(false));
+  EXPECT_THAT(
+      pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results, context),
+      IsOkAndHolds(false));
+}
+
+// Verifies that a single literal switch is _not_ converted into a table
+// lookup.
+TEST_F(TableSwitchPassTest, SkipsTrivialPrioritySelect) {
+  const std::string program = R"(
+fn main(index: bits[32]) -> bits[32] {
+  literal.0: bits[32] = literal(value=0)
+  literal.1 : bits[32]= literal(value=1)
+  eq.4: bits[1] = eq(index, literal.0)
+  ret result: bits[32] = priority_sel(eq.4, cases=[literal.1], default=literal.0)
+}
+)";
+
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(program, p.get()));
+  PassResults results;
+  OptimizationContext context;
+  TableSwitchPass pass;
+  EXPECT_THAT(
+      pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results, context),
+      IsOkAndHolds(false));
 }
 
 // Verifies that TableSwitch only allows binary selects.
@@ -262,44 +478,83 @@ fn main(index: bits[32], bad_selector: bits[3]) -> bits[32] {
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(program, p.get()));
   PassResults results;
+  OptimizationContext context;
   TableSwitchPass pass;
-  EXPECT_THAT(pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results),
-              IsOkAndHolds(false));
+  EXPECT_THAT(
+      pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results, context),
+      IsOkAndHolds(false));
 }
 
-// Verifies that non-dense index sets (e.g., [0, 1, 2, 5]) aren't switched, but
-// subsets >= the minimum size are.
-TEST_F(TableSwitchPassTest, DenseOnly) {
+// Verifies that non-zero index sets, even with holes (e.g., [1, 2, 3, 5]), can
+// be switched to tables.
+TEST_F(TableSwitchPassTest, NonzeroStart) {
   const std::string program = R"(
 fn main(index: bits[32]) -> bits[32] {
-  literal.0: bits[32] = literal(value=0)
   literal.1: bits[32] = literal(value=1)
   literal.2: bits[32] = literal(value=2)
-  literal.4: bits[32] = literal(value=4)
+  literal.3: bits[32] = literal(value=3)
   literal.5: bits[32] = literal(value=5)
   literal.50: bits[32] = literal(value=0)
   literal.51: bits[32] = literal(value=111)
   literal.52: bits[32] = literal(value=222)
   literal.53: bits[32] = literal(value=333)
   literal.55: bits[32] = literal(value=555)
-  literal.56: bits[32] = literal(value=666)
-  eq.10: bits[1] = eq(index, literal.0)
   eq.11: bits[1] = eq(index, literal.1)
   eq.12: bits[1] = eq(index, literal.2)
-  eq.14: bits[1] = eq(index, literal.4)
+  eq.13: bits[1] = eq(index, literal.3)
   eq.15: bits[1] = eq(index, literal.5)
-  sel.20: bits[32] = sel(eq.10, cases=[literal.50, literal.51])
-  sel.21: bits[32] = sel(eq.11, cases=[sel.20, literal.52])
-  sel.22: bits[32] = sel(eq.12, cases=[sel.21, literal.53])
-  sel.24: bits[32] = sel(eq.14, cases=[sel.22, literal.55])
-  ret sel.25: bits[32] = sel(eq.15, cases=[sel.24, literal.56])
+  sel.21: bits[32] = sel(eq.11, cases=[literal.50, literal.51])
+  sel.22: bits[32] = sel(eq.12, cases=[sel.21, literal.52])
+  sel.23: bits[32] = sel(eq.13, cases=[sel.22, literal.53])
+  ret sel.25: bits[32] = sel(eq.15, cases=[sel.23, literal.55])
 }
 )";
   auto p = CreatePackage();
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(program, p.get()));
+
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value array, Value::UBitsArray({0, 111, 222, 333, 0, 555, 0}, 32));
+  EXPECT_THAT(f->return_value(), m::ArrayIndex(m::Literal(array),
+                                               /*indices=*/{m::Param()}));
+}
+
+// Verifies that non-dense index sets (e.g., [0, 1, 3, 7, 9]) aren't switched,
+// but subsets >= the minimum size are.
+TEST_F(TableSwitchPassTest, DenseOnly) {
+  const std::string program = R"(
+fn main(index: bits[32]) -> bits[32] {
+  literal.0: bits[32] = literal(value=0)
+  literal.1: bits[32] = literal(value=1)
+  literal.3: bits[32] = literal(value=3)
+  literal.7: bits[32] = literal(value=7)
+  literal.9: bits[32] = literal(value=9)
+  literal.50: bits[32] = literal(value=0)
+  literal.51: bits[32] = literal(value=111)
+  literal.52: bits[32] = literal(value=222)
+  literal.53: bits[32] = literal(value=333)
+  literal.57: bits[32] = literal(value=777)
+  literal.59: bits[32] = literal(value=999)
+  eq.10: bits[1] = eq(index, literal.0)
+  eq.11: bits[1] = eq(index, literal.1)
+  eq.13: bits[1] = eq(index, literal.3)
+  eq.17: bits[1] = eq(index, literal.7)
+  eq.19: bits[1] = eq(index, literal.9)
+  sel.20: bits[32] = sel(eq.10, cases=[literal.50, literal.51])
+  sel.21: bits[32] = sel(eq.11, cases=[sel.20, literal.52])
+  sel.22: bits[32] = sel(eq.13, cases=[sel.21, literal.53])
+  sel.24: bits[32] = sel(eq.17, cases=[sel.22, literal.57])
+  ret sel.25: bits[32] = sel(eq.19, cases=[sel.24, literal.59])
+}
+)";
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(program, p.get()));
+
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f);
   ASSERT_THAT(Run(f), IsOkAndHolds(true));
   XLS_ASSERT_OK_AND_ASSIGN(Value array,
-                           Value::UBitsArray({111, 222, 333, 0}, 32));
+                           Value::UBitsArray({111, 222, 0, 333, 0}, 32));
   bool has_array_index = false;
   for (const Node* node : f->nodes()) {
     if (node->op() == Op::kArrayIndex) {
@@ -507,9 +762,11 @@ fn main(x4: bits[62], x1: bits[25], x2: bits[24]) -> bits[62] {
                            ParsePackage(program));
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, p->GetFunction("main"));
   PassResults results;
+  OptimizationContext context;
   TableSwitchPass pass;
-  ASSERT_THAT(pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results),
-              IsOkAndHolds(false));
+  ASSERT_THAT(
+      pass.RunOnFunctionBase(f, OptimizationPassOptions(), &results, context),
+      IsOkAndHolds(false));
 }
 
 TEST_F(TableSwitchPassTest, FullIndexSpace) {
@@ -785,6 +1042,99 @@ fn main(index: bits[2]) -> bits[32] {
       m::ArrayIndex(
           m::Literal(Value::UBitsArray({111, 222, 333, 444}, 32).value()),
           /*indices=*/{m::Param()}));
+}
+
+// Verifies that if the chain ends mid-priority-select (and therefore without a
+// terminating literal), we terminate & recognize that it can't be replaced this
+// way.
+TEST_F(TableSwitchPassTest, ChainEndsMidPrioritySelect) {
+  const std::string program = R"(
+fn main(index: bits[32]) -> bits[32] {
+  literal.0: bits[32] = literal(value=0)
+  literal.1: bits[32] = literal(value=1)
+  literal.2: bits[32] = literal(value=2)
+  literal.3: bits[32] = literal(value=3)
+  literal.4: bits[32] = literal(value=4)
+  literal.5: bits[32] = literal(value=5)
+  literal.6: bits[32] = literal(value=6)
+  eq.10: bits[1] = eq(index, literal.0)
+  eq.11: bits[1] = eq(index, literal.1)
+  eq.12: bits[1] = eq(index, literal.2)
+  eq.13: bits[1] = eq(index, literal.3)
+  eq.14: bits[1] = eq(index, literal.4)
+  eq.15: bits[1] = eq(index, literal.5)
+  add.16: bits[32] = add(index, index)
+  uge.17: bits[1] = uge(add.16, literal.6)
+  concat.18: bits[7] = concat(uge.17, eq.15, eq.14, eq.13, eq.12, eq.11, eq.10)
+  ret priority_sel.19: bits[32] = priority_sel(concat.18, cases=[literal.1, literal.2, literal.3, literal.4, literal.5, literal.6, add.16], default=literal.0)
+})";
+
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(program, p.get()));
+  ASSERT_THAT(Run(f), IsOkAndHolds(false));
+}
+
+// Verifies that if the chain starts mid-priority-select, we can still switch
+// that part to a table.
+TEST_F(TableSwitchPassTest, ChainStartsMidPrioritySelect) {
+  constexpr int kNumLiterals = 7;
+  const std::string program = R"(
+fn main(index: bits[32]) -> bits[32] {
+  literal.0: bits[32] = literal(value=0)
+  literal.1: bits[32] = literal(value=1)
+  literal.2: bits[32] = literal(value=2)
+  literal.3: bits[32] = literal(value=3)
+  literal.4: bits[32] = literal(value=4)
+  literal.5: bits[32] = literal(value=5)
+  literal.6: bits[32] = literal(value=6)
+  eq.10: bits[1] = eq(index, literal.0)
+  eq.11: bits[1] = eq(index, literal.1)
+  eq.12: bits[1] = eq(index, literal.2)
+  eq.13: bits[1] = eq(index, literal.3)
+  eq.14: bits[1] = eq(index, literal.4)
+  eq.15: bits[1] = eq(index, literal.5)
+  add.16: bits[32] = add(index, index)
+  uge.17: bits[1] = uge(add.16, literal.6)
+  concat.18: bits[7] = concat(eq.15, eq.14, eq.13, eq.12, eq.11, eq.10, uge.17)
+  ret priority_sel.19: bits[32] = priority_sel(concat.18, cases=[add.16, literal.1, literal.2, literal.3, literal.4, literal.5, literal.6], default=literal.0)
+})";
+
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(program, p.get()));
+  // Capture the behavior before the transformation.
+  XLS_ASSERT_OK_AND_ASSIGN(std::vector<Value> before_data,
+                           GetBeforeData(f, kNumLiterals));
+
+  solvers::z3::ScopedVerifyEquivalence stays_equivalent(f);
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  XLS_ASSERT_OK_AND_ASSIGN(Value array,
+                           Value::UBitsArray({1, 2, 3, 4, 5, 6, 0}, 32));
+  EXPECT_THAT(
+      f->return_value(),
+      m::PrioritySelect(
+          m::BitSlice(),
+          /*cases=*/{m::Add()},
+          /*default_value=*/
+          m::ArrayIndex(m::Literal(array), /*indices=*/{m::Param("index")})));
+
+  XLS_ASSERT_OK(CompareBeforeAfter(f, before_data));
+}
+
+// Discovered by fuzzing as `crasher_2024-09-14_3014.x`, then minimized.
+TEST_F(TableSwitchPassTest, NeMidPrioritySelect) {
+  std::string program = R"(
+fn main(x0: bits[2]) -> bits[2] {
+  lit1: bits[2] = literal(value=1)
+  lit0: bits[2] = literal(value=0)
+  is1: bits[1] = eq(lit1, x0)
+  not0: bits[1] = ne(x0, lit0)
+  selector: bits[3] = concat(is1, is1, not0)
+  ret x15: bits[2] = priority_sel(selector, cases=[lit1, lit0, lit1], default=lit0)
+})";
+
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(program, p.get()));
+  ASSERT_THAT(Run(f), IsOkAndHolds(false));
 }
 
 }  // namespace

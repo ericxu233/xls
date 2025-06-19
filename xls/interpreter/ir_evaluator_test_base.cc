@@ -20,23 +20,27 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/base/casts.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/substitute.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/math_util.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/interpreter/observer.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
 #include "xls/ir/events.h"
@@ -48,18 +52,45 @@
 #include "xls/ir/ir_test_base.h"
 #include "xls/ir/package.h"
 #include "xls/ir/value.h"
-#include "xls/ir/value_helpers.h"
+#include "xls/ir/value_builder.h"
+#include "xls/ir/value_utils.h"
 #include "xls/ir/verifier.h"
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::ElementsAre;
+using ::testing::FieldsAre;
 using ::testing::HasSubstr;
+using ::testing::Pair;
+using ::testing::UnorderedElementsAre;
 
 using ArgMap = absl::flat_hash_map<std::string, Value>;
+
+using VB = ValueBuilder;
+
+TEST_P(IrEvaluatorTestBase, InterpretObserver) {
+  if (!GetParam().supports_observer) {
+    GTEST_SKIP() << "Observer not supported.";
+  }
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue p1 = fb.Param("p1", p->GetBitsType(32));
+  BValue p2 = fb.Param("p2", p->GetBitsType(32));
+  BValue res = fb.Add(p1, p2);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  CollectingEvaluationObserver observer;
+  ASSERT_THAT(
+      RunWithNoEvents(f, {Value(UBits(1, 32)), Value(UBits(2, 32))}, &observer),
+      IsOkAndHolds(Value(UBits(3, 32))));
+  EXPECT_THAT(
+      observer.values(),
+      UnorderedElementsAre(Pair(p1.node(), ElementsAre(Value(UBits(1, 32)))),
+                           Pair(p2.node(), ElementsAre(Value(UBits(2, 32)))),
+                           Pair(res.node(), ElementsAre(Value(UBits(3, 32))))));
+}
 
 TEST_P(IrEvaluatorTestBase, InterpretLiteral) {
   Package package("my_package");
@@ -335,7 +366,8 @@ absl::Status RunZeroExtendTest(const IrEvaluatorTestParam& param,
   XLS_ASSIGN_OR_RETURN(auto package, Parser::ParsePackage(formatted_ir));
   XLS_ASSIGN_OR_RETURN(Function * function, package->GetTopAsFunction());
 
-  EXPECT_THAT(DropInterpreterEvents(param.evaluator(function, /*args=*/{})),
+  EXPECT_THAT(DropInterpreterEvents(
+                  param.evaluator(function, /*args=*/{}, std::nullopt)),
               IsOkAndHolds(Value(UBits(3, output_size))));
 
   return absl::OkStatus();
@@ -364,8 +396,9 @@ absl::Status RunSignExtendTest(const IrEvaluatorTestParam& param,
   XLS_ASSIGN_OR_RETURN(auto package, Parser::ParsePackage(formatted_text));
   XLS_ASSIGN_OR_RETURN(Function * function, package->GetTopAsFunction());
   Value expected(bits_ops::SignExtend(input, new_bit_count));
-  EXPECT_THAT(DropInterpreterEvents(param.evaluator(function, {})),
-              IsOkAndHolds(expected));
+  EXPECT_THAT(
+      DropInterpreterEvents(param.evaluator(function, {}, std::nullopt)),
+      IsOkAndHolds(expected));
   return absl::OkStatus();
 }
 
@@ -966,7 +999,7 @@ TEST_P(IrEvaluatorTestBase, SMulpSignExtensionNotSound) {
           bits_ops::SignExtend(bits_ops::SMul(x_bits, y_bits), result_width);
       XLS_ASSERT_OK_AND_ASSIGN(Bits actual,
                                RunWithBitsNoEvents(function, {x_bits, y_bits}));
-      XLS_VLOG(3) << absl::StreamFormat(
+      VLOG(3) << absl::StreamFormat(
           "smulp(bits[%d]: %v, bits[%d]: %v) = bits[%d]: %v =? %v", x_width,
           x_bits, y_width, y_bits, result_width, actual, product);
       if (actual != product) {
@@ -978,7 +1011,6 @@ TEST_P(IrEvaluatorTestBase, SMulpSignExtensionNotSound) {
 after_loop:
   EXPECT_TRUE(found_mismatch);
 }
-
 
 TEST_P(IrEvaluatorTestBase, UMulpSimple) {
   Package package("my_package");
@@ -1121,7 +1153,7 @@ TEST_P(IrEvaluatorTestBase, UMulpZeroExtensionNotSound) {
           bits_ops::ZeroExtend(bits_ops::UMul(x_bits, y_bits), result_width);
       XLS_ASSERT_OK_AND_ASSIGN(Bits actual,
                                RunWithBitsNoEvents(function, {x_bits, y_bits}));
-      XLS_VLOG(3) << absl::StreamFormat(
+      VLOG(3) << absl::StreamFormat(
           "umulp(bits[%d]: %v, bits[%d]: %v) = bits[%d]: %v =? %v", x_width,
           x_bits, y_width, y_bits, result_width, actual, product);
       if (actual != product) {
@@ -1132,6 +1164,21 @@ TEST_P(IrEvaluatorTestBase, UMulpZeroExtensionNotSound) {
   }
 after_loop:
   EXPECT_TRUE(found_mismatch);
+}
+
+TEST_P(IrEvaluatorTestBase, BigDiv) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue lhs = fb.Param("lhs", p->GetBitsType(100));
+  BValue rhs = fb.Param("rhs", p->GetBitsType(100));
+  fb.Tuple({fb.UDiv(lhs, rhs), fb.SDiv(lhs, rhs), fb.UMod(lhs, rhs),
+            fb.SMod(lhs, rhs)});
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+
+  EXPECT_THAT(
+      RunWithNoEvents(f, {Value(UBits(12, 100)), Value(UBits(2, 100))}),
+      IsOkAndHolds(Value::Tuple({Value(UBits(6, 100)), Value(UBits(6, 100)),
+                                 Value(UBits(0, 100)), Value(UBits(0, 100))})));
 }
 
 TEST_P(IrEvaluatorTestBase, InterpretUDiv) {
@@ -1497,7 +1544,6 @@ absl::Status RunConcatTest(const IrEvaluatorTestParam& param,
   }
   )";
 
-  std::string bytes_str = "0x";
   std::vector<uint8_t> bytes;
 
   const Value& a = kwargs.at("a");
@@ -1510,7 +1556,8 @@ absl::Status RunConcatTest(const IrEvaluatorTestParam& param,
   XLS_ASSIGN_OR_RETURN(Function * function, package->GetTopAsFunction());
 
   Value expected(bits_ops::Concat({a.bits(), b.bits()}));
-  EXPECT_THAT(DropInterpreterEvents(param.kwargs_evaluator(function, kwargs)),
+  EXPECT_THAT(DropInterpreterEvents(
+                  param.kwargs_evaluator(function, kwargs, std::nullopt)),
               IsOkAndHolds(expected));
   return absl::OkStatus();
 }
@@ -1559,11 +1606,10 @@ TEST_P(IrEvaluatorTestBase, InterpretOneHot) {
   };
 
   for (const auto& example : examples) {
-    XLS_VLOG(2) << "input: "
-                << BitsToString(example.input, FormatPreference::kBinary, true)
-                << " expected: "
-                << BitsToString(example.output, FormatPreference::kBinary,
-                                true);
+    VLOG(2) << "input: "
+            << BitsToString(example.input, FormatPreference::kBinary, true)
+            << " expected: "
+            << BitsToString(example.output, FormatPreference::kBinary, true);
     EXPECT_THAT(RunWithNoEvents(function, {Value(example.input)}),
                 IsOkAndHolds(Value(example.output)));
   }
@@ -1590,11 +1636,10 @@ TEST_P(IrEvaluatorTestBase, InterpretOneHotMsbPrio) {
   };
 
   for (const auto& example : examples) {
-    XLS_VLOG(2) << "input: "
-                << BitsToString(example.input, FormatPreference::kBinary, true)
-                << " expected: "
-                << BitsToString(example.output, FormatPreference::kBinary,
-                                true);
+    VLOG(2) << "input: "
+            << BitsToString(example.input, FormatPreference::kBinary, true)
+            << " expected: "
+            << BitsToString(example.output, FormatPreference::kBinary, true);
     EXPECT_THAT(RunWithNoEvents(function, {Value(example.input)}),
                 IsOkAndHolds(Value(example.output)));
   }
@@ -1749,18 +1794,84 @@ TEST_P(IrEvaluatorTestBase, InterpretOneHotSelect2DArray) {
                   "[[bits[4]:12, bits[4]:14], [bits[4]:9, bits[4]:6]]")));
 }
 
+TEST_P(IrEvaluatorTestBase, OneBitSignExtend) {
+  Package package("my_package");
+
+  // 1-bit values are handled somewhat specially.
+  XLS_ASSERT_OK_AND_ASSIGN(Function * function,
+                           ParseAndGetFunction(&package, R"(
+fn __sample__main(x1: bits[4] id=1) -> (bits[24], bits[20][1]) {
+  or_reduce.328: bits[1] = or_reduce(x1, id=328)
+  not.335: bits[1] = not(or_reduce.328, id=335)
+  x16: bits[24] = sign_ext(not.335, new_bit_count=24, id=333)
+  x17: bits[20][1] = literal(value=[0], id=326, pos=[(0,28,36)])
+  ret tuple.308: (bits[24], bits[20][1]) = tuple(x16, x17, id=308, pos=[(0,38,8)])
+}
+  )"));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value expected0,
+      ValueBuilder::Tuple({ValueBuilder::Bits(UBits(0xffffff, 24)),
+                           ValueBuilder::SBitsArray({0}, 20)})
+          .Build());
+  EXPECT_THAT(RunWithNoEvents(function, {Value(UBits(0, 4))}),
+              IsOkAndHolds(Value(expected0)));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value expected_other,
+      ValueBuilder::Tuple({ValueBuilder::Bits(UBits(0x0, 24)),
+                           ValueBuilder::SBitsArray({0}, 20)})
+          .Build());
+  EXPECT_THAT(RunWithNoEvents(function, {Value(UBits(1, 4))}),
+              IsOkAndHolds(Value(expected_other)));
+}
+
+TEST_P(IrEvaluatorTestBase, InterpretPrioritySelectBus) {
+  Package package("my_package");
+  // This was found to cause a bus error on jit.
+  XLS_ASSERT_OK_AND_ASSIGN(Function * function,
+                           ParseAndGetFunction(&package, R"(
+fn __sample__main(x1: bits[4] id=1) -> (bits[24], bits[20][1]) {
+  literal.299: (bits[1], bits[24]) = literal(value=(0, 0), id=299, pos=[(0,24,45)])
+  literal.170: (bits[1], bits[24]) = literal(value=(1, 16777215), id=170, pos=[(0,26,17)])
+  literal.141: bits[20][7] = literal(value=[0, 0, 0, 0, 0, 0, 0], id=141)
+
+  priority_sel.71: (bits[1], bits[24]) = priority_sel(x1, cases=[literal.299, literal.299, literal.299, literal.299], default=literal.170, id=71)
+
+  x15: bits[1] = tuple_index(priority_sel.71, index=0, id=72, pos=[(0,22,13)])
+  x16: bits[24] = tuple_index(priority_sel.71, index=1, id=73, pos=[(0,22,18)])
+  x17: bits[20][1] = array_slice(literal.141, x15, width=1, id=77, pos=[(0,28,36)])
+
+  ret tuple.308: (bits[24], bits[20][1]) = tuple(x16, x17, id=308, pos=[(0,38,8)])
+}
+  )"));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value expected0,
+      ValueBuilder::Tuple({ValueBuilder::Bits(UBits(0xffffff, 24)),
+                           ValueBuilder::SBitsArray({0}, 20)})
+          .Build());
+  EXPECT_THAT(RunWithNoEvents(function, {Value(UBits(0, 4))}),
+              IsOkAndHolds(Value(expected0)));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value expected_other,
+      ValueBuilder::Tuple({ValueBuilder::Bits(UBits(0x0, 24)),
+                           ValueBuilder::SBitsArray({0}, 20)})
+          .Build());
+  EXPECT_THAT(RunWithNoEvents(function, {Value(UBits(1, 4))}),
+              IsOkAndHolds(Value(expected_other)));
+}
+
 TEST_P(IrEvaluatorTestBase, InterpretPrioritySelect) {
   Package package("my_package");
   XLS_ASSERT_OK_AND_ASSIGN(Function * function,
                            ParseAndGetFunction(&package, R"(
-  fn one_hot(p: bits[3], x: bits[8], y: bits[8], z: bits[8]) -> bits[8] {
-    ret priority_sel.1: bits[8] = priority_sel(p, cases=[x, y, z])
+  fn one_hot(p: bits[3], x: bits[8], y: bits[8], z: bits[8], d: bits[8]) -> bits[8] {
+    ret priority_sel.1: bits[8] = priority_sel(p, cases=[x, y, z], default=d)
   }
   )"));
   absl::flat_hash_map<std::string, Value> args_map = {
       {"x", Value(UBits(0b00001111, 8))},
       {"y", Value(UBits(0b00110011, 8))},
-      {"z", Value(UBits(0b01010101, 8))}};
+      {"z", Value(UBits(0b01010101, 8))},
+      {"d", Value(UBits(0b00000000, 8))}};
 
   struct Example {
     Bits p;
@@ -1783,6 +1894,7 @@ TEST_P(IrEvaluatorTestBase, InterpretPrioritySelect) {
     args.push_back(args_map["x"]);
     args.push_back(args_map["y"]);
     args.push_back(args_map["z"]);
+    args.push_back(args_map["d"]);
     EXPECT_THAT(RunWithNoEvents(function, args),
                 IsOkAndHolds(Value(example.output)));
   }
@@ -1792,13 +1904,14 @@ TEST_P(IrEvaluatorTestBase, InterpretPriorityNestedTuple) {
   Package package("my_package");
   XLS_ASSERT_OK_AND_ASSIGN(Function * function,
                            ParseAndGetFunction(&package, R"(
-  fn priority(p: bits[2], x: (bits[3], (bits[8])), y: (bits[3], (bits[8]))) -> (bits[3], (bits[8])) {
-    ret priority_sel.1: (bits[3], (bits[8])) = priority_sel(p, cases=[x, y])
+  fn priority(p: bits[2], x: (bits[3], (bits[8])), y: (bits[3], (bits[8])), d: (bits[3], (bits[8]))) -> (bits[3], (bits[8])) {
+    ret priority_sel.1: (bits[3], (bits[8])) = priority_sel(p, cases=[x, y], default=d)
   }
   )"));
   absl::flat_hash_map<std::string, Value> args = {
       {"x", AsValue("(bits[3]:0b101, (bits[8]:0b11001100))")},
-      {"y", AsValue("(bits[3]:0b001, (bits[8]:0b00001111))")}};
+      {"y", AsValue("(bits[3]:0b001, (bits[8]:0b00001111))")},
+      {"d", AsValue("(bits[3]:0b000, (bits[8]:0b00000000))")}};
 
   args["p"] = AsValue("bits[2]: 0b00");
   EXPECT_THAT(RunWithKwargsNoEvents(function, args),
@@ -1818,13 +1931,14 @@ TEST_P(IrEvaluatorTestBase, InterpretPriorityArray) {
   Package package("my_package");
   XLS_ASSERT_OK_AND_ASSIGN(Function * function,
                            ParseAndGetFunction(&package, R"(
-  fn priority(p: bits[2], x: bits[4][3], y: bits[4][3]) -> bits[4][3] {
-    ret priority_sel.1: bits[4][3] = priority_sel(p, cases=[x, y])
+  fn priority(p: bits[2], x: bits[4][3], y: bits[4][3], d: bits[4][3]) -> bits[4][3] {
+    ret priority_sel.1: bits[4][3] = priority_sel(p, cases=[x, y], default=d)
   }
   )"));
   absl::flat_hash_map<std::string, Value> args = {
       {"x", AsValue("[bits[4]:0b0001, bits[4]:0b0010, bits[4]:0b0100]")},
-      {"y", AsValue("[bits[4]:0b1100, bits[4]:0b0101, bits[4]:0b1110]")}};
+      {"y", AsValue("[bits[4]:0b1100, bits[4]:0b0101, bits[4]:0b1110]")},
+      {"d", AsValue("[bits[4]:0b0000, bits[4]:0b0000, bits[4]:0b0000]")}};
 
   args["p"] = AsValue("bits[2]: 0b00");
   EXPECT_THAT(RunWithKwargsNoEvents(function, args),
@@ -2037,7 +2151,8 @@ absl::Status RunReverseTest(const IrEvaluatorTestParam& param,
   XLS_ASSIGN_OR_RETURN(Function * function, package->GetTopAsFunction());
 
   Value expected(bits_ops::Reverse(bits));
-  EXPECT_THAT(DropInterpreterEvents(param.evaluator(function, {Value(bits)})),
+  EXPECT_THAT(DropInterpreterEvents(
+                  param.evaluator(function, {Value(bits)}, std::nullopt)),
               IsOkAndHolds(expected));
 
   return absl::OkStatus();
@@ -2548,23 +2663,23 @@ TEST_P(IrEvaluatorTestBase, InterpretArrayUpdateInBounds) {
   // Index 0
   EXPECT_THAT(
       RunWithKwargsNoEvents(function,
-                            /*args=*/{{"array", make_array({1, 2, 3})},
-                                      {"idx", Value(UBits(0, 32))},
-                                      {"new_value", Value(UBits(99, 32))}}),
+                            /*kwargs=*/{{"array", make_array({1, 2, 3})},
+                                        {"idx", Value(UBits(0, 32))},
+                                        {"new_value", Value(UBits(99, 32))}}),
       IsOkAndHolds(make_array({99, 2, 3})));
   // Index 1
   EXPECT_THAT(
       RunWithKwargsNoEvents(function,
-                            /*args=*/{{"array", make_array({1, 2, 3})},
-                                      {"idx", Value(UBits(1, 32))},
-                                      {"new_value", Value(UBits(99, 32))}}),
+                            /*kwargs=*/{{"array", make_array({1, 2, 3})},
+                                        {"idx", Value(UBits(1, 32))},
+                                        {"new_value", Value(UBits(99, 32))}}),
       IsOkAndHolds(make_array({1, 99, 3})));
   // Index 2
   EXPECT_THAT(
       RunWithKwargsNoEvents(function,
-                            /*args=*/{{"array", make_array({1, 2, 3})},
-                                      {"idx", Value(UBits(2, 32))},
-                                      {"new_value", Value(UBits(99, 32))}}),
+                            /*kwargs=*/{{"array", make_array({1, 2, 3})},
+                                        {"idx", Value(UBits(2, 32))},
+                                        {"new_value", Value(UBits(99, 32))}}),
       IsOkAndHolds(make_array({1, 2, 99})));
 }
 
@@ -2752,7 +2867,7 @@ TEST_P(IrEvaluatorTestBase, InterpretArrayUpdateWideIndexInbounds) {
                                               }));
   Value index = Value(UBits(1, 1000));
   EXPECT_THAT(RunWithKwargsNoEvents(function,
-                                    /*args=*/{{"index", index}}),
+                                    /*kwargs=*/{{"index", index}}),
               IsOkAndHolds(array_value));
 }
 
@@ -2774,7 +2889,7 @@ TEST_P(IrEvaluatorTestBase, InterpretArrayUpdateWideIndexOutOfBounds) {
                                               }));
   Value index = Value(Bits::PowerOfTwo(900, 1000));
   EXPECT_THAT(RunWithKwargsNoEvents(function,
-                                    /*args=*/{{"index", index}}),
+                                    /*kwargs=*/{{"index", index}}),
               IsOkAndHolds(array_value));
 }
 
@@ -2794,7 +2909,7 @@ TEST_P(IrEvaluatorTestBase, InterpretArrayConcatArraysOfBits) {
                            Value::UBitsArray({1, 2, 3, 4, 5, 1, 2}, 32));
 
   EXPECT_THAT(RunWithKwargsNoEvents(function,
-                                    /*args=*/{{"a0", a0}, {"a1", a1}}),
+                                    /*kwargs=*/{{"a0", a0}, {"a1", a1}}),
               IsOkAndHolds(ret));
 }
 
@@ -2818,7 +2933,7 @@ TEST_P(IrEvaluatorTestBase, InterpretArrayConcatArraysOfBitsMixedOperands) {
 
   EXPECT_THAT(
       RunWithKwargsNoEvents(function,
-                            /*args=*/{{"a0", a0}, {"a1", a1}, {"a2", a2}}),
+                            /*kwargs=*/{{"a0", a0}, {"a1", a1}, {"a2", a2}}),
       IsOkAndHolds(ret));
 }
 
@@ -3016,8 +3131,8 @@ TEST_P(IrEvaluatorTestBase, AfterAllTokenArgs) {
   )"));
   XLS_ASSERT_OK_AND_ASSIGN(Function * function, package->GetTopAsFunction());
   EXPECT_THAT(
-      RunWithKwargsNoEvents(
-          function, /*args=*/{{"t1", Value::Token()}, {"t2", Value::Token()}}),
+      RunWithKwargsNoEvents(function, /*kwargs=*/{{"t1", Value::Token()},
+                                                  {"t2", Value::Token()}}),
       IsOkAndHolds(Value::Token()));
 }
 
@@ -3057,12 +3172,68 @@ TEST_P(IrEvaluatorTestBase, Decode) {
   EXPECT_THAT(RunWithUint64sNoEvents(function, {7}), IsOkAndHolds(128));
 }
 
+TEST_P(IrEvaluatorTestBase, DecodeAfterZeroExtension) {
+  XLS_ASSERT_OK_AND_ASSIGN(auto package, Parser::ParsePackage(R"(
+  package test
+
+  top fn main(x: bits[2]) -> bits[8] {
+    zero_ext.1: bits[3] = zero_ext(x, new_bit_count=3)
+    ret decode.2: bits[8] = decode(zero_ext.1, width=8)
+  }
+  )"));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * function, package->GetTopAsFunction());
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {0}), IsOkAndHolds(1));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {1}), IsOkAndHolds(2));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {2}), IsOkAndHolds(4));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {3}), IsOkAndHolds(8));
+}
+
 TEST_P(IrEvaluatorTestBase, NarrowedDecode) {
   XLS_ASSERT_OK_AND_ASSIGN(auto package, Parser::ParsePackage(R"(
   package test
 
   top fn main(x: bits[3]) -> bits[5] {
     ret decode.1: bits[5] = decode(x, width=5)
+  }
+  )"));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * function, package->GetTopAsFunction());
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {0}), IsOkAndHolds(1));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {1}), IsOkAndHolds(2));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {2}), IsOkAndHolds(4));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {3}), IsOkAndHolds(8));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {4}), IsOkAndHolds(16));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {5}), IsOkAndHolds(0));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {6}), IsOkAndHolds(0));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {7}), IsOkAndHolds(0));
+}
+
+// Tests decode where the output is narrower than the input.
+TEST_P(IrEvaluatorTestBase, ExtremelyNarrowedDecode) {
+  XLS_ASSERT_OK_AND_ASSIGN(auto package, Parser::ParsePackage(R"(
+  package test
+
+  top fn main(x: bits[3]) -> bits[2] {
+    ret decode.1: bits[2] = decode(x, width=2)
+  }
+  )"));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * function, package->GetTopAsFunction());
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {0}), IsOkAndHolds(1));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {1}), IsOkAndHolds(2));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {2}), IsOkAndHolds(0));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {3}), IsOkAndHolds(0));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {4}), IsOkAndHolds(0));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {5}), IsOkAndHolds(0));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {6}), IsOkAndHolds(0));
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {7}), IsOkAndHolds(0));
+}
+
+TEST_P(IrEvaluatorTestBase, ExtremelyNarrowedDecodeAfterZeroExtension) {
+  XLS_ASSERT_OK_AND_ASSIGN(auto package, Parser::ParsePackage(R"(
+  package test
+
+  top fn main(x: bits[3]) -> bits[5] {
+    zero_ext.1: bits[42] = zero_ext(x, new_bit_count=42)
+    ret decode.2: bits[5] = decode(zero_ext.1, width=5)
   }
   )"));
   XLS_ASSERT_OK_AND_ASSIGN(Function * function, package->GetTopAsFunction());
@@ -3110,6 +3281,40 @@ TEST_P(IrEvaluatorTestBase, Encode) {
   }
 }
 
+TEST_P(IrEvaluatorTestBase, WideEncode) {
+  XLS_ASSERT_OK_AND_ASSIGN(auto package, Parser::ParsePackage(R"(
+  package test
+
+  top fn main(x: bits[100]) -> bits[7] {
+    ret encode.1: bits[7] = encode(x)
+  }
+  )"));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * function, package->GetTopAsFunction());
+  EXPECT_THAT(RunWithUint64sNoEvents(function, {0}), IsOkAndHolds(0));
+
+  EXPECT_THAT(RunWithNoEvents(
+                  function, {Parser::ParseTypedValue("bits[100]:0x0").value()}),
+              IsOkAndHolds(Value(UBits(0, 7))));
+  EXPECT_THAT(RunWithNoEvents(
+                  function, {Parser::ParseTypedValue(
+                                 "bits[100]:0x8_0000_0000_0000_0000_0000_0000")
+                                 .value()}),
+              IsOkAndHolds(Value(UBits(99, 7))));
+  EXPECT_THAT(RunWithNoEvents(
+                  function, {Parser::ParseTypedValue("bits[100]:0x1").value()}),
+              IsOkAndHolds(Value(UBits(0, 7))));
+  EXPECT_THAT(
+      RunWithNoEvents(function, {Parser::ParseTypedValue(
+                                     "bits[100]:0x1000_0000_0000_0000_0000")
+                                     .value()}),
+      IsOkAndHolds(Value(UBits(76, 7))));
+  EXPECT_THAT(
+      RunWithNoEvents(
+          function,
+          {Parser::ParseTypedValue("bits[100]:0x10_0040_0008_0300").value()}),
+      IsOkAndHolds(Value(UBits(0x3f, 7))));
+}
+
 TEST_P(IrEvaluatorTestBase, RunMismatchedType) {
   XLS_ASSERT_OK_AND_ASSIGN(auto package, Parser::ParsePackage(R"(
   package test
@@ -3155,8 +3360,9 @@ absl::Status RunBitSliceTest(const IrEvaluatorTestParam& param,
   std::reverse(bytes.begin(), bytes.end());
   Value expected(
       Bits::FromBytes(bytes, literal_width).Slice(slice_start, slice_width));
-  EXPECT_THAT(DropInterpreterEvents(param.evaluator(function, {})),
-              IsOkAndHolds(expected));
+  EXPECT_THAT(
+      DropInterpreterEvents(param.evaluator(function, {}, std::nullopt)),
+      IsOkAndHolds(expected));
 
   return absl::OkStatus();
 }
@@ -3212,8 +3418,9 @@ absl::Status RunDynamicBitSliceTest(const IrEvaluatorTestParam& param,
     Bits truncated = shifted.Slice(0, slice_width);
     expected = Value(truncated);
   }
-  EXPECT_THAT(DropInterpreterEvents(param.evaluator(function, {})),
-              IsOkAndHolds(expected));
+  EXPECT_THAT(
+      DropInterpreterEvents(param.evaluator(function, {}, std::nullopt)),
+      IsOkAndHolds(expected));
 
   return absl::OkStatus();
 }
@@ -3258,8 +3465,9 @@ absl::Status RunDynamicBitSliceTestLargeStart(const IrEvaluatorTestParam& param,
 
   // Clearly out of bounds
   Value expected = Value(Bits(slice_width));
-  EXPECT_THAT(DropInterpreterEvents(param.evaluator(function, {})),
-              IsOkAndHolds(expected));
+  EXPECT_THAT(
+      DropInterpreterEvents(param.evaluator(function, {}, std::nullopt)),
+      IsOkAndHolds(expected));
 
   return absl::OkStatus();
 }
@@ -3309,7 +3517,8 @@ absl::Status RunBitwiseReduceTest(
   XLS_ASSIGN_OR_RETURN(auto package, Parser::ParsePackage(formatted_ir));
   XLS_ASSIGN_OR_RETURN(Function * function, package->GetTopAsFunction());
 
-  EXPECT_THAT(DropInterpreterEvents(param.evaluator(function, {Value(bits)})),
+  EXPECT_THAT(DropInterpreterEvents(
+                  param.evaluator(function, {Value(bits)}, std::nullopt)),
               IsOkAndHolds(generate_expected(bits)));
   return absl::OkStatus();
 }
@@ -3843,7 +4052,7 @@ TEST_P(IrEvaluatorTestBase, FunAssert) {
 
   XLS_ASSERT_OK_AND_ASSIGN(Function * fun, fun_builder.Build());
 
-  FunctionBuilder top_builder("top", &p);
+  FunctionBuilder top_builder("top_f", &p);
   auto y = top_builder.Param("y", p.GetBitsType(5));
 
   std::vector<BValue> args = {y};
@@ -3952,7 +4161,12 @@ fn ba (in_token:token, a_cond: bits[1], b_cond: bits[1]) -> bits[8] {
   auto run_for_traces = [this](Function* f, absl::Span<const Value> args)
       -> absl::StatusOr<std::vector<std::string>> {
     XLS_ASSIGN_OR_RETURN(auto result, RunWithEvents(f, args));
-    return result.events.trace_msgs;
+    std::vector<std::string> trace_msgs;
+    trace_msgs.reserve(result.events.trace_msgs.size());
+    for (const auto& msg : result.events.trace_msgs) {
+      trace_msgs.push_back(msg.message);
+    }
+    return trace_msgs;
   };
 
   std::vector<std::string> no_traces = {};
@@ -4005,7 +4219,8 @@ TEST_P(IrEvaluatorTestBase, EmptyTraceTest) {
                            RunWithEvents(f, print_trace_args));
   EXPECT_EQ(print_trace_result.value, Value::Token());
   EXPECT_THAT(print_trace_result.events.assert_msgs, ElementsAre());
-  EXPECT_THAT(print_trace_result.events.trace_msgs, ElementsAre(""));
+  EXPECT_THAT(print_trace_result.events.trace_msgs,
+              ElementsAre(FieldsAre("", 0)));
 }
 
 TEST_P(IrEvaluatorTestBase, ThreeStringTraceTest) {
@@ -4030,7 +4245,102 @@ TEST_P(IrEvaluatorTestBase, ThreeStringTraceTest) {
   EXPECT_EQ(print_trace_result.value, Value::Token());
   EXPECT_THAT(print_trace_result.events.assert_msgs, ElementsAre());
   EXPECT_THAT(print_trace_result.events.trace_msgs,
-              ElementsAre("hello world!"));
+              ElementsAre(FieldsAre("hello world!", 0)));
+}
+
+TEST_P(IrEvaluatorTestBase, TupleTraceTest) {
+  Package p("empty_trace_test");
+
+  FunctionBuilder b("fun", &p);
+
+  auto p0 = b.Param("tkn", p.GetTokenType());
+  std::vector<BValue> args = {};
+  b.Trace(
+      p0, /*condition=*/b.Literal(UBits(1, 1)),
+      {b.Literal(Value::Tuple({Value(UBits(1, 8)), Value(UBits(123, 32))}))},
+      "my tuple = {}");
+
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, b.Build());
+
+  XLS_ASSERT_OK_AND_ASSIGN(InterpreterResult<Value> print_trace_result,
+                           RunWithEvents(f, {Value::Token()}));
+  EXPECT_THAT(print_trace_result.events.assert_msgs, ElementsAre());
+  EXPECT_THAT(print_trace_result.events.trace_msgs,
+              ElementsAre(FieldsAre("my tuple = (1, 123)", 0)));
+}
+
+TEST_P(IrEvaluatorTestBase, TupleTraceTestHex) {
+  Package p("empty_trace_test");
+
+  FunctionBuilder b("fun", &p);
+
+  auto p0 = b.Param("tkn", p.GetTokenType());
+  std::vector<BValue> args = {};
+  b.Trace(
+      p0, /*condition=*/b.Literal(UBits(1, 1)),
+      {b.Literal(Value::Tuple({Value(UBits(1, 8)), Value(UBits(123, 32))}))},
+      "my tuple = {:#x}");
+
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, b.Build());
+
+  XLS_ASSERT_OK_AND_ASSIGN(InterpreterResult<Value> print_trace_result,
+                           RunWithEvents(f, {Value::Token()}));
+  EXPECT_THAT(print_trace_result.events.assert_msgs, ElementsAre());
+  EXPECT_THAT(print_trace_result.events.trace_msgs,
+              ElementsAre(FieldsAre("my tuple = (0x1, 0x7b)", 0)));
+}
+
+TEST_P(IrEvaluatorTestBase, ComplexTypeTraceTest) {
+  Package p("empty_trace_test");
+
+  FunctionBuilder b("fun", &p);
+
+  auto p0 = b.Param("tkn", p.GetTokenType());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value complex_value,
+      VB::Tuple(
+          {VB::Array(
+               {VB::Tuple({VB::Bits(UBits(1, 4)), VB::Bits(UBits(2, 24))}),
+                VB::Tuple({VB::Bits(UBits(3, 4)), VB::Bits(UBits(123, 24))})}),
+           VB::Bits(UBits(42, 8)), VB::Token(), VB::Tuple({})})
+          .Build());
+  b.Trace(p0, /*condition=*/b.Literal(UBits(1, 1)), {b.Literal(complex_value)},
+          "my complex value = {}");
+
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, b.Build());
+
+  XLS_ASSERT_OK_AND_ASSIGN(InterpreterResult<Value> print_trace_result,
+                           RunWithEvents(f, {Value::Token()}));
+  EXPECT_THAT(print_trace_result.events.assert_msgs, ElementsAre());
+  EXPECT_THAT(
+      print_trace_result.events.trace_msgs,
+      ElementsAre(FieldsAre(
+          "my complex value = ([(1, 2), (3, 123)], 42, token, ())", 0)));
+}
+
+TEST_P(IrEvaluatorTestBase, TraceVerbosityTest) {
+  Package p("empty_trace_test");
+
+  FunctionBuilder b("fun", &p);
+
+  auto p0 = b.Param("tkn", p.GetTokenType());
+  auto p1 = b.Param("cnd", p.GetBitsType(1));
+  std::vector<BValue> args = {};
+  std::vector<FormatStep> format = {"hello", " ", "world!"};
+  b.Trace(p0, p1, args, format, /*verbosity=*/3);
+
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, b.Build());
+
+  std::vector<Value> no_trace_args = {Value::Token(), Value(UBits(0, 1))};
+  EXPECT_THAT(RunWithNoEvents(f, no_trace_args), IsOkAndHolds(Value::Token()));
+
+  std::vector<Value> print_trace_args = {Value::Token(), Value(UBits(1, 1))};
+  XLS_ASSERT_OK_AND_ASSIGN(InterpreterResult<Value> print_trace_result,
+                           RunWithEvents(f, print_trace_args));
+  EXPECT_EQ(print_trace_result.value, Value::Token());
+  EXPECT_THAT(print_trace_result.events.assert_msgs, ElementsAre());
+  EXPECT_THAT(print_trace_result.events.trace_msgs,
+              ElementsAre(FieldsAre("hello world!", 3)));
 }
 
 TEST_P(IrEvaluatorTestBase, ConcatWithZeroWidth) {
@@ -4042,6 +4352,19 @@ TEST_P(IrEvaluatorTestBase, ConcatWithZeroWidth) {
   EXPECT_THAT(RunWithUint64sNoEvents(f, {42}), 42);
   EXPECT_THAT(RunWithUint64sNoEvents(f, {0}), 0);
   EXPECT_THAT(RunWithUint64sNoEvents(f, {0x12345678}), 0x12345678);
+}
+
+TEST_P(IrEvaluatorTestBase, DecodeWithWideInput) {
+  auto p = CreatePackage();
+  FunctionBuilder b(TestName(), p.get());
+  auto x = b.Param("x", p->GetBitsType(32));
+  auto extended_x = b.SignExtend(x, 128);
+  b.Decode(extended_x, /*width=*/64);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, b.Build());
+  EXPECT_THAT(RunWithUint64sNoEvents(f, {42}), uint64_t{1} << 42);
+  EXPECT_THAT(RunWithUint64sNoEvents(f, {0}), 1);
+  EXPECT_THAT(
+      RunWithUint64sNoEvents(f, {absl::bit_cast<uint32_t>(int32_t{-64})}), 0);
 }
 
 }  // namespace

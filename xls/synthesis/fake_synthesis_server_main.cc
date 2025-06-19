@@ -16,8 +16,10 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "absl/flags/flag.h"
+#include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -27,13 +29,12 @@
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/synthesis/credentials.h"
 #include "xls/synthesis/synthesis.pb.h"
 #include "xls/synthesis/synthesis_service.grpc.pb.h"
 #include "grpcpp/support/status_code_enum.h"
 
-const char kUsage[] = R"(
+static constexpr std::string_view kUsage = R"(
 Launches a XLS synthesis server which serves fake results. The flag
 --max_frequency_ghz is used to determine whether a negative slack value is
 returned in the response.
@@ -56,8 +57,7 @@ namespace {
 // Service implementation that dispatches compile requests.
 class FakeSynthesisServiceImpl : public SynthesisService::Service {
  public:
-  explicit FakeSynthesisServiceImpl(int64_t max_frequency_hz,
-                                     bool serve_errors)
+  explicit FakeSynthesisServiceImpl(int64_t max_frequency_hz, bool serve_errors)
       : max_frequency_hz_(max_frequency_hz), serve_errors_(serve_errors) {}
 
   ::grpc::Status Compile(::grpc::ServerContext* server_context,
@@ -93,14 +93,14 @@ void RealMain() {
   int port = absl::GetFlag(FLAGS_port);
   std::string server_address = absl::StrCat("0.0.0.0:", port);
   FakeSynthesisServiceImpl service(max_frequency_hz,
-                                    absl::GetFlag(FLAGS_serve_errors));
+                                   absl::GetFlag(FLAGS_serve_errors));
 
   ::grpc::ServerBuilder builder;
   std::shared_ptr<::grpc::ServerCredentials> creds = GetServerCredentials();
   builder.AddListeningPort(server_address, creds);
   builder.RegisterService(&service);
   std::unique_ptr<::grpc::Server> server(builder.BuildAndStart());
-  XLS_LOG(INFO) << "Serving on port: " << port;
+  LOG(INFO) << "Serving on port: " << port;
   server->Wait();
 }
 

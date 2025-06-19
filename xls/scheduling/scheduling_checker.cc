@@ -14,24 +14,39 @@
 
 #include "xls/scheduling/scheduling_checker.h"
 
-#include <optional>
+#include <vector>
 
+#include "absl/status/status.h"
+#include "absl/strings/str_format.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/function_base.h"
 #include "xls/ir/verifier.h"
+#include "xls/passes/pass_base.h"
+#include "xls/scheduling/pipeline_schedule.h"
+#include "xls/scheduling/scheduling_pass.h"
 
 namespace xls {
 
-absl::Status SchedulingChecker::Run(SchedulingUnit<>* unit,
+absl::Status SchedulingChecker::Run(Package* package,
                                     const SchedulingPassOptions& options,
-                                    SchedulingPassResults* results) const {
-  XLS_RETURN_IF_ERROR(VerifyPackage(unit->ir));
-  if (unit->schedule.has_value()) {
-    std::optional<FunctionBase*> top = unit->ir->GetTop();
-    XLS_RET_CHECK(top.has_value())
-        << "Package " << unit->name() << " needs a top function/proc.";
-    XLS_RET_CHECK_EQ(top.value(), unit->schedule->function_base());
-    XLS_RETURN_IF_ERROR(unit->schedule->Verify());
+                                    PassResults* results,
+                                    SchedulingContext& context) const {
+  XLS_RETURN_IF_ERROR(VerifyPackage(package));
+  XLS_ASSIGN_OR_RETURN(std::vector<FunctionBase*> schedulable_functions,
+                       context.GetSchedulableFunctions());
+  XLS_RET_CHECK_GT(schedulable_functions.size(), 0);
+  for (FunctionBase* fb : schedulable_functions) {
+    XLS_RET_CHECK_EQ(fb->package(), package);
+    auto itr = context.schedules().find(fb);
+    if (itr == context.schedules().end()) {
+      XLS_RET_CHECK(context.schedules().empty()) << absl::StreamFormat(
+          "Schedulable function %v not found in non-empty schedules map", *fb);
+      continue;
+    }
+    const PipelineSchedule& schedule = itr->second;
+    XLS_RET_CHECK_EQ(schedule.function_base(), fb);
+    XLS_RETURN_IF_ERROR(schedule.Verify());
     // TODO(meheff): Add check to ensure schedule matches the specified
     // SchedulingOptions. For example, number pipeline_stages, clock_period,
     // etc.

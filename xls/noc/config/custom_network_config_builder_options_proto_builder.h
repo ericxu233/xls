@@ -14,10 +14,12 @@
 
 // Builder definitions for the custom network config options proto.
 
-#ifndef XLS_NOC_CONFIG_CUSTOM_NETWORK_CONFIG_BUILDER_OPTIONS_PROTO_H_
-#define XLS_NOC_CONFIG_CUSTOM_NETWORK_CONFIG_BUILDER_OPTIONS_PROTO_H_
+#ifndef XLS_NOC_CONFIG_CUSTOM_NETWORK_CONFIG_BUILDER_OPTIONS_PROTO_BUILDER_H_
+#define XLS_NOC_CONFIG_CUSTOM_NETWORK_CONFIG_BUILDER_OPTIONS_PROTO_BUILDER_H_
 
-#include "xls/common/logging/logging.h"
+#include <cstdint>
+
+#include "absl/log/die_if_null.h"
 #include "xls/noc/config/network_config_builder_options.pb.h"
 
 namespace xls::noc {
@@ -28,7 +30,7 @@ class GridNetworkConfigOptionsProtoBuilder {
   // proto cannot be nullptr.
   explicit GridNetworkConfigOptionsProtoBuilder(
       GridNetworkConfigOptionsProto* proto)
-      : proto_(XLS_DIE_IF_NULL(proto)) {}
+      : proto_(ABSL_DIE_IF_NULL(proto)) {}
 
   // Adds the number of rows.
   GridNetworkConfigOptionsProtoBuilder& WithNumRows(int64_t num_rows);
@@ -54,7 +56,7 @@ class UnidirectionalTreeNetworkConfigOptionsProtoBuilder {
   // proto cannot be nullptr.
   explicit UnidirectionalTreeNetworkConfigOptionsProtoBuilder(
       UnidirectionalTreeNetworkConfigOptionsProto* proto)
-      : proto_(XLS_DIE_IF_NULL(proto)) {}
+      : proto_(ABSL_DIE_IF_NULL(proto)) {}
 
   // Adds the maximum number of input ports for each router.
   UnidirectionalTreeNetworkConfigOptionsProtoBuilder& WithRadix(int64_t radix);
@@ -76,7 +78,7 @@ class BidirectionalTreeNetworkConfigOptionsProtoBuilder {
   // proto cannot be nullptr.
   explicit BidirectionalTreeNetworkConfigOptionsProtoBuilder(
       BidirectionalTreeNetworkConfigOptionsProto* proto)
-      : proto_(XLS_DIE_IF_NULL(proto)) {}
+      : proto_(ABSL_DIE_IF_NULL(proto)) {}
 
   // Adds the maximum number of input ports for each router.
   BidirectionalTreeNetworkConfigOptionsProtoBuilder& WithRadix(int64_t radix);
@@ -100,7 +102,7 @@ class FullyConnectedNetworkConfigOptionsProtoBuilder {
   // proto cannot be nullptr.
   explicit FullyConnectedNetworkConfigOptionsProtoBuilder(
       FullyConnectedNetworkConfigOptionsProto* proto)
-      : proto_(XLS_DIE_IF_NULL(proto)) {}
+      : proto_(ABSL_DIE_IF_NULL(proto)) {}
 
  private:
   FullyConnectedNetworkConfigOptionsProto* proto_;
@@ -108,4 +110,4 @@ class FullyConnectedNetworkConfigOptionsProtoBuilder {
 
 }  // namespace xls::noc
 
-#endif  // XLS_NOC_CONFIG_CUSTOM_NETWORK_CONFIG_BUILDER_OPTIONS_PROTO_H_
+#endif  // XLS_NOC_CONFIG_CUSTOM_NETWORK_CONFIG_BUILDER_OPTIONS_PROTO_BUILDER_H_

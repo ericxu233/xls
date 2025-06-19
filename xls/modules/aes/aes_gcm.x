@@ -20,11 +20,11 @@
 // TODOs:
 //  - Support partial blocks of plaintext and AAD (additional authenticated data).
 //  - Parameterize the proc in terms of number of CTR units.
-import std
-import xls.modules.aes.aes
-import xls.modules.aes.aes_common
-import xls.modules.aes.aes_ctr
-import xls.modules.aes.ghash
+import std;
+import xls.modules.aes.aes;
+import xls.modules.aes.aes_common;
+import xls.modules.aes.aes_ctr;
+import xls.modules.aes.ghash;
 
 type Block = aes_common::Block;
 type InitVector = aes_common::InitVector;
@@ -192,14 +192,14 @@ proc aes_gcm {
     config(command_in: chan<Command> in,
            data_r: chan<Block> in,
            data_s: chan<Block> out) {
-        let (ctr_cmd_s, ctr_cmd_r) = chan<aes_ctr::Command>;
-        let (ctr_input_s, ctr_input_r) = chan<Block>;
-        let (ctr_result_s, ctr_result_r) = chan<Block>;
+        let (ctr_cmd_s, ctr_cmd_r) = chan<aes_ctr::Command>("ctr_cmd");
+        let (ctr_input_s, ctr_input_r) = chan<Block>("ctr_input");
+        let (ctr_result_s, ctr_result_r) = chan<Block>("ctr_result");
         spawn aes_ctr::aes_ctr(ctr_cmd_r, ctr_input_r, ctr_result_s);
 
-        let (ghash_cmd_s, ghash_cmd_r) = chan<ghash::Command>;
-        let (ghash_input_s, ghash_input_r) = chan<Block>;
-        let (ghash_tag_s, ghash_tag_r) = chan<Block>;
+        let (ghash_cmd_s, ghash_cmd_r) = chan<ghash::Command>("ghash_cmd");
+        let (ghash_input_s, ghash_input_r) = chan<Block>("ghash_input");
+        let (ghash_tag_s, ghash_tag_r) = chan<Block>("ghash_tag");
         spawn ghash::ghash(ghash_cmd_r, ghash_input_r, ghash_tag_s);
 
         (command_in, data_r, data_s,
@@ -207,9 +207,9 @@ proc aes_gcm {
          ghash_cmd_s, ghash_input_s, ghash_tag_r)
     }
 
-    next(tok: token, state: State) {
+    next(state: State) {
         let (tok, command) = recv_if(
-            tok, command_in, state.step == Step::IDLE, zero!<Command>());
+            join(), command_in, state.step == Step::IDLE, zero!<Command>());
         let ctr_command = get_ctr_command(command);
         let ghash_command = get_ghash_command(command);
 
@@ -297,14 +297,14 @@ proc aes_gcm_test_smoke_128 {
     init { () }
 
     config(terminator: chan<bool> out) {
-        let (command_s, command_r) = chan<Command>;
-        let (input_s, input_r) = chan<Block>;
-        let (result_s, result_r) = chan<Block>;
+        let (command_s, command_r) = chan<Command>("command");
+        let (input_s, input_r) = chan<Block>("input");
+        let (result_s, result_r) = chan<Block>("result");
         spawn aes_gcm(command_r, input_r, result_s);
         (command_s, input_s, result_r, terminator)
     }
 
-    next(tok: token, state: ()) {
+    next(state: ()) {
         let command = Command {
             encrypt: true,
             msg_blocks: u32:1,
@@ -313,7 +313,7 @@ proc aes_gcm_test_smoke_128 {
             key_width: KeyWidth::KEY_128,
             iv: InitVector:0,
         };
-        let tok = send(tok, command_out, command);
+        let tok = send(join(), command_out, command);
 
         let msg_block = Block:[
             [u8:0x00, u8:0x00, u8:0x00, u8:0x00],
@@ -364,14 +364,14 @@ proc aes_gcm_multi_block_gcm {
     init { () }
 
     config(terminator: chan<bool> out) {
-        let (command_s, command_r) = chan<Command>;
-        let (input_s, input_r) = chan<Block>;
-        let (result_s, result_r) = chan<Block>;
+        let (command_s, command_r) = chan<Command>("command");
+        let (input_s, input_r) = chan<Block>("input");
+        let (result_s, result_r) = chan<Block>("result");
         spawn aes_gcm(command_r, input_r, result_s);
         (command_s, input_s, result_r, terminator)
     }
 
-    next(tok: token, state: ()) {
+    next(state: ()) {
         let key = Key:[
             u8:0xfe, u8:0xdc, u8:0xba, u8:0x98,
             u8:0x76, u8:0x54, u8:0x32, u8:0x10,
@@ -387,7 +387,7 @@ proc aes_gcm_multi_block_gcm {
             key_width: KeyWidth::KEY_128,
             iv: iv,
         };
-        let tok = send(tok, command_out, command);
+        let tok = send(join(), command_out, command);
 
         // AAD.
         let aad_block = Block:[
@@ -486,14 +486,14 @@ proc aes_128_gcm_zero_block_commands {
     init { () }
 
     config(terminator: chan<bool> out) {
-        let (command_s, command_r) = chan<Command>;
-        let (input_s, input_r) = chan<Block>;
-        let (result_s, result_r) = chan<Block>;
+        let (command_s, command_r) = chan<Command>("command");
+        let (input_s, input_r) = chan<Block>("input");
+        let (result_s, result_r) = chan<Block>("result");
         spawn aes_gcm(command_r, input_r, result_s);
         (command_s, input_s, result_r, terminator)
     }
 
-    next(tok: token, state: ()) {
+    next(state: ()) {
         let key = Key:[
             u8:0xfe, u8:0xdc, u8:0xba, u8:0x98,
             u8:0x76, u8:0x54, u8:0x32, u8:0x10,
@@ -511,7 +511,7 @@ proc aes_128_gcm_zero_block_commands {
             key_width: KeyWidth::KEY_128,
             iv: iv,
         };
-        let tok = send(tok, command_out, command);
+        let tok = send(join(), command_out, command);
 
         let aad_block = Block:[
             [u8:0xff, u8:0xee, u8:0xdd, u8:0xcc],
@@ -612,14 +612,14 @@ proc sample_generator_test {
     init { () }
 
     config(terminator: chan<bool> out) {
-        let (command_s, command_r) = chan<Command>;
-        let (input_s, input_r) = chan<Block>;
-        let (result_s, result_r) = chan<Block>;
+        let (command_s, command_r) = chan<Command>("command");
+        let (input_s, input_r) = chan<Block>("input");
+        let (result_s, result_r) = chan<Block>("result");
         spawn aes_gcm(command_r, input_r, result_s);
         (command_s, input_s, result_r, terminator)
     }
 
-    next(tok: token, state: ()) {
+    next(state: ()) {
         let key = Key:[
             u8:0x66, u8:0x63, u8:0x23, u8:0x41,
             u8:0x15, u8:0xb9, u8:0x6c, u8:0x76,
@@ -672,7 +672,7 @@ proc sample_generator_test {
             key_width: KeyWidth::KEY_256,
             iv: iv,
         };
-        let tok = send(tok, command_out, command);
+        let tok = send(join(), command_out, command);
 
         let tok = send(tok, input_out, aad[0]);
         let tok = send(tok, input_out, aad[1]);

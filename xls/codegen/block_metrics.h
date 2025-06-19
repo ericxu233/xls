@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_CODEGEN_BLOCK_METRICS_GENERATOR_H_
-#define XLS_CODEGEN_BLOCK_METRICS_GENERATOR_H_
+#ifndef XLS_CODEGEN_BLOCK_METRICS_H_
+#define XLS_CODEGEN_BLOCK_METRICS_H_
 
-#include <optional>
 
 #include "absl/status/statusor.h"
 #include "xls/codegen/xls_metrics.pb.h"
-#include "xls/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/ir/block.h"
 
 namespace xls::verilog {
@@ -33,4 +32,4 @@ absl::StatusOr<BlockMetricsProto> GenerateBlockMetrics(
 
 }  // namespace xls::verilog
 
-#endif  // XLS_CODEGEN_BLOCK_METRICS_GENERATOR_H_
+#endif  // XLS_CODEGEN_BLOCK_METRICS_H_

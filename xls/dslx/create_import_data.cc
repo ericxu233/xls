@@ -16,7 +16,6 @@
 
 #include <filesystem>  // NOLINT
 #include <memory>
-#include <string>
 #include <utility>
 
 #include "absl/memory/memory.h"
@@ -24,6 +23,7 @@
 #include "xls/dslx/bytecode/bytecode_cache.h"
 #include "xls/dslx/default_dslx_stdlib_path.h"
 #include "xls/dslx/import_data.h"
+#include "xls/dslx/virtualizable_file_system.h"
 #include "xls/dslx/warning_kind.h"
 
 namespace xls::dslx {
@@ -31,25 +31,31 @@ namespace xls::dslx {
 ImportData CreateImportData(
     const std::filesystem::path& stdlib_path,
     absl::Span<const std::filesystem::path> additional_search_paths,
-    WarningKindSet warnings) {
-  ImportData import_data(stdlib_path, additional_search_paths, warnings);
-  import_data.SetBytecodeCache(std::make_unique<BytecodeCache>(&import_data));
+    WarningKindSet warnings, std::unique_ptr<VirtualizableFilesystem> vfs) {
+  ImportData import_data(stdlib_path, additional_search_paths, warnings,
+                         std::move(vfs));
+  import_data.SetBytecodeCache(std::make_unique<BytecodeCache>());
   return import_data;
 }
 
-ImportData CreateImportDataForTest() {
-  ImportData import_data(xls::kDefaultDslxStdlibPath,
-                         /*additional_search_paths=*/{}, kAllWarningsSet);
-  import_data.SetBytecodeCache(std::make_unique<BytecodeCache>(&import_data));
+ImportData CreateImportDataForTest(std::unique_ptr<VirtualizableFilesystem> vfs,
+                                   WarningKindSet warnings) {
+  if (vfs == nullptr) {
+    vfs = std::make_unique<RealFilesystem>();
+  }
+  absl::Span<const std::filesystem::path> additional_search_paths = {};
+  ImportData import_data(xls::kDefaultDslxStdlibPath, additional_search_paths,
+                         warnings, std::move(vfs));
+  import_data.SetBytecodeCache(std::make_unique<BytecodeCache>());
   return import_data;
 }
 
 std::unique_ptr<ImportData> CreateImportDataPtrForTest() {
   auto import_data = absl::WrapUnique(
       new ImportData(xls::kDefaultDslxStdlibPath,
-                     /*additional_search_paths=*/{}, kAllWarningsSet));
-  import_data->SetBytecodeCache(
-      std::make_unique<BytecodeCache>(import_data.get()));
+                     /*additional_search_paths=*/{}, kAllWarningsSet,
+                     std::make_unique<RealFilesystem>()));
+  import_data->SetBytecodeCache(std::make_unique<BytecodeCache>());
   return import_data;
 }
 

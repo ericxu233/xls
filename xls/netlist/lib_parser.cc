@@ -14,6 +14,8 @@
 
 #include "xls/netlist/lib_parser.h"
 
+#include <cctype>
+#include <cstdint>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -22,9 +24,16 @@
 #include <utility>
 #include <vector>
 
+#include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
-#include "xls/common/logging/logging.h"
+#include "absl/types/variant.h"
+#include "xls/common/status/status_macros.h"
 
 namespace xls {
 namespace netlist {
@@ -72,7 +81,7 @@ std::string TokenKindToString(TokenKind kind) {
 
 absl::StatusOr<Token> Scanner::ScanIdentifier() {
   const Pos start_pos = cs_->GetPos();
-  XLS_CHECK(IsIdentifierStart(cs_->PeekCharOrDie()));
+  CHECK(IsIdentifierStart(cs_->PeekCharOrDie()));
   absl::InlinedVector<char, 16> chars;
   while (!cs_->AtEof() && IsIdentifierRest(cs_->PeekCharOrDie())) {
     chars.push_back(cs_->PopCharOrDie());
@@ -84,7 +93,7 @@ absl::StatusOr<Token> Scanner::ScanIdentifier() {
 // Scans a number token.
 absl::StatusOr<Token> Scanner::ScanNumber() {
   const Pos start_pos = cs_->GetPos();
-  XLS_CHECK(std::isdigit(cs_->PeekCharOrDie()) != 0);
+  CHECK_NE(std::isdigit(cs_->PeekCharOrDie()), 0);
   absl::InlinedVector<char, 16> chars;
   while (!cs_->AtEof()) {
     if (IsNumberRest(cs_->PeekCharOrDie())) {
@@ -103,7 +112,7 @@ absl::StatusOr<Token> Scanner::ScanNumber() {
 // Scans a string token.
 absl::StatusOr<Token> Scanner::ScanQuotedString() {
   const Pos start_pos = cs_->GetPos();
-  XLS_CHECK(cs_->TryDropChar('"'));
+  CHECK(cs_->TryDropChar('"'));
   absl::InlinedVector<char, 16> chars;
   while (true) {
     if (cs_->AtEof()) {
@@ -122,8 +131,8 @@ absl::StatusOr<Token> Scanner::ScanQuotedString() {
 }
 
 absl::Status Scanner::PeekInternal() {
-  XLS_DCHECK(!lookahead_.has_value());
-  XLS_DCHECK(!cs_->AtEof());
+  DCHECK(!lookahead_.has_value());
+  DCHECK(!cs_->AtEof());
   if (IsIdentifierStart(cs_->PeekCharOrDie())) {
     XLS_ASSIGN_OR_RETURN(lookahead_, ScanIdentifier());
     DropWhitespaceAndComments();
@@ -217,8 +226,8 @@ const std::string& Block::GetKVOrDie(std::string_view target_key) const {
       return kv_entry->value;
     }
   }
-  XLS_LOG(FATAL) << "Target key is not present in " << kind
-                 << " block: " << target_key;
+  LOG(FATAL) << "Target key is not present in " << kind
+             << " block: " << target_key;
 }
 
 int64_t Block::CountEntries(std::string_view target) const {
@@ -240,7 +249,7 @@ absl::StatusOr<bool> Parser::TryDropToken(TokenKind target, Pos* pos) {
     if (pos != nullptr) {
       *pos = peek->pos();
     }
-    XLS_CHECK(scanner_->Pop().ok());
+    CHECK(scanner_->Pop().ok());
     return true;
   }
   return false;

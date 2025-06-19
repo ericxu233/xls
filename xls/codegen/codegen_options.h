@@ -15,18 +15,23 @@
 #ifndef XLS_CODEGEN_CODEGEN_OPTIONS_H_
 #define XLS_CODEGEN_CODEGEN_OPTIONS_H_
 
-#include <memory>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/types/span.h"
 #include "xls/codegen/module_signature.pb.h"
 #include "xls/codegen/op_override.h"
 #include "xls/codegen/ram_configuration.h"
+#include "xls/ir/channel.h"
 #include "xls/ir/op.h"
 #include "xls/ir/register.h"
+#include "xls/ir/xls_ir_interface.pb.h"
 
 namespace xls::verilog {
 
@@ -35,14 +40,15 @@ class CodegenOptions {
  public:
   explicit CodegenOptions() = default;
 
-  CodegenOptions(const CodegenOptions& options);
-  CodegenOptions& operator=(const CodegenOptions& options);
-  CodegenOptions(CodegenOptions&& options) = default;
-  CodegenOptions& operator=(CodegenOptions&& options) = default;
-  ~CodegenOptions() = default;
+  // Enum to describe which codegen version to use.
+  enum class Version : uint8_t {
+    kDefault = 0,
+    kOneDotZero = 1,
+    kTwoDotZero = 2
+  };
 
   // Enum to describe how IO should be registered.
-  enum class IOKind { kFlop = 0, kSkidBuffer, kZeroLatencyBuffer };
+  enum class IOKind : uint8_t { kFlop = 0, kSkidBuffer, kZeroLatencyBuffer };
 
   // Convert IOKind enum to a string.
   static std::string_view IOKindToString(IOKind kind);
@@ -61,6 +67,28 @@ class CodegenOptions {
     }
   }
 
+  // TODO(allight): Merge these two enums.
+  static FlopKind IOKindToFlopKind(IOKind k) {
+    switch (k) {
+      case IOKind::kFlop:
+        return FlopKind::kFlop;
+      case IOKind::kSkidBuffer:
+        return FlopKind::kSkid;
+      case IOKind::kZeroLatencyBuffer:
+        return FlopKind::kZeroLatency;
+    }
+  }
+
+  enum class RegisterMergeStrategy : int8_t {
+    // Never merge registers even when doing so is legal.
+    kDontMerge,
+    // Merge registers only if the merged registers have the same exact same
+    // value
+    kIdentityOnly,
+
+    kDefault = kDontMerge,
+  };
+
   // The name of the top-level function or proc to generate a Verilog module
   // for. Required.
   // TODO(meheff): 2021/04/21 As this is required, perhaps this should be made a
@@ -71,9 +99,11 @@ class CodegenOptions {
   // Name to use for the generated module. If not given, the name of the XLS
   // function/proc is used.
   CodegenOptions& module_name(std::string_view name);
-  const std::optional<std::string_view> module_name() const {
-    return module_name_;
-  }
+  std::optional<std::string_view> module_name() const { return module_name_; }
+
+  // Name to use for the output port name (only applies to fonctions).
+  CodegenOptions& output_port_name(std::string_view name);
+  std::string_view output_port_name() const { return output_port_name_; }
 
   // Reset signal to use for any registers with initial values. Required if the
   // proc contains any registers with initial values.
@@ -81,8 +111,8 @@ class CodegenOptions {
                         bool active_low, bool reset_data_path);
   const std::optional<ResetProto>& reset() const { return reset_proto_; }
 
-  // Returns an xls::Reset constructed from the reset() proto.
-  std::optional<xls::Reset> ResetBehavior() const;
+  // Returns an ResetBehavior constructed from the reset() proto.
+  std::optional<ResetBehavior> GetResetBehavior() const;
 
   // Specifies manual pipeline register load-enable control.
   CodegenOptions& manual_control(std::string_view input_name);
@@ -112,13 +142,16 @@ class CodegenOptions {
   CodegenOptions& separate_lines(bool value);
   bool separate_lines() const { return separate_lines_; }
 
+  CodegenOptions& max_inline_depth(int64_t value);
+  int64_t max_inline_depth() const { return max_inline_depth_; }
+
   // Whether to flop inputs into a register at the beginning of the pipeline. If
-  // true, adds a single cycle to the latency of the pipline.
+  // true, adds a single cycle to the latency of the pipeline.
   CodegenOptions& flop_inputs(bool value);
   bool flop_inputs() const { return flop_inputs_; }
 
   // Whether to flop outputs into a register at the end of the pipeline. If
-  // true, adds a single cycle to the latency of the pipline.
+  // true, adds a single cycle to the latency of the pipeline.
   CodegenOptions& flop_outputs(bool value);
   bool flop_outputs() const { return flop_outputs_; }
 
@@ -157,15 +190,14 @@ class CodegenOptions {
   bool add_idle_output() const { return add_idle_output_; }
 
   // Set an OpOverride to customize codegen for an Op.
-  CodegenOptions& SetOpOverride(Op kind,
-                                std::unique_ptr<OpOverride> configuration);
+  CodegenOptions& SetOpOverride(Op kind, OpOverride configuration);
   // Get the OpOverride for an op, if it's defined.
-  std::optional<OpOverride*> GetOpOverride(Op kind) const {
+  std::optional<OpOverride> GetOpOverride(Op kind) const {
     auto itr = op_overrides_.find(kind);
     if (itr == op_overrides_.end()) {
       return std::nullopt;
     }
-    return itr->second.get();
+    return itr->second;
   }
 
   // Emit the signal declarations and logic in the Verilog as a sequence of
@@ -226,20 +258,115 @@ class CodegenOptions {
 
   // List of channels to rewrite for RAMs.
   CodegenOptions& ram_configurations(
-      absl::Span<const std::unique_ptr<RamConfiguration>> ram_configurations);
-  absl::Span<const std::unique_ptr<RamConfiguration>> ram_configurations()
-      const {
+      absl::Span<const RamConfiguration> ram_configurations);
+  absl::Span<RamConfiguration const> ram_configurations() const {
     return ram_configurations_;
   }
+
+  CodegenOptions& register_merge_strategy(RegisterMergeStrategy strategy);
+  RegisterMergeStrategy register_merge_strategy() const {
+    return register_merge_strategy_;
+  }
+
+  int64_t max_trace_verbosity() const { return max_trace_verbosity_; }
+  CodegenOptions& set_max_trace_verbosity(int64_t value) {
+    max_trace_verbosity_ = value;
+    return *this;
+  }
+
+  const std::optional<PackageInterfaceProto>& package_interface() const {
+    return package_interface_;
+  }
+
+  CodegenOptions& package_interface(PackageInterfaceProto p) {
+    package_interface_ = std::move(p);
+    return *this;
+  }
+
+  CodegenOptions& emit_sv_types(bool v) {
+    emit_sv_types_ = v;
+    return *this;
+  }
+  bool emit_sv_types() const { return emit_sv_types_; }
+
+  std::string_view simulation_macro_name() const {
+    return simulation_macro_name_;
+  }
+  CodegenOptions& set_simulation_macro_name(std::string macro_name) {
+    simulation_macro_name_ = std::move(macro_name);
+    return *this;
+  }
+
+  absl::Span<std::string const> assertion_macro_names() const {
+    return assertion_macro_names_;
+  }
+  CodegenOptions& set_assertion_macro_names(
+      std::vector<std::string>&& macro_names) {
+    assertion_macro_names_ = std::move(macro_names);
+    return *this;
+  }
+
+  // Sets which codegen version to use.
+  CodegenOptions& codegen_version(int64_t value) {
+    QCHECK(value >= 0 && value <= 2) << "codegen_version must be 0, 1, or 2";
+    codegen_version_ = static_cast<Version>(value);
+    return *this;
+  }
+  CodegenOptions& codegen_version(Version value) {
+    codegen_version_ = value;
+    return *this;
+  }
+  Version codegen_version() const { return codegen_version_; }
+
+  // Whether to generate combinational logic.
+  CodegenOptions& generate_combinational(bool value) {
+    generate_combinational_ = value;
+    return *this;
+  }
+  bool generate_combinational() const { return generate_combinational_; }
+
+  // Which module to use for FIFOs. If empty, will materialize an internal
+  // implementation.
+  std::string_view fifo_module() const { return fifo_module_; }
+  CodegenOptions& set_fifo_module(std::string_view module) {
+    fifo_module_ = module;
+    return *this;
+  }
+
+  // Which module to use for no-data FIFOs. If empty, will materialize an
+  // internal implementation.
+  std::string_view nodata_fifo_module() const { return nodata_fifo_module_; }
+  CodegenOptions& set_nodata_fifo_module(std::string_view module) {
+    nodata_fifo_module_ = module;
+    return *this;
+  }
+
+  // If non-empty, the seed used to randomize the order of lines in the output.
+  // If not provided, will use a default order. This is useful for creating
+  // multiple equivalent Verilog outputs to exercise the rest of the pipeline.
+  CodegenOptions& randomize_order_seed(absl::Span<const int32_t> value) {
+    randomize_order_seed_ = std::vector<int32_t>(value.begin(), value.end());
+    return *this;
+  }
+  const std::vector<int32_t>& randomize_order_seed() const {
+    return randomize_order_seed_;
+  }
+
+  // Control whether runtime invariant asserts are emitted.
+  CodegenOptions& add_invariant_assertions(bool value);
+  bool add_invariant_assertions() const { return add_invariant_assertions_; }
 
  private:
   std::optional<std::string> entry_;
   std::optional<std::string> module_name_;
+  std::string output_port_name_ = "out";
   std::optional<ResetProto> reset_proto_;
   std::optional<PipelineControl> pipeline_control_;
   std::optional<std::string> clock_name_;
+  bool generate_combinational_ = false;
   bool use_system_verilog_ = true;
   bool separate_lines_ = false;
+  int64_t max_inline_depth_ = 5;
   bool flop_inputs_ = false;
   bool flop_outputs_ = false;
   IOKind flop_inputs_kind_ = IOKind::kFlop;
@@ -247,15 +374,40 @@ class CodegenOptions {
   bool split_outputs_ = false;
   bool add_idle_output_ = false;
   bool flop_single_value_channels_ = false;
-  absl::flat_hash_map<Op, std::unique_ptr<OpOverride>> op_overrides_;
+  absl::flat_hash_map<Op, OpOverride> op_overrides_;
   bool emit_as_pipeline_ = false;
   std::string streaming_channel_data_suffix_ = "";
   std::string streaming_channel_ready_suffix_ = "_rdy";
   std::string streaming_channel_valid_suffix_ = "_vld";
   bool array_index_bounds_checking_ = true;
   bool gate_recvs_ = true;
-  std::vector<std::unique_ptr<RamConfiguration>> ram_configurations_;
+  bool add_invariant_assertions_ = true;
+  std::vector<RamConfiguration> ram_configurations_;
+  int64_t max_trace_verbosity_ = 0;
+  RegisterMergeStrategy register_merge_strategy_ =
+      RegisterMergeStrategy::kDefault;
+  std::optional<PackageInterfaceProto> package_interface_;
+  std::vector<std::string> includes_;
+  bool emit_sv_types_ = true;
+  std::string simulation_macro_name_ = "SIMULATION";
+  std::vector<std::string> assertion_macro_names_ = {"ASSERT_ON"};
+  Version codegen_version_ = Version::kDefault;
+  std::string fifo_module_ = "xls_fifo_wrapper";
+  std::string nodata_fifo_module_ = "";
+  std::vector<int32_t> randomize_order_seed_;
 };
+
+template <typename Sink>
+void AbslStringify(Sink& sink, const CodegenOptions::RegisterMergeStrategy s) {
+  switch (s) {
+    case CodegenOptions::RegisterMergeStrategy::kDontMerge:
+      absl::Format(&sink, "DontMerge");
+      return;
+    case CodegenOptions::RegisterMergeStrategy::kIdentityOnly:
+      absl::Format(&sink, "IdentityOnly");
+      return;
+  }
+}
 
 }  // namespace xls::verilog
 

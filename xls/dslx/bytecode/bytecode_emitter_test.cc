@@ -14,31 +14,41 @@
 #include "xls/dslx/bytecode/bytecode_emitter.h"
 
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <variant>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/algorithm/container.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
+#include "xls/common/casts.h"
 #include "xls/common/status/matchers.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/dslx/bytecode/bytecode.h"
 #include "xls/dslx/create_import_data.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/import_data.h"
+#include "xls/dslx/interp_value.h"
 #include "xls/dslx/parse_and_typecheck.h"
 #include "xls/dslx/type_system/parametric_env.h"
+#include "xls/dslx/type_system/type_info.h"
 #include "re2/re2.h"
 
 namespace xls::dslx {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
+using ::testing::ElementsAre;
 
 absl::StatusOr<std::unique_ptr<BytecodeFunction>> EmitBytecodes(
     ImportData* import_data, std::string_view program,
@@ -68,9 +78,10 @@ TEST(BytecodeEmitterTest, SimpleTranslation) {
 
   XLS_ASSERT_OK_AND_ASSIGN(
       Function * f, tm.module->GetMemberOrError<Function>("one_plus_one"));
+  ASSERT_TRUE(f != nullptr);
   XLS_ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<BytecodeFunction> bf,
-      BytecodeEmitter::Emit(&import_data, tm.type_info, f, ParametricEnv()));
+      BytecodeEmitter::Emit(&import_data, tm.type_info, *f, ParametricEnv()));
 
   const std::vector<Bytecode>& bytecodes = bf->bytecodes();
   ASSERT_EQ(bytecodes.size(), 5);
@@ -115,18 +126,18 @@ fn expect_fail() -> u32{
       std::unique_ptr<BytecodeFunction> bf,
       EmitBytecodes(&import_data, kProgram, "expect_fail"));
 
-  EXPECT_EQ(BytecodesToString(bf->bytecodes(), /*source_locs=*/false),
+  EXPECT_EQ(BytecodesToString(bf->bytecodes(), /*source_locs=*/false,
+                              import_data.file_table()),
             R"(000 literal u32:3
 001 store 0
 002 load 0
 003 literal u32:2
 004 literal builtin:assert_eq
-005 call assert_eq(foo, u32:2) : {}
+005 call assert_eq(foo, u32:2)
 006 pop
 007 load 0)");
 }
 
-// Validates emission of Let nodes with structured bindings.
 TEST(BytecodeEmitterTest, DestructuringLet) {
   constexpr std::string_view kProgram = R"(#[test]
 fn has_name_def_tree() -> (u32, u64, uN[128]) {
@@ -143,7 +154,8 @@ fn has_name_def_tree() -> (u32, u64, uN[128]) {
       std::unique_ptr<BytecodeFunction> bf,
       EmitBytecodes(&import_data, kProgram, "has_name_def_tree"));
 
-  EXPECT_EQ(BytecodesToString(bf->bytecodes(), /*source_locs=*/false),
+  EXPECT_EQ(BytecodesToString(bf->bytecodes(), /*source_locs=*/false,
+                              import_data.file_table()),
             R"(000 literal u4:0
 001 literal u8:1
 002 literal u16:2
@@ -162,17 +174,17 @@ fn has_name_def_tree() -> (u32, u64, uN[128]) {
 015 load 0
 016 literal u4:0
 017 literal builtin:assert_eq
-018 call assert_eq(a, u4:0) : {}
+018 call assert_eq(a, u4:0)
 019 pop
 020 load 1
 021 literal u8:1
 022 literal builtin:assert_eq
-023 call assert_eq(b, u8:1) : {}
+023 call assert_eq(b, u8:1)
 024 pop
 025 load 2
 026 literal u16:2
 027 literal builtin:assert_eq
-028 call assert_eq(c, u16:2) : {}
+028 call assert_eq(c, u16:2)
 029 pop
 030 load 3
 031 literal u32:3
@@ -180,9 +192,63 @@ fn has_name_def_tree() -> (u32, u64, uN[128]) {
 033 literal u128:0x5
 034 create_tuple 3
 035 literal builtin:assert_eq
-036 call assert_eq(d, (u32:3, u64:4, uN[128]:5)) : {}
+036 call assert_eq(d, (u32:3, u64:4, uN[128]:5))
 037 pop
 038 load 3)");
+}
+
+TEST(BytecodeEmitterTest, DestructuringLetWithRestOfTuple) {
+  constexpr std::string_view kProgram = R"(#[test]
+fn destructuring_let_with_rest_of_tuple() -> (u32, u64, uN[128]) {
+  let (a, b, .., (c, d)) = (u4:0, u8:1, u9:2, (u16:3, (u32:4, u64:5, uN[128]:6)));
+  assert_eq(a, u4:0);
+  assert_eq(b, u8:1);
+  assert_eq(c, u16:3);
+  assert_eq(d, (u32:4, u64:5, uN[128]:6));
+  d
+})";
+
+  ImportData import_data(CreateImportDataForTest());
+  // Asserts that we can generate bytecode for this situation. We shouldn't
+  // assert on the contents of the bytecode generated, since that is fragile
+  // and is essentially a "Change Detector" test.
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<BytecodeFunction> bf,
+      EmitBytecodes(&import_data, kProgram,
+                    "destructuring_let_with_rest_of_tuple"));
+}
+
+TEST(BytecodeEmitterTest, DestructuringLetWithRestOfTupleNested) {
+  constexpr std::string_view kProgram = R"(#[test]
+fn destructuring_let_with_rest_of_tuple_nested() -> (u32, u64, uN[128]) {
+  let (a, b, .., (c, .., d)) = (u4:0, u8:1, u9:2, (u16:2, u10:4, (u32:5, u64:6, uN[128]:7)));
+  assert_eq(a, u4:0);
+  assert_eq(b, u8:1);
+  assert_eq(c, u16:2);
+  assert_eq(d, (u32:5, u64:6, uN[128]:7));
+  d
+})";
+
+  ImportData import_data(CreateImportDataForTest());
+  XLS_ASSERT_OK(EmitBytecodes(&import_data, kProgram,
+                              "destructuring_let_with_rest_of_tuple_nested"));
+}
+
+TEST(BytecodeEmitterTest, DestructuringNonConstantTuple) {
+  constexpr std::string_view kProgram = R"(#[test]
+fn destructuring_non_constant_tuple() -> (u32, u64, uN[128]) {
+  let t = (u4:0, u8:1, u9:2, (u16:2, u10:4, (u32:5, u64:6, uN[128]:7)));
+  let (a, b, .., (c, .., d)) = t;
+  assert_eq(a, u4:0);
+  assert_eq(b, u8:1);
+  assert_eq(c, u16:2);
+  assert_eq(d, (u32:5, u64:6, uN[128]:7));
+  d
+})";
+
+  ImportData import_data(CreateImportDataForTest());
+  XLS_ASSERT_OK(EmitBytecodes(&import_data, kProgram,
+                              "destructuring_non_constant_tuple"));
 }
 
 TEST(BytecodeEmitterTest, Ternary) {
@@ -195,7 +261,8 @@ fn do_ternary() -> u32 {
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BytecodeFunction> bf,
                            EmitBytecodes(&import_data, kProgram, "do_ternary"));
 
-  EXPECT_EQ(BytecodesToString(bf->bytecodes(), /*source_locs=*/false),
+  EXPECT_EQ(BytecodesToString(bf->bytecodes(), /*source_locs=*/false,
+                              import_data.file_table()),
             R"(000 literal u1:1
 001 jump_rel_if +3
 002 literal u32:64
@@ -203,6 +270,22 @@ fn do_ternary() -> u32 {
 004 jump_dest
 005 literal u32:42
 006 jump_dest)");
+}
+
+TEST(BytecodeEmitterTest, CastToXbits) {
+  constexpr std::string_view kProgram = R"(#[test]
+fn main(x: u1) -> s1 {
+  x as xN[true][1]
+})";
+
+  ImportData import_data(CreateImportDataForTest());
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BytecodeFunction> bf,
+                           EmitBytecodes(&import_data, kProgram, "main"));
+
+  EXPECT_EQ(BytecodesToString(bf->bytecodes(), /*source_locs=*/false,
+                              import_data.file_table()),
+            R"(000 load 0
+001 cast xN[is_signed=1][1])");
 }
 
 TEST(BytecodeEmitterTest, Shadowing) {
@@ -217,12 +300,35 @@ fn f() -> u32 {
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BytecodeFunction> bf,
                            EmitBytecodes(&import_data, kProgram, "f"));
 
-  EXPECT_EQ(BytecodesToString(bf->bytecodes(), /*source_locs=*/false),
+  EXPECT_EQ(BytecodesToString(bf->bytecodes(), /*source_locs=*/false,
+                              import_data.file_table()),
             R"(000 literal u32:42
 001 store 0
 002 literal u32:64
 003 store 1
 004 load 1)");
+}
+
+TEST(BytecodeEmitterTest, MatchTuplesWithRestOfTuple) {
+  constexpr std::string_view kProgram = R"(#[test]
+fn match_tuple() -> u32 {
+  let x = (u32:42, u32:64, u32:128);
+  let y = match x {
+    (u32:42, u32:64, u32:128) => u32:42,
+    (u32:41, u32:63, ..) => u32:63,
+    (u32:40, ..) => u32:40,
+    _ => u32:0
+  };
+  y
+})";
+
+  ImportData import_data(CreateImportDataForTest());
+  // Asserts that we can generate bytecode for this situation. We shouldn't
+  // assert on the contents of the bytecode generated, since that is fragile
+  // and is essentially a "Change Detector" test.
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<BytecodeFunction> bf,
+      EmitBytecodes(&import_data, kProgram, "match_tuple"));
 }
 
 TEST(BytecodeEmitterTest, MatchSimpleArms) {
@@ -240,7 +346,8 @@ fn do_match() -> u32 {
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BytecodeFunction> bf,
                            EmitBytecodes(&import_data, kProgram, "do_match"));
 
-  EXPECT_EQ(BytecodesToString(bf->bytecodes(), /*source_locs=*/false),
+  EXPECT_EQ(BytecodesToString(bf->bytecodes(), /*source_locs=*/false,
+                              import_data.file_table()),
             R"(000 literal u32:77
 001 store 0
 002 load 0
@@ -284,7 +391,8 @@ TEST(BytecodeEmitterTest, BytecodesFromString) {
                            BytecodesFromString(s));
   EXPECT_THAT(bytecodes.at(3).value_data(),
               IsOkAndHolds(InterpValue::MakeSBits(3, -1)));
-  EXPECT_EQ(BytecodesToString(bytecodes, /*source_locs=*/false), s);
+  FileTable file_table;
+  EXPECT_EQ(BytecodesToString(bytecodes, /*source_locs=*/false, file_table), s);
 }
 
 // Tests emission of all of the supported binary operators.
@@ -334,7 +442,8 @@ fn binops_galore() {
       EmitBytecodes(&import_data, kProgram, "binops_galore"));
 
   const std::vector<Bytecode>& bytecodes = bf->bytecodes();
-  std::string got = BytecodesToString(bytecodes, /*source_locs=*/false);
+  std::string got = BytecodesToString(bytecodes, /*source_locs=*/false,
+                                      import_data.file_table());
   std::vector<std::string_view> opcodes;
   for (std::string_view line : absl::StrSplit(got, '\n')) {
     if (RE2::FullMatch(line, RE2(R"(^\d+ (literal|store|load).*$)"))) {
@@ -399,8 +508,7 @@ fn unops() {
 // Tests array creation.
 TEST(BytecodeEmitterTest, Arrays) {
   constexpr std::string_view kProgram = R"(#[test]
-fn arrays() -> u32[3] {
-  let a = u32:32;
+fn arrays(a: u32) -> u32[3] {
   u32[3]:[u32:0, u32:1, a]
 }
 )";
@@ -410,8 +518,8 @@ fn arrays() -> u32[3] {
                            EmitBytecodes(&import_data, kProgram, "arrays"));
 
   const std::vector<Bytecode>& bytecodes = bf->bytecodes();
-  ASSERT_EQ(bytecodes.size(), 6);
-  const Bytecode* bc = &bytecodes[5];
+  ASSERT_EQ(bytecodes.size(), 4);
+  const Bytecode* bc = &bytecodes[3];
   ASSERT_EQ(bc->op(), Bytecode::Op::kCreateArray);
   ASSERT_TRUE(bc->has_data());
   XLS_ASSERT_OK_AND_ASSIGN(Bytecode::NumElements num_elements,
@@ -457,21 +565,22 @@ fn index_array() -> u32 {
   ASSERT_EQ(bytecodes.size(), 11);
 
   const std::string_view kWant =
-      R"(literal [u32:0, u32:1, u32:2] @ test.x:3:18-3:27
-store 0 @ test.x:3:7-3:8
-literal [u32:3, u32:4, u32:5] @ test.x:4:23-4:32
-store 1 @ test.x:4:7-4:8
-load 0 @ test.x:6:3-6:4
-literal u32:0 @ test.x:6:9-6:10
-index @ test.x:6:4-6:11
-load 1 @ test.x:6:14-6:15
-literal u32:1 @ test.x:6:20-6:21
-index @ test.x:6:15-6:22
-uadd @ test.x:6:12-6:13)";
-  std::string got = absl::StrJoin(bf->bytecodes(), "\n",
-                                  [](std::string* out, const Bytecode& b) {
-                                    absl::StrAppend(out, b.ToString());
-                                  });
+      R"(literal [u32:0, u32:1, u32:2]
+store 0
+literal [u32:3, u32:4, u32:5]
+store 1
+load 0
+literal u32:0
+index
+load 1
+literal u32:1
+index
+uadd)";
+  std::string got = absl::StrJoin(
+      bf->bytecodes(), "\n",
+      [&import_data](std::string* out, const Bytecode& b) {
+        absl::StrAppend(out, b.ToString(import_data.file_table()));
+      });
 
   EXPECT_EQ(kWant, got);
 }
@@ -663,7 +772,7 @@ TEST(BytecodeEmitterTest, ImportedEnumRef) {
 }
 )";
   constexpr std::string_view kBaseProgram = R"(
-import import_0
+import import_0;
 
 #[test]
 fn imported_enum_ref() -> import_0::ImportedEnum {
@@ -699,11 +808,167 @@ fn imported_enum_ref() -> import_0::ImportedEnum {
               IsOkAndHolds(InterpValue::MakeSBits(4, 2)));
 }
 
-TEST(BytecodeEmitterTest, ImportedConstant) {
-  constexpr std::string_view kImportedProgram =
-      R"(pub const MY_CONST = u3:2;)";
+TEST(BytecodeEmitterTest, StructImplConstant) {
   constexpr std::string_view kBaseProgram = R"(
-import import_0
+struct Empty {}
+
+impl Empty {
+  const MY_CONST = u4:7;
+}
+
+#[test]
+fn struct_const_ref() -> u4 {
+  Empty::MY_CONST
+}
+)";
+
+  auto import_data = CreateImportDataForTest();
+  XLS_ASSERT_OK_AND_ASSIGN(
+      TypecheckedModule tm,
+      ParseAndTypecheck(kBaseProgram, "test.x", "test", &import_data));
+
+  XLS_ASSERT_OK_AND_ASSIGN(TestFunction * tf,
+                           tm.module->GetTest("struct_const_ref"));
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BytecodeFunction> bf,
+                           BytecodeEmitter::Emit(&import_data, tm.type_info,
+                                                 tf->fn(), ParametricEnv()));
+
+  const std::vector<Bytecode>& bytecodes = bf->bytecodes();
+  ASSERT_EQ(bytecodes.size(), 1);
+
+  const Bytecode* bc = bytecodes.data();
+  ASSERT_EQ(bc->op(), Bytecode::Op::kLiteral);
+  ASSERT_TRUE(bc->has_data());
+  EXPECT_THAT(bytecodes.at(0).value_data(),
+              IsOkAndHolds(InterpValue::MakeSBits(4, 7)));
+}
+
+TEST(BytecodeEmitterTest, StructImplConstantParametric) {
+  constexpr std::string_view kBaseProgram = R"(
+struct Empty<N: u32> {}
+
+impl Empty<N> {
+  const MY_CONST = uN[N]:7;
+}
+
+#[test]
+fn struct_const_ref() -> u4 {
+  type MyEmpty = Empty<u32:4>;
+  MyEmpty::MY_CONST
+}
+)";
+
+  auto import_data = CreateImportDataForTest();
+  XLS_ASSERT_OK_AND_ASSIGN(
+      TypecheckedModule tm,
+      ParseAndTypecheck(kBaseProgram, "test.x", "test", &import_data));
+
+  XLS_ASSERT_OK_AND_ASSIGN(TestFunction * tf,
+                           tm.module->GetTest("struct_const_ref"));
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BytecodeFunction> bf,
+                           BytecodeEmitter::Emit(&import_data, tm.type_info,
+                                                 tf->fn(), ParametricEnv()));
+
+  const std::vector<Bytecode>& bytecodes = bf->bytecodes();
+  ASSERT_EQ(bytecodes.size(), 1);
+
+  const Bytecode* bc = bytecodes.data();
+  ASSERT_EQ(bc->op(), Bytecode::Op::kLiteral);
+  ASSERT_TRUE(bc->has_data());
+  EXPECT_THAT(bytecodes.at(0).value_data(),
+              IsOkAndHolds(InterpValue::MakeSBits(4, 7)));
+}
+
+TEST(BytecodeEmitterTest, ImportedStructImplConstant) {
+  constexpr std::string_view kImportedProgram = R"(
+pub struct Empty<N: u32> {}
+
+impl Empty<N> {
+  const MY_CONST = uN[N]:7;
+}
+
+  )";
+  constexpr std::string_view kBaseProgram = R"(
+import import_0;
+
+#[test]
+fn struct_const_ref() -> u4 {
+  type MyEmpty = import_0::Empty<u32:4>;
+  MyEmpty::MY_CONST
+}
+)";
+
+  auto import_data = CreateImportDataForTest();
+
+  {
+    XLS_ASSERT_OK_AND_ASSIGN(TypecheckedModule tm,
+                             ParseAndTypecheck(kImportedProgram, "import_0.x",
+                                               "import_0", &import_data));
+  }
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      TypecheckedModule tm,
+      ParseAndTypecheck(kBaseProgram, "test.x", "test", &import_data));
+
+  XLS_ASSERT_OK_AND_ASSIGN(TestFunction * tf,
+                           tm.module->GetTest("struct_const_ref"));
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BytecodeFunction> bf,
+                           BytecodeEmitter::Emit(&import_data, tm.type_info,
+                                                 tf->fn(), ParametricEnv()));
+}
+
+TEST(BytecodeEmitterTest, ImportedStructAliasWithConstant) {
+  constexpr std::string_view kImportedProgram = R"(
+pub struct Empty<N: u32> {}
+
+impl Empty<N> {
+  const MY_CONST = uN[N]:7;
+}
+
+  )";
+  constexpr std::string_view kImportedAlias = R"(
+import import_0;
+
+pub type MyEmpty = import_0::Empty<u32:4>;
+
+  )";
+  constexpr std::string_view kBaseProgram = R"(
+import import_1;
+
+#[test]
+fn struct_const_ref() -> u4 {
+  import_1::MyEmpty::MY_CONST
+}
+)";
+
+  auto import_data = CreateImportDataForTest();
+
+  {
+    XLS_ASSERT_OK_AND_ASSIGN(TypecheckedModule tm,
+                             ParseAndTypecheck(kImportedProgram, "import_0.x",
+                                               "import_0", &import_data));
+  }
+  {
+    XLS_ASSERT_OK_AND_ASSIGN(TypecheckedModule tm,
+                             ParseAndTypecheck(kImportedAlias, "import_1.x",
+                                               "import_1", &import_data));
+  }
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      TypecheckedModule tm,
+      ParseAndTypecheck(kBaseProgram, "test.x", "test", &import_data));
+
+  XLS_ASSERT_OK_AND_ASSIGN(TestFunction * tf,
+                           tm.module->GetTest("struct_const_ref"));
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BytecodeFunction> bf,
+                           BytecodeEmitter::Emit(&import_data, tm.type_info,
+                                                 tf->fn(), ParametricEnv()));
+}
+
+TEST(BytecodeEmitterTest, ImportedConstant) {
+  constexpr std::string_view kImportedProgram = R"(pub const MY_CONST = u3:2;)";
+  constexpr std::string_view kBaseProgram = R"(
+import import_0;
 
 #[test]
 fn imported_enum_ref() -> u3 {
@@ -739,7 +1004,7 @@ fn imported_enum_ref() -> u3 {
               IsOkAndHolds(InterpValue::MakeSBits(3, 2)));
 }
 
-TEST(BytecodeEmitterTest, HandlesConstRefs) {
+TEST(BytecodeEmitterTest, HandlesConstantRefs) {
   constexpr std::string_view kProgram = R"(const kFoo = u32:100;
 
 #[test]
@@ -838,14 +1103,15 @@ fn cast_array_to_bits() -> u32 {
   ASSERT_EQ(bytecodes.size(), 4);
 
   const std::string_view kWant =
-      R"(literal [u8:12, u8:10, u8:15, u8:14] @ test.x:3:17-3:37
-store 0 @ test.x:3:7-3:8
-load 0 @ test.x:4:3-4:4
-cast uN[32] @ test.x:4:3-4:11)";
-  std::string got = absl::StrJoin(bf->bytecodes(), "\n",
-                                  [](std::string* out, const Bytecode& b) {
-                                    absl::StrAppend(out, b.ToString());
-                                  });
+      R"(literal [u8:12, u8:10, u8:15, u8:14]
+store 0
+load 0
+cast uN[32])";
+  std::string got = absl::StrJoin(
+      bf->bytecodes(), "\n",
+      [&import_data](std::string* out, const Bytecode& b) {
+        absl::StrAppend(out, b.ToString(import_data.file_table()));
+      });
 
   EXPECT_EQ(kWant, got);
 }
@@ -969,9 +1235,10 @@ fn has_params(x: u32, y: u64) -> u48 {
       ParseAndTypecheck(kProgram, "test.x", "test", &import_data));
   XLS_ASSERT_OK_AND_ASSIGN(Function * f,
                            tm.module->GetMemberOrError<Function>("has_params"));
+  ASSERT_TRUE(f != nullptr);
   XLS_ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<BytecodeFunction> bf,
-      BytecodeEmitter::Emit(&import_data, tm.type_info, f, ParametricEnv()));
+      BytecodeEmitter::Emit(&import_data, tm.type_info, *f, ParametricEnv()));
 
   const std::vector<Bytecode>& bytecodes = bf->bytecodes();
   ASSERT_EQ(bytecodes.size(), 15);
@@ -1051,14 +1318,14 @@ fn main() -> u32 {
   const Bytecode* bc = &bytecodes[2];
   EXPECT_EQ(bc->op(), Bytecode::Op::kCall);
   XLS_ASSERT_OK_AND_ASSIGN(Bytecode::InvocationData id, bc->invocation_data());
-  NameRef* name_ref = dynamic_cast<NameRef*>(id.invocation->callee());
+  NameRef* name_ref = dynamic_cast<NameRef*>(id.invocation()->callee());
   ASSERT_NE(name_ref, nullptr);
   EXPECT_EQ(name_ref->identifier(), "foo");
 
   bc = &bytecodes[6];
   EXPECT_EQ(bc->op(), Bytecode::Op::kCall);
   XLS_ASSERT_OK_AND_ASSIGN(id, bc->invocation_data());
-  name_ref = dynamic_cast<NameRef*>(id.invocation->callee());
+  name_ref = dynamic_cast<NameRef*>(id.invocation()->callee());
   ASSERT_NE(name_ref, nullptr);
   EXPECT_EQ(name_ref->identifier(), "foo");
 }
@@ -1078,42 +1345,44 @@ fn main() -> u32 {
   // Since `for` generates a complex set of bytecodes, we test. every. one.
   // To make that a bit easier, we do string comparison.
   const std::vector<std::string> kExpected = {
-      "literal u32:0 @ test.x:3:44-3:45",
-      "literal u32:8 @ test.x:3:51-3:52",
-      "literal builtin:range @ test.x:3:34-3:39",
-      "call range(u32:0, u32:8) : {} @ test.x:3:39-3:53",
-      "store 0 @ test.x:3:6-5:11",
-      "literal u32:0 @ test.x:3:6-5:11",
-      "store 1 @ test.x:3:6-5:11",
-      "literal u32:1 @ test.x:5:9-5:10",
-      "jump_dest @ test.x:3:6-5:11",
-      "load 1 @ test.x:3:6-5:11",
-      "literal u32:8 @ test.x:3:6-5:11",
-      "eq @ test.x:3:6-5:11",
-      "jump_rel_if +17 @ test.x:3:6-5:11",
-      "load 0 @ test.x:3:6-5:11",
-      "load 1 @ test.x:3:6-5:11",
-      "index @ test.x:3:6-5:11",
-      "swap @ test.x:3:6-5:11",
-      "create_tuple 2 @ test.x:3:6-5:11",
-      "expand_tuple @ test.x:3:7-3:17",
-      "store 2 @ test.x:3:8-3:9",
-      "store 3 @ test.x:3:11-3:16",
-      "load 3 @ test.x:4:5-4:10",
-      "load 2 @ test.x:4:13-4:14",
-      "uadd @ test.x:4:11-4:12",
-      "load 1 @ test.x:3:6-5:11",
-      "literal u32:1 @ test.x:3:6-5:11",
-      "uadd @ test.x:3:6-5:11",
-      "store 1 @ test.x:3:6-5:11",
-      "jump_rel -20 @ test.x:3:6-5:11",
-      "jump_dest @ test.x:3:6-5:11",
+      "literal u32:0",
+      "literal u32:8",
+      "literal builtin:range",
+      "call range(u32:0, u32:8)",
+      "store 0",
+      "literal u32:0",
+      "store 1",
+      "literal u32:1",
+      "jump_dest",
+      "load 1",
+      "literal u32:8",
+      "eq",
+      "jump_rel_if +17",
+      "load 0",
+      "load 1",
+      "index",
+      "swap",
+      "create_tuple 2",
+      "expand_tuple",
+      "store 2",
+      "store 3",
+      "load 3",
+      "load 2",
+      "uadd",
+      "load 1",
+      "literal u32:1",
+      "uadd",
+      "store 1",
+      "jump_rel -20",
+      "jump_dest",
   };
 
   const std::vector<Bytecode>& bytecodes = bf->bytecodes();
   ASSERT_EQ(bytecodes.size(), 30);
   for (int i = 0; i < bytecodes.size(); i++) {
-    ASSERT_EQ(bytecodes[i].ToString(), kExpected[i]);
+    ASSERT_EQ(
+        bytecodes[i].ToString(import_data.file_table(), /*source_locs=*/false),
+        kExpected[i]);
   }
 }
 
@@ -1135,44 +1404,46 @@ fn test_main(s: SomeStruct) {
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BytecodeFunction> bf,
                            EmitBytecodes(&import_data, kProgram, "test_main"));
 
-  const std::string_view kWant = R"(literal u32:0 @ test.x:8:23-8:24
-literal u32:4 @ test.x:8:30-8:31
-range @ test.x:8:23-8:31
-store 1 @ test.x:8:6-11:8
-literal u32:0 @ test.x:8:6-11:8
-store 2 @ test.x:8:6-11:8
-create_tuple 0 @ test.x:11:5-11:7
-jump_dest @ test.x:8:6-11:8
-load 2 @ test.x:8:6-11:8
-literal u32:4 @ test.x:8:6-11:8
-eq @ test.x:8:6-11:8
-jump_rel_if +22 @ test.x:8:6-11:8
-load 1 @ test.x:8:6-11:8
-load 2 @ test.x:8:6-11:8
-index @ test.x:8:6-11:8
-swap @ test.x:8:6-11:8
-create_tuple 2 @ test.x:8:6-11:8
-expand_tuple @ test.x:8:8-8:15
-pop @ test.x:8:9-8:10
-expand_tuple @ test.x:8:12-8:14
-literal [u8:119, u8:104, u8:101, u8:101] @ test.x:9:20-9:26
-load 0 @ test.x:9:28-9:29
-literal u64:0 @ test.x:9:29-9:39
-tuple_index @ test.x:9:29-9:39
-literal builtin:cover! @ test.x:9:13-9:19
-call cover!("whee", s.some_bool) : {} @ test.x:9:19-9:40
-pop @ test.x:9:9-9:10
-create_tuple 0 @ test.x:10:5-10:7
-load 2 @ test.x:8:6-11:8
-literal u32:1 @ test.x:8:6-11:8
-uadd @ test.x:8:6-11:8
-store 2 @ test.x:8:6-11:8
-jump_rel -25 @ test.x:8:6-11:8
-jump_dest @ test.x:8:6-11:8)";
-  std::string got = absl::StrJoin(bf->bytecodes(), "\n",
-                                  [](std::string* out, const Bytecode& b) {
-                                    absl::StrAppend(out, b.ToString());
-                                  });
+  const std::string_view kWant = R"(literal u32:0
+literal u32:4
+range
+store 1
+literal u32:0
+store 2
+create_tuple 0
+jump_dest
+load 2
+literal u32:4
+eq
+jump_rel_if +22
+load 1
+load 2
+index
+swap
+create_tuple 2
+expand_tuple
+pop
+expand_tuple
+literal [u8:119, u8:104, u8:101, u8:101]
+load 0
+literal u64:0
+tuple_index
+literal builtin:cover!
+call cover!("whee", s.some_bool)
+pop
+create_tuple 0
+load 2
+literal u32:1
+uadd
+store 2
+jump_rel -25
+jump_dest)";
+  std::string got = absl::StrJoin(
+      bf->bytecodes(), "\n",
+      [&import_data](std::string* out, const Bytecode& b) {
+        absl::StrAppend(
+            out, b.ToString(import_data.file_table(), /*source_locs=*/false));
+      });
 
   EXPECT_EQ(kWant, got);
 }
@@ -1215,6 +1486,110 @@ fn main() -> u32 {
   ASSERT_EQ(bc->op(), Bytecode::Op::kShr);
 }
 
+TEST(BytecodeEmitterTest, BitCount) {
+  constexpr std::string_view kProgram = R"(
+struct S {
+  a: u32
+}
+
+struct T<N: u32> {
+  a: uN[N]
+}
+
+#[test]
+fn main() -> u32 {
+  bit_count<u32>() +
+  bit_count<s64>() +
+  bit_count<u32[u32:4]>() +
+  bit_count<bool>() +
+  bit_count<S>() +
+  bit_count<T<u32:4>>() +
+  bit_count<(u32, bool)>()
+}
+)";
+
+  constexpr std::string_view kWant = R"(literal u32:32
+literal u32:64
+uadd
+literal u32:128
+uadd
+literal u32:1
+uadd
+literal u32:32
+uadd
+literal u32:4
+uadd
+literal u32:33
+uadd)";
+
+  ImportData import_data(CreateImportDataForTest());
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BytecodeFunction> bf,
+                           EmitBytecodes(&import_data, kProgram, "main"));
+
+  std::string got = absl::StrJoin(
+      bf->bytecodes(), "\n",
+      [&import_data](std::string* out, const Bytecode& b) {
+        absl::StrAppend(
+            out, b.ToString(import_data.file_table(), /*source_locs=*/false));
+      });
+
+  EXPECT_EQ(kWant, got);
+}
+
+TEST(BytecodeEmitterTest, ElementCount) {
+  constexpr std::string_view kProgram = R"(
+struct S {
+  a: u32,
+  b: u32
+}
+
+struct T<N: u32> {
+  a: uN[N]
+}
+
+#[test]
+fn main() -> u32 {
+  element_count<u32>() +
+  element_count<s64>() +
+  element_count<u32[u32:4]>() +
+  element_count<u32[u32:4][u32:5]>() +
+  element_count<bool>() +
+  element_count<S>() +
+  element_count<T<u32:4>>() +
+  element_count<(u32, bool)>()
+}
+)";
+
+  constexpr std::string_view kWant = R"(literal u32:32
+literal u32:64
+uadd
+literal u32:4
+uadd
+literal u32:5
+uadd
+literal u32:1
+uadd
+literal u32:2
+uadd
+literal u32:1
+uadd
+literal u32:2
+uadd)";
+
+  ImportData import_data(CreateImportDataForTest());
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BytecodeFunction> bf,
+                           EmitBytecodes(&import_data, kProgram, "main"));
+
+  std::string got = absl::StrJoin(
+      bf->bytecodes(), "\n",
+      [&import_data](std::string* out, const Bytecode& b) {
+        absl::StrAppend(
+            out, b.ToString(import_data.file_table(), /*source_locs=*/false));
+      });
+
+  EXPECT_EQ(kWant, got);
+}
+
 TEST(BytecodeEmitterTest, ParameterizedTypeDefToImportedEnum) {
   constexpr std::string_view kImported = R"(
 pub struct ImportedStruct<X: u32> {
@@ -1228,7 +1603,7 @@ pub enum ImportedEnum : u32 {
 })";
 
   constexpr std::string_view kProgram = R"(
-import imported
+import imported;
 
 type MyEnum = imported::ImportedEnum;
 type MyStruct = imported::ImportedStruct<16>;
@@ -1272,11 +1647,11 @@ proc Foo {
   y: u32;
   init { () }
   config() {
-    let (p, c) = chan<u32>;
+    let (p, c) = chan<u32>("my_chan");
     (c, u32:100)
   }
 
-  next(tok: token, state: ()) {
+  next(state: ()) {
     ()
   }
 }
@@ -1295,16 +1670,18 @@ proc Foo {
   const std::vector<Bytecode>& config_bytecodes = bf->bytecodes();
   ASSERT_EQ(config_bytecodes.size(), 7);
   const std::vector<std::string> kConfigExpected = {
-      "literal (channel, channel) @ test.x:7:18-7:26",
-      "expand_tuple @ test.x:7:9-7:15",
-      "store 0 @ test.x:7:10-7:11",
-      "store 1 @ test.x:7:13-7:14",
-      "load 1 @ test.x:8:6-8:7",
-      "literal u32:100 @ test.x:8:13-8:16",
-      "create_tuple 2 @ test.x:8:5-8:17"};
+      "literal (channel_reference(out, channel_instance_id=none), "
+      "channel_reference(in, channel_instance_id=none))",
+      "expand_tuple",
+      "store 0",
+      "store 1",
+      "load 1",
+      "literal u32:100",
+      "create_tuple 2"};
 
   for (int i = 0; i < config_bytecodes.size(); i++) {
-    ASSERT_EQ(config_bytecodes[i].ToString(), kConfigExpected[i]);
+    ASSERT_EQ(config_bytecodes[i].ToString(import_data.file_table()),
+              kConfigExpected[i]);
   }
 }
 
@@ -1323,8 +1700,8 @@ proc Child {
     u64:1234
   }
 
-  next(tok: token, a: u64) {
-    let (tok, b) = recv(tok, c);
+  next(a: u64) {
+    let (tok, b) = recv(join(), c);
     a + x as u64 + y + b as u64
   }
 }
@@ -1333,12 +1710,12 @@ proc Parent {
   p: chan<u32> out;
   init { () }
   config() {
-    let (p, c) = chan<u32>;
+    let (p, c) = chan<u32>("my_chan");
     spawn Child(c, u64:100, uN[128]:200);
     (p,)
   }
 
-  next(tok: token, state: ()) {
+  next(state: ()) {
     ()
   }
 }
@@ -1353,12 +1730,38 @@ proc Parent {
   XLS_ASSERT_OK_AND_ASSIGN(Proc * child,
                            tm.module->GetMemberOrError<Proc>("Child"));
 
-  Block* config_body = parent->config()->body();
+  StatementBlock* config_body = parent->config().body();
   EXPECT_EQ(config_body->statements().size(), 3);
   Spawn* spawn = down_cast<Spawn*>(
       std::get<Expr*>(config_body->statements().at(1)->wrapped()));
   XLS_ASSERT_OK_AND_ASSIGN(TypeInfo * parent_ti,
                            tm.type_info->GetTopLevelProcTypeInfo(parent));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<BytecodeFunction> parent_config_bf,
+      BytecodeEmitter::EmitProcConfig(&import_data, parent_ti, parent->config(),
+                                      ParametricEnv()));
+  const std::vector<Bytecode>& parent_config_bytecodes =
+      parent_config_bf->bytecodes();
+  const std::vector<std::string> kParentConfigExpected = {
+      "literal (channel_reference(out, channel_instance_id=none), "
+      "channel_reference(in, channel_instance_id=none))",
+      "expand_tuple",
+      "store 0",
+      "store 1",
+      "load 1",
+      "literal u64:100",
+      "literal u128:0xc8",
+      "spawn spawn (c, u64:100, uN[128]:200)",
+      "pop",
+      "load 0",
+      "create_tuple 1",
+  };
+  ASSERT_EQ(parent_config_bytecodes.size(), kParentConfigExpected.size());
+  for (int i = 0; i < parent_config_bytecodes.size(); i++) {
+    ASSERT_EQ(parent_config_bytecodes[i].ToString(import_data.file_table()),
+              kParentConfigExpected[i]);
+  }
+
   TypeInfo* child_ti =
       parent_ti->GetInvocationTypeInfo(spawn->config(), ParametricEnv())
           .value();
@@ -1369,17 +1772,18 @@ proc Parent {
   const std::vector<Bytecode>& config_bytecodes = bf->bytecodes();
   ASSERT_EQ(config_bytecodes.size(), 8);
   const std::vector<std::string> kConfigExpected = {
-      "load 0 @ test.x:8:6-8:7",           //
-      "load 1 @ test.x:8:9-8:10",          //
-      "cast uN[32] @ test.x:8:9-8:17",     //
-      "load 1 @ test.x:8:20-8:21",         //
-      "load 2 @ test.x:8:24-8:25",         //
-      "cast uN[64] @ test.x:8:24-8:32",    //
-      "uadd @ test.x:8:22-8:23",           //
-      "create_tuple 3 @ test.x:8:5-8:34",  //
+      "load 0",          //
+      "load 1",          //
+      "cast uN[32]",     //
+      "load 1",          //
+      "load 2",          //
+      "cast uN[64]",     //
+      "uadd",            //
+      "create_tuple 3",  //
   };
   for (int i = 0; i < config_bytecodes.size(); i++) {
-    ASSERT_EQ(config_bytecodes[i].ToString(), kConfigExpected[i]);
+    ASSERT_EQ(config_bytecodes[i].ToString(import_data.file_table()),
+              kConfigExpected[i]);
   }
 
   std::vector<NameDef*> members;
@@ -1392,28 +1796,29 @@ proc Parent {
       bf, BytecodeEmitter::EmitProcNext(&import_data, child_ti, child->next(),
                                         ParametricEnv(), members));
   const std::vector<Bytecode>& next_bytecodes = bf->bytecodes();
-  ASSERT_EQ(next_bytecodes.size(), 17);
-  const std::vector<std::string> kNextExpected = {
-      "load 3 @ test.x:16:25-16:28",
-      "load 0 @ test.x:16:30-16:31",
-      "literal u1:1 @ test.x:16:24-16:32",
-      "literal u32:0 @ test.x:16:24-16:32",
-      "recv Child::c @ test.x:16:24-16:32",
-      "expand_tuple @ test.x:16:9-16:17",
-      "store 5 @ test.x:16:10-16:13",
-      "store 6 @ test.x:16:15-16:16",
-      "load 4 @ test.x:17:5-17:6",
-      "load 1 @ test.x:17:9-17:10",
-      "cast uN[64] @ test.x:17:9-17:17",
-      "uadd @ test.x:17:7-17:8",
-      "load 2 @ test.x:17:20-17:21",
-      "uadd @ test.x:17:18-17:19",
-      "load 6 @ test.x:17:24-17:25",
-      "cast uN[64] @ test.x:17:24-17:32",
-      "uadd @ test.x:17:22-17:23"};
-  for (int i = 0; i < next_bytecodes.size(); i++) {
-    ASSERT_EQ(next_bytecodes[i].ToString(), kNextExpected[i]);
-  }
+  std::vector<std::string> next_bytecode_strings;
+  absl::c_transform(next_bytecodes, std::back_inserter(next_bytecode_strings),
+                    [&import_data](const Bytecode& bc) {
+                      return bc.ToString(import_data.file_table());
+                    });
+  EXPECT_THAT(next_bytecode_strings,
+              ElementsAre(testing::MatchesRegex("literal token:0x[0-9a-f]+"),
+                          "load 0",         //
+                          "literal u1:1",   //
+                          "literal u32:0",  //
+                          "recv c",         //
+                          "expand_tuple",   //
+                          "store 4",        //
+                          "store 5",        //
+                          "load 3",         //
+                          "load 1",         //
+                          "cast uN[64]",    //
+                          "uadd",           //
+                          "load 2",         //
+                          "uadd",           //
+                          "load 5",         //
+                          "cast uN[64]",    //
+                          "uadd"));
 }
 
 // Verifies no explosions when calling BytecodeEmitter::EmitExpression with an
@@ -1423,7 +1828,7 @@ TEST(BytecodeEmitterTest, EmitExpressionWithImport) {
 pub const MY_CONST = u32:4;
 )";
   constexpr std::string_view kProgram = R"(
-import imported as mod
+import imported as mod;
 
 #[test]
 fn main() -> u32 {
@@ -1444,22 +1849,58 @@ fn main() -> u32 {
       ParseAndTypecheck(kProgram, "test.x", "test", &import_data));
 
   XLS_ASSERT_OK_AND_ASSIGN(TestFunction * tf, tm.module->GetTest("main"));
-  Function* f = tf->fn();
-  Expr* body = f->body();
+  Function& f = tf->fn();
+  Expr* body = f.body();
 
-  XLS_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<BytecodeFunction> bf,
-      BytecodeEmitter::EmitExpression(
-          &import_data, tm.type_info, body, /*env=*/{},
-          /*caller_bindings=*/std::nullopt));
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BytecodeFunction> bf,
+                           BytecodeEmitter::EmitExpression(
+                               &import_data, tm.type_info, body, /*env=*/{},
+                               /*caller_bindings=*/std::nullopt));
   const std::vector<Bytecode>& bytecodes = bf->bytecodes();
   ASSERT_EQ(bytecodes.size(), 3);
   const std::vector<std::string> kNextExpected = {
-      "literal u32:4 @ test.x:6:6-6:16", "literal u32:1 @ test.x:6:23-6:24",
-      "uadd @ test.x:6:17-6:18"};
+      "literal u32:4",  //
+      "literal u32:1",  //
+      "uadd"            //
+  };
   for (int i = 0; i < bytecodes.size(); i++) {
-    ASSERT_EQ(bytecodes[i].ToString(), kNextExpected[i]);
+    ASSERT_EQ(bytecodes[i].ToString(import_data.file_table()),
+              kNextExpected[i]);
   }
+}
+
+TEST(BytecodeEmitterTest, ProcNextWithxNChannels) {
+  constexpr std::string_view kProgram = R"(
+proc Foo {
+  x: chan<xN[true][32]> in;
+  y: chan<xN[false][32]> out;
+
+  init { () }
+
+  config() {
+    let (x_s, x_r) = chan<xN[true][32]>("x");
+    let (y_s, y_r) = chan<xN[false][32]>("y");
+    (x_r, y_s)
+  }
+
+  next(state: ()) {
+    let (tok, data) = recv(join(), x);
+    let tok = send(tok, y, data as xN[false][32]);
+  }
+}
+)";
+
+  ImportData import_data(CreateImportDataForTest());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      TypecheckedModule tm,
+      ParseAndTypecheck(kProgram, "test.x", "test", &import_data));
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * p, tm.module->GetMemberOrError<Proc>("Foo"));
+  XLS_ASSERT_OK_AND_ASSIGN(TypeInfo * ti,
+                           tm.type_info->GetTopLevelProcTypeInfo(p));
+  std::vector<NameDef*> members = {p->members().at(0)->name_def(),
+                                   p->members().at(1)->name_def()};
+  XLS_EXPECT_OK(BytecodeEmitter::EmitProcNext(&import_data, ti, p->next(),
+                                              ParametricEnv(), members));
 }
 
 }  // namespace

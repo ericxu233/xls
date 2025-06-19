@@ -15,13 +15,26 @@
 #include "xls/jit/jit_channel_queue.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
 
+#include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
 #include "absl/memory/memory.h"
+#include "absl/status/statusor.h"
+#include "absl/types/span.h"
+#include "xls/common/math_util.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/interpreter/channel_queue.h"
+#include "xls/ir/package.h"
+#include "xls/ir/proc_elaboration.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
+#include "xls/jit/jit_runtime.h"
 
 namespace xls {
 namespace {
@@ -40,7 +53,7 @@ std::optional<Value> ReadValueFromQueue(Type* type, JitRuntime& runtime,
   if (!queue.Read(buffer.data())) {
     return std::nullopt;
   }
-  return runtime.UnpackBuffer(buffer.data(), type, /*unpoision=*/true);
+  return runtime.UnpackBuffer(buffer.data(), type);
 }
 
 }  // namespace
@@ -94,11 +107,17 @@ int64_t ThreadSafeJitChannelQueue::GetSizeInternal() const {
 }
 
 void ThreadSafeJitChannelQueue::WriteInternal(const Value& value) {
+  CallWriteCallbacks(value);
   WriteValueOnQueue(value, channel()->type(), *jit_runtime_, byte_queue_);
 }
 
 std::optional<Value> ThreadSafeJitChannelQueue::ReadInternal() {
-  return ReadValueFromQueue(channel()->type(), *jit_runtime_, byte_queue_);
+  std::optional<Value> value =
+      ReadValueFromQueue(channel()->type(), *jit_runtime_, byte_queue_);
+  if (value.has_value()) {
+    CallReadCallbacks(value.value());
+  }
+  return value;
 }
 
 int64_t ThreadUnsafeJitChannelQueue::GetSizeInternal() const {
@@ -106,42 +125,70 @@ int64_t ThreadUnsafeJitChannelQueue::GetSizeInternal() const {
 }
 
 void ThreadUnsafeJitChannelQueue::WriteInternal(const Value& value) {
+  CallWriteCallbacks(value);
   WriteValueOnQueue(value, channel()->type(), *jit_runtime_, byte_queue_);
 }
 
 std::optional<Value> ThreadUnsafeJitChannelQueue::ReadInternal() {
-  return ReadValueFromQueue(channel()->type(), *jit_runtime_, byte_queue_);
+  std::optional<Value> value =
+      ReadValueFromQueue(channel()->type(), *jit_runtime_, byte_queue_);
+  if (value.has_value()) {
+    CallReadCallbacks(value.value());
+  }
+  return value;
 }
 
 /* static */ absl::StatusOr<std::unique_ptr<JitChannelQueueManager>>
-JitChannelQueueManager::CreateThreadSafe(Package* package) {
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<JitRuntime> runtime,
-                       JitRuntime::Create());
-  std::vector<std::unique_ptr<ChannelQueue>> queues;
-  for (Channel* channel : package->channels()) {
-    queues.push_back(
-        std::make_unique<ThreadSafeJitChannelQueue>(channel, runtime.get()));
-  }
-  return absl::WrapUnique(new JitChannelQueueManager(package, std::move(queues),
-                                                     std::move(runtime)));
+JitChannelQueueManager::CreateThreadSafe(Package* package,
+                                         std::unique_ptr<JitRuntime> runtime) {
+  XLS_ASSIGN_OR_RETURN(ProcElaboration elaboration,
+                       ProcElaboration::ElaborateOldStylePackage(package));
+  return CreateThreadSafe(std::move(elaboration), std::move(runtime));
 }
 
 /* static */ absl::StatusOr<std::unique_ptr<JitChannelQueueManager>>
-JitChannelQueueManager::CreateThreadUnsafe(Package* package) {
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<JitRuntime> runtime,
-                       JitRuntime::Create());
+JitChannelQueueManager::CreateThreadSafe(ProcElaboration&& elaboration,
+                                         std::unique_ptr<JitRuntime> runtime) {
   std::vector<std::unique_ptr<ChannelQueue>> queues;
-  for (Channel* channel : package->channels()) {
-    queues.push_back(
-        std::make_unique<ThreadUnsafeJitChannelQueue>(channel, runtime.get()));
+  for (ChannelInstance* channel_instance : elaboration.channel_instances()) {
+    queues.push_back(std::make_unique<ThreadSafeJitChannelQueue>(
+        channel_instance, runtime.get()));
   }
-  return absl::WrapUnique(new JitChannelQueueManager(package, std::move(queues),
-                                                     std::move(runtime)));
+  return absl::WrapUnique(new JitChannelQueueManager(
+      std::move(elaboration), std::move(queues), std::move(runtime)));
+}
+
+/* static */ absl::StatusOr<std::unique_ptr<JitChannelQueueManager>>
+JitChannelQueueManager::CreateThreadUnsafe(
+    Package* package, std::unique_ptr<JitRuntime> runtime) {
+  XLS_ASSIGN_OR_RETURN(ProcElaboration elaboration,
+                       ProcElaboration::ElaborateOldStylePackage(package));
+  return CreateThreadUnsafe(std::move(elaboration), std::move(runtime));
+}
+
+/* static */ absl::StatusOr<std::unique_ptr<JitChannelQueueManager>>
+JitChannelQueueManager::CreateThreadUnsafe(
+    ProcElaboration&& elaboration, std::unique_ptr<JitRuntime> runtime) {
+  std::vector<std::unique_ptr<ChannelQueue>> queues;
+  for (ChannelInstance* channel_instance : elaboration.channel_instances()) {
+    queues.push_back(std::make_unique<ThreadUnsafeJitChannelQueue>(
+        channel_instance, runtime.get()));
+  }
+  return absl::WrapUnique(new JitChannelQueueManager(
+      std::move(elaboration), std::move(queues), std::move(runtime)));
 }
 
 JitChannelQueue& JitChannelQueueManager::GetJitQueue(Channel* channel) {
   JitChannelQueue* queue = dynamic_cast<JitChannelQueue*>(&GetQueue(channel));
-  XLS_CHECK_NE(queue, nullptr);
+  CHECK_NE(queue, nullptr);
+  return *queue;
+}
+
+JitChannelQueue& JitChannelQueueManager::GetJitQueue(
+    ChannelInstance* channel_instance) {
+  JitChannelQueue* queue =
+      dynamic_cast<JitChannelQueue*>(&GetQueue(channel_instance));
+  CHECK_NE(queue, nullptr);
   return *queue;
 }
 

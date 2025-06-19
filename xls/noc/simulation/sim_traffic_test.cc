@@ -12,12 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdint>
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
+#include "absl/container/flat_hash_map.h"
 #include "xls/common/status/matchers.h"
+#include "xls/noc/config/network_config.pb.h"
+#include "xls/noc/simulation/common.h"
+#include "xls/noc/simulation/global_routing_table.h"
+#include "xls/noc/simulation/network_graph.h"
+#include "xls/noc/simulation/network_graph_builder.h"
 #include "xls/noc/simulation/noc_traffic_injector.h"
+#include "xls/noc/simulation/parameters.h"
+#include "xls/noc/simulation/random_number_interface.h"
 #include "xls/noc/simulation/sample_network_graphs.h"
 #include "xls/noc/simulation/sim_objects.h"
 #include "xls/noc/simulation/simulator_to_link_monitor_service_shim.h"

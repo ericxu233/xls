@@ -17,10 +17,13 @@
 
 #include <cstdint>
 #include <ostream>
+#include <string_view>
 
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
+#include "xls/passes/pass_pipeline.pb.h"
 
 namespace xls {
 
@@ -29,28 +32,27 @@ namespace xls {
 class NarrowingPass : public OptimizationFunctionBasePass {
  public:
   enum class AnalysisType : uint8_t {
-    kBdd,
+    kTernary,
     kRange,
     // Use the select context of instructions when calculating ranges.
     kRangeWithContext,
     // Use the select context controlled by the optimization options.
     kRangeWithOptionalContext,
   };
-  explicit NarrowingPass(AnalysisType analysis = AnalysisType::kRange,
-                         int64_t opt_level = kMaxOptLevel)
-      : OptimizationFunctionBasePass("narrow", "Narrowing"),
-        analysis_(analysis),
-        opt_level_(opt_level) {}
+  static constexpr std::string_view kName = "narrow";
+  explicit NarrowingPass(AnalysisType analysis = AnalysisType::kRange)
+      : OptimizationFunctionBasePass(kName, "Narrowing"), analysis_(analysis) {}
   ~NarrowingPass() override = default;
+
+  absl::StatusOr<PassPipelineProto::Element> ToProto() const override;
 
  protected:
   AnalysisType analysis_;
-  int64_t opt_level_;
 
   AnalysisType RealAnalysis(const OptimizationPassOptions& options) const;
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
 };
 
 std::ostream& operator<<(std::ostream& os, NarrowingPass::AnalysisType a);

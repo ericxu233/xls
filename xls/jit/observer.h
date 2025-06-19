@@ -15,12 +15,23 @@
 #ifndef XLS_JIT_OBSERVER_H_
 #define XLS_JIT_OBSERVER_H_
 
+#include <cstdint>
+#include <functional>
+#include <optional>
 #include <string_view>
+#include <utility>
 #include <vector>
 
-#include "absl/algorithm/container.h"
 #include "absl/types/span.h"
-#include "llvm/include/llvm/IR/Module.h"
+#include "xls/interpreter/observer.h"
+#include "xls/ir/node.h"
+#include "xls/ir/value.h"
+#include "xls/jit/jit_runtime.h"
+
+// Forward declare llvm::Module so we don't need to link it.
+namespace llvm {
+class Module;
+}  // namespace llvm
 
 namespace xls {
 
@@ -52,9 +63,9 @@ class JitObserver {
 };
 
 // A compound observer that lets one trigger multiple observers at once.
-class CompoundObserver final : public JitObserver {
+class CompoundJitObserver final : public JitObserver {
  public:
-  explicit CompoundObserver(absl::Span<JitObserver* const> observers);
+  explicit CompoundJitObserver(absl::Span<JitObserver* const> observers);
 
   JitObserverRequests GetNotificationOptions() const final;
   void UnoptimizedModule(const llvm::Module* module) final;
@@ -66,6 +77,47 @@ class CompoundObserver final : public JitObserver {
 
  private:
   std::vector<JitObserver*> observers_;
+};
+
+// An observer that is given a node-pointer (frozen at the time of jit) and the
+// jit-encoded value that node takes.
+class RuntimeObserver {
+ public:
+  virtual ~RuntimeObserver() = default;
+  virtual void RecordNodeValue(int64_t node_ptr, const uint8_t* data) = 0;
+};
+
+// A translator that lets one easily convert from a jit runtime observer to the
+// interpreter observer.
+class RuntimeEvaluationObserver : public RuntimeObserver,
+                                  public EvaluationObserver {
+ public:
+  RuntimeEvaluationObserver(std::function<Node*(int64_t)> to_node,
+                            JitRuntime* runtime)
+      : to_node_(std::move(to_node)), runtime_(runtime) {}
+  void RecordNodeValue(int64_t node_ptr, const uint8_t* data) final;
+
+ private:
+  std::function<Node*(int64_t)> to_node_;
+  JitRuntime* runtime_;
+};
+
+class RuntimeEvaluationObserverAdapter final
+    : public RuntimeEvaluationObserver {
+ public:
+  RuntimeEvaluationObserverAdapter(EvaluationObserver* obs,
+                                   const std::function<Node*(int64_t)>& to_node,
+                                   JitRuntime* runtime)
+      : RuntimeEvaluationObserver(to_node, runtime), real_(obs) {}
+
+  std::optional<RuntimeObserver*> AsRawObserver() override { return this; }
+
+  void NodeEvaluated(Node* n, const Value& v) override {
+    real_->NodeEvaluated(n, v);
+  }
+
+ private:
+  EvaluationObserver* real_;
 };
 
 }  // namespace xls

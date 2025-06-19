@@ -15,17 +15,23 @@
 #include "xls/scheduling/schedule_bounds.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
-#include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
+#include "xls/ir/node.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/topo_sort.h"
+#include "xls/scheduling/schedule_util.h"
 
 namespace xls {
 namespace sched {
@@ -35,6 +41,7 @@ ScheduleBounds::ScheduleBounds(FunctionBase* f, int64_t clock_period_ps,
     : clock_period_ps_(clock_period_ps), delay_estimator_(&delay_estimator) {
   auto topo_sort_it = TopoSort(f);
   topo_sort_ = std::vector<Node*>(topo_sort_it.begin(), topo_sort_it.end());
+  dead_after_synthesis_ = GetDeadAfterSynthesisNodes(f);
   Reset();
 }
 
@@ -42,6 +49,7 @@ ScheduleBounds::ScheduleBounds(FunctionBase* f, std::vector<Node*> topo_sort,
                                int64_t clock_period_ps,
                                const DelayEstimator& delay_estimator)
     : topo_sort_(std::move(topo_sort)),
+      dead_after_synthesis_(GetDeadAfterSynthesisNodes(f)),
       clock_period_ps_(clock_period_ps),
       delay_estimator_(&delay_estimator) {
   Reset();
@@ -70,8 +78,16 @@ std::string ScheduleBounds::ToString() const {
   return out;
 }
 
+absl::StatusOr<int64_t> ScheduleBounds::GetDelay(Node* node) const {
+  // Treat nodes that will be dead after synthesis as having a delay of 0.
+  if (dead_after_synthesis_.contains(node)) {
+    return 0;
+  }
+  return delay_estimator_->GetOperationDelayInPs(node);
+}
+
 absl::Status ScheduleBounds::PropagateLowerBounds() {
-  XLS_VLOG(4) << "PropagateLowerBounds()";
+  VLOG(4) << "PropagateLowerBounds()";
   // The delay in picoseconds from the beginning of a cycle to the start of the
   // node.
   absl::flat_hash_map<Node*, int64_t> in_cycle_delay;
@@ -80,28 +96,36 @@ absl::Status ScheduleBounds::PropagateLowerBounds() {
   // operands of the node.
   for (Node* node : topo_sort_) {
     int64_t& node_in_cycle_delay = in_cycle_delay[node];
-    XLS_VLOG(4) << absl::StreamFormat("  %s : original lb=%d", node->GetName(),
-                                      lb(node));
+    VLOG(4) << absl::StreamFormat("  %s : original lb=%d", node->GetName(),
+                                  lb(node));
     for (Node* operand : node->operands()) {
       int64_t operand_lb = lb(operand);
       if (operand_lb < lb(node)) {
         continue;
       }
-      XLS_ASSIGN_OR_RETURN(int64_t operand_delay,
-                           delay_estimator_->GetOperationDelayInPs(operand));
+      XLS_ASSIGN_OR_RETURN(int64_t operand_delay, GetDelay(operand));
       if (operand_lb > lb(node)) {
-        XLS_VLOG(4) << absl::StreamFormat(
+        VLOG(4) << absl::StreamFormat(
             "    tightened lb to %d because of operand %s", operand_lb,
             operand->GetName());
         XLS_RETURN_IF_ERROR(TightenNodeLb(node, operand_lb));
         node_in_cycle_delay = in_cycle_delay.at(operand) + operand_delay;
         continue;
       }
+      int64_t min_delay =
+          operand->Is<MinDelay>() ? operand->As<MinDelay>()->delay() : 0;
+      if (operand_lb + min_delay > lb(node)) {
+        VLOG(4) << absl::StreamFormat(
+            "    tightened lb to %d because of operand %s", operand_lb,
+            operand->GetName());
+        XLS_RETURN_IF_ERROR(TightenNodeLb(node, operand_lb + min_delay));
+        node_in_cycle_delay = 0;
+        continue;
+      }
       node_in_cycle_delay = std::max(
           node_in_cycle_delay, in_cycle_delay.at(operand) + operand_delay);
     }
-    XLS_ASSIGN_OR_RETURN(int64_t node_delay,
-                         delay_estimator_->GetOperationDelayInPs(node));
+    XLS_ASSIGN_OR_RETURN(int64_t node_delay, GetDelay(node));
     if (node_delay > clock_period_ps_) {
       return absl::ResourceExhaustedError(absl::StrFormat(
           "Node %s has a greater delay (%dps) than the clock period (%dps)",
@@ -109,8 +133,7 @@ absl::Status ScheduleBounds::PropagateLowerBounds() {
     }
     if (node_in_cycle_delay + node_delay > clock_period_ps_) {
       // Node does not fit in this cycle. Move to next cycle.
-      XLS_VLOG(4) << "    overflows clock period, tightened lb to "
-                  << lb(node) + 1;
+      VLOG(4) << "    overflows clock period, tightened lb to " << lb(node) + 1;
       XLS_RETURN_IF_ERROR(TightenNodeLb(node, lb(node) + 1));
       node_in_cycle_delay = 0;
     }
@@ -119,7 +142,7 @@ absl::Status ScheduleBounds::PropagateLowerBounds() {
 }
 
 absl::Status ScheduleBounds::PropagateUpperBounds() {
-  XLS_VLOG(4) << "PropagateUpperBounds()";
+  VLOG(4) << "PropagateUpperBounds()";
   // The delay in picoseconds from the end of a cycle to the end of the node.
   absl::flat_hash_map<Node*, int64_t> in_cycle_delay;
 
@@ -128,18 +151,17 @@ absl::Status ScheduleBounds::PropagateUpperBounds() {
   for (auto it = topo_sort_.rbegin(); it != topo_sort_.rend(); ++it) {
     Node* node = *it;
     int64_t& node_in_cycle_delay = in_cycle_delay[node];
-    XLS_VLOG(4) << absl::StreamFormat("  %s : original ub=%d", node->GetName(),
-                                      ub(node));
+    VLOG(4) << absl::StreamFormat("  %s : original ub=%d", node->GetName(),
+                                  ub(node));
     for (Node* user : node->users()) {
       int64_t user_ub = ub(user);
       if (user_ub == std::numeric_limits<int64_t>::max() ||
           user_ub > ub(node)) {
         continue;
       }
-      XLS_ASSIGN_OR_RETURN(int64_t user_delay,
-                           delay_estimator_->GetOperationDelayInPs(user));
+      XLS_ASSIGN_OR_RETURN(int64_t user_delay, GetDelay(user));
       if (user_ub < ub(node)) {
-        XLS_VLOG(4) << absl::StreamFormat(
+        VLOG(4) << absl::StreamFormat(
             "    tightened ub to %d because of user %s", user_ub,
             user->GetName());
         XLS_RETURN_IF_ERROR(TightenNodeUb(node, user_ub));
@@ -149,8 +171,7 @@ absl::Status ScheduleBounds::PropagateUpperBounds() {
       node_in_cycle_delay =
           std::max(node_in_cycle_delay, in_cycle_delay.at(user) + user_delay);
     }
-    XLS_ASSIGN_OR_RETURN(int64_t node_delay,
-                         delay_estimator_->GetOperationDelayInPs(node));
+    XLS_ASSIGN_OR_RETURN(int64_t node_delay, GetDelay(node));
     if (node_delay > clock_period_ps_) {
       return absl::ResourceExhaustedError(absl::StrFormat(
           "Node %s has a greater delay (%dps) than the clock period (%dps)",
@@ -158,8 +179,7 @@ absl::Status ScheduleBounds::PropagateUpperBounds() {
     }
     if (node_in_cycle_delay + node_delay > clock_period_ps_) {
       // Node does not fit in this cycle. Move to next cycle.
-      XLS_VLOG(4) << "    overflows clock period, tightened ub to "
-                  << ub(node) - 1;
+      VLOG(4) << "    overflows clock period, tightened ub to " << ub(node) - 1;
       XLS_RETURN_IF_ERROR(TightenNodeUb(node, ub(node) - 1));
       node_in_cycle_delay = 0;
     }
@@ -167,15 +187,15 @@ absl::Status ScheduleBounds::PropagateUpperBounds() {
   return absl::OkStatus();
 }
 
-/* static */
-absl::StatusOr<ScheduleBounds> ScheduleBounds::ComputeAsapAndAlapBounds(
+/* static */ absl::StatusOr<ScheduleBounds>
+ScheduleBounds::ComputeAsapAndAlapBounds(
     FunctionBase* f, int64_t clock_period_ps,
     const DelayEstimator& delay_estimator) {
-  XLS_VLOG(4) << "ComputeAsapAndAlapBounds()";
+  VLOG(4) << "ComputeAsapAndAlapBounds()";
   ScheduleBounds bounds(f, clock_period_ps, delay_estimator);
   XLS_RETURN_IF_ERROR(bounds.PropagateLowerBounds());
-  XLS_VLOG(4) << "Setting all upper bounds to max-lower-bound "
-              << bounds.max_lower_bound();
+  VLOG(4) << "Setting all upper bounds to max-lower-bound "
+          << bounds.max_lower_bound();
   for (Node* node : f->nodes()) {
     XLS_RETURN_IF_ERROR(bounds.TightenNodeUb(node, bounds.max_lower_bound()));
   }

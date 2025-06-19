@@ -112,12 +112,12 @@ original leaf node A is being removed and a corresponding logging statement
     unique_operands.clear();
     for (Node* operand : node->operands()) {
       if (unique_operands.insert(operand).second) {
-        if (operand->users().size() == 1 && is_deletable(operand)) {
+        if (HasSingleUse(operand) && is_deletable(operand)) {
           worklist.push_back(operand);
         }
       }
     }
-    XLS_VLOG(3) << "DCE removing " << node->ToString();
+    VLOG(3) << "DCE removing " << node->ToString();
     XLS_RETURN_IF_ERROR(f->RemoveNode(node));
     removed_count++;
   }
@@ -128,7 +128,7 @@ For this pass, this amounts to returning whether or not a single IR node has
 been DCE'ed:
 
 ```c++
-  XLS_VLOG(2) << "Removed " << removed_count << " dead nodes";
+  VLOG(2) << "Removed " << removed_count << " dead nodes";
   return removed_count > 0;
 }
 ```
@@ -265,7 +265,7 @@ confusing in the code but is really just a performance optimization:
 ```c++
 absl::Span<Node* const> GetOperandsForCse(
     Node* node, std::vector<Node*>* span_backing_store) {
-  XLS_CHECK(span_backing_store->empty());
+  CHECK(span_backing_store->empty());
   if (!OpIsCommutative(node->op())) {
     return node->operands();
   }
@@ -349,7 +349,7 @@ and mark the IR as modified. We also note whether a true match was found (via
 `replaced`):
 
 ```c++
-        XLS_VLOG(3) << absl::StreamFormat(
+        VLOG(3) << absl::StreamFormat(
             "Replacing %s with equivalent node %s", node->GetName(),
             candidate->GetName());
         XLS_RETURN_IF_ERROR(node->ReplaceUsesWith(candidate));
@@ -416,7 +416,7 @@ literals as operands as well as whether it is safe to replace the node.
         !OpIsSideEffecting(node->op()) &&
         std::all_of(node->operands().begin(), node->operands().end(),
                     [](Node* o) { return o->Is<Literal>(); })) {
-      XLS_VLOG(2) << "Folding: " << *node;
+      VLOG(2) << "Folding: " << *node;
 ```
 
 Here now comes the fun part. If the condition is true, XLS simply collects the
@@ -914,4 +914,3 @@ output, so the MSB can safely be replaced with a 0 bit. Note: This approach
 assumes that IR nodes do not have any side effects. When IR nodes with side
 effects are introduced (i.e. channels) the analysis for this optimization will
 have to be adjusted slightly to account for this.
-

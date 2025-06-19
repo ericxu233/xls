@@ -14,6 +14,8 @@
 
 #include "xls/examples/jpeg/streams.h"
 
+#include <climits>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -21,9 +23,15 @@
 #include <utility>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
+#include "absl/types/span.h"
 #include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/examples/jpeg/constants.h"
 
 namespace xls::jpeg {
@@ -106,7 +114,7 @@ absl::Status ByteStream::DropExpected(uint8_t want, std::string_view message) {
 
 absl::StatusOr<uint8_t> ByteStream::Pop() {
   XLS_ASSIGN_OR_RETURN(uint8_t b, Peek());
-  XLS_CHECK_OK(Drop());
+  CHECK_OK(Drop());
   return b;
 }
 
@@ -165,8 +173,8 @@ absl::Status BitStream::LookaheadOneByte() {
   lookahead_bits_ += 8;
   if (byte == 0xff) {
     XLS_ASSIGN_OR_RETURN(uint8_t marker, byte_stream_->Pop());
-    XLS_VLOG(3) << absl::StreamFormat("Bit stream encountered marker: %#02x",
-                                      marker);
+    VLOG(3) << absl::StreamFormat("Bit stream encountered marker: %#02x",
+                                  marker);
     // Not clear whether we ever have to do anything with this marker or we can
     // assume it's always effectively EOI.
     if (marker != kEoiMarker) {

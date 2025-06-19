@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -26,10 +27,9 @@
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/get_runfile_path.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 
-const char kUsage[] =
+static constexpr std::string_view kUsage =
     "A bogus yosys binary used by tests. It regurgitates a precanned stdout "
     "which looks like yosys output and writes a json netlist file output.";
 
@@ -59,6 +59,26 @@ Top module:  \__input__fun
 2.50. Executing CHECK pass (checking for obvious problems).
 checking module __input__fun..
 found and reported 0 problems.
+
+XLS marker: statistics section starts here
+
+9. Printing statistics.
+
+=== __input__fun ===
+
+   Number of wires:                 11
+   Number of wire bits:            578
+   Number of public wires:          11
+   Number of public wire bits:     578
+   Number of memories:               0
+   Number of memory bits:            0
+   Number of processes:              0
+   Number of cells:                224
+     CCU2C                          32
+     TRELLIS_FF                    192
+
+   Chip area for module '\__input__fun': 1074.385620
+     of which used for sequential elements: 37.324800 (3.47%)
 
 ....
 )";

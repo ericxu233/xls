@@ -14,14 +14,20 @@
 
 #include "xls/ir/type.h"
 
+#include <cstdint>
 #include <ostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "xls/common/status/ret_check.h"
+#include "xls/ir/xls_type.pb.h"
 
 namespace xls {
 
@@ -48,14 +54,24 @@ absl::StatusOr<BitsType*> Type::AsBits() {
   if (IsBits()) {
     return AsBitsOrDie();
   }
-  return absl::InvalidArgumentError("Type is not 'bits': " + ToString());
+  return absl::InvalidArgumentError(
+      absl::StrCat("Type is not 'bits': ", *this));
 }
 
 absl::StatusOr<ArrayType*> Type::AsArray() {
   if (IsArray()) {
     return AsArrayOrDie();
   }
-  return absl::InvalidArgumentError("Type is not an array: " + ToString());
+  return absl::InvalidArgumentError(
+      absl::StrCat("Type is not an array: ", *this));
+}
+
+absl::StatusOr<TupleType*> Type::AsTuple() {
+  if (IsTuple()) {
+    return AsTupleOrDie();
+  }
+  return absl::InvalidArgumentError(
+      absl::StrCat("Type is not a tuple: ", *this));
 }
 
 TypeProto BitsType::ToProto() const {
@@ -149,7 +165,7 @@ std::string TupleType::ToString() const {
 
 BitsType::BitsType(int64_t bit_count)
     : Type(TypeKind::kBits), bit_count_(bit_count) {
-  XLS_CHECK_GE(bit_count_, 0);
+  CHECK_GE(bit_count_, 0);
 }
 
 std::string BitsType::ToString() const {
@@ -245,6 +261,17 @@ bool TypeHasToken(Type* type) {
     }
   }
   return false;
+}
+
+absl::StatusOr<Type*> InstantiationType::GetOutputPortType(
+    std::string_view name) const {
+  XLS_RET_CHECK(output_types_.contains(name));
+  return output_types_.at(name);
+}
+absl::StatusOr<Type*> InstantiationType::GetInputPortType(
+    std::string_view name) const {
+  XLS_RET_CHECK(input_types_.contains(name));
+  return input_types_.at(name);
 }
 
 }  // namespace xls

@@ -22,13 +22,15 @@
 #include <tuple>
 #include <type_traits>
 #include <variant>
+#include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "xls/dslx/frontend/ast.h"
-#include "xls/dslx/import_data.h"
-#include "xls/dslx/type_system/type_info.h"
+#include "xls/dslx/interp_value.h"
 
 namespace xls::dslx {
 
@@ -40,20 +42,15 @@ namespace xls::dslx {
 bool IsBuiltinFn(Expr* callee,
                  std::optional<std::string_view> target = std::nullopt);
 
-// Returns the name of `callee` if it's a builtin function and an error
-// otherwise.
-absl::StatusOr<std::string> GetBuiltinName(Expr* callee);
+// Returns the name of the builtin function referred to by `callee` if it is a
+// builtin function. If `callee` isn't a builtin function, returns std::nullopt.
+std::optional<std::string_view> GetBuiltinFnName(Expr* callee);
 
-// Finds the Function identified by the given node (either NameRef or ColonRef),
-// using the associated ImportData for import Module lookup.
-// The target function must have been typechecked prior to this call.
-absl::StatusOr<Function*> ResolveFunction(Expr* callee,
-                                          const TypeInfo* type_info);
-
-// Finds the Proc identified by the given node (either NameRef or ColonRef),
-// using the associated ImportData for import Module lookup.
-// The target proc must have been typechecked prior to this call.
-absl::StatusOr<Proc*> ResolveProc(Expr* callee, const TypeInfo* type_info);
+// Returns true if `callee` refers to a builtin function that requires an
+// implicit token parameter.
+//
+// Precondition: `IsBuiltinFn(callee)`.
+bool GetBuiltinFnRequiresImplicitToken(Expr* callee);
 
 // Resolves the given TypeDefinition to a struct definition node local to the
 // module.
@@ -63,30 +60,6 @@ absl::StatusOr<Proc*> ResolveProc(Expr* callee, const TypeInfo* type_info);
 // current module, returns a status error.
 absl::StatusOr<StructDef*> ResolveLocalStructDef(TypeDefinition td);
 
-// Returns the basis of the given ColonRef.
-//
-// In valid cases this will generally be:
-// * a module
-// * an enum definition
-// * a builtin type (with a constant item on it, a la `u7::MAX`)
-//
-// Struct definitions cannot currently have constant items on them, so this will
-// have to be flagged by the type checker.
-absl::StatusOr<std::variant<Module*, EnumDef*, BuiltinNameDef*,
-                            ArrayTypeAnnotation*, StructDef*, ColonRef*>>
-ResolveColonRefSubjectForTypeChecking(ImportData* import_data,
-                                      const TypeInfo* type_info,
-                                      const ColonRef* colon_ref);
-
-// Implementation of the above that can be called after type checking has been
-// performed, in which case we can eliminate some of the (invalid) possibilities
-// so they no longer need to be handled.
-absl::StatusOr<
-    std::variant<Module*, EnumDef*, BuiltinNameDef*, ArrayTypeAnnotation*>>
-ResolveColonRefSubjectAfterTypeChecking(ImportData* import_data,
-                                        const TypeInfo* type_info,
-                                        const ColonRef* colon_ref);
-
 // Verifies that every node's child thinks that that node is its parent.
 absl::Status VerifyParentage(const Module* module);
 absl::Status VerifyParentage(const AstNode* root);
@@ -94,6 +67,25 @@ absl::Status VerifyParentage(const AstNode* root);
 // Returns the set consisting of all transitive children of the given node (as
 // well as that node itself).
 absl::flat_hash_set<const AstNode*> FlattenToSet(const AstNode* node);
+
+// Returns whether the given attribute is a known colon-ref attribute of a
+// builtin bits type.
+bool IsBuiltinBitsTypeAttr(std::string_view attr);
+
+// Returns whether node n is a parametric function.
+//
+// "n" may be null.
+bool IsParametricFunction(const AstNode* n);
+
+// Returns whether node n is a `NameRef` to a parametric function.
+//
+// "n" may be null.
+bool IsNameRefToParametricFunction(const AstNode* n);
+
+// Returns whether the parent of "n" is an invocation where "n" is the callee.
+//
+// "n" should not be null.
+bool ParentIsInvocationWithCallee(const NameRef* n);
 
 // Returns the result of accessing a colon-ref member of a builtin type; e.g.
 // `s7::MAX`.
@@ -104,14 +96,8 @@ absl::StatusOr<InterpValue> GetArrayTypeColonAttr(
     const ArrayTypeAnnotation* type, uint64_t constexpr_dim,
     std::string_view attr);
 
-// Returns the indentation level of the given AST node.
-//
-// That is, the contents of the AST node when formatted (flat) should be
-// indented by kSpacesPerIndent * $retval.
-//
-// This is used for determining indentation level at an arbitrary point in the
-// AST for formatting.
-int64_t DetermineIndentLevel(const AstNode& n);
+// Returns a non-nullopt value if `name_ref` is bound by a `use` statement.
+std::optional<const UseTreeEntry*> IsExternNameRef(const NameRef& name_ref);
 
 // -- Template Metaprogramming helpers for dealing with AST node variants
 
@@ -140,7 +126,7 @@ inline ToVariantType TryWidenVariant(const std::variant<FromTypes...>& v) {
     return std::get<TryT>(v);
   }
   if constexpr (N == 0) {
-    XLS_LOG(FATAL) << "Could not find variant in FromTypes.";
+    LOG(FATAL) << "Could not find variant in FromTypes.";
   } else {
     return TryWidenVariant<N - 1, ToVariantType>(v);
   }
@@ -152,24 +138,11 @@ struct is_variant : std::false_type {};
 template <typename... Args>
 struct is_variant<std::variant<Args...>> : std::true_type {};
 
-template <typename... ToTypes, typename... FromTypes,
-          typename = std::enable_if_t<sizeof...(ToTypes) != 1, int>>
-inline std::variant<ToTypes...> TryWidenVariant(
-    const std::variant<FromTypes...>& v) {
-  return TryWidenVariant<sizeof...(FromTypes) - 1, std::variant<ToTypes...>>(v);
-}
-
 // "Widens" a variant from a smaller set of types to a larger set of types; e.g.
 //
 // `variant<int, double>` can be widened to `variant<int, double, std::string>`
 // where `int, double` would be FromTypes and `int, double, std::string` would
 // be ToTypes.
-template <typename... ToTypes, typename... FromTypes>
-inline std::variant<ToTypes...> WidenVariant(
-    const std::variant<FromTypes...>& v) {
-  return TryWidenVariant<sizeof...(FromTypes) - 1, std::variant<ToTypes...>>(v);
-}
-
 template <typename T, typename... FromTypes,
           typename = std::enable_if_t<is_variant<T>::value>>
 inline T WidenVariantTo(const std::variant<FromTypes...>& v) {
@@ -203,11 +176,74 @@ struct BitVectorMetadata {
 };
 
 // Returns metadata about the bit-vector type if `type_annotation` refers to a
-// type whose underlying representation is a bit-vector. Examples include u32,
-// s10, uN[42], bits[11], enums, etc, and aliases of these types. Returns
-// std::nullopt otherwise.
+// type whose underlying representation is a bit-vector. Returns std::nullopt
+// otherwise.
+//
+// Examples include `u32`, `s10`, `uN[42]`, `bits[11]`, enums, etc, and
+// aliases of these types.
 std::optional<BitVectorMetadata> ExtractBitVectorMetadata(
     const TypeAnnotation* type_annotation);
+
+// Collects all nodes under the given root.
+absl::StatusOr<std::vector<AstNode*>> CollectUnder(AstNode* root,
+                                                   bool want_types);
+
+absl::StatusOr<std::vector<const NameRef*>> CollectNameRefsUnder(
+    const AstNode* root, const NameDef* to);
+
+absl::StatusOr<std::vector<const AstNode*>> CollectUnder(const AstNode* root,
+                                                         bool want_types);
+
+// Collects NameDefs referred to by NameRefs under "root".
+absl::StatusOr<std::vector<const NameDef*>> CollectReferencedUnder(
+    const AstNode* root, bool want_types = false);
+
+// Wrapper around GetUnaryParametricBuiltinNames() that checks whether name_ref
+// refers to a builtin name def and whether that builtin name is a parametric
+// function.
+bool IsBuiltinParametricNameRef(const NameRef* name_ref);
+
+// Returns whether "node" is a "bare" number (without an explicit type
+// annotation on it).
+const Number* IsBareNumber(const AstNode* node, bool* is_boolean = nullptr);
+
+// Returns whether the given "invocation" is contained within the function
+// "caller".
+//
+// Precondition: invocation should be contained within /some/ function (i.e. not
+// at module scope). Note that this could be relaxed but it's the only use case
+// we need today and it makes for stronger invariant checking.
+//
+// Implementation note: this traverses parent links from the invocation node to
+// see if we arrive at the caller node as the immediately containing function.
+bool ContainedWithinFunction(const Invocation& invocation,
+                             const Function& caller);
+
+// Retrieves the containing function of `node`, if any.
+std::optional<const Function*> GetContainingFunction(const AstNode* node);
+
+// Organizes a group of ParametricBinding pointers by their identifiers.
+class ParametricBindings {
+ public:
+  template <typename Container>
+  explicit ParametricBindings(const Container& bindings) {
+    for (const ParametricBinding* binding : bindings) {
+      bindings_[binding->identifier()] = binding;
+    }
+  }
+
+  const ParametricBinding* at(std::string identifier) const {
+    return bindings_.at(identifier);
+  }
+
+ private:
+  absl::flat_hash_map<std::string, const ParametricBinding*> bindings_;
+};
+
+// Returns true if the subtree rooted at "node" contains any `Invocation`
+// AST node. `want_types` is forwarded to `GetChildren()` to control whether
+// type-annotation children are included in the traversal.
+bool ContainsInvocation(const AstNode* node, bool want_types = true);
 
 }  // namespace xls::dslx
 

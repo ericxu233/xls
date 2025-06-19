@@ -22,12 +22,13 @@
 #include <vector>
 
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/file/temp_directory.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/fuzzer/sample_runner.h"
 
 constexpr std::string_view kUsage = R"(Sample runner program.
@@ -45,11 +46,9 @@ sample_runner_main --options_file=OPT_FILE \
 ABSL_FLAG(std::string, options_file, "",
           "File to load sample runner options from.");
 ABSL_FLAG(std::string, input_file, "", "Code input file.");
-ABSL_FLAG(std::optional<std::string>, args_file, std::nullopt,
-          "Optional file containing arguments to use for interpretation and "
-          "simulation.");
-ABSL_FLAG(std::optional<std::string>, ir_channel_names_file, std::nullopt,
-          "Optional file containing IR names of input channels for a proc.");
+ABSL_FLAG(std::string, testvector_textproto, "",
+          "A textproto file containing the function argument or proc "
+          "channel test vectors.");
 
 namespace xls {
 
@@ -59,10 +58,13 @@ namespace {
 // returns the basename of the file.
 std::filesystem::path MaybeCopyFile(const std::filesystem::path& file_path,
                                     const std::filesystem::path& dir_path) {
-  XLS_DCHECK(std::filesystem::is_directory(dir_path));
-  std::filesystem::path basename = file_path.filename();
-  if (file_path.parent_path() != dir_path) {
-    std::filesystem::copy_file(file_path, dir_path / basename);
+  namespace fs = std::filesystem;
+  DCHECK(fs::is_directory(dir_path));
+  const fs::path canonical_dir = fs::canonical(dir_path);
+  const fs::path canonical_file = fs::canonical(file_path);
+  const fs::path basename = file_path.filename();
+  if (canonical_file.parent_path() != canonical_dir) {
+    fs::copy_file(file_path, dir_path / basename);
   }
   return dir_path / basename;
 }
@@ -70,23 +72,18 @@ std::filesystem::path MaybeCopyFile(const std::filesystem::path& file_path,
 }  // namespace
 
 // Runs the sample in the given run directory.
-static absl::Status RealMain(
-    const std::filesystem::path& run_dir, const std::string& options_file,
-    const std::string& input_file, const std::optional<std::string>& args_file,
-    const std::optional<std::string>& ir_channel_names_file) {
+static absl::Status RealMain(const std::filesystem::path& run_dir,
+                             const std::string& options_file,
+                             const std::string& input_file,
+                             const std::string& testvector_file) {
   SampleRunner runner(run_dir);
   std::filesystem::path input_filename = MaybeCopyFile(input_file, run_dir);
   std::filesystem::path options_filename = MaybeCopyFile(options_file, run_dir);
-  std::optional<std::filesystem::path> args_filename =
-      args_file.has_value()
-          ? std::make_optional(MaybeCopyFile(*args_file, run_dir))
-          : std::nullopt;
-  std::optional<std::filesystem::path> ir_channel_names_filename =
-      ir_channel_names_file.has_value()
-          ? std::make_optional(MaybeCopyFile(*ir_channel_names_file, run_dir))
-          : std::nullopt;
-  return runner.RunFromFiles(input_filename, options_filename, args_filename,
-                             ir_channel_names_filename);
+  std::filesystem::path testvector_filename =
+      MaybeCopyFile(testvector_file, run_dir);
+  return runner
+      .RunFromFiles(input_filename, options_filename, testvector_filename)
+      .status();
 }
 
 }  // namespace xls
@@ -95,13 +92,15 @@ int main(int argc, char** argv) {
   std::vector<std::string_view> positional_arguments =
       xls::InitXls(kUsage, argc, argv);
 
-  XLS_QCHECK(!absl::GetFlag(FLAGS_options_file).empty())
+  QCHECK(!absl::GetFlag(FLAGS_options_file).empty())
       << "--options_file is required.";
-  XLS_QCHECK(!absl::GetFlag(FLAGS_input_file).empty())
+  QCHECK(!absl::GetFlag(FLAGS_input_file).empty())
       << "--input_file is required.";
+  QCHECK(!absl::GetFlag(FLAGS_testvector_textproto).empty())
+      << "--testvector_textproto is required.";
 
   if (positional_arguments.size() > 1) {
-    XLS_LOG(QFATAL) << "Usage:\n" << kUsage;
+    LOG(QFATAL) << "Usage:\n" << kUsage;
   }
 
   std::filesystem::path run_dir;
@@ -124,8 +123,9 @@ int main(int argc, char** argv) {
     }
   }
 
-  return xls::ExitStatus(xls::RealMain(
-      run_dir, absl::GetFlag(FLAGS_options_file),
-      absl::GetFlag(FLAGS_input_file), absl::GetFlag(FLAGS_args_file),
-      absl::GetFlag(FLAGS_ir_channel_names_file)));
+  return xls::ExitStatus(
+      xls::RealMain(run_dir, absl::GetFlag(FLAGS_options_file),
+                    absl::GetFlag(FLAGS_input_file),
+                    absl::GetFlag(FLAGS_testvector_textproto)),
+      /*log_on_error=*/false);
 }

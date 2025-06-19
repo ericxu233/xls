@@ -17,35 +17,55 @@
 #include <string_view>
 
 #include "gtest/gtest.h"
+#include "xls/dslx/frontend/pos.h"
 
 namespace xls::dslx {
 namespace {
 
 TEST(PrettyPrintTest, OneTextDoc) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef ref = arena.MakeText("hi");
   EXPECT_EQ(PrettyPrint(arena, ref, 0), "hi");
   EXPECT_EQ(PrettyPrint(arena, ref, 1), "hi");
   EXPECT_EQ(PrettyPrint(arena, ref, 2), "hi");
   EXPECT_EQ(PrettyPrint(arena, ref, 3), "hi");
+
+  EXPECT_EQ(arena.ToDebugString(ref), "Doc{2, \"hi\"}");
 }
 
 TEST(PrettyPrintTest, EmptyConcatIsEmptyString) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef ref = ConcatN(arena, {});
   EXPECT_EQ(PrettyPrint(arena, ref, 0), "");
   EXPECT_EQ(PrettyPrint(arena, ref, 1), "");
+
+  EXPECT_EQ(arena.ToDebugString(ref), "Doc{0, \"\"}");
+}
+
+TEST(PrettyPrintTest, ConcatOfEmpty) {
+  FileTable file_table;
+  DocArena arena(file_table);
+  DocRef ref = arena.MakeConcat(arena.empty(), arena.empty());
+  EXPECT_EQ(PrettyPrint(arena, ref, 0), "");
+  EXPECT_EQ(PrettyPrint(arena, ref, 1), "");
+
+  EXPECT_EQ(arena.ToDebugString(ref),
+            "Doc{0, Concat{Doc{0, \"\"}, Doc{0, \"\"}}}");
 }
 
 TEST(PrettyPrintTest, OneHardLineDoc) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef ref = arena.hard_line();
   EXPECT_EQ(PrettyPrint(arena, ref, 0), "\n");
   EXPECT_EQ(PrettyPrint(arena, ref, 1), "\n");
 }
 
 TEST(PrettyPrintTest, TwoTextDoc) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef ref0 = arena.MakeText("hi");
   DocRef ref1 = arena.MakeText("there");
   DocRef concat = arena.MakeConcat(ref0, ref1);
@@ -56,7 +76,8 @@ TEST(PrettyPrintTest, TwoTextDoc) {
 }
 
 TEST(PrettyPrintTest, LetExample) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef let = arena.MakeText("let");
   DocRef break1 = arena.break1();
   DocRef x_colon = arena.MakeText("x:");
@@ -83,7 +104,8 @@ u32:42)";
 }
 
 TEST(PrettyPrintTest, CallExample) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef call_with_args = ConcatN(
       arena,
       {arena.MakeText("foo("),
@@ -100,7 +122,8 @@ TEST(PrettyPrintTest, CallExample) {
 }
 
 TEST(PrettyPrintTest, PrefixedReflow) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef ref = arena.MakePrefixedReflow(
       "// ", "this is overly long for our liking, gladly");
   EXPECT_EQ(PrettyPrint(arena, ref, 18), R"(// this is overly
@@ -109,7 +132,8 @@ TEST(PrettyPrintTest, PrefixedReflow) {
 }
 
 TEST(PrettyPrintTest, PrefixedReflowAfterIndentWidth18) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef ref0 = arena.MakePrefixedReflow(
       "// ", "this is overly long for our liking, gladly");
   DocRef ref1 = arena.MakeNest(arena.MakePrefixedReflow(
@@ -127,7 +151,8 @@ TEST(PrettyPrintTest, PrefixedReflowAfterIndentWidth18) {
 }
 
 TEST(PrettyPrintTest, PrefixedReflowAfterIndentWidth40) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef ref0 = arena.MakePrefixedReflow(
       "// ", "this is overly long for our liking, gladly");
   DocRef ref1 = arena.MakeNest(arena.MakePrefixedReflow(
@@ -142,10 +167,21 @@ TEST(PrettyPrintTest, PrefixedReflowAfterIndentWidth40) {
     // indented)");
 }
 
+TEST(PrettyPrintTest, PrefixedReflowOffByOne) {
+  FileTable file_table;
+  DocArena arena(file_table);
+  // Total width is 8, so it should reflow since the max width is 7.
+  DocRef ref = arena.MakePrefixedReflow("// ", "1 2 3");
+  EXPECT_EQ(PrettyPrint(arena, ref, 7),
+            R"(// 1 2
+// 3)");
+}
+
 // Demonstrates that the empty line between nested elements don't have leading
 // spaces.
 TEST(PrettyPrintTest, NestLevelWithEmptyLine) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef ref0 = arena.MakeText("foo");
   DocRef ref1 = arena.MakeText("bar");
 
@@ -159,7 +195,8 @@ TEST(PrettyPrintTest, NestLevelWithEmptyLine) {
 }
 
 TEST(PrettyPrintTest, PrefixedReflowOneOverflongToken) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef ref = arena.MakePrefixedReflow(
       "//",
       " abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrs"
@@ -170,7 +207,8 @@ TEST(PrettyPrintTest, PrefixedReflowOneOverflongToken) {
 }
 
 TEST(PrettyPrintTest, PrefixedReflowCustomSpacingBeforeToken) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef ref = arena.MakePrefixedReflow("//", "     I like this many spaces");
   EXPECT_EQ(PrettyPrint(arena, ref, 40), R"(//     I like this many spaces)");
 }
@@ -179,7 +217,8 @@ TEST(PrettyPrintTest, PrefixedReflowCustomSpacingBeforeToken) {
 // inline into the current line so we emit the "on_nested_flat_ref" into the
 // subsequent line (it does fit there).
 TEST(PrettyPrintTest, NestIfFlatFitsDoNest) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef six_nums = arena.MakeText("123456");
   DocRef six_chars = arena.MakeText("abcdef");
   DocRef ref = arena.MakeConcat(
@@ -193,7 +232,8 @@ TEST(PrettyPrintTest, NestIfFlatFitsDoNest) {
 // Scenario where we use NestIfFlatFits and the "on_other_ref" fits inline into
 // the current line so we don't need to emit nested.
 TEST(PrettyPrintTest, NestIfFlatFitsDoFlatInline) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef six_nums = arena.MakeText("123456");
   DocRef four_chars = arena.MakeConcat(arena.break0(), arena.MakeText("abcd"));
   DocRef ref = arena.MakeConcat(
@@ -206,7 +246,8 @@ TEST(PrettyPrintTest, NestIfFlatFitsDoFlatInline) {
 // Scenario where we use NestIfFlatFits but we fall back to the "break mode"
 // case; i.e. the on_other_ref is selected and emitted in break mode.
 TEST(PrettyPrintTest, NestIfFlatFitsDoFlatBreak) {
-  DocArena arena;
+  FileTable file_table;
+  DocArena arena(file_table);
   DocRef six_nums = arena.MakeText("123456");
   DocRef seven_chars =
       arena.MakeConcat(arena.break0(), arena.MakeText("abcdefg"));

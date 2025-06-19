@@ -15,21 +15,35 @@
 #include "xls/passes/boolean_simplification_pass.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <optional>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_join.h"
-#include "xls/common/logging/logging.h"
+#include "absl/types/span.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
+#include "xls/ir/dfs_visitor.h"
+#include "xls/ir/format_preference.h"
+#include "xls/ir/function_base.h"
+#include "xls/ir/node.h"
 #include "xls/ir/node_util.h"
-#include "xls/netlist/logical_effort.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/op.h"
+#include "xls/ir/source_location.h"
+#include "xls/ir/value.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 namespace {
@@ -48,19 +62,19 @@ TruthTable::TruthTable(const Bits& xyz_present, const Bits& xyz_negated,
     : xyz_present_(xyz_present),
       xyz_negated_(xyz_negated),
       logical_op_(logical_op) {
-  XLS_CHECK(!xyz_present.IsZero());
-  XLS_CHECK_EQ(3, xyz_present.bit_count());
-  XLS_CHECK_EQ(3, xyz_negated.bit_count());
+  CHECK(!xyz_present.IsZero());
+  CHECK_EQ(3, xyz_present.bit_count());
+  CHECK_EQ(3, xyz_negated.bit_count());
   if (!logical_op.has_value()) {
-    XLS_CHECK_EQ(1, xyz_present.PopCount());
-    XLS_CHECK_LE(xyz_negated.PopCount(), 1);
+    CHECK_EQ(1, xyz_present.PopCount());
+    CHECK_LE(xyz_negated.PopCount(), 1);
   }
   // Check for not-present bits that are negated.
-  XLS_CHECK(bits_ops::And(bits_ops::Not(xyz_present), xyz_negated).IsZero());
+  CHECK(bits_ops::And(bits_ops::Not(xyz_present), xyz_negated).IsZero());
 }
 
 /* static */ Bits TruthTable::GetInitialVector(int64_t i) {
-  XLS_CHECK_LT(i, kMaxFrontierNodes);
+  CHECK_LT(i, kMaxFrontierNodes);
   switch (i) {
     case 0:
       return UBits(0b00001111, /*bit_count=*/8);
@@ -69,7 +83,7 @@ TruthTable::TruthTable(const Bits& xyz_present, const Bits& xyz_negated,
     case 2:
       return UBits(0b01010101, /*bit_count=*/8);
   }
-  XLS_LOG(FATAL) << "Unreachable.";
+  LOG(FATAL) << "Unreachable.";
 }
 
 /* static */ Bits TruthTable::RunNaryOp(Op op,
@@ -86,7 +100,7 @@ TruthTable::TruthTable(const Bits& xyz_present, const Bits& xyz_negated,
     case Op::kXor:
       return bits_ops::NaryXor(operands);
     default:
-      XLS_LOG(FATAL) << "Unhandled nary logical operation: " << op;
+      LOG(FATAL) << "Unhandled nary logical operation: " << op;
   }
 }
 
@@ -104,7 +118,7 @@ Bits TruthTable::ComputeTruthTable() const {
   if (logical_op_.has_value()) {
     return RunNaryOp(logical_op_.value(), operands);
   }
-  XLS_CHECK_EQ(1, operands.size());
+  CHECK_EQ(1, operands.size());
   return operands[0];
 }
 
@@ -142,24 +156,23 @@ bool TruthTable::MatchesSymmetrical(
   }
   // When there is no logical function, only one of the "present" bits may be
   // set.
-  XLS_CHECK_EQ(1, xyz_present_.PopCount());
+  CHECK_EQ(1, xyz_present_.PopCount());
   for (int64_t i = 0; i < kMaxFrontierNodes; ++i) {
     if (!xyz_present_.GetFromMsb(i)) {
       continue;  // Don't care about this operand.
     }
     if (xyz_negated_.GetFromMsb(i)) {
       return IsNotOf(original, operands[i]);
-    } else {
-      return original == operands[i];
     }
+    return original == operands[i];
   }
-  XLS_LOG(FATAL) << "Unreachable.";
+  LOG(FATAL) << "Unreachable.";
 }
 
 absl::StatusOr<Node*> TruthTable::CreateReplacement(
     const SourceInfo& original_loc, absl::Span<Node* const> operands,
     FunctionBase* f) const {
-  XLS_CHECK_LE(operands.size(), kMaxFrontierNodes);
+  CHECK_LE(operands.size(), kMaxFrontierNodes);
   std::vector<Node*> this_operands;
   for (int64_t i = 0; i < kMaxFrontierNodes; ++i) {
     if (!xyz_present_.GetFromMsb(i)) {
@@ -173,7 +186,7 @@ absl::StatusOr<Node*> TruthTable::CreateReplacement(
     this_operands.push_back(operand);
   }
   if (!logical_op_.has_value()) {
-    XLS_CHECK_EQ(1, this_operands.size());
+    CHECK_EQ(1, this_operands.size());
     return this_operands[0];
   }
   return f->MakeNode<NaryOp>(original_loc, this_operands, logical_op_.value());
@@ -183,7 +196,7 @@ absl::StatusOr<Node*> TruthTable::CreateReplacement(
 
 namespace {
 
-using xls::internal::TruthTable;
+using ::xls::internal::TruthTable;
 
 // Indicates more than kMaxFrontierNodes are involved in a boolean expression.
 struct TooManySentinel {};
@@ -297,7 +310,7 @@ class BooleanFlowTracker : public DfsVisitorWithDefault {
     for (int64_t presence = 0b0001; presence < 0b1000; presence <<= 1) {
       for (bool negate : {false, true}) {
         add(TruthTable(UBits(presence, /*bit_count=*/3),
-                       UBits(negate ? presence : 0LL, /*bit_count=*/3),
+                       UBits(negate ? presence : int64_t{0}, /*bit_count=*/3),
                        std::nullopt));
       }
     }
@@ -373,13 +386,13 @@ class BooleanFlowTracker : public DfsVisitorWithDefault {
   //
   // Starting at node, recursively invokes itself until it gets to the "frontier
   // nodes" at the frontier of the boolean computation. Those get initialized
-  // with the full truth table of possibiliites for two variables:
+  // with the full truth table of possibilities for two variables:
   //
   //    X: 0 0 1 1 0 0 1 1
   //    Y: 0 1 0 1 0 1 0 1
   //    Z: 0 0 0 0 1 1 1 1
   //
-  // Once we've pushed this vector of possiblities though all the intermediate
+  // Once we've pushed this vector of possibilities though all the intermediate
   // bitwise nodes what we're left with at "node" is the resulting logical
   // function. At that point we can just look up whether there's a simplified
   // expression of that logical function is and replace it accordingly, as we do
@@ -429,7 +442,7 @@ class BooleanFlowTracker : public DfsVisitorWithDefault {
           result = bits_ops::Not(operands[0]);
           break;
         default:
-          XLS_LOG(FATAL) << "Expected node to be logical bitwise: " << node;
+          LOG(FATAL) << "Expected node to be logical bitwise: " << node;
       }
     }
     memoized_results[node] = result;
@@ -446,8 +459,8 @@ class BooleanFlowTracker : public DfsVisitorWithDefault {
       absl::flat_hash_map<Node*, Bits> memoized_results;
       XLS_ASSIGN_OR_RETURN(Bits result, FlowFromFrontierToNode(
                                             frontier, node, memoized_results));
-      XLS_VLOG(3) << "Flow result for " << node << ": "
-                  << BitsToString(result, FormatPreference::kBinary, true);
+      VLOG(3) << "Flow result for " << node << ": "
+              << BitsToString(result, FormatPreference::kBinary, true);
       XLS_ASSIGN_OR_RETURN(Node * replacement,
                            ResolveTruthTable(result, operands, node));
       if (replacement == nullptr) {
@@ -485,16 +498,18 @@ class BooleanFlowTracker : public DfsVisitorWithDefault {
 
 absl::StatusOr<bool> BooleanSimplificationPass::RunOnFunctionBaseInternal(
     FunctionBase* f, const OptimizationPassOptions& options,
-    PassResults* results) const {
+    PassResults* results, OptimizationContext& context) const {
   BooleanFlowTracker visitor;
   XLS_RETURN_IF_ERROR(f->Accept(&visitor));
   for (auto& pair : visitor.node_replacements()) {
     Node* node = pair.first;
     Node* replacement = pair.second;
-    XLS_VLOG(3) << "Replacing " << node << " with " << replacement;
+    VLOG(3) << "Replacing " << node << " with " << replacement;
     XLS_RETURN_IF_ERROR(node->ReplaceUsesWith(replacement));
   }
   return !visitor.node_replacements().empty();
 }
+
+REGISTER_OPT_PASS(BooleanSimplificationPass);
 
 }  // namespace xls

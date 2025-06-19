@@ -14,9 +14,9 @@
 
 #include "xls/public/runtime_build_actions.h"
 
+#include <string>
 #include <string_view>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "xls/common/status/matchers.h"
 #include "xls/dslx/default_dslx_stdlib_path.h"

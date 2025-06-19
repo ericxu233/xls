@@ -19,8 +19,10 @@
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
 #include "xls/interpreter/channel_queue.h"
+#include "xls/interpreter/evaluator_options.h"
 #include "xls/interpreter/proc_evaluator.h"
 #include "xls/interpreter/proc_runtime.h"
 #include "xls/ir/package.h"
@@ -33,18 +35,18 @@ namespace xls {
 class SerialProcRuntime : public ProcRuntime {
  public:
   // Creates and returns an proc network interpreter for the given
-  // package.
+  // evaluators.
   static absl::StatusOr<std::unique_ptr<SerialProcRuntime>> Create(
-      Package* package,
       std::vector<std::unique_ptr<ProcEvaluator>>&& evaluators,
-      std::unique_ptr<ChannelQueueManager>&& queue_manager);
+      std::unique_ptr<ChannelQueueManager>&& queue_manager,
+      const EvaluatorOptions& options = EvaluatorOptions());
 
  private:
   SerialProcRuntime(
-      Package* package,
       absl::flat_hash_map<Proc*, std::unique_ptr<ProcEvaluator>>&& evaluators,
-      std::unique_ptr<ChannelQueueManager>&& queue_manager)
-      : ProcRuntime(package, std::move(evaluators), std::move(queue_manager)) {}
+      std::unique_ptr<ChannelQueueManager>&& queue_manager,
+      const EvaluatorOptions& options = EvaluatorOptions())
+      : ProcRuntime(std::move(evaluators), std::move(queue_manager), options) {}
 
   absl::StatusOr<SerialProcRuntime::NetworkTickResult> TickInternal() override;
 };

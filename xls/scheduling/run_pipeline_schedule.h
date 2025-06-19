@@ -15,22 +15,38 @@
 #ifndef XLS_SCHEDULING_RUN_PIPELINE_SCHEDULE_H_
 #define XLS_SCHEDULING_RUN_PIPELINE_SCHEDULE_H_
 
+#include <optional>
+
 #include "absl/status/statusor.h"
-#include "xls/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/fdo/synthesizer.h"
 #include "xls/ir/function_base.h"
+#include "xls/ir/package.h"
+#include "xls/ir/proc_elaboration.h"
 #include "xls/scheduling/pipeline_schedule.h"
 #include "xls/scheduling/scheduling_options.h"
 
 namespace xls {
 
 // Produces a pipeline schedule using the given delay model and scheduling
-// options. The synthesizer argument should be non-null when we are doing
-// feedback-directed scheduling.
+// options. `elab` must be specified if scheduling a proc with proc-scoped
+// channels.
 absl::StatusOr<PipelineSchedule> RunPipelineSchedule(
     FunctionBase* f, const DelayEstimator& delay_estimator,
     const SchedulingOptions& options,
-    const synthesis::Synthesizer* synthesizer = nullptr);
+    std::optional<const ProcElaboration*> elab = std::nullopt);
+
+// Produce a pipeline schedule using feedback-directed scheduling.
+absl::StatusOr<PipelineSchedule> RunPipelineScheduleWithFdo(
+    FunctionBase* f, const DelayEstimator& delay_estimator,
+    const SchedulingOptions& options, const synthesis::Synthesizer& synthesizer,
+    std::optional<const ProcElaboration*> elab = std::nullopt);
+
+// Produces a pipeline schedule for the network of procs defined by `elab`. The
+// schedule is for a synchronous proc implementation.
+absl::StatusOr<PackagePipelineSchedules> RunSynchronousPipelineSchedule(
+    Package* package, const DelayEstimator& delay_estimator,
+    const SchedulingOptions& options, const ProcElaboration& elab);
 
 }  // namespace xls
 

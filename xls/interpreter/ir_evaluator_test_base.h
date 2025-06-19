@@ -12,28 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_IR_IR_EVALUATOR_TEST_H_
-#define XLS_IR_IR_EVALUATOR_TEST_H_
+#ifndef XLS_INTERPRETER_IR_EVALUATOR_TEST_BASE_H_
+#define XLS_INTERPRETER_IR_EVALUATOR_TEST_BASE_H_
 
+#include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
-#include "xls/common/logging/logging.h"
+#include "absl/types/span.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/interpreter/observer.h"
 #include "xls/ir/bits.h"
-#include "xls/ir/bits_ops.h"
 #include "xls/ir/events.h"
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/ir_test_base.h"
 #include "xls/ir/package.h"
+#include "xls/ir/value.h"
 #include "xls/ir/verifier.h"
 
 namespace xls {
@@ -44,25 +50,39 @@ struct IrEvaluatorTestParam {
   // Function to perform evaluation of the specified program with the given
   // [positional] args.
   using EvaluatorFnT = std::function<absl::StatusOr<InterpreterResult<Value>>(
-      Function* function, absl::Span<const Value> args)>;
+      Function* function, absl::Span<const Value> args,
+      std::optional<EvaluationObserver*> observer)>;
 
   // Function to perform evaluation of the specified program with the given
   // keyword args.
   using KwargsEvaluatorFnT =
       std::function<absl::StatusOr<InterpreterResult<Value>>(
           Function* function,
-          const absl::flat_hash_map<std::string, Value>& kwargs)>;
+          const absl::flat_hash_map<std::string, Value>& kwargs,
+          std::optional<EvaluationObserver*> observer)>;
 
   IrEvaluatorTestParam(EvaluatorFnT evaluator_in,
-                       KwargsEvaluatorFnT kwargs_evaluator_in)
+                       KwargsEvaluatorFnT kwargs_evaluator_in,
+                       bool supports_observer, std::string name)
       : evaluator(std::move(evaluator_in)),
-        kwargs_evaluator(std::move(kwargs_evaluator_in)) {}
+        kwargs_evaluator(std::move(kwargs_evaluator_in)),
+        supports_observer(supports_observer),
+        name(name) {}
 
   // Function to execute a function and return a Value.
   EvaluatorFnT evaluator;
 
   // Function to execute a function w/keyword args and return a Value.
   KwargsEvaluatorFnT kwargs_evaluator;
+
+  bool supports_observer;
+
+  std::string name;
+
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink, const IrEvaluatorTestParam& p) {
+    absl::Format(&sink, "%s", p.name);
+  }
 };
 
 // Public face of the suite of tests to run against IR evaluators
@@ -80,7 +100,7 @@ class IrEvaluatorTestBase
                                                 std::string_view program) {
     XLS_ASSIGN_OR_RETURN(Function * function,
                          Parser::ParseFunction(program, package));
-    XLS_VLOG(1) << "Dumped:\n" << function->DumpIr();
+    VLOG(1) << "Dumped:\n" << function->DumpIr();
     return function;
   }
 
@@ -95,21 +115,28 @@ class IrEvaluatorTestBase
   // Run the given function with Values as input, returning the result and any
   // events generated.
   absl::StatusOr<InterpreterResult<Value>> RunWithEvents(
-      Function* f, absl::Span<const Value> args) {
-    return GetParam().evaluator(f, args);
+      Function* f, absl::Span<const Value> args,
+      std::optional<EvaluationObserver*> observer = std::nullopt) {
+    return GetParam().evaluator(f, args, observer);
   }
 
   // Runs the given function with Values as input, checking that no traces or
   // assertion failures are recorded.
-  absl::StatusOr<Value> RunWithNoEvents(Function* f,
-                                        absl::Span<const Value> args) {
+  absl::StatusOr<Value> RunWithNoEvents(
+      Function* f, absl::Span<const Value> args,
+      std::optional<EvaluationObserver*> observer = std::nullopt) {
     XLS_ASSIGN_OR_RETURN(InterpreterResult<Value> result,
-                         GetParam().evaluator(f, args));
+                         GetParam().evaluator(f, args, observer));
 
     if (!result.events.trace_msgs.empty()) {
+      std::vector<std::string_view> trace_messages;
+      trace_messages.reserve(result.events.trace_msgs.size());
+      for (const TraceMessage& trace : result.events.trace_msgs) {
+        trace_messages.push_back(trace.message);
+      }
       return absl::FailedPreconditionError(
           absl::StrFormat("Unexpected traces during RunWithNoEvents:\n%s",
-                          absl::StrJoin(result.events.trace_msgs, "\n")));
+                          absl::StrJoin(trace_messages, "\n")));
     }
 
     return InterpreterResultToStatusOrValue(result);
@@ -119,13 +146,15 @@ class IrEvaluatorTestBase
   // generated. Converts to/from Values under the hood. All arguments and result
   // must be bits-typed.
   absl::StatusOr<uint64_t> RunWithUint64sNoEvents(
-      Function* f, absl::Span<const uint64_t> args) {
+      Function* f, absl::Span<const uint64_t> args,
+      std::optional<EvaluationObserver*> observer = std::nullopt) {
     std::vector<Value> value_args;
     for (int64_t i = 0; i < args.size(); ++i) {
       XLS_RET_CHECK(f->param(i)->GetType()->IsBits());
       value_args.push_back(Value(UBits(args[i], f->param(i)->BitCountOrDie())));
     }
-    XLS_ASSIGN_OR_RETURN(Value value_result, RunWithNoEvents(f, value_args));
+    XLS_ASSIGN_OR_RETURN(Value value_result,
+                         RunWithNoEvents(f, value_args, observer));
     XLS_RET_CHECK(value_result.IsBits());
     return value_result.bits().ToUint64();
   }
@@ -149,8 +178,9 @@ class IrEvaluatorTestBase
   absl::StatusOr<Value> RunWithKwargsNoEvents(
       Function* function,
       const absl::flat_hash_map<std::string, Value>& kwargs) {
-    XLS_ASSIGN_OR_RETURN(InterpreterResult<Value> result,
-                         GetParam().kwargs_evaluator(function, kwargs));
+    XLS_ASSIGN_OR_RETURN(
+        InterpreterResult<Value> result,
+        GetParam().kwargs_evaluator(function, kwargs, std::nullopt));
     XLS_RET_CHECK(result.events.trace_msgs.empty());
     XLS_RET_CHECK(result.events.assert_msgs.empty());
     return result.value;
@@ -159,4 +189,4 @@ class IrEvaluatorTestBase
 
 }  // namespace xls
 
-#endif  // XLS_IR_IR_EVALUATOR_TEST_H_
+#endif  // XLS_INTERPRETER_IR_EVALUATOR_TEST_BASE_H_

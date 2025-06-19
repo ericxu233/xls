@@ -22,22 +22,31 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "xls/common/logging/log_lines.h"
-#include "xls/common/logging/logging.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/interpreter/function_interpreter.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
-#include "xls/ir/dfs_visitor.h"
+#include "xls/ir/events.h"
+#include "xls/ir/format_preference.h"
+#include "xls/ir/format_strings.h"
 #include "xls/ir/function.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/ir/lsb_or_msb.h"
+#include "xls/ir/node.h"
 #include "xls/ir/nodes.h"
+#include "xls/ir/op.h"
 #include "xls/ir/package.h"
+#include "xls/ir/type.h"
 #include "xls/ir/value.h"
-#include "xls/ir/value_helpers.h"
+#include "xls/ir/value_utils.h"
 
 namespace xls {
 
@@ -82,7 +91,7 @@ absl::StatusOr<Value> InterpretNode(Node* node,
 
 absl::Status IrInterpreter::AddInterpreterEvents(
     const InterpreterEvents& events) {
-  for (const std::string& trace_msg : events.trace_msgs) {
+  for (const TraceMessage& trace_msg : events.trace_msgs) {
     GetInterpreterEvents().trace_msgs.push_back(trace_msg);
   }
 
@@ -241,6 +250,7 @@ absl::Status IrInterpreter::HandleDynamicBitSlice(
 
 absl::Status IrInterpreter::HandleConcat(Concat* concat) {
   std::vector<Bits> operand_values;
+  operand_values.reserve(concat->operand_count());
   for (Node* operand : concat->operands()) {
     operand_values.push_back(ResolveAsBits(operand));
   }
@@ -279,10 +289,10 @@ absl::Status IrInterpreter::HandleCountedFor(CountedFor* counted_for) {
 }
 
 absl::Status IrInterpreter::HandleDecode(Decode* decode) {
-  XLS_ASSIGN_OR_RETURN(int64_t input_value,
-                       ResolveAsBits(decode->operand(0)).ToUint64());
-  if (input_value < decode->BitCountOrDie()) {
-    return SetBitsResult(decode, Bits::PowerOfTwo(/*set_bit_index=*/input_value,
+  Bits index_bits = ResolveAsBits(decode->operand(0));
+  if (bits_ops::ULessThan(index_bits, decode->BitCountOrDie())) {
+    XLS_ASSIGN_OR_RETURN(int64_t index, index_bits.ToUint64());
+    return SetBitsResult(decode, Bits::PowerOfTwo(/*set_bit_index=*/index,
                                                   decode->BitCountOrDie()));
   }
   return SetBitsResult(decode, Bits(decode->BitCountOrDie()));
@@ -492,8 +502,8 @@ absl::Status IrInterpreter::HandleArrayConcat(ArrayConcat* concat) {
 }
 
 absl::Status IrInterpreter::HandleAssert(Assert* assert_op) {
-  XLS_VLOG(2) << "Checking assert " << assert_op->ToString();
-  XLS_VLOG(2) << "Condition is " << ResolveAsBool(assert_op->condition());
+  VLOG(2) << "Checking assert " << assert_op->ToString();
+  VLOG(2) << "Condition is " << ResolveAsBool(assert_op->condition());
   if (!ResolveAsBool(assert_op->condition())) {
     GetInterpreterEvents().assert_msgs.push_back(assert_op->message());
   }
@@ -536,9 +546,12 @@ absl::Status IrInterpreter::HandleTrace(Trace* trace_op) {
       return make_error("Too many operands");
     }
 
-    XLS_VLOG(3) << "Trace output: " << trace_output;
+    VLOG(3) << "Trace output: " << trace_output;
 
-    GetInterpreterEvents().trace_msgs.push_back(trace_output);
+    GetInterpreterEvents().trace_msgs.push_back(TraceMessage{
+        .message = trace_output,
+        .verbosity = trace_op->verbosity(),
+    });
   }
   return SetValueResult(trace_op, Value::Token());
 }
@@ -642,7 +655,7 @@ absl::Status IrInterpreter::HandleUMul(ArithOp* mul) {
 
 absl::Status IrInterpreter::HandleSMulp(PartialProductOp* mul) {
   const int64_t mul_width = mul->width();
-  XLS_VLOG(1) << "mul_width = " << mul_width << "\n";
+  VLOG(1) << "mul_width = " << mul_width << "\n";
   Bits result = bits_ops::SMul(ResolveAsBits(mul->operand(0)),
                                ResolveAsBits(mul->operand(1)));
 
@@ -659,7 +672,7 @@ absl::Status IrInterpreter::HandleSMulp(PartialProductOp* mul) {
 
 absl::Status IrInterpreter::HandleUMulp(PartialProductOp* mul) {
   const int64_t mul_width = mul->width();
-  XLS_VLOG(1) << "mul_width = " << mul_width << "\n";
+  VLOG(1) << "mul_width = " << mul_width << "\n";
   Bits result = bits_ops::UMul(ResolveAsBits(mul->operand(0)),
                                ResolveAsBits(mul->operand(1)));
   Bits offset = MulpOffsetForSimulation(mul_width, /*shift_size=*/2);
@@ -724,11 +737,20 @@ absl::Status IrInterpreter::HandlePrioritySel(PrioritySelect* sel) {
       return SetValueResult(sel, ResolveAsValue(sel->get_case(i)));
     }
   }
-  return SetValueResult(sel, ZeroOfType(sel->GetType()));
+  return SetValueResult(sel, ResolveAsValue(sel->default_value()));
 }
 
 absl::Status IrInterpreter::HandleParam(Param* param) {
   return absl::UnimplementedError("Param not implemented in IrInterpreter");
+}
+
+absl::Status IrInterpreter::HandleStateRead(StateRead* state_read) {
+  return absl::UnimplementedError("StateRead not implemented in IrInterpreter");
+}
+
+absl::Status IrInterpreter::HandleNext(Next* next) {
+  return absl::UnimplementedError(
+      "Next value not implemented in IrInterpreter");
 }
 
 absl::Status IrInterpreter::HandleReverse(UnOp* reverse) {
@@ -823,7 +845,7 @@ const Bits& IrInterpreter::ResolveAsBits(Node* node) {
 
 bool IrInterpreter::ResolveAsBool(Node* node) {
   const Bits& bits = NodeValuesMap().at(node).bits();
-  XLS_CHECK_EQ(bits.bit_count(), 1);
+  CHECK_EQ(bits.bit_count(), 1);
   return bits.IsAllOnes();
 }
 
@@ -854,24 +876,27 @@ absl::Status IrInterpreter::SetBitsResult(Node* node, const Bits& result) {
 }
 
 absl::Status IrInterpreter::SetValueResult(Node* node, Value result) {
-  if (XLS_VLOG_IS_ON(4) &&
+  if (VLOG_IS_ON(4) &&
       std::all_of(node->operands().begin(), node->operands().end(),
                   [this](Node* o) { return NodeValuesMap().contains(o); })) {
-    XLS_VLOG(4) << absl::StreamFormat("%s operands:", node->GetName());
+    VLOG(4) << absl::StreamFormat("%s operands:", node->GetName());
     for (int64_t i = 0; i < node->operand_count(); ++i) {
-      XLS_VLOG(4) << absl::StreamFormat(
+      VLOG(4) << absl::StreamFormat(
           "  operand %d (%s): %s", i, node->operand(i)->GetName(),
           ResolveAsValue(node->operand(i)).ToString());
     }
   }
-  XLS_VLOG(3) << absl::StreamFormat("Result of %s: %s", node->ToString(),
-                                    result.ToString());
+  VLOG(3) << absl::StreamFormat("Result of %s: %s", node->ToString(),
+                                result.ToString());
 
   XLS_RET_CHECK(!NodeValuesMap().contains(node));
   if (!ValueConformsToType(result, node->GetType())) {
     return absl::InternalError(absl::StrFormat(
         "Expected value %s to match type %s of node %s", result.ToString(),
         node->GetType()->ToString(), node->GetName()));
+  }
+  if (observer_) {
+    (*observer_)->NodeEvaluated(node, result);
   }
   NodeValuesMap()[node] = std::move(result);
   return absl::OkStatus();
@@ -889,6 +914,7 @@ absl::StatusOr<Value> IrInterpreter::DeepOr(
 
   auto input_elements = [&](int64_t i) {
     std::vector<const Value*> values;
+    values.reserve(inputs.size());
     for (int64_t j = 0; j < inputs.size(); ++j) {
       values.push_back(&inputs[j]->elements()[i]);
     }

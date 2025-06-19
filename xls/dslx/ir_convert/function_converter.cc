@@ -15,6 +15,7 @@
 #include "xls/dslx/ir_convert/function_converter.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -27,61 +28,79 @@
 
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/substitute.h"
 #include "absl/types/span.h"
 #include "absl/types/variant.h"
 #include "xls/common/casts.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/visitor.h"
 #include "xls/dslx/constexpr_evaluator.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/ast_node.h"
 #include "xls/dslx/frontend/ast_utils.h"
-#include "xls/dslx/frontend/builtins_metadata.h"
+#include "xls/dslx/frontend/module.h"
 #include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/frontend/proc_id.h"
 #include "xls/dslx/import_data.h"
 #include "xls/dslx/interp_value.h"
-#include "xls/dslx/interp_value_helpers.h"
+#include "xls/dslx/interp_value_utils.h"
+#include "xls/dslx/ir_convert/channel_scope.h"
 #include "xls/dslx/ir_convert/convert_format_macro.h"
 #include "xls/dslx/ir_convert/convert_options.h"
-#include "xls/dslx/ir_convert/extract_conversion_order.h"
 #include "xls/dslx/ir_convert/ir_conversion_utils.h"
 #include "xls/dslx/ir_convert/proc_config_ir_converter.h"
 #include "xls/dslx/mangle.h"
-#include "xls/dslx/type_system/concrete_type.h"
+#include "xls/dslx/type_system/deduce_utils.h"
 #include "xls/dslx/type_system/parametric_env.h"
+#include "xls/dslx/type_system/type.h"
 #include "xls/dslx/type_system/type_info.h"
 #include "xls/dslx/warning_collector.h"
 #include "xls/ir/bits.h"
+#include "xls/ir/channel.h"
 #include "xls/ir/fileno.h"
 #include "xls/ir/foreign_function.h"
-#include "xls/ir/format_strings.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/lsb_or_msb.h"
 #include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
+#include "xls/ir/package.h"
 #include "xls/ir/source_location.h"
 #include "xls/ir/type.h"
 #include "xls/ir/value.h"
+#include "xls/ir/value_utils.h"
 #include "xls/ir/verifier.h"
+#include "xls/ir/xls_ir_interface.pb.h"
 
 namespace xls::dslx {
 namespace {
 
 constexpr WarningCollector* kNoWarningCollector = nullptr;
 
+// For values that are generic sizes (e.g. indexing into an array) we prefer to
+// use this bitwidth, which should suffice for all programs we can compile in
+// effect.
+//
+// This corresponds to what we think of as our "usize" type, though we don't
+// actually have that type yet, tracked in
+// https://github.com/google/xls/issues/450
+constexpr size_t kUsizeBits = 32;
+
 // Returns a status that indicates an error in the IR conversion process.
-absl::Status ConversionErrorStatus(const std::optional<Span>& span,
-                                   std::string_view message) {
-  return absl::InternalError(
-      absl::StrFormat("ConversionError: %s %s",
-                      span ? span->ToString() : "<no span>", message));
+absl::Status IrConversionErrorStatus(const std::optional<Span>& span,
+                                     std::string_view message,
+                                     const FileTable& file_table) {
+  return absl::InternalError(absl::StrFormat(
+      "IrConversionError: %s %s",
+      span ? span->ToString(file_table) : "<no span>", message));
 }
 
 // Convert a NameDefTree node variant to an AstNode pointer (either the leaf
@@ -97,21 +116,25 @@ absl::StatusOr<TypeDefinition> ToTypeDefinition(
     const TypeAnnotation* type_annotation) {
   auto* type_ref_type_annotation =
       dynamic_cast<const TypeRefTypeAnnotation*>(type_annotation);
-  XLS_RET_CHECK(type_annotation != nullptr);
+  XLS_RET_CHECK_NE(type_annotation, nullptr);
   return type_ref_type_annotation->type_ref()->type_definition();
 }
 
 }  // namespace
 
 absl::StatusOr<xls::Function*> EmitImplicitTokenEntryWrapper(
-    xls::Function* implicit_token_f, dslx::Function* dslx_function,
-    bool is_top) {
+    xls::Function* implicit_token_f, dslx::Function* dslx_function, bool is_top,
+    PackageInterfaceProto* interface_proto,
+    const PackageInterfaceProto::Function& implicit_token_proto) {
   XLS_RET_CHECK_GE(implicit_token_f->params().size(), 2);
   XLS_ASSIGN_OR_RETURN(
       std::string mangled_name,
       MangleDslxName(dslx_function->owner()->name(),
                      dslx_function->identifier(), CallingConvention::kTypical,
                      /*free_keys=*/{}, /*parametric_env=*/nullptr));
+  PackageInterfaceProto::Function* wrapper_proto =
+      interface_proto->add_functions();
+  wrapper_proto->mutable_base()->set_name(mangled_name);
   FunctionBuilder fb(mangled_name, implicit_token_f->package(), true);
   fb.SetForeignFunctionData(dslx_function->extern_verilog_module());
   // Entry is a top entity.
@@ -122,6 +145,16 @@ absl::StatusOr<xls::Function*> EmitImplicitTokenEntryWrapper(
   std::vector<BValue> params;
   for (const xls::Param* p : implicit_token_f->params().subspan(2)) {
     params.push_back(fb.Param(p->name(), p->GetType()));
+    auto* param = wrapper_proto->add_parameters();
+    param->set_name(p->name());
+    *param->mutable_type() = p->GetType()->ToProto();
+  }
+  // Copy sv data
+  for (int64_t i = 0; i < implicit_token_f->params().size() - 2; ++i) {
+    if (implicit_token_proto.parameters(i + 2).has_sv_type()) {
+      wrapper_proto->mutable_parameters(i)->set_sv_type(
+          implicit_token_proto.parameters(i + 2).sv_type());
+    }
   }
 
   // Invoke the function with the primordial "implicit token" values.
@@ -138,29 +171,76 @@ absl::StatusOr<xls::Function*> EmitImplicitTokenEntryWrapper(
   return fb.BuildWithReturnValue(result);
 }
 
-bool GetRequiresImplicitToken(dslx::Function* f, ImportData* import_data,
+bool GetRequiresImplicitToken(const dslx::Function& f, ImportData* import_data,
                               const ConvertOptions& options) {
-  std::optional<bool> requires_opt = import_data->GetRootTypeInfo(f->owner())
-                                         .value()
-                                         ->GetRequiresImplicitToken(f);
-  XLS_CHECK(requires_opt.has_value());
-  return requires_opt.value();
+  std::optional<bool> requires_opt =
+      import_data->GetRootTypeInfo(f.owner()).value()->GetRequiresImplicitToken(
+          f);
+
+  CHECK(requires_opt.has_value());
+  bool requires_for_test = options.convert_tests && f.parent() != nullptr &&
+                           f.parent()->kind() == AstNodeKind::kTestFunction;
+  return requires_opt.value() || requires_for_test;
 }
 
+// RAII helper that swaps out the current_type_info_ member on the
+// FunctionConverter within a scope -- this is useful for cases where we
+// temporarily traverse to emit things in other modules than the module
+// containing the function being converted.
 struct ScopedTypeInfoSwap {
+  static absl::StatusOr<std::optional<ScopedTypeInfoSwap>> ForNode(
+      FunctionConverter* converter, AstNode* node) {
+    if (node->owner() == converter->current_type_info_->module()) {
+      return std::nullopt;
+    }
+    XLS_ASSIGN_OR_RETURN(
+        TypeInfo * type_info,
+        converter->import_data_->GetRootTypeInfo(node->owner()));
+    XLS_RET_CHECK_EQ(type_info->module(), node->owner());
+    return ScopedTypeInfoSwap(converter, type_info);
+  }
+
   ScopedTypeInfoSwap(FunctionConverter* converter, TypeInfo* new_type_info)
       : converter_(converter),
-        original_type_info_(converter_->current_type_info_) {
-    XLS_CHECK(new_type_info != nullptr);
+        original_type_info_(converter_->current_type_info_),
+        new_type_info_(new_type_info) {
+    CHECK(new_type_info != nullptr);
     converter_->current_type_info_ = new_type_info;
   }
 
+  // Move-only type.
+  ScopedTypeInfoSwap(ScopedTypeInfoSwap&& other) {
+    converter_ = other.converter_;
+    original_type_info_ = other.original_type_info_;
+    new_type_info_ = other.new_type_info_;
+    other.converter_ = nullptr;
+    other.original_type_info_ = nullptr;
+    other.new_type_info_ = nullptr;
+  }
+  ScopedTypeInfoSwap& operator=(ScopedTypeInfoSwap&& other) {
+    CHECK(other.converter_ != nullptr);
+    converter_ = other.converter_;
+    original_type_info_ = other.original_type_info_;
+    new_type_info_ = other.new_type_info_;
+    other.converter_ = nullptr;
+    other.original_type_info_ = nullptr;
+    other.new_type_info_ = nullptr;
+    return *this;
+  }
+  ScopedTypeInfoSwap(const ScopedTypeInfoSwap&) = delete;
+  ScopedTypeInfoSwap& operator=(const ScopedTypeInfoSwap&) = delete;
+
   ~ScopedTypeInfoSwap() {
+    if (converter_ == nullptr) {
+      return;
+    }
+    CHECK_EQ(converter_->current_type_info_, new_type_info_);
     converter_->current_type_info_ = original_type_info_;
   }
 
   FunctionConverter* converter_;
   TypeInfo* original_type_info_;
+  TypeInfo* new_type_info_;
 };
 
 // RAII helper that establishes a control predicate for a lexical scope that
@@ -217,14 +297,26 @@ class FunctionConverterVisitor : public AstNodeVisitor {
 
   // Causes node "n" to accept this visitor (basic double-dispatch).
   absl::Status Visit(const AstNode* n) {
-    XLS_VLOG(6) << this << " visiting: `" << n->ToString() << "` ("
-                << n->GetNodeTypeName() << ")"
-                << " @ " << SpanToString(n->GetSpan());
+    XLS_RET_CHECK_NE(n, nullptr);
+    VLOG(6) << this << " visiting: `" << n->ToString() << "` ("
+            << n->GetNodeTypeName() << ")" << " @ "
+            << SpanToString(n->GetSpan(), converter_->file_table());
     return n->Accept(this);
   }
 
   // Causes all children of "node" to accept this visitor.
   absl::Status VisitChildren(const AstNode* node) {
+    if (const UnrollFor* loop = dynamic_cast<const UnrollFor*>(node); loop) {
+      std::optional<const Expr*> unrolled_for =
+          converter_->GetUnrolledForLoop(loop);
+      if (unrolled_for.has_value()) {
+        return (*unrolled_for)->Accept(this);
+      } else {
+        return absl::FailedPreconditionError(
+            absl::StrCat("unroll_for! should have been unrolled by now at: ",
+                         loop->span().ToString(converter_->file_table())));
+      }
+    }
     for (AstNode* child : node->GetChildren(/*want_types=*/false)) {
       XLS_RETURN_IF_ERROR(Visit(child));
     }
@@ -244,10 +336,14 @@ class FunctionConverterVisitor : public AstNodeVisitor {
     return converter_->Handle##__type(node);                 \
   }
 
-  TRAVERSE_DISPATCH(Unop)
+  // keep-sorted start
+  TRAVERSE_DISPATCH(AllOnesMacro)
   TRAVERSE_DISPATCH(Binop)
+  TRAVERSE_DISPATCH(Unop)
+  TRAVERSE_DISPATCH(UnrollFor)
   TRAVERSE_DISPATCH(XlsTuple)
   TRAVERSE_DISPATCH(ZeroMacro)
+  // keep-sorted end
 
   // A macro used for AST types where we don't want to visit any children, just
   // call the FunctionConverter handler.
@@ -256,11 +352,12 @@ class FunctionConverterVisitor : public AstNodeVisitor {
     return converter_->Handle##__type(node);                 \
   }
 
-  NO_TRAVERSE_DISPATCH(Param)
+  // keep-sorted start
   NO_TRAVERSE_DISPATCH(NameRef)
-  NO_TRAVERSE_DISPATCH(ConstRef)
   NO_TRAVERSE_DISPATCH(Number)
+  NO_TRAVERSE_DISPATCH(Param)
   NO_TRAVERSE_DISPATCH(String)
+  // keep-sorted end
 
   // A macro used for AST types where we don't want to visit any children, just
   // call the FunctionConverter handler.
@@ -269,12 +366,12 @@ class FunctionConverterVisitor : public AstNodeVisitor {
     return converter_->Handle##__type(node);                 \
   }
 
-  NO_TRAVERSE_DISPATCH_VISIT(Attr)
+  // keep-sorted start
   NO_TRAVERSE_DISPATCH_VISIT(Array)
-  NO_TRAVERSE_DISPATCH_VISIT(Block)
-  NO_TRAVERSE_DISPATCH_VISIT(ConstantArray)
+  NO_TRAVERSE_DISPATCH_VISIT(Attr)
   NO_TRAVERSE_DISPATCH_VISIT(Cast)
   NO_TRAVERSE_DISPATCH_VISIT(ColonRef)
+  NO_TRAVERSE_DISPATCH_VISIT(Conditional)
   NO_TRAVERSE_DISPATCH_VISIT(ConstantDef)
   NO_TRAVERSE_DISPATCH_VISIT(For)
   NO_TRAVERSE_DISPATCH_VISIT(FormatMacro)
@@ -285,9 +382,10 @@ class FunctionConverterVisitor : public AstNodeVisitor {
   NO_TRAVERSE_DISPATCH_VISIT(Range)
   NO_TRAVERSE_DISPATCH_VISIT(SplatStructInstance)
   NO_TRAVERSE_DISPATCH_VISIT(Statement)
+  NO_TRAVERSE_DISPATCH_VISIT(StatementBlock)
   NO_TRAVERSE_DISPATCH_VISIT(StructInstance)
-  NO_TRAVERSE_DISPATCH_VISIT(Conditional)
   NO_TRAVERSE_DISPATCH_VISIT(TupleIndex)
+  // keep-sorted end
 
   // A macro used for AST types that we never expect to visit (if we do we
   // provide an error message noting it was unexpected).
@@ -298,46 +396,68 @@ class FunctionConverterVisitor : public AstNodeVisitor {
 
   // These are always custom-visited (i.e. traversed to in a specialized way
   // from their parent nodes).
+  // keep-sorted start
+  INVALID(FunctionRef)
+  INVALID(MatchArm)
+  INVALID(NameDef)
   INVALID(NameDefTree)
   INVALID(ParametricBinding)
-  INVALID(MatchArm)
-  INVALID(WildcardPattern)
-  INVALID(WidthSlice)
+  INVALID(RestOfTuple)
   INVALID(Slice)
-  INVALID(NameDef)
+  INVALID(TestFunction)
+  INVALID(TestProc)
   INVALID(TypeRef)
+  INVALID(VerbatimNode)
+  INVALID(WidthSlice)
+  INVALID(WildcardPattern)
+  // keep-sorted end
+  // keep-sorted start
+  INVALID(AnyTypeAnnotation)
   INVALID(ArrayTypeAnnotation)
   INVALID(BuiltinTypeAnnotation)
   INVALID(ChannelTypeAnnotation)
+  INVALID(ElementTypeAnnotation)
+  INVALID(SliceTypeAnnotation)
+  INVALID(FunctionTypeAnnotation)
+  INVALID(GenericTypeAnnotation)
+  INVALID(MemberTypeAnnotation)
+  INVALID(ParamTypeAnnotation)
+  INVALID(ReturnTypeAnnotation)
+  INVALID(SelfTypeAnnotation)
   INVALID(TupleTypeAnnotation)
   INVALID(TypeRefTypeAnnotation)
-  INVALID(TestFunction)
-  INVALID(TestProc)
+  INVALID(TypeVariableTypeAnnotation)
+  // keep-sorted end
 
   // The visitor operates within a function, so none of these should be visible.
+  // keep-sorted start
   INVALID(BuiltinNameDef)
   INVALID(ChannelDecl)
   INVALID(EnumDef)
-  INVALID(Import)
   INVALID(Function)
-  INVALID(TypeAlias)
-  INVALID(Proc)
+  INVALID(Impl)
+  INVALID(Import)
+  INVALID(Lambda)
   INVALID(Module)
+  INVALID(Proc)
+  INVALID(ProcDef)
+  INVALID(ProcMember)
   INVALID(QuickCheck)
   INVALID(Spawn)
   INVALID(StructDef)
-  INVALID(ProcMember)
-
-  // This should have been unrolled into a sequence of statements and is
-  // unconvertible.
-  INVALID(UnrollFor)
+  INVALID(StructMemberNode)
+  INVALID(TypeAlias)
+  INVALID(Use)
+  INVALID(UseTreeEntry)
+  // keep-sorted end
 
  private:
   // Called when we visit a node we don't expect to observe in the traversal.
   absl::Status Invalid(const AstNode* node) {
     return absl::UnimplementedError(absl::StrFormat(
         "AST node unsupported for IR conversion: %s @ %s",
-        node->GetNodeTypeName(), SpanToString(node->GetSpan())));
+        node->GetNodeTypeName(),
+        SpanToString(node->GetSpan(), converter_->file_table())));
   }
 
   // The converter object we call back to for node handling.
@@ -351,46 +471,62 @@ absl::Status FunctionConverter::Visit(const AstNode* node) {
 
 /* static */ std::string FunctionConverter::IrValueToString(
     const IrValue& value) {
-  if (std::holds_alternative<BValue>(value)) {
-    return absl::StrFormat("%p", std::get<BValue>(value).node());
-  }
-
-  if (std::holds_alternative<CValue>(value)) {
-    return absl::StrFormat("%p", std::get<CValue>(value).value.node());
-  }
-
-  return absl::StrFormat("%p", std::get<Channel*>(value));
+  return absl::visit(
+      Visitor{[](BValue b) { return absl::StrFormat("%p", b.node()); },
+              [](CValue c) { return absl::StrFormat("%p", c.value.node()); },
+              [](Channel* chan) { return absl::StrFormat("%p", chan); },
+              [](ChannelInterface* ci) { return absl::StrFormat("%p", ci); }},
+      value);
 }
 
 FunctionConverter::FunctionConverter(PackageData& package_data, Module* module,
                                      ImportData* import_data,
                                      ConvertOptions options,
-                                     ProcConversionData* proc_data, bool is_top)
+                                     ProcConversionData* proc_data,
+                                     ChannelScope* channel_scope, bool is_top)
     : package_data_(package_data),
       module_(module),
       import_data_(import_data),
       options_(options),
-      fileno_(module->fs_path().has_value()
-                  ? package_data.package->GetOrCreateFileno(
-                        std::string{module->fs_path().value()})
-                  : Fileno(0)),
+      ir_fileno_(module->fs_path().has_value()
+                     ? package_data.conversion_info->package->GetOrCreateFileno(
+                           std::string{module->fs_path().value()})
+                     : xls::Fileno(0)),
       proc_data_(proc_data),
+      channel_scope_(channel_scope),
       is_top_(is_top) {
-  XLS_VLOG(5) << "Constructed IR converter: " << this;
+  VLOG(5) << "Constructed IR converter: " << this;
 }
 
-bool FunctionConverter::GetRequiresImplicitToken(dslx::Function* f) const {
-  return xls::dslx::GetRequiresImplicitToken(f, import_data_, options_);
+bool FunctionConverter::GetRequiresImplicitToken(
+    const dslx::Function* f) const {
+  return xls::dslx::GetRequiresImplicitToken(*f, import_data_, options_);
 }
 
 void FunctionConverter::SetFunctionBuilder(
     std::unique_ptr<BuilderBase> builder) {
-  XLS_CHECK(function_builder_ == nullptr);
+  CHECK_EQ(function_builder_, nullptr);
+  function_proto_.reset();
+  proc_proto_.reset();
+  PackageInterfaceProto::FunctionBase* base;
+  if (builder->function()->IsFunction()) {
+    function_proto_ = package_data_.conversion_info->interface.add_functions();
+    base = function_proto_.value()->mutable_base();
+  } else {
+    CHECK(builder->function()->IsProc())
+        << "Building of block interfaces unsupported.";
+    proc_proto_ = package_data_.conversion_info->interface.add_procs();
+    base = proc_proto_.value()->mutable_base();
+  }
+  *base->mutable_name() = builder->function()->name();
+  if (is_top_) {
+    base->set_top(true);
+  }
   function_builder_ = std::move(builder);
 }
 
 void FunctionConverter::AddConstantDep(ConstantDef* constant_def) {
-  XLS_VLOG(2) << "Adding constant dep: " << constant_def->ToString();
+  VLOG(2) << "Adding constant dep: " << constant_def->ToString();
   constant_deps_.push_back(constant_def);
 }
 
@@ -401,12 +537,12 @@ absl::Status FunctionConverter::DefAlias(const AstNode* from,
   if (it == node_to_ir_.end()) {
     return absl::InternalError(absl::StrFormat(
         "TypeAliasError: %s internal error during IR conversion: could not "
-        "find AST node for aliasing: %s (%s) to: %s (%s)",
-        SpanToString(from->GetSpan()), from->ToString(),
+        "find AST node for aliasing: `%s` (%s) to: `%s` (%s)",
+        SpanToString(from->GetSpan(), file_table()), from->ToString(),
         from->GetNodeTypeName(), to->ToString(), to->GetNodeTypeName()));
   }
   IrValue value = it->second;
-  XLS_VLOG(6) << absl::StreamFormat(
+  VLOG(6) << absl::StreamFormat(
       "Aliased node '%s' (%s) to be same as '%s' (%s): %s", to->ToString(),
       to->GetNodeTypeName(), from->ToString(), from->GetNodeTypeName(),
       IrValueToString(value));
@@ -432,10 +568,19 @@ absl::StatusOr<BValue> FunctionConverter::DefWithStatus(
     const std::function<absl::StatusOr<BValue>(const SourceInfo&)>& ir_func) {
   SourceInfo loc = ToSourceInfo(node->GetSpan());
   XLS_ASSIGN_OR_RETURN(BValue result, ir_func(loc));
-  XLS_VLOG(6) << absl::StreamFormat("Define node '%s' (%s) to be %s @ %s",
-                                    node->ToString(), node->GetNodeTypeName(),
-                                    IrValueToString(result),
-                                    SpanToString(node->GetSpan()));
+  VLOG(6) << absl::StreamFormat("Define node '%s' (%s) to be %s @ %s",
+                                node->ToString(), node->GetNodeTypeName(),
+                                IrValueToString(result),
+                                SpanToString(node->GetSpan(), file_table()));
+
+  // If there was an error in the function builder while defining this node
+  // (which is an internal error -- the system-level expectation is that any
+  // issues that would occur in IR building would have been caught previously in
+  // type inference) then we flag them here to avoid returning husks of BValues
+  // that callers can trip over and segfault (e.g. because they have a nullptr
+  // type).
+  XLS_RETURN_IF_ERROR(function_builder_->GetError());
+
   SetNodeToIr(node, result);
   return result;
 }
@@ -470,9 +615,9 @@ absl::StatusOr<BValue> FunctionConverter::Use(const AstNode* node) const {
                         node->GetNodeTypeName(), node->ToString()));
   }
   const IrValue& ir_value = it->second;
-  XLS_VLOG(6) << absl::StreamFormat("Using node '%s' (%p) as IR value %s.",
-                                    node->ToString(), node,
-                                    IrValueToString(ir_value));
+  VLOG(6) << absl::StreamFormat("Using node '%s' (%p) as IR value %s.",
+                                node->ToString(), node,
+                                IrValueToString(ir_value));
   if (std::holds_alternative<BValue>(ir_value)) {
     return std::get<BValue>(ir_value);
   }
@@ -481,9 +626,8 @@ absl::StatusOr<BValue> FunctionConverter::Use(const AstNode* node) const {
 }
 
 void FunctionConverter::SetNodeToIr(const AstNode* node, IrValue value) {
-  XLS_VLOG(6) << absl::StreamFormat("Setting node '%s' (%p) to IR value %s.",
-                                    node->ToString(), node,
-                                    IrValueToString(value));
+  VLOG(6) << absl::StreamFormat("Setting node '%s' (%p) to IR value %s.",
+                                node->ToString(), node, IrValueToString(value));
   node_to_ir_[node] = std::move(value);
 }
 
@@ -518,10 +662,9 @@ absl::Status FunctionConverter::HandleUnop(const Unop* node) {
 
 absl::Status FunctionConverter::HandleConcat(const Binop* node, BValue lhs,
                                              BValue rhs) {
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> output_type,
-                       ResolveType(node));
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> output_type, ResolveType(node));
   std::vector<BValue> pieces = {lhs, rhs};
-  if (dynamic_cast<BitsType*>(output_type.get()) != nullptr) {
+  if (IsBitsLike(*output_type)) {
     Def(node, [&](const SourceInfo& loc) {
       return function_builder_->Concat(pieces, loc);
     });
@@ -529,8 +672,7 @@ absl::Status FunctionConverter::HandleConcat(const Binop* node, BValue lhs,
   }
 
   // Fallthrough case should be an ArrayType.
-  auto* array_output_type = dynamic_cast<ArrayType*>(output_type.get());
-  XLS_RET_CHECK(array_output_type != nullptr);
+  XLS_RET_CHECK_NE(dynamic_cast<ArrayType*>(output_type.get()), nullptr);
   Def(node, [&](const SourceInfo& loc) {
     return function_builder_->ArrayConcat(pieces, loc);
   });
@@ -556,12 +698,12 @@ absl::Status FunctionConverter::HandleNe(const Binop* node, BValue lhs,
 }
 
 absl::Status FunctionConverter::HandleNumber(const Number* node) {
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> type, ResolveType(node));
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> type, ResolveType(node));
   XLS_RET_CHECK(!type->IsMeta());
-  XLS_ASSIGN_OR_RETURN(ConcreteTypeDim dim, type->GetTotalBitCount());
+  XLS_ASSIGN_OR_RETURN(TypeDim dim, type->GetTotalBitCount());
   XLS_ASSIGN_OR_RETURN(int64_t bit_count,
                        std::get<InterpValue>(dim.value()).GetBitValueViaSign());
-  XLS_ASSIGN_OR_RETURN(Bits bits, node->GetBits(bit_count));
+  XLS_ASSIGN_OR_RETURN(Bits bits, node->GetBits(bit_count, file_table()));
   DefConst(node, Value(bits));
   return absl::OkStatus();
 }
@@ -579,6 +721,8 @@ absl::Status FunctionConverter::HandleString(const String* node) {
 absl::Status FunctionConverter::HandleTupleIndex(const TupleIndex* node) {
   XLS_RETURN_IF_ERROR(Visit(ToAstNode(node->lhs())));
   XLS_ASSIGN_OR_RETURN(BValue v, Use(node->lhs()));
+  XLS_RET_CHECK(v.GetType()->IsTuple());
+
   XLS_RETURN_IF_ERROR(Visit(ToAstNode(node->index())));
   XLS_ASSIGN_OR_RETURN(Bits rhs, GetConstBits(ToAstNode(node->index())));
   XLS_ASSIGN_OR_RETURN(uint64_t index, rhs.ToUint64());
@@ -610,22 +754,71 @@ absl::Status FunctionConverter::HandleZeroMacro(const ZeroMacro* node) {
   return absl::OkStatus();
 }
 
+absl::Status FunctionConverter::HandleAllOnesMacro(const AllOnesMacro* node) {
+  XLS_ASSIGN_OR_RETURN(InterpValue iv, current_type_info_->GetConstExpr(node));
+  XLS_ASSIGN_OR_RETURN(Value value, InterpValueToValue(iv));
+  Def(node, [this, &value](const SourceInfo& loc) {
+    return function_builder_->Literal(value, loc);
+  });
+  return absl::OkStatus();
+}
+
 absl::Status FunctionConverter::HandleParam(const Param* node) {
-  XLS_VLOG(5) << "FunctionConverter::HandleParam: " << node->ToString();
+  VLOG(5) << "FunctionConverter::HandleParam: " << node->ToString();
   XLS_ASSIGN_OR_RETURN(xls::Type * type,
                        ResolveTypeToIr(node->type_annotation()));
   Def(node->name_def(), [&](const SourceInfo& loc) {
     return function_builder_->Param(node->identifier(), type);
   });
+  XLS_RET_CHECK(function_proto_);
+  PackageInterfaceProto::NamedValue* param =
+      function_proto_.value()->add_parameters();
+  param->set_name(node->identifier());
+  *param->mutable_type() = type->ToProto();
+  XLS_ASSIGN_OR_RETURN(std::optional<std::string> sv_value,
+                       current_type_info_->FindSvType(node->type_annotation()));
+  if (sv_value) {
+    param->set_sv_type(*sv_value);
+  }
   return absl::OkStatus();
 }
 
-absl::Status FunctionConverter::HandleConstRef(const ConstRef* node) {
-  return DefAlias(node->name_def(), /*to=*/node);
+absl::Status FunctionConverter::HandleExternNameRef(
+    const NameRef* node, const UseTreeEntry* use_tree_entry) {
+  XLS_ASSIGN_OR_RETURN(const ImportedInfo* imported_info,
+                       current_type_info_->GetImportedOrError(use_tree_entry));
+  std::optional<const ModuleMember*> member =
+      imported_info->module->FindMemberWithName(node->identifier());
+  XLS_RET_CHECK(member.has_value());
+  return absl::visit(
+      Visitor{
+          [&](Function* f) -> absl::Status { return DefAlias(f, /*to=*/node); },
+          [&](ConstantDef* c) -> absl::Status {
+            XLS_RET_CHECK(node_to_ir_.contains(c->value()))
+                << absl::StreamFormat(
+                       "ConstantDef `%s` not found in node_to_ir_ map",
+                       c->ToString());
+            return DefAlias(c->value(), /*to=*/node);
+          },
+          [&](auto) -> absl::Status {
+            return absl::UnimplementedError(absl::StrFormat(
+                "Unsupported module member type %s for external name "
+                "reference: `%s` @ %s",
+                GetModuleMemberTypeName(*member.value()), node->identifier(),
+                node->span().ToString(file_table())));
+          }},
+      *member.value());
 }
 
 absl::Status FunctionConverter::HandleNameRef(const NameRef* node) {
+  XLS_RET_CHECK_EQ(node->owner(), current_type_info_->module());
+
   AstNode* from = ToAstNode(node->name_def());
+
+  if (std::optional<const UseTreeEntry*> tree_entry = IsExternNameRef(*node);
+      tree_entry.has_value()) {
+    return HandleExternNameRef(node, *tree_entry);
+  }
 
   if (!node_to_ir_.contains(from)) {
     XLS_RET_CHECK(proc_id_.has_value());
@@ -633,15 +826,21 @@ absl::Status FunctionConverter::HandleNameRef(const NameRef* node) {
     for (const auto& [k, v] : proc_data_->id_to_members.at(proc_id_.value())) {
       if (k == node->identifier()) {
         if (std::holds_alternative<Value>(v)) {
-          XLS_VLOG(4) << "Reference to Proc member: " << k
-                      << " : Value : " << std::get<Value>(v).ToString();
+          VLOG(4) << "Reference to Proc member: " << k
+                  << " : Value : " << std::get<Value>(v).ToString();
           CValue cvalue;
           cvalue.ir_value = std::get<Value>(v);
           cvalue.value = function_builder_->Literal(cvalue.ir_value);
           SetNodeToIr(from, cvalue);
+        } else if (std::holds_alternative<ChannelArray*>(v)) {
+          VLOG(4) << "Reference to Proc member: " << k << " : Chan array : "
+                  << std::get<ChannelArray*>(v)->ToString();
+          // There is no IR equivalent for a channel array. The Index nodes
+          // that refer to it have to be lowered to refer to specific channels.
+          return absl::OkStatus();
         } else {
-          XLS_VLOG(4) << "Reference to Proc member: " << k
-                      << " : Chan  : " << std::get<Channel*>(v)->ToString();
+          VLOG(4) << "Reference to Proc member: " << k
+                  << " : Chan  : " << std::get<Channel*>(v)->ToString();
           SetNodeToIr(from, std::get<Channel*>(v));
         }
       }
@@ -652,25 +851,37 @@ absl::Status FunctionConverter::HandleNameRef(const NameRef* node) {
 }
 
 absl::Status FunctionConverter::HandleConstantDef(const ConstantDef* node) {
+  XLS_RET_CHECK_EQ(node->owner(), current_type_info_->module())
+      << absl::StreamFormat(
+             "handling ConstantDef `%s` from module `%s` but current type info "
+             "is for module `%s`",
+             node->ToString(), node->owner()->name(),
+             current_type_info_->module()->name());
+
   // We've already evaluated constants to their values; we don't need to dive
   // into them for [useless] IR conversion.
-  XLS_VLOG(5) << "Visiting ConstantDef expr: " << node->value()->ToString();
+  VLOG(5) << "Visiting ConstantDef expr: " << node->value()->ToString();
   XLS_ASSIGN_OR_RETURN(InterpValue iv,
                        current_type_info_->GetConstExpr(node->value()));
   XLS_ASSIGN_OR_RETURN(Value value, InterpValueToValue(iv));
   Def(node->value(), [this, &value](const SourceInfo& loc) {
     return function_builder_->Literal(value, loc);
   });
-  XLS_VLOG(5) << "Aliasing NameDef for constant: "
-              << node->name_def()->ToString();
+  VLOG(5) << "Aliasing NameDef for constant: " << node->name_def()->ToString();
   return DefAlias(node->value(), /*to=*/node->name_def());
 }
 
+absl::Status FunctionConverter::HandleLambda(const Lambda* node) {
+  return absl::UnimplementedError("lambdas not yet supported");
+}
+
 absl::Status FunctionConverter::HandleLet(const Let* node) {
-  XLS_VLOG(5) << "FunctionConverter::HandleLet: " << node->ToString();
+  VLOG(5) << "FunctionConverter::HandleLet: `" << node->ToString()
+          << "`; rhs: `" << node->rhs()->ToString() << "`";
   XLS_RETURN_IF_ERROR(Visit(node->rhs()));
 
   XLS_ASSIGN_OR_RETURN(BValue rhs, Use(node->rhs()));
+  XLS_RET_CHECK(rhs.valid());
 
   // Verify that the RHS conforms to the annotation (if present).
   if (node->type_annotation() != nullptr) {
@@ -688,6 +899,10 @@ absl::Status FunctionConverter::HandleLet(const Let* node) {
     XLS_RETURN_IF_ERROR(
         DefAlias(node->rhs(), /*to=*/ToAstNode(node->name_def_tree()->leaf())));
   } else {
+    // TODO: https://github.com/google/xls/issues/1459 - Rewrite this to be
+    // actually recursive (instead of "effectively recursive" via the `levels`
+    // and `delta_at_level` vectors).
+
     // Walk the tree of names we're trying to bind, performing tuple_index
     // operations on the RHS to get to the values we want to bind to those
     // names.
@@ -696,28 +911,74 @@ absl::Status FunctionConverter::HandleLet(const Let* node) {
     // NameDefTree to the corresponding value (being pattern matched).
     //
     // Args:
-    //  x: Current subtree of the NameDefTree.
+    //  name_def_tree: Current subtree of the NameDefTree.
     //  level: Level (depth) in the NameDefTree, root is 0.
     //  index: Index of node in the current tree level (e.g. leftmost is 0).
-    auto walk = [&](NameDefTree* x, int64_t level,
+
+    // We need to add the delta to every tuple index *at this level*. E.g.,:
+    // if have a NameDefTree like: (a,..,b,(c,..,d),e), then b, (c,..,d) and
+    // e's indexes need to be adjusted at level 1; d's needs to be adjusted at
+    // level 2, etc.
+    std::vector<int64_t> delta_at_level;
+
+    auto walk = [&](NameDefTree* name_def_tree, int64_t level,
                     int64_t index) -> absl::Status {
-      XLS_VLOG(6) << absl::StreamFormat("Walking level %d index %d: `%s`",
-                                        level, index, x->ToString());
+      XLS_RET_CHECK_NE(name_def_tree, nullptr);
+      VLOG(6) << absl::StreamFormat("Walking level %d index %d: `%s`", level,
+                                    index, name_def_tree->ToString());
+
+      while (level > delta_at_level.size()) {
+        // Make sure we have enough entries at this level
+        delta_at_level.push_back(0);
+      }
+      // Levels start at 1, so we subtract one.
+      index += delta_at_level[level - 1];
+
       levels.resize(level);
-      levels.push_back(Def(x, [this, &levels, x, index](SourceInfo loc) {
+      BValue tuple = levels.back();
+      CHECK(tuple.valid());
+
+      xls::TupleType* tuple_type = tuple.GetType()->AsTupleOrDie();
+
+      if (name_def_tree->IsRestOfTupleLeaf()) {
+        // If we're at a "rest of tuple" operator, we may need to "skip"
+        // tuple elements at this level. We can tell how many tuple *entries*
+        // there are via tuple_type, and how many *bindings* there are at this
+        // level (i.e., siblings to the "rest of tuple") via the parent
+        // NameDefTree.
+        const NameDefTree* parent =
+            down_cast<const NameDefTree*>(name_def_tree->parent());
+        int64_t number_of_bindings = parent->nodes().size();
+        int64_t number_of_tuple_elements = tuple_type->size();
+
+        int64_t delta = number_of_tuple_elements - number_of_bindings;
+        delta_at_level[level - 1] = delta;
+
+        // Don't need to bind anything to the ..
+        return absl::OkStatus();
+      }
+
+      CHECK_LT(index, tuple_type->size())
+          << "index: " << index << " type: " << tuple_type->ToString();
+
+      levels.push_back(Def(name_def_tree, [this, name_def_tree, index,
+                                           tuple](SourceInfo loc) {
         if (!loc.Empty()) {
-          loc = ToSourceInfo(x->is_leaf() ? ToAstNode(x->leaf())->GetSpan()
-                                          : x->GetSpan());
+          loc = ToSourceInfo(name_def_tree->is_leaf()
+                                 ? ToAstNode(name_def_tree->leaf())->GetSpan()
+                                 : name_def_tree->GetSpan());
         }
-        BValue tuple = levels.back();
-        xls::TupleType* tuple_type = tuple.GetType()->AsTupleOrDie();
-        XLS_CHECK_LT(index, tuple_type->size())
-            << "index: " << index << " type: " << tuple_type->ToString();
+
+        CHECK(tuple.GetType()->IsTuple());
         BValue tuple_index = function_builder_->TupleIndex(tuple, index, loc);
+        CHECK_OK(function_builder_->GetError());
+
         return tuple_index;
       }));
-      if (x->is_leaf()) {
-        XLS_RETURN_IF_ERROR(DefAlias(x, ToAstNode(x->leaf())));
+
+      if (name_def_tree->is_leaf()) {
+        XLS_RETURN_IF_ERROR(
+            DefAlias(name_def_tree, ToAstNode(name_def_tree->leaf())));
       }
       return absl::OkStatus();
     };
@@ -730,36 +991,47 @@ absl::Status FunctionConverter::HandleLet(const Let* node) {
 
 absl::Status FunctionConverter::HandleCast(const Cast* node) {
   XLS_RETURN_IF_ERROR(Visit(node->expr()));
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> output_type,
-                       ResolveType(node));
-  if (auto* array_type = dynamic_cast<ArrayType*>(output_type.get())) {
-    return CastToArray(node, *array_type);
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> output_type, ResolveType(node));
+  if (auto* to_array_type = dynamic_cast<ArrayType*>(output_type.get());
+      to_array_type != nullptr && !IsArrayOfBitsConstructor(*to_array_type)) {
+    return CastToArray(node, *to_array_type);
   }
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> input_type,
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> input_type,
                        ResolveType(node->expr()));
-  if (dynamic_cast<ArrayType*>(input_type.get()) != nullptr) {
+
+  // We break out the case where the input type is an array.
+  if (dynamic_cast<ArrayType*>(input_type.get()) != nullptr &&
+      !IsArrayOfBitsConstructor(*input_type)) {
     return CastFromArray(node, *output_type);
   }
-  XLS_ASSIGN_OR_RETURN(ConcreteTypeDim new_bit_count_ctd,
+
+  XLS_ASSIGN_OR_RETURN(TypeDim new_bit_count_ctd,
                        output_type->GetTotalBitCount());
   XLS_ASSIGN_OR_RETURN(
       int64_t new_bit_count,
       std::get<InterpValue>(new_bit_count_ctd.value()).GetBitValueViaSign());
-  XLS_ASSIGN_OR_RETURN(ConcreteTypeDim input_bit_count_ctd,
+
+  XLS_ASSIGN_OR_RETURN(TypeDim input_bit_count_ctd,
                        input_type->GetTotalBitCount());
   XLS_ASSIGN_OR_RETURN(
       int64_t old_bit_count,
       std::get<InterpValue>(input_bit_count_ctd.value()).GetBitValueViaSign());
+
   if (new_bit_count < old_bit_count) {
+    // Truncating conversion -- since the bit count is going down, we just bit
+    // slice.
     auto bvalue_status = DefWithStatus(
         node,
         [this, node,
          new_bit_count](const SourceInfo& loc) -> absl::StatusOr<BValue> {
           XLS_ASSIGN_OR_RETURN(BValue input, Use(node->expr()));
-          return function_builder_->BitSlice(input, 0, new_bit_count);
+          return function_builder_->BitSlice(input, /*start=*/0,
+                                             /*width=*/new_bit_count);
         });
     XLS_RETURN_IF_ERROR(bvalue_status.status());
   } else {
+    // Widening conversion -- since the bit count is going up, we need to sign
+    // or zero extend -- this is done based on the signedness of the input type.
     XLS_ASSIGN_OR_RETURN(bool signed_input, IsSigned(*input_type));
     auto bvalue_status = DefWithStatus(
         node,
@@ -782,38 +1054,44 @@ absl::Status FunctionConverter::HandleBuiltinCheckedCast(
 
   XLS_ASSIGN_OR_RETURN(BValue arg, Use(node->args()[0]));
 
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> output_type,
-                       ResolveType(node));
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> input_type,
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> output_type, ResolveType(node));
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> input_type,
                        ResolveType(node->args()[0]));
 
   XLS_ASSIGN_OR_RETURN(bool signed_input, IsSigned(*input_type));
 
-  XLS_ASSIGN_OR_RETURN(ConcreteTypeDim new_bit_count_ctd,
+  XLS_ASSIGN_OR_RETURN(TypeDim new_bit_count_ctd,
                        output_type->GetTotalBitCount());
   XLS_ASSIGN_OR_RETURN(
       int64_t new_bit_count,
       std::get<InterpValue>(new_bit_count_ctd.value()).GetBitValueViaSign());
 
-  XLS_ASSIGN_OR_RETURN(ConcreteTypeDim input_bit_count_ctd,
+  XLS_ASSIGN_OR_RETURN(TypeDim input_bit_count_ctd,
                        input_type->GetTotalBitCount());
   XLS_ASSIGN_OR_RETURN(
       int64_t old_bit_count,
       std::get<InterpValue>(input_bit_count_ctd.value()).GetBitValueViaSign());
 
-  if (dynamic_cast<ArrayType*>(output_type.get()) != nullptr ||
-      dynamic_cast<ArrayType*>(input_type.get()) != nullptr) {
-    return absl::UnimplementedError(
-        absl::StrFormat("ConversionError: CheckedCast to and from arrays (%s) "
-                        "is not currently supported for IR conversion.",
-                        node->span().ToString()));
+  std::optional<BitsLikeProperties> output_bits_like =
+      GetBitsLike(*output_type);
+  std::optional<BitsLikeProperties> input_bits_like = GetBitsLike(*input_type);
+
+  if (!output_bits_like.has_value() || !input_bits_like.has_value()) {
+    return IrConversionErrorStatus(
+        node->span(),
+        absl::StrFormat("CheckedCast is only supported for bits-like types in "
+                        "IR conversion; "
+                        "attempted checked cast from: %s to: %s",
+                        input_type->ToString(), output_type->ToString()),
+        file_table());
   }
 
   // TODO(tedhong): 2023-05-22 Add verilog assertion that cast has not
   // lost any data.
   if (new_bit_count < old_bit_count) {
     Def(node, [this, arg, new_bit_count](const SourceInfo& loc) {
-      return function_builder_->BitSlice(arg, 0, new_bit_count);
+      return function_builder_->BitSlice(arg, /*start=*/0,
+                                         /*width=*/new_bit_count);
     });
   } else {
     Def(node, [this, arg, signed_input, new_bit_count](const SourceInfo& loc) {
@@ -826,23 +1104,39 @@ absl::Status FunctionConverter::HandleBuiltinCheckedCast(
   return absl::OkStatus();
 }
 
+absl::Status FunctionConverter::HandleBuiltinBitCount(const Invocation* node) {
+  // Like array_size, bit_count is always constexpr.
+  XLS_ASSIGN_OR_RETURN(InterpValue iv, current_type_info_->GetConstExpr(node));
+  XLS_ASSIGN_OR_RETURN(Value v, InterpValueToValue(iv));
+  DefConst(node, v);
+  return absl::OkStatus();
+}
+
+absl::Status FunctionConverter::HandleBuiltinElementCount(
+    const Invocation* node) {
+  // Like bit_count, element_count is always constexpr.
+  XLS_ASSIGN_OR_RETURN(InterpValue iv, current_type_info_->GetConstExpr(node));
+  XLS_ASSIGN_OR_RETURN(Value v, InterpValueToValue(iv));
+  DefConst(node, v);
+  return absl::OkStatus();
+}
+
 absl::Status FunctionConverter::HandleBuiltinWideningCast(
     const Invocation* node) {
   XLS_RET_CHECK_EQ(node->args().size(), 1);
 
   XLS_ASSIGN_OR_RETURN(BValue arg, Use(node->args()[0]));
 
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> output_type,
-                       ResolveType(node));
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> input_type,
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> output_type, ResolveType(node));
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> input_type,
                        ResolveType(node->args()[0]));
 
-  XLS_CHECK_NE(dynamic_cast<BitsType*>(input_type.get()), nullptr);
-  XLS_CHECK_NE(dynamic_cast<BitsType*>(output_type.get()), nullptr);
+  XLS_RET_CHECK(IsBitsLike(*input_type));
+  XLS_RET_CHECK(IsBitsLike(*output_type));
 
   XLS_ASSIGN_OR_RETURN(bool signed_input, IsSigned(*input_type));
 
-  XLS_ASSIGN_OR_RETURN(ConcreteTypeDim new_bit_count_ctd,
+  XLS_ASSIGN_OR_RETURN(TypeDim new_bit_count_ctd,
                        output_type->GetTotalBitCount());
   XLS_ASSIGN_OR_RETURN(
       int64_t new_bit_count,
@@ -860,17 +1154,17 @@ absl::Status FunctionConverter::HandleBuiltinWideningCast(
 }
 
 absl::Status FunctionConverter::HandleMatch(const Match* node) {
-  if (node->arms().empty() ||
-      !node->arms().back()->patterns()[0]->IsIrrefutable()) {
-    return ConversionErrorStatus(
+  if (node->arms().empty()) {
+    return IrConversionErrorStatus(
         node->span(),
-        "Only matches with trailing irrefutable patterns (i.e. `_ => ...`) "
-        "are currently supported for IR conversion.");
+        "Only matches with complete patterns (i.e. a trailing `_ => ...`) "
+        "are currently supported for IR conversion.",
+        file_table());
   }
 
   XLS_RETURN_IF_ERROR(Visit(node->matched()));
   XLS_ASSIGN_OR_RETURN(BValue matched, Use(node->matched()));
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> matched_type,
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> matched_type,
                        ResolveType(node->matched()));
 
   std::vector<BValue> arm_selectors;
@@ -882,7 +1176,8 @@ absl::Status FunctionConverter::HandleMatch(const Match* node) {
     std::vector<BValue> this_arm_selectors;
     for (NameDefTree* pattern : arm->patterns()) {
       XLS_ASSIGN_OR_RETURN(BValue selector,
-                           HandleMatcher(pattern, {i}, matched, *matched_type));
+                           HandleMatcher(pattern, matched, *matched_type));
+      XLS_RET_CHECK(selector.valid());
       this_arm_selectors.push_back(selector);
     }
 
@@ -907,9 +1202,11 @@ absl::Status FunctionConverter::HandleMatch(const Match* node) {
             BValue not_any_prev_selected;
             if (prior_selectors.empty()) {
               not_any_prev_selected = function_builder_->Literal(UBits(1, 1));
+            } else if (prior_selectors.size() == 1) {
+              not_any_prev_selected =
+                  function_builder_->Not(prior_selectors.front());
             } else {
-              not_any_prev_selected = function_builder_->Not(
-                  function_builder_->Or(prior_selectors));
+              not_any_prev_selected = function_builder_->Nor(prior_selectors);
             }
             BValue this_arm_selected = arm_selectors.back();
             return function_builder_->And({orig_control_predicate(),
@@ -923,8 +1220,8 @@ absl::Status FunctionConverter::HandleMatch(const Match* node) {
     arm_values.push_back(arm_rhs_value);
   }
 
-  // For compute of the default arm the control predicate is "none of the other
-  // arms matched".
+  // For compute of the default (last) arm the control predicate is "none of the
+  // other arms matched".
   ScopedControlPredicate scp(
       this, [&](const PredicateFun& orig_control_predicate) {
         // The default arm is "activated" when:
@@ -934,24 +1231,22 @@ absl::Status FunctionConverter::HandleMatch(const Match* node) {
         BValue not_any_prev_selected;
         if (prior_selectors.empty()) {
           not_any_prev_selected = function_builder_->Literal(UBits(1, 1));
-        } else {
+        } else if (prior_selectors.size() == 1) {
           not_any_prev_selected =
-              function_builder_->Not(function_builder_->Or(prior_selectors));
+              function_builder_->Not(prior_selectors.front());
+        } else {
+          not_any_prev_selected = function_builder_->Nor(prior_selectors);
         }
         return function_builder_->And(
             {orig_control_predicate(), not_any_prev_selected});
       });
+
+  // We are guaranteed from exhaustiveness checking that the last arm handles
+  // all of the rest of the values aside from the ones covered by the earlier
+  // match arms, and so can be emitted as the "default" in the selection IR.
   MatchArm* default_arm = node->arms().back();
-  if (default_arm->patterns().size() != 1) {
-    return absl::UnimplementedError(
-        absl::StrFormat("ConversionError: %s Multiple patterns in default arm "
-                        "is not currently supported for IR conversion.",
-                        node->span().ToString()));
-  }
   XLS_RETURN_IF_ERROR(
-      HandleMatcher(default_arm->patterns()[0],
-                    {static_cast<int64_t>(node->arms().size()) - 1}, matched,
-                    *matched_type)
+      HandleMatcher(default_arm->patterns()[0], matched, *matched_type)
           .status());
   XLS_RETURN_IF_ERROR(Visit(default_arm->expr()));
 
@@ -975,8 +1270,10 @@ absl::Status FunctionConverter::HandleMatch(const Match* node) {
     XLS_RET_CHECK(arm_values.empty());
     SetNodeToIr(node, default_value);
   } else {
-    SetNodeToIr(node, function_builder_->MatchTrue(arm_selectors, arm_values,
-                                                   default_value));
+    BValue result =
+        function_builder_->MatchTrue(arm_selectors, arm_values, default_value);
+    XLS_RETURN_IF_ERROR(function_builder_->GetError());
+    SetNodeToIr(node, result);
   }
   return absl::OkStatus();
 }
@@ -984,11 +1281,13 @@ absl::Status FunctionConverter::HandleMatch(const Match* node) {
 absl::StatusOr<FunctionConverter::RangeData> FunctionConverter::GetRangeData(
     const Expr* iterable) {
   auto error = [&] {
-    return absl::InvalidArgumentError(
-        absl::StrFormat("ConversionError: %s iterable (%s) "
+    return IrConversionErrorStatus(
+        iterable->span(),
+        absl::StrFormat("iterable `%s` "
                         "must be bits-typed, constexpr, and its start must be "
                         "less than or equal to its limit.",
-                        iterable->span().ToString(), iterable->ToString()));
+                        iterable->ToString()),
+        file_table());
   };
 
   // Easy case first: using the `..` range operator.
@@ -997,15 +1296,17 @@ absl::StatusOr<FunctionConverter::RangeData> FunctionConverter::GetRangeData(
   ParametricEnv bindings(parametric_env_map_);
 
   const auto* range_op = dynamic_cast<const Range*>(iterable);
+  bool inclusive_end = false;
   if (range_op != nullptr) {
     XLS_ASSIGN_OR_RETURN(
         start_value, ConstexprEvaluator::EvaluateToValue(
                          import_data_, current_type_info_, kNoWarningCollector,
-                         bindings, range_op->start(), nullptr));
+                         bindings, range_op->start()));
     XLS_ASSIGN_OR_RETURN(
         limit_value, ConstexprEvaluator::EvaluateToValue(
                          import_data_, current_type_info_, kNoWarningCollector,
-                         bindings, range_op->end(), nullptr));
+                         bindings, range_op->end()));
+    inclusive_end = range_op->inclusive_end();
   } else {
     const auto* iterable_call = dynamic_cast<const Invocation*>(iterable);
     if (iterable_call == nullptr) {
@@ -1031,11 +1332,11 @@ absl::StatusOr<FunctionConverter::RangeData> FunctionConverter::GetRangeData(
     XLS_ASSIGN_OR_RETURN(
         start_value, ConstexprEvaluator::EvaluateToValue(
                          import_data_, current_type_info_, kNoWarningCollector,
-                         bindings, start, nullptr));
+                         bindings, start));
     XLS_ASSIGN_OR_RETURN(
         limit_value, ConstexprEvaluator::EvaluateToValue(
                          import_data_, current_type_info_, kNoWarningCollector,
-                         bindings, limit, nullptr));
+                         bindings, limit));
   }
 
   if (!start_value.IsBits() || !limit_value.IsBits()) {
@@ -1045,12 +1346,17 @@ absl::StatusOr<FunctionConverter::RangeData> FunctionConverter::GetRangeData(
   XLS_ASSIGN_OR_RETURN(int64_t start_int, start_value.GetBitValueViaSign());
   XLS_ASSIGN_OR_RETURN(int64_t bit_width, start_value.GetBitCount());
 
-  XLS_ASSIGN_OR_RETURN(InterpValue start_ge_limit, start_value.Ge(limit_value));
-  if (start_ge_limit.IsTrue()) {
+  XLS_ASSIGN_OR_RETURN(InterpValue start_gt_limit, start_value.Gt(limit_value));
+  if (start_gt_limit.IsTrue()) {
     return RangeData{start_int, 0, bit_width};
   }
 
   XLS_ASSIGN_OR_RETURN(InterpValue trip_count, limit_value.Sub(start_value));
+  if (inclusive_end) {
+    trip_count = InterpValue::MakeUnsigned(trip_count.GetBitsOrDie());
+    XLS_ASSIGN_OR_RETURN(trip_count,
+                         trip_count.IncrementZeroExtendIfOverflow());
+  }
   XLS_RET_CHECK(trip_count.IsBits());
   int64_t trip_count_int;
   if (trip_count.IsSigned()) {
@@ -1062,57 +1368,20 @@ absl::StatusOr<FunctionConverter::RangeData> FunctionConverter::GetRangeData(
   return RangeData{start_int, trip_count_int, bit_width};
 }
 
-absl::Status FunctionConverter::HandleFor(const For* node) {
-  XLS_RETURN_IF_ERROR(Visit(node->init()));
-
-  XLS_ASSIGN_OR_RETURN(RangeData range_data, GetRangeData(node->iterable()));
-
-  XLS_VLOG(5) << "Converting for-loop @ " << node->span();
-  FunctionConverter body_converter(package_data_, module_, import_data_,
-                                   options_, proc_data_, /*is_top=*/false);
-  body_converter.set_parametric_env_map(parametric_env_map_);
-
-  // The body conversion uses the same types that we use in the caller.
-  body_converter.current_type_info_ = current_type_info_;
-
-  // Note: there should be no name collisions (i.e. this name is unique)
-  // because:
-  //
-  // a) Double underscore symbols are reserved for the compiler.
-  //    TODO(leary): document this in the DSL reference.
-  // b) The function name being built must be unique in the module.
-  // c) The loop number bumps for each loop in that function.
-  std::string body_fn_name =
-      absl::StrFormat("__%s_counted_for_%d_body", function_builder_->name(),
-                      GetAndBumpCountedForCount());
-  auto body_builder =
-      std::make_unique<FunctionBuilder>(body_fn_name, package());
-  auto* body_builder_ptr = body_builder.get();
-  body_converter.SetFunctionBuilder(std::move(body_builder));
-
-  // Grab the two tuple of `(ivar, accum)`.
-  std::vector<std::variant<NameDefTree::Leaf, NameDefTree*>> flat =
-      node->names()->Flatten1();
-  if (flat.size() != 2) {
-    return absl::UnimplementedError(
-        "Expect for loop to have counter (induction variable) and carry data "
-        "for IR conversion.");
-  }
-
-  // Add the induction value (the "ranged" counter).
-  auto ivar = std::get<NameDefTree::Leaf>(flat[0]);
-  absl::StatusOr<BValue> loop_index_or = absl::visit(
+absl::StatusOr<BValue> FunctionConverter::HandleRangedForInductionVariable(
+    const For* node, FunctionConverter& body_converter,
+    NameDefTree::Leaf ivar_node) {
+  return absl::visit(
       Visitor{
           [&](NameDef* name_def) -> absl::StatusOr<BValue> {
-            XLS_RET_CHECK(name_def != nullptr);
+            XLS_RET_CHECK_NE(name_def, nullptr);
             XLS_ASSIGN_OR_RETURN(xls::Type * ivar_type,
                                  ResolveTypeToIr(name_def));
-            return body_converter.function_builder_->Param(
-                name_def->identifier(), ivar_type);
+            return body_converter.AddParam(name_def->identifier(), ivar_type);
           },
           [&](WildcardPattern* ivar) -> absl::StatusOr<BValue> {
             XLS_ASSIGN_OR_RETURN(xls::Type * ivar_type, ResolveTypeToIr(ivar));
-            return body_converter.function_builder_->Param("__", ivar_type);
+            return body_converter.AddParam("__", ivar_type);
           },
           [&](Range*) -> absl::StatusOr<BValue> {
             return absl::InternalError("Induction variable cannot be a range");
@@ -1128,25 +1397,36 @@ absl::Status FunctionConverter::HandleFor(const For* node) {
             return absl::InternalError(
                 "Induction variable cannot be a name-reference");
           },
+          [&](RestOfTuple*) -> absl::StatusOr<BValue> {
+            return absl::InternalError(
+                "Induction variable cannot be a \"rest of tuple\"");
+          },
       },
-      ivar);
-  XLS_ASSIGN_OR_RETURN(auto loop_index, loop_index_or);
+      ivar_node);
+}
 
+absl::Status FunctionConverter::HandleForLoopCarry(
+    const For* node, FunctionConverter& body_converter,
+    const std::optional<RangeData>& range_data, BValue loop_index,
+    NameDefTree::Leaf ivar, AstNode* carry_node) {
   // IR `counted_for` ops only support a trip count, not a set of iterables, so
   // we need to add an offset to that trip count/index to support nonzero loop
-  // start indices.
-  // Pulling values out of the iterable invocation is safe, as it was all
-  // checked in QueryConstRangeCall.
-  Value index_offset =
-      Value(UBits(range_data.start_value, range_data.bit_width));
-  BValue offset_literal =
-      body_converter.function_builder_->Literal(index_offset);
-  BValue offset_sum =
-      body_converter.function_builder_->Add(loop_index, offset_literal);
-  body_converter.SetNodeToIr(ToAstNode(ivar), offset_sum);
+  // start indices; e.g. `for (i, accum) in 1..10` we actually iterate from 0 to
+  // 9 and add the offset of 1 to the index.
+  if (range_data.has_value()) {
+    Value index_offset =
+        Value(UBits(range_data->start_value, range_data->bit_width));
+    BValue offset_literal =
+        body_converter.function_builder_->Literal(index_offset);
+    BValue offset_sum =
+        body_converter.function_builder_->Add(loop_index, offset_literal);
+
+    body_converter.SetNodeToIr(ToAstNode(ivar), offset_sum);
+  } else {
+    body_converter.SetNodeToIr(ToAstNode(ivar), loop_index);
+  }
 
   // Add the loop carry value.
-  AstNode* carry_node = ToAstNode(flat[1]);
   if (auto* carry_name_def = dynamic_cast<NameDef*>(carry_node)) {
     // When the loop carry value is just a name; e.g. the `x` in `for (i, x)` we
     // can simply bind it.
@@ -1158,8 +1438,8 @@ absl::Status FunctionConverter::HandleFor(const For* node) {
       BValue unwrapped = body_converter.AddTokenWrappedParam(type);
       body_converter.SetNodeToIr(carry_name_def, unwrapped);
     } else {
-      BValue param = body_converter.function_builder_->Param(
-          carry_name_def->identifier(), type);
+      BValue param =
+          body_converter.AddParam(carry_name_def->identifier(), type);
       body_converter.SetNodeToIr(carry_name_def, param);
     }
   } else {
@@ -1168,49 +1448,51 @@ absl::Status FunctionConverter::HandleFor(const For* node) {
     // WildcardPattern -- even if it's a wildcard pattern we throw away, we
     // still want to make the loop with the same pattern.
     AstNode* accum = carry_node;
-    XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> carry_type,
-                         ResolveType(accum));
-    XLS_ASSIGN_OR_RETURN(xls::Type * carry_ir_type,
-                         TypeToIr(package_data_.package, *carry_type,
-                                  ParametricEnv(parametric_env_map_)));
+    XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> carry_type, ResolveType(accum));
+    XLS_ASSIGN_OR_RETURN(
+        xls::Type * carry_ir_type,
+        TypeToIr(package(), *carry_type, ParametricEnv(parametric_env_map_)));
     BValue carry;
     if (implicit_token_data_.has_value()) {
       carry = body_converter.AddTokenWrappedParam(carry_ir_type);
     } else {
-      carry = body_converter.function_builder_->Param("__loop_carry",
-                                                      carry_ir_type);
+      carry = body_converter.AddParam("__loop_carry", carry_ir_type);
     }
     body_converter.SetNodeToIr(accum, carry);
     // This will destructure the names for us in the body of the anonymous
     // function.
     if (auto* ndt = dynamic_cast<NameDefTree*>(accum)) {
       XLS_RETURN_IF_ERROR(body_converter
-                              .HandleMatcher(/*matcher=*/ndt, /*index=*/{},
+                              .HandleMatcher(/*matcher=*/ndt,
                                              /*matched_value=*/carry,
                                              /*matched_type=*/*carry_type)
                               .status());
     } else {
-      XLS_RET_CHECK(dynamic_cast<WildcardPattern*>(accum) != nullptr)
+      XLS_RET_CHECK_NE(dynamic_cast<WildcardPattern*>(accum), nullptr)
           << "Expect post-typechecking loop binding to be NameDefTree or "
              "WildcardPattern";
     }
   }
+  return absl::OkStatus();
+}
 
-  // We need to capture the lexical scope and pass it to his loop body function.
-  //
-  // So we suffix free variables for the function body onto the function
-  // parameters.
+absl::StatusOr<std::vector<const NameDef*>>
+FunctionConverter::HandleForLexicalScope(const For* node,
+                                         FunctionConverter& body_converter) {
+  // Get all of the lexical free variables that are not builtin names.
   FreeVariables freevars =
-      GetFreeVariables(node->body(), &node->span().start());
+      GetFreeVariablesByPos(node->body(), &node->span().start());
   freevars = freevars.DropBuiltinDefs();
+
   std::vector<const NameDef*> relevant_name_defs;
   for (const auto& any_name_def : freevars.GetNameDefs()) {
     const auto* freevar_name_def = std::get<const NameDef*>(any_name_def);
-    std::optional<const ConcreteType*> type =
+    std::optional<const Type*> type =
         current_type_info_->GetItem(freevar_name_def);
     if (!type.has_value()) {
       continue;
     }
+    // Functions will be available to call at package scope.
     if (dynamic_cast<const FunctionType*>(type.value()) != nullptr) {
       continue;
     }
@@ -1219,14 +1501,12 @@ absl::Status FunctionConverter::HandleFor(const For* node) {
         dynamic_cast<TypeAlias*>(definer) != nullptr) {
       continue;
     }
-    XLS_VLOG(5) << "Converting freevar name: " << freevar_name_def->ToString();
+    VLOG(5) << "Converting freevar name: " << freevar_name_def->ToString();
 
     std::optional<IrValue> ir_value = GetNodeToIr(freevar_name_def);
-    if (!ir_value.has_value()) {
-      return absl::InternalError(
-          absl::StrFormat("AST node had no associated IR value: %s @ %s",
-                          node->ToString(), SpanToString(node->GetSpan())));
-    }
+    XLS_RET_CHECK(ir_value.has_value())
+        << "AST node had no associated IR value: " << node->ToString() << " @ "
+        << SpanToString(node->GetSpan(), file_table());
 
     // If free variable is a constant, create constant node inside body.
     // This preserves const-ness of loop body uses (e.g. loop bounds for
@@ -1238,11 +1518,11 @@ absl::Status FunctionConverter::HandleFor(const For* node) {
       // Otherwise, pass in the variable to the loop body function as
       // a parameter.
       relevant_name_defs.push_back(freevar_name_def);
-      XLS_ASSIGN_OR_RETURN(xls::Type * name_def_type,
-                           TypeToIr(package_data_.package, **type,
-                                    ParametricEnv(parametric_env_map_)));
+      XLS_ASSIGN_OR_RETURN(
+          xls::Type * name_def_type,
+          TypeToIr(package(), **type, ParametricEnv(parametric_env_map_)));
       body_converter.SetNodeToIr(
-          freevar_name_def, body_converter.function_builder_->Param(
+          freevar_name_def, body_converter.AddParam(
                                 freevar_name_def->identifier(), name_def_type));
     }
   }
@@ -1250,7 +1530,11 @@ absl::Status FunctionConverter::HandleFor(const For* node) {
   if (implicit_token_data_.has_value()) {
     XLS_RET_CHECK(body_converter.implicit_token_data_.has_value());
   }
+  return relevant_name_defs;
+}
 
+absl::StatusOr<BValue> FunctionConverter::HandleForBody(
+    const For* node, FunctionConverter& body_converter, int64_t trip_count) {
   FunctionConverterVisitor visitor(&body_converter);
   XLS_RETURN_IF_ERROR(visitor.Visit(node->body()));
 
@@ -1267,8 +1551,7 @@ absl::Status FunctionConverter::HandleFor(const For* node) {
   // is simpler because it keeps all the params in the same spot regardless of
   // whether it's a function body or any other kind of function.
   if (implicit_token_data_.has_value()) {
-    XLS_ASSIGN_OR_RETURN(BValue retval,
-                         body_converter.function_builder_->GetLastValue());
+    XLS_ASSIGN_OR_RETURN(BValue retval, body_converter.Use(node->body()));
     std::vector<BValue> after_all_tokens(
         body_converter.implicit_token_data_->control_tokens.begin(),
         body_converter.implicit_token_data_->control_tokens.end());
@@ -1287,29 +1570,135 @@ absl::Status FunctionConverter::HandleFor(const For* node) {
          retval});
   }
 
-  XLS_ASSIGN_OR_RETURN(xls::Function * body_function,
-                       body_builder_ptr->Build());
-  XLS_VLOG(5) << "Converted body function: " << body_function->name();
+  XLS_ASSIGN_OR_RETURN(BValue init, Use(node->init()));
+  if (implicit_token_data_.has_value()) {
+    BValue activated = trip_count == 0 ? function_builder_->Literal(UBits(0, 1))
+                                       : implicit_token_data_->activated;
+    init = function_builder_->Tuple(
+        {implicit_token_data_->entry_token, activated, init});
+  }
+  return init;
+}
+
+// Returns whether `node` is a range expression, which is either a `Range` node
+// or an `Invocation` node with a callee of the builtin `range`.
+static bool IsRangeExpr(AstNode* node) {
+  if (auto* range = dynamic_cast<Range*>(node)) {
+    return true;
+  }
+  if (auto* invocation = dynamic_cast<Invocation*>(node)) {
+    // If the callee is builtin name ref to `range` then we also consider it a
+    // range expression.
+    if (auto* callee_name_ref = dynamic_cast<NameRef*>(invocation->callee())) {
+      return std::holds_alternative<BuiltinNameDef*>(
+                 callee_name_ref->name_def()) &&
+             std::get<BuiltinNameDef*>(callee_name_ref->name_def())
+                     ->identifier() == "range";
+    }
+  }
+  return false;
+}
+
+absl::Status FunctionConverter::HandleFor(const For* node) {
+  XLS_RETURN_IF_ERROR(Visit(node->init()));
+
+  std::optional<BValue> indexable;
+  std::optional<RangeData> range_data;
+  int64_t trip_count;
+  if (IsRangeExpr(node->iterable())) {
+    XLS_ASSIGN_OR_RETURN(range_data, GetRangeData(node->iterable()));
+    trip_count = range_data->trip_count;
+  } else {
+    XLS_RETURN_IF_ERROR(Visit(node->iterable()));
+    XLS_ASSIGN_OR_RETURN(indexable, Use(node->iterable()));
+    int64_t array_size = indexable->GetType()->AsArrayOrDie()->size();
+    XLS_RET_CHECK_GE(array_size, 0);
+    trip_count = array_size;
+  }
+
+  // Grab the two tuple of `(ivar, accum)`.
+  std::vector<std::variant<NameDefTree::Leaf, NameDefTree*>> flat =
+      node->names()->Flatten1();
+  if (flat.size() != 2) {
+    return absl::UnimplementedError(
+        "Expect for loop to have counter (induction variable) and carry data "
+        "for IR conversion.");
+  }
+
+  // Add the induction value (the "ranged" counter).
+  NameDefTree::Leaf ivar_node = std::get<NameDefTree::Leaf>(flat[0]);
+  AstNode* carry_node = ToAstNode(flat[1]);
+
+  VLOG(5) << "Converting for-loop @ " << node->span().ToString(file_table());
+  FunctionConverter body_converter(package_data_, module_, import_data_,
+                                   options_, proc_data_, channel_scope_,
+                                   /*is_top=*/false);
+  body_converter.set_parametric_env_map(parametric_env_map_);
+
+  // The body conversion uses the same types that we use in the caller.
+  body_converter.current_type_info_ = current_type_info_;
+
+  // Note: there should be no name collisions (i.e. this name is unique)
+  // because:
+  //
+  // a) Double underscore symbols are reserved for the compiler.
+  //    TODO(leary): document this in the DSL reference.
+  // b) The function name being built must be unique in the module.
+  // c) The loop number bumps for each loop in that function.
+  std::string body_fn_name =
+      absl::StrFormat("__%s_counted_for_%d_body", function_builder_->name(),
+                      GetAndBumpCountedForCount());
+  auto ir_body_builder =
+      std::make_unique<FunctionBuilder>(body_fn_name, package());
+  auto* ir_body_builder_ptr = ir_body_builder.get();
+  body_converter.SetFunctionBuilder(std::move(ir_body_builder));
 
   std::vector<BValue> invariant_args;
+
+  // Get the induction variable value -- this is handled differently for range
+  // expression vs iterating elements of an array because we need to add the
+  // iterable as an extra invariant arg in the latter case.
+  BValue ivar_value;
+  if (range_data.has_value()) {
+    XLS_ASSIGN_OR_RETURN(ivar_value, HandleRangedForInductionVariable(
+                                         node, body_converter, ivar_node));
+    XLS_RETURN_IF_ERROR(HandleForLoopCarry(node, body_converter, range_data,
+                                           ivar_value, ivar_node, carry_node));
+  } else {
+    BValue index =
+        body_converter.AddParam("__index", package()->GetBitsType(32));
+    XLS_RETURN_IF_ERROR(HandleForLoopCarry(node, body_converter, range_data,
+                                           ivar_value, ivar_node, carry_node));
+    BValue iterable =
+        body_converter.AddParam("__indexable", indexable->GetType());
+    ivar_value =
+        body_converter.function_builder_->ArrayIndex(iterable, {index});
+    body_converter.SetNodeToIr(ToAstNode(ivar_node), ivar_value);
+    invariant_args.push_back(indexable.value());
+  }
+
+  // Get any arguments we need lexically as invariant arguments -- this also
+  // prepares them to be available for discovery when we convert in
+  // `HandleForBody`.
+  XLS_ASSIGN_OR_RETURN(std::vector<const NameDef*> relevant_name_defs,
+                       HandleForLexicalScope(node, body_converter));
+
+  // Convert the for-loop body block into its IR (function) form.
+  XLS_ASSIGN_OR_RETURN(BValue init,
+                       HandleForBody(node, body_converter, trip_count));
+
+  // Now the body has been built up, we can get the IR function for it.
+  XLS_ASSIGN_OR_RETURN(xls::Function * ir_body_function,
+                       ir_body_builder_ptr->Build());
+
   for (const NameDef* nd : relevant_name_defs) {
     XLS_ASSIGN_OR_RETURN(BValue value, Use(nd));
     invariant_args.push_back(value);
   }
 
-  XLS_ASSIGN_OR_RETURN(BValue init, Use(node->init()));
-  if (implicit_token_data_.has_value()) {
-    BValue activated = range_data.trip_count == 0
-                           ? function_builder_->Literal(UBits(0, 1))
-                           : implicit_token_data_->activated;
-    init = function_builder_->Tuple(
-        {implicit_token_data_->entry_token, activated, init});
-  }
-
   Def(node, [&](const SourceInfo& loc) {
-    BValue result =
-        function_builder_->CountedFor(init, range_data.trip_count, /*stride=*/1,
-                                      body_function, invariant_args);
+    BValue result = function_builder_->CountedFor(
+        init, trip_count, /*stride=*/1, ir_body_function, invariant_args);
     // If a token was threaded through, we grab it and note it's an assertion
     // token.
     if (implicit_token_data_.has_value()) {
@@ -1323,13 +1712,13 @@ absl::Status FunctionConverter::HandleFor(const For* node) {
 }
 
 absl::StatusOr<BValue> FunctionConverter::HandleMatcher(
-    NameDefTree* matcher, absl::Span<const int64_t> index,
-    const BValue& matched_value, const ConcreteType& matched_type) {
+    NameDefTree* matcher, const BValue& matched_value,
+    const Type& matched_type) {
   if (matcher->is_leaf()) {
     NameDefTree::Leaf leaf = matcher->leaf();
-    XLS_VLOG(5) << absl::StreamFormat("Matcher is leaf: %s (%s)",
-                                      ToAstNode(leaf)->ToString(),
-                                      ToAstNode(leaf)->GetNodeTypeName());
+    VLOG(5) << absl::StreamFormat("Matcher is leaf: %s (%s)",
+                                  ToAstNode(leaf)->ToString(),
+                                  ToAstNode(leaf)->GetNodeTypeName());
     auto equality = [&]() -> absl::StatusOr<BValue> {
       XLS_RETURN_IF_ERROR(Visit(ToAstNode(leaf)));
       XLS_ASSIGN_OR_RETURN(BValue to_match, Use(ToAstNode(leaf)));
@@ -1344,13 +1733,27 @@ absl::StatusOr<BValue> FunctionConverter::HandleMatcher(
                 return function_builder_->Literal(UBits(1, 1), loc);
               });
             },
+            [&](RestOfTuple* n) -> absl::StatusOr<BValue> {
+              return Def(matcher, [&](const SourceInfo& loc) {
+                return function_builder_->Literal(UBits(1, 1), loc);
+              });
+            },
             [&](Number* n) -> absl::StatusOr<BValue> { return equality(); },
             [&](ColonRef* n) -> absl::StatusOr<BValue> { return equality(); },
             [&](Range* n) -> absl::StatusOr<BValue> {
               XLS_RETURN_IF_ERROR(Visit(ToAstNode(n->start())));
               XLS_RETURN_IF_ERROR(Visit(ToAstNode(n->end())));
-              bool signed_input =
-                  down_cast<const BitsType*>(&matched_type)->is_signed();
+
+              // Look at the matched-on-value's type to determine if we should
+              // use signed or unsigned comparisons.
+              std::optional<BitsLikeProperties> bits_like =
+                  GetBitsLike(matched_type);
+              XLS_RET_CHECK(bits_like.has_value())
+                  << "Range type should be bits-like; got: "
+                  << matched_type.ToString();
+              XLS_ASSIGN_OR_RETURN(bool signed_input,
+                                   bits_like->is_signed.GetAsBool());
+
               XLS_ASSIGN_OR_RETURN(BValue start, Use(n->start()));
               XLS_ASSIGN_OR_RETURN(BValue limit, Use(n->end()));
               SourceInfo loc = ToSourceInfo(n->span());
@@ -1366,8 +1769,16 @@ absl::StatusOr<BValue> FunctionConverter::HandleMatcher(
                 }
                 return function_builder_->ULt(lhs, rhs, loc);
               };
+              auto le = [&](const BValue& lhs, const BValue& rhs) {
+                if (signed_input) {
+                  return function_builder_->SLe(lhs, rhs, loc);
+                }
+                return function_builder_->ULe(lhs, rhs, loc);
+              };
               return function_builder_->And(ge(matched_value, start),
-                                            lt(matched_value, limit));
+                                            n->inclusive_end()
+                                                ? le(matched_value, limit)
+                                                : lt(matched_value, limit));
             },
             [&](NameRef* n) -> absl::StatusOr<BValue> {
               // Comparing for equivalence to a (referenced) name.
@@ -1394,16 +1805,26 @@ absl::StatusOr<BValue> FunctionConverter::HandleMatcher(
   }
 
   auto* matched_tuple_type = dynamic_cast<const TupleType*>(&matched_type);
+  XLS_ASSIGN_OR_RETURN((auto [number_of_tuple_elements, number_of_names]),
+                       GetTupleSizes(matcher, matched_tuple_type));
+
+  int64_t tuple_index = 0;
   BValue ok = function_builder_->Literal(UBits(/*value=*/1, /*bit_count=*/1));
-  for (int64_t i = 0; i < matched_tuple_type->size(); ++i) {
-    const ConcreteType& element_type = matched_tuple_type->GetMemberType(i);
-    NameDefTree* element = matcher->nodes()[i];
-    BValue member = function_builder_->TupleIndex(matched_value, i);
-    std::vector<int64_t> sub_index(index.begin(), index.end());
-    sub_index.push_back(i);
-    XLS_ASSIGN_OR_RETURN(
-        BValue cond, HandleMatcher(element, sub_index, member, element_type));
+  const NameDefTree::Nodes& nodes = matcher->nodes();
+  for (int64_t name_index = 0; name_index < nodes.size(); ++name_index) {
+    NameDefTree* element = nodes[name_index];
+    if (element->IsRestOfTupleLeaf()) {
+      // Skip ahead.
+      int64_t wildcards_to_insert = number_of_tuple_elements - number_of_names;
+      tuple_index += wildcards_to_insert;
+      continue;
+    }
+    const Type& element_type = matched_tuple_type->GetMemberType(tuple_index);
+    BValue member = function_builder_->TupleIndex(matched_value, tuple_index);
+    XLS_ASSIGN_OR_RETURN(BValue cond,
+                         HandleMatcher(element, member, element_type));
     ok = function_builder_->And(ok, cond);
+    tuple_index++;
   }
   return ok;
 }
@@ -1418,11 +1839,12 @@ absl::StatusOr<BValue> FunctionConverter::DefMapWithBuiltin(
                                       CallingConvention::kTypical,
                                       /*free_keys=*/{}, &parametric_env));
   XLS_ASSIGN_OR_RETURN(BValue arg_value, Use(arg));
-  XLS_VLOG(5) << "Mapping with builtin; arg: "
-              << arg_value.GetType()->ToString();
+  VLOG(5) << "Mapping with builtin; arg: " << arg_value.GetType()->ToString();
   auto* array_type = arg_value.GetType()->AsArrayOrDie();
-  if (!package()->HasFunctionWithName(mangled_name)) {
+  std::optional<xls::Function*> f = package()->TryGetFunction(mangled_name);
+  if (!f.has_value()) {
     FunctionBuilder fb(mangled_name, package());
+
     BValue param = fb.Param("arg", array_type->element_type());
     const std::string& builtin_name = node->identifier();
     BValue result;
@@ -1431,15 +1853,22 @@ absl::StatusOr<BValue> FunctionConverter::DefMapWithBuiltin(
     } else if (builtin_name == "ctz") {
       result = fb.Ctz(param);
     } else {
-      return absl::InternalError("Invalid builtin name for map: " +
-                                 builtin_name);
+      return absl::InternalError(
+          absl::StrCat("Invalid builtin name for map: ", builtin_name));
     }
-    XLS_RETURN_IF_ERROR(fb.Build().status());
+    // Add an interface entry.
+    PackageInterfaceProto::Function* fp =
+        package_data_.conversion_info->interface.add_functions();
+    *fp->mutable_base()->mutable_name() = mangled_name;
+    auto* param_proto = fp->add_parameters();
+    param_proto->set_name("arg");
+    *param_proto->mutable_type() = array_type->element_type()->ToProto();
+    *fp->mutable_result_type() = result.GetType()->ToProto();
+    XLS_ASSIGN_OR_RETURN(f, fb.Build());
   }
 
-  XLS_ASSIGN_OR_RETURN(xls::Function * f, package()->GetFunction(mangled_name));
   return Def(parent_node, [&](const SourceInfo& loc) {
-    return function_builder_->Map(arg_value, f);
+    return function_builder_->Map(arg_value, *f);
   });
 }
 
@@ -1449,29 +1878,35 @@ absl::StatusOr<BValue> FunctionConverter::HandleMap(const Invocation* node) {
   }
   XLS_ASSIGN_OR_RETURN(BValue arg, Use(node->args()[0]));
   Expr* fn_node = node->args()[1];
-  XLS_VLOG(5) << "Function being mapped AST: " << fn_node->ToString();
+  VLOG(5) << "Function being mapped AST: " << fn_node->ToString();
   std::optional<const ParametricEnv*> node_parametric_env =
       GetInvocationCalleeBindings(node);
-
+  if (auto* callee_ref = dynamic_cast<FunctionRef*>(fn_node);
+      callee_ref != nullptr) {
+    // The callee is currently only a `FunctionRef` if it has explicit
+    // parametrics.
+    fn_node = callee_ref->callee();
+  }
   std::string map_fn_name;
   Module* lookup_module = nullptr;
   if (auto* name_ref = dynamic_cast<NameRef*>(fn_node)) {
     map_fn_name = name_ref->identifier();
-    if (IsNameParametricBuiltin(map_fn_name)) {
-      XLS_VLOG(5) << "Map of parametric builtin: " << map_fn_name;
+    if (IsBuiltinParametricNameRef(name_ref)) {
+      VLOG(5) << "Map of parametric builtin: " << map_fn_name;
       return DefMapWithBuiltin(node, name_ref, node->args()[0],
                                *node_parametric_env.value());
     }
     lookup_module = module_;
   } else if (auto* colon_ref = dynamic_cast<ColonRef*>(fn_node)) {
     map_fn_name = colon_ref->attr();
-    Import* import_node = colon_ref->ResolveImportSubject().value();
+    std::optional<ImportSubject> import = colon_ref->ResolveImportSubject();
+    XLS_RET_CHECK(import.has_value());
     std::optional<const ImportedInfo*> info =
-        current_type_info_->GetImported(import_node);
+        current_type_info_->GetImported(import.value());
     lookup_module = (*info)->module;
   } else {
-    return absl::UnimplementedError("Unhandled function mapping: " +
-                                    fn_node->ToString());
+    return absl::UnimplementedError(
+        absl::StrCat("Unhandled function mapping: ", fn_node->ToString()));
   }
 
   XLS_ASSIGN_OR_RETURN(Function * mapped_fn,
@@ -1479,26 +1914,124 @@ absl::StatusOr<BValue> FunctionConverter::HandleMap(const Invocation* node) {
   std::vector<std::string> free = mapped_fn->GetFreeParametricKeys();
   absl::btree_set<std::string> free_set(free.begin(), free.end());
   CallingConvention convention = GetCallingConvention(mapped_fn);
+  bool is_implicit_token = convention == CallingConvention::kImplicitToken;
+
   XLS_ASSIGN_OR_RETURN(
       std::string mangled_name,
-      MangleDslxName(lookup_module->name(), mapped_fn->identifier(), convention,
-                     free_set, node_parametric_env.value()));
-  XLS_VLOG(5) << "Getting function with mangled name: " << mangled_name
-              << " from package: " << package()->name();
+      MangleDslxName(
+          lookup_module->name(), mapped_fn->identifier(), convention, free_set,
+          (node_parametric_env.has_value() ? node_parametric_env.value()
+                                           : nullptr)));
+  VLOG(5) << "Getting function with mangled name: " << mangled_name
+          << " from package: " << package()->name();
   XLS_ASSIGN_OR_RETURN(xls::Function * f, package()->GetFunction(mangled_name));
-  return Def(node, [&](const SourceInfo& loc) -> BValue {
-    return function_builder_->Map(arg, f, loc);
-  });
+  size_t arg_size = arg.GetType()->AsArrayOrDie()->size();
+  xls::Type* output_type = package()->GetArrayType(
+      arg_size,
+      is_implicit_token
+          ? f->return_value()->GetType()->AsTupleOrDie()->element_type(1)
+          : f->return_value()->GetType());
+  std::string synthetic_function_name = absl::StrFormat(
+      "__SYNTHETIC_LOOP_BODY_%s_CALLING_%s__MAP_%d", function_builder_->name(),
+      mangled_name, GetAndBumpCountedForCount());
+  if (is_implicit_token) {
+    // add args for token and activation.
+    XLS_RET_CHECK(implicit_token_data_.has_value()) << absl::StreamFormat(
+        "If callee (%s @ %s) requires an implicit token, caller must require "
+        "a token as well (property is transitive across call graph).",
+        map_fn_name, node->span().ToString(file_table()));
+    // Prepend the token and the control predicate boolean on the args.
+    BValue entry_token = implicit_token_data_->entry_token;
+    BValue control_pred = implicit_token_data_->create_control_predicate();
+    return DefWithStatus(
+        node, [&](const SourceInfo& loc) -> absl::StatusOr<BValue> {
+          FunctionBuilder syn(synthetic_function_name, package());
+          BValue loop_idx = syn.Param("idx", package()->GetBitsType(32), loc);
+          BValue loop_data = syn.Param(
+              "token_and_array",
+              package()->GetTupleType({package()->GetTokenType(), output_type}),
+              loc);
+          BValue activated =
+              syn.Param("activated", package()->GetBitsType(1), loc);
+          BValue input_array = syn.Param("input_array", arg.GetType());
+          BValue array_val =
+              syn.TupleIndex(loop_data, 1, loc, "out_array_value");
+          BValue tok_and_new_val = syn.Invoke(
+              {syn.TupleIndex(loop_data, 0, loc, "token_value"), activated,
+               syn.ArrayIndex(input_array, {loop_idx}, loc, "input_value")},
+              f, loc, absl::StrFormat("map_%s_call", map_fn_name));
+          syn.Tuple(
+              {syn.TupleIndex(tok_and_new_val, 0),
+               syn.ArrayUpdate(array_val, syn.TupleIndex(tok_and_new_val, 1),
+                               {loop_idx}, loc, "map_iteration")});
+          XLS_ASSIGN_OR_RETURN(
+              xls::Function * loop_fn, syn.Build(),
+              _ << "Unable to build for-loop synthetic method for "
+                << node->ToString());
+          VLOG(5) << "desugared map into loop over function "
+                  << loop_fn->DumpIr();
+          BValue arg_and_tok = function_builder_->CountedFor(
+              function_builder_->Tuple(
+                  {entry_token,
+                   function_builder_->Literal(ZeroOfType(output_type))}),
+              arg_size, /*stride=*/1, loop_fn, {control_pred, arg}, loc,
+              absl::StrFormat("map_invocation__%s", map_fn_name));
+          implicit_token_data_->control_tokens.push_back(
+              function_builder_->TupleIndex(arg_and_tok, 0));
+          return function_builder_->TupleIndex(arg_and_tok, 1);
+        });
+  }
+  return DefWithStatus(
+      node, [&](const SourceInfo& loc) -> absl::StatusOr<BValue> {
+        FunctionBuilder syn(synthetic_function_name, package());
+        BValue loop_idx = syn.Param("idx", package()->GetBitsType(32), loc);
+        BValue array = syn.Param("array_val", output_type, loc);
+        BValue input_array = syn.Param("input_array", arg.GetType());
+        syn.ArrayUpdate(
+            array,
+            syn.Invoke({syn.ArrayIndex(input_array, {loop_idx})}, f, loc,
+                       absl::StrFormat("map_%s_call", map_fn_name)),
+            {loop_idx}, loc, "map_iteration");
+        XLS_ASSIGN_OR_RETURN(
+            xls::Function * loop_fn, syn.Build(),
+            _ << "Unable to build for-loop synthetic method for "
+              << node->ToString());
+        VLOG(5) << "desugared map into loop over function "
+                << loop_fn->DumpIr();
+        return function_builder_->CountedFor(
+            function_builder_->Literal(ZeroOfType(output_type)),
+            /*trip_count=*/arg_size, /*stride=*/1, loop_fn, {arg}, loc,
+            absl::StrFormat("map_invocation__%s", map_fn_name));
+      });
 }
 
 absl::Status FunctionConverter::HandleIndex(const Index* node) {
+  if (proc_id_.has_value()) {
+    absl::StatusOr<ChannelOrArray> channel_or_array =
+        channel_scope_->GetChannelOrArrayForArrayIndex(*proc_id_, node);
+    if (channel_or_array.ok()) {
+      if (std::holds_alternative<ChannelArray*>(*channel_or_array)) {
+        // We don't allow referencing subarrays outside of config(), and the
+        // ones that occur in config() are dealt with in `ProcConfigIrConverter`
+        // rather than ending up here. The reason for disallowing them in next()
+        // is low utility and higher difficulty of implementation against
+        // non-lowered arrays, which can't be an `IrValue`, `BValue`, etc.
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "Invalid channel subarray use: `%s` at %s; channel subarrays can "
+            "only be used in proc config functions.",
+            node->ToString(), node->span().ToString(file_table())));
+      }
+      node_to_ir_[node] = std::get<Channel*>(*channel_or_array);
+      return absl::OkStatus();
+    }
+  }
   XLS_RETURN_IF_ERROR(Visit(node->lhs()));
   XLS_ASSIGN_OR_RETURN(BValue lhs, Use(node->lhs()));
 
-  std::optional<const ConcreteType*> lhs_type =
+  std::optional<const Type*> lhs_type =
       current_type_info_->GetItem(node->lhs());
   XLS_RET_CHECK(lhs_type.has_value());
-  if (dynamic_cast<const TupleType*>(lhs_type.value()) != nullptr) {
+  if (dynamic_cast<const TupleType*>(lhs_type.value())) {
     // Tuple indexing requires a compile-time-constant RHS.
     XLS_RETURN_IF_ERROR(Visit(ToAstNode(node->rhs())));
     XLS_ASSIGN_OR_RETURN(Bits rhs, GetConstBits(ToAstNode(node->rhs())));
@@ -1506,15 +2039,15 @@ absl::Status FunctionConverter::HandleIndex(const Index* node) {
     Def(node, [&](const SourceInfo& loc) {
       return function_builder_->TupleIndex(lhs, index, loc);
     });
-  } else if (dynamic_cast<const BitsType*>(lhs_type.value()) != nullptr) {
+  } else if (IsBitsLike(*lhs_type.value())) {
     IndexRhs rhs = node->rhs();
     if (std::holds_alternative<WidthSlice*>(rhs)) {
       auto* width_slice = std::get<WidthSlice*>(rhs);
       XLS_RETURN_IF_ERROR(Visit(width_slice->start()));
       XLS_ASSIGN_OR_RETURN(BValue start, Use(width_slice->start()));
-      XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> output_type,
+      XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> output_type,
                            ResolveType(node));
-      XLS_ASSIGN_OR_RETURN(ConcreteTypeDim output_type_dim,
+      XLS_ASSIGN_OR_RETURN(TypeDim output_type_dim,
                            output_type->GetTotalBitCount());
       XLS_ASSIGN_OR_RETURN(int64_t width, output_type_dim.GetAsInt64());
       Def(node, [&](const SourceInfo& loc) {
@@ -1526,7 +2059,8 @@ absl::Status FunctionConverter::HandleIndex(const Index* node) {
           current_type_info_->GetSliceStartAndWidth(slice, GetParametricEnv());
       XLS_RET_CHECK(saw.has_value());
       Def(node, [&](const SourceInfo& loc) {
-        return function_builder_->BitSlice(lhs, saw->start, saw->width, loc);
+        return function_builder_->BitSlice(lhs, /*start=*/saw->start,
+                                           /*width=*/saw->width, loc);
       });
     }
   } else {
@@ -1540,9 +2074,9 @@ absl::Status FunctionConverter::HandleIndex(const Index* node) {
 }
 
 absl::Status FunctionConverter::HandleArray(const Array* node) {
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> type, ResolveType(node));
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> type, ResolveType(node));
   const ArrayType* array_type = dynamic_cast<ArrayType*>(type.get());
-  XLS_RET_CHECK(array_type != nullptr);
+  XLS_RET_CHECK_NE(array_type, nullptr);
   std::vector<BValue> members;
   for (Expr* member : node->members()) {
     XLS_RETURN_IF_ERROR(Visit(member));
@@ -1551,7 +2085,7 @@ absl::Status FunctionConverter::HandleArray(const Array* node) {
   }
 
   if (node->has_ellipsis()) {
-    ConcreteTypeDim array_size_ctd = array_type->size();
+    TypeDim array_size_ctd = array_type->size();
     XLS_ASSIGN_OR_RETURN(int64_t array_size, array_size_ctd.GetAsInt64());
     while (members.size() < array_size) {
       members.push_back(members.back());
@@ -1572,22 +2106,22 @@ absl::Status FunctionConverter::HandleArray(const Array* node) {
 absl::Status FunctionConverter::HandleUdfInvocation(const Invocation* node,
                                                     xls::Function* f,
                                                     std::vector<BValue> args) {
-  XLS_VLOG(5) << "HandleUdfInvocation: " << f->name() << " via "
-              << node->ToString();
+  VLOG(5) << "HandleUdfInvocation: " << f->name() << " via "
+          << node->ToString();
   XLS_RET_CHECK(package_data_.ir_to_dslx.contains(f)) << f->name();
   dslx::Function* dslx_callee =
       dynamic_cast<dslx::Function*>(package_data_.ir_to_dslx.at(f));
 
   const bool callee_requires_implicit_token =
       GetRequiresImplicitToken(dslx_callee);
-  XLS_VLOG(6) << "HandleUdfInvocation: callee: " << dslx_callee->ToString()
-              << " callee_requires_implicit_token: "
-              << callee_requires_implicit_token;
+  VLOG(6) << "HandleUdfInvocation: callee: " << dslx_callee->ToString()
+          << " callee_requires_implicit_token: "
+          << callee_requires_implicit_token;
   if (callee_requires_implicit_token) {
     XLS_RET_CHECK(implicit_token_data_.has_value()) << absl::StreamFormat(
         "If callee (%s @ %s) requires an implicit token, caller must require "
         "a token as well (property is transitive across call graph).",
-        f->name(), node->span().ToString());
+        f->name(), node->span().ToString(file_table()));
     // Prepend the token and the control predicate boolean on the args.
     std::vector<BValue> new_args = {implicit_token_data_->entry_token};
     new_args.push_back(implicit_token_data_->create_control_predicate());
@@ -1613,6 +2147,29 @@ absl::Status FunctionConverter::HandleUdfInvocation(const Invocation* node,
   return absl::OkStatus();
 }
 
+absl::StatusOr<FunctionConverter::AssertionLabelData>
+FunctionConverter::GetAssertionLabel(std::string_view caller_name,
+                                     const Expr* label_expr, const Span& span) {
+  ParametricEnv bindings(parametric_env_map_);
+  XLS_RETURN_IF_ERROR(
+      ConstexprEvaluator::Evaluate(import_data_, current_type_info_,
+                                   kNoWarningCollector, bindings, label_expr));
+
+  std::optional<InterpValue> start_value =
+      current_type_info_->GetConstExprOption(label_expr);
+  XLS_RET_CHECK(start_value.has_value());
+  XLS_ASSIGN_OR_RETURN(std::optional<std::string> label,
+                       InterpValueAsString(start_value.value()));
+  XLS_RET_CHECK(label.has_value());
+
+  // TODO(cdleary): 2024-03-12 We should put the label into the assertion
+  // failure error message.
+  std::string message =
+      absl::StrFormat("Assertion failure via %s @ %s", caller_name,
+                      span.ToString(file_table()));
+  return AssertionLabelData{.label = label.value(), .message = message};
+}
+
 absl::Status FunctionConverter::HandleFailBuiltin(const Invocation* node,
                                                   Expr* label_expr,
                                                   BValue arg) {
@@ -1621,26 +2178,17 @@ absl::Status FunctionConverter::HandleFailBuiltin(const Invocation* node,
     // "control" leading to this DSL program point.
     XLS_RET_CHECK(implicit_token_data_.has_value())
         << "Invoking fail!(), but no implicit token is present for caller @ "
-        << node->span();
+        << node->span().ToString(file_table());
     XLS_RET_CHECK(implicit_token_data_->create_control_predicate != nullptr);
     BValue control_predicate = implicit_token_data_->create_control_predicate();
 
-    std::optional<std::string> label;
-    ParametricEnv bindings(parametric_env_map_);
-    XLS_RETURN_IF_ERROR(ConstexprEvaluator::Evaluate(
-        import_data_, current_type_info_, kNoWarningCollector, bindings,
-        label_expr));
-
-    std::optional<InterpValue> start_value =
-        current_type_info_->GetConstExprOption(label_expr);
-    if (start_value.has_value()) {
-      XLS_ASSIGN_OR_RETURN(label, InterpValueAsString(start_value.value()));
-    }
-    std::string message = absl::StrFormat("Assertion failure via fail! @ %s",
-                              node->span().ToString());
-    BValue assert_result_token = function_builder_->Assert(
-        implicit_token_data_->entry_token,
-        function_builder_->Not(control_predicate), message, label);
+    XLS_ASSIGN_OR_RETURN(AssertionLabelData label_data,
+                         GetAssertionLabel("fail!", label_expr, node->span()));
+    BValue assert_result_token =
+        function_builder_->Assert(implicit_token_data_->entry_token,
+                                  function_builder_->Not(control_predicate),
+                                  label_data.message, label_data.label);
+    XLS_RETURN_IF_ERROR(function_builder_->GetError());
     implicit_token_data_->control_tokens.push_back(assert_result_token);
     tokens_.push_back(assert_result_token);
   }
@@ -1652,10 +2200,81 @@ absl::Status FunctionConverter::HandleFailBuiltin(const Invocation* node,
   return absl::OkStatus();
 }
 
+absl::Status FunctionConverter::HandleAssertLtBuiltin(const Invocation* node,
+                                                      BValue lhs, BValue rhs) {
+  std::optional<Type*> lhs_type = current_type_info_->GetItem(node->args()[0]);
+  std::optional<Type*> rhs_type = current_type_info_->GetItem(node->args()[1]);
+  XLS_RET_CHECK(lhs_type.has_value());
+  XLS_RET_CHECK(rhs_type.has_value());
+  std::optional<BitsLikeProperties> lhs_bits_like =
+      GetBitsLike(*lhs_type.value());
+  std::optional<BitsLikeProperties> rhs_bits_like =
+      GetBitsLike(*rhs_type.value());
+  XLS_RET_CHECK(lhs_bits_like.has_value());
+  XLS_RET_CHECK(rhs_bits_like.has_value());
+  XLS_ASSIGN_OR_RETURN(bool is_lhs_signed,
+                       lhs_bits_like->is_signed.GetAsBool());
+  XLS_ASSIGN_OR_RETURN(bool is_rhs_signed,
+                       rhs_bits_like->is_signed.GetAsBool());
+  XLS_RET_CHECK_EQ(is_lhs_signed, is_rhs_signed);
+  BValue cmp;
+  if (is_lhs_signed) {
+    cmp = function_builder_->SLt(lhs, rhs);
+  } else {
+    cmp = function_builder_->ULt(lhs, rhs);
+  }
+  return HandleAssertBuiltin(
+      node, cmp, module_->Make<String>(node->span(), node->ToInlineString()));
+}
+
+absl::Status FunctionConverter::HandleAssertEqBuiltin(const Invocation* node,
+                                                      BValue lhs, BValue rhs) {
+  BValue cmp = function_builder_->Eq(lhs, rhs);
+  return HandleAssertBuiltin(
+      node, cmp, module_->Make<String>(node->span(), node->ToInlineString()));
+}
+
+absl::Status FunctionConverter::HandleAssertBuiltin(const Invocation* node,
+                                                    BValue assert_predicate,
+                                                    Expr* label_expr) {
+  if (options_.emit_fail_as_assert) {
+    // For a fail node we both create a predicate that corresponds to the
+    // "control" leading to this DSL program point.
+    XLS_RET_CHECK(implicit_token_data_.has_value())
+        << "Invoking assert!(), but no implicit token is present for caller @ "
+        << node->span().ToString(file_table());
+    XLS_RET_CHECK(implicit_token_data_->create_control_predicate != nullptr);
+    BValue control_predicate = implicit_token_data_->create_control_predicate();
+
+    // Variables:
+    // * we got to the control point (CP)
+    // * the assert predicate (AP)
+    //
+    // OK = !CP | AP
+    BValue ok = function_builder_->Or(function_builder_->Not(control_predicate),
+                                      assert_predicate);
+
+    XLS_ASSIGN_OR_RETURN(std::string name, GetCalleeIdentifier(node));
+    XLS_ASSIGN_OR_RETURN(AssertionLabelData label_data,
+                         GetAssertionLabel(name, label_expr, node->span()));
+    BValue assert_result_token =
+        function_builder_->Assert(implicit_token_data_->entry_token, ok,
+                                  label_data.message, label_data.label);
+    implicit_token_data_->control_tokens.push_back(assert_result_token);
+    tokens_.push_back(assert_result_token);
+  }
+
+  // The result of the assert call is unit, the empty tuple.
+  Def(node, [&](const SourceInfo& loc) {
+    return function_builder_->Tuple(std::vector<BValue>());
+  });
+  return absl::OkStatus();
+}
+
 absl::Status FunctionConverter::HandleFormatMacro(const FormatMacro* node) {
   XLS_RET_CHECK(implicit_token_data_.has_value())
       << "Invoking trace_fmt!(), but no implicit token is present for caller @ "
-      << node->span();
+      << node->span().ToString(file_table());
   XLS_RET_CHECK(implicit_token_data_->create_control_predicate != nullptr);
   BValue control_predicate = implicit_token_data_->create_control_predicate();
 
@@ -1679,14 +2298,36 @@ absl::Status FunctionConverter::HandleFormatMacro(const FormatMacro* node) {
     args.push_back(argval);
   }
 
-  std::vector<FormatStep> fmt_steps;
-  std::vector<BValue> ir_args;
-
+  int64_t verbosity = 0;
+  if (node->verbosity().has_value()) {
+    absl::StatusOr<InterpValue> verbosity_interp_value =
+        ConstexprEvaluator::EvaluateToValue(
+            import_data_, current_type_info_, kNoWarningCollector,
+            ParametricEnv(parametric_env_map_), *node->verbosity());
+    if (!verbosity_interp_value.ok()) {
+      return IrConversionErrorStatus(
+          (*node->verbosity())->span(),
+          absl::Substitute("$0 verbosity values must be compile-time "
+                           "constants; got `$1`.",
+                           node->macro(), (*node->verbosity())->ToString()),
+          file_table());
+    }
+    absl::StatusOr<int64_t> verbosity_value =
+        verbosity_interp_value->GetBitValueSigned();
+    if (!verbosity_value.ok()) {
+      return IrConversionErrorStatus(
+          (*node->verbosity())->span(),
+          absl::Substitute("$0 verbosity values must be integers; got `$1`.",
+                           node->macro(), (*node->verbosity())->ToString()),
+          file_table());
+    }
+    verbosity = *verbosity_value;
+  }
   XLS_ASSIGN_OR_RETURN(
       BValue trace_result_token,
       ConvertFormatMacro(*node, implicit_token_data_->entry_token,
-                         control_predicate, args, *current_type_info_,
-                         *function_builder_));
+                         control_predicate, args, verbosity,
+                         *current_type_info_, *function_builder_));
 
   implicit_token_data_->control_tokens.push_back(trace_result_token);
 
@@ -1706,20 +2347,25 @@ absl::Status FunctionConverter::HandleCoverBuiltin(const Invocation* node,
     // "control" leading to this DSL program point.
     XLS_RET_CHECK(implicit_token_data_.has_value())
         << "Invoking cover!(), but no implicit token is present for caller @ "
-        << node->span();
+        << node->span().ToString(file_table());
     XLS_RET_CHECK(implicit_token_data_->create_control_predicate != nullptr);
+    BValue control_predicate = implicit_token_data_->create_control_predicate();
+
+    // Variables:
+    // * we got to the control point (CP)
+    // * the cover condition (CC)
+    //
+    // COVERED = CP & CC
+    BValue covered = function_builder_->And(control_predicate, condition);
     XLS_RET_CHECK_EQ(node->args().size(), 2);
     String* label = dynamic_cast<String*>(node->args()[0]);
-    XLS_RET_CHECK(label != nullptr)
+    XLS_RET_CHECK_NE(label, nullptr)
         << "cover!() argument 0 must be a literal string "
         << "(should have been typechecked?).";
-    BValue cover_result_token = function_builder_->Cover(
-        implicit_token_data_->entry_token, condition, label->text());
-    implicit_token_data_->control_tokens.push_back(cover_result_token);
+    function_builder_->Cover(covered, label->text());
   }
 
-  // The result of the cover call is the argument given; e.g. if we were to
-  // turn off coverpoints, this is the value that would be used.
+  // The result of the cover call is unit, the empty tuple.
   Def(node, [&](const SourceInfo& loc) {
     return function_builder_->Tuple(std::vector<BValue>());
   });
@@ -1727,10 +2373,16 @@ absl::Status FunctionConverter::HandleCoverBuiltin(const Invocation* node,
 }
 
 absl::Status FunctionConverter::HandleInvocation(const Invocation* node) {
-  XLS_VLOG(5) << "FunctionConverter::HandleInvocation: " << node->ToString();
+  VLOG(5) << "FunctionConverter::HandleInvocation: " << node->ToString();
   XLS_ASSIGN_OR_RETURN(std::string called_name, GetCalleeIdentifier(node));
   auto accept_args = [&]() -> absl::StatusOr<std::vector<BValue>> {
     std::vector<BValue> values;
+    if (auto* attr = dynamic_cast<Attr*>(node->callee())) {
+      Expr* param = attr->lhs();
+      XLS_RETURN_IF_ERROR(Visit(param));
+      XLS_ASSIGN_OR_RETURN(BValue value, Use(param));
+      values.push_back(value);
+    }
     for (Expr* arg : node->args()) {
       XLS_RETURN_IF_ERROR(Visit(arg));
       XLS_ASSIGN_OR_RETURN(BValue value, Use(arg));
@@ -1739,11 +2391,10 @@ absl::Status FunctionConverter::HandleInvocation(const Invocation* node) {
     return values;
   };
 
-  if (package()->HasFunctionWithName(called_name)) {
-    XLS_ASSIGN_OR_RETURN(xls::Function * f,
-                         package()->GetFunction(called_name));
+  if (std::optional<xls::Function*> f = package()->TryGetFunction(called_name);
+      f.has_value()) {
     XLS_ASSIGN_OR_RETURN(std::vector<BValue> args, accept_args());
-    return HandleUdfInvocation(node, f, std::move(args));
+    return HandleUdfInvocation(node, *f, std::move(args));
   }
 
   // A few builtins are handled specially.
@@ -1754,6 +2405,25 @@ absl::Status FunctionConverter::HandleInvocation(const Invocation* node) {
         << called_name << " builtin requires two arguments";
     return HandleFailBuiltin(node, /*label_expr=*/node->args()[0],
                              /*arg=*/args[1]);
+  }
+  if (called_name == "assert!") {
+    XLS_ASSIGN_OR_RETURN(std::vector<BValue> args, accept_args());
+    XLS_RET_CHECK_EQ(args.size(), 2)
+        << called_name << " builtin requires two arguments";
+    return HandleAssertBuiltin(node, /*predicate=*/args[0],
+                               /*label_expr=*/node->args()[1]);
+  }
+  if (called_name == "assert_lt") {
+    XLS_ASSIGN_OR_RETURN(std::vector<BValue> args, accept_args());
+    XLS_RET_CHECK_EQ(args.size(), 2)
+        << called_name << " builtin requires two arguments";
+    return HandleAssertLtBuiltin(node, /*lhs=*/args[0], /*rhs=*/args[1]);
+  }
+  if (called_name == "assert_eq") {
+    XLS_ASSIGN_OR_RETURN(std::vector<BValue> args, accept_args());
+    XLS_RET_CHECK_EQ(args.size(), 2)
+        << called_name << " builtin requires two arguments";
+    return HandleAssertEqBuiltin(node, /*lhs=*/args[0], /*rhs=*/args[1]);
   }
   if (called_name == "cover!") {
     XLS_ASSIGN_OR_RETURN(std::vector<BValue> args, accept_args());
@@ -1794,54 +2464,73 @@ absl::Status FunctionConverter::HandleInvocation(const Invocation* node) {
   if (called_name == "join") {
     return HandleBuiltinJoin(node);
   }
+  if (called_name == "token") {
+    return HandleBuiltinToken(node);
+  }
 
   // The rest of the builtins have "handle" methods we can resolve.
   absl::flat_hash_map<std::string,
                       decltype(&FunctionConverter::HandleBuiltinClz)>
       map = {
+          // keep-sorted start
+          {"and_reduce", &FunctionConverter::HandleBuiltinAndReduce},
           {"array_rev", &FunctionConverter::HandleBuiltinArrayRev},
           {"array_size", &FunctionConverter::HandleBuiltinArraySize},
+          {"array_slice", &FunctionConverter::HandleBuiltinArraySlice},
+          {"bit_count", &FunctionConverter::HandleBuiltinBitCount},
+          {"bit_slice_update", &FunctionConverter::HandleBuiltinBitSliceUpdate},
+          {"checked_cast", &FunctionConverter::HandleBuiltinCheckedCast},
           {"clz", &FunctionConverter::HandleBuiltinClz},
           {"ctz", &FunctionConverter::HandleBuiltinCtz},
+          {"decode", &FunctionConverter::HandleBuiltinDecode},
+          {"element_count", &FunctionConverter::HandleBuiltinElementCount},
+          {"encode", &FunctionConverter::HandleBuiltinEncode},
           {"gate!", &FunctionConverter::HandleBuiltinGate},
-          {"signex", &FunctionConverter::HandleBuiltinSignex},
           {"one_hot", &FunctionConverter::HandleBuiltinOneHot},
           {"one_hot_sel", &FunctionConverter::HandleBuiltinOneHotSel},
-          {"priority_sel", &FunctionConverter::HandleBuiltinPrioritySel},
-          {"slice", &FunctionConverter::HandleBuiltinArraySlice},
-          {"bit_slice", &FunctionConverter::HandleBuiltinBitSlice},
-          {"bit_slice_update", &FunctionConverter::HandleBuiltinBitSliceUpdate},
-          {"rev", &FunctionConverter::HandleBuiltinRev},
-          {"and_reduce", &FunctionConverter::HandleBuiltinAndReduce},
           {"or_reduce", &FunctionConverter::HandleBuiltinOrReduce},
-          {"xor_reduce", &FunctionConverter::HandleBuiltinXorReduce},
-          {"widening_cast", &FunctionConverter::HandleBuiltinWideningCast},
-          {"checked_cast", &FunctionConverter::HandleBuiltinCheckedCast},
-          {"update", &FunctionConverter::HandleBuiltinUpdate},
-          {"umulp", &FunctionConverter::HandleBuiltinUMulp},
+          {"priority_sel", &FunctionConverter::HandleBuiltinPrioritySel},
+          {"rev", &FunctionConverter::HandleBuiltinRev},
+          {"signex", &FunctionConverter::HandleBuiltinSignex},
           {"smulp", &FunctionConverter::HandleBuiltinSMulp},
+          {"umulp", &FunctionConverter::HandleBuiltinUMulp},
+          {"update", &FunctionConverter::HandleBuiltinUpdate},
+          {"widening_cast", &FunctionConverter::HandleBuiltinWideningCast},
+          {"xor_reduce", &FunctionConverter::HandleBuiltinXorReduce},
+          {"zip", &FunctionConverter::HandleBuiltinZip},
+          // keep-sorted end
       };
   auto it = map.find(called_name);
   if (it == map.end()) {
-    return absl::InvalidArgumentError(
-        absl::StrFormat("ConversionError: %s Could not find name for "
-                        "invocation: %s; available: [%s]",
-                        node->span().ToString(), called_name,
-                        absl::StrJoin(module_->GetFunctionNames(), ", ")));
+    return IrConversionErrorStatus(
+        node->span(),
+        absl::StrFormat("Could not find name for "
+                        "invocation: `%s`; available: [%s]",
+                        called_name,
+                        absl::StrJoin(module_->GetFunctionNames(), ", ")),
+        file_table());
   }
   XLS_RETURN_IF_ERROR(accept_args().status());
   auto f = it->second;
   return (this->*f)(node);
 }
 
+/* static */ absl::Status FunctionConverter::CheckValueIsChannel(
+    const IrValue& ir_value) {
+  if (!(std::holds_alternative<Channel*>(ir_value) ||
+        std::holds_alternative<ChannelInterface*>(ir_value))) {
+    return absl::InvalidArgumentError(
+        "Expected Channel or ChannelInterface, got BValue or CValue.");
+  }
+  return absl::OkStatus();
+}
+
 absl::Status FunctionConverter::HandleBuiltinSend(const Invocation* node) {
   ProcBuilder* builder_ptr =
       dynamic_cast<ProcBuilder*>(function_builder_.get());
-  if (builder_ptr == nullptr) {
-    return absl::InternalError(
-        "Send nodes should only be encountered during Proc conversion; "
-        "we seem to be in function conversion.");
-  }
+  XLS_RET_CHECK_NE(builder_ptr, nullptr)
+      << "Send nodes should only be encountered during Proc conversion; "
+         "we seem to be in function conversion.";
 
   Expr* token = node->args()[0];
   Expr* channel = node->args()[1];
@@ -1851,14 +2540,20 @@ absl::Status FunctionConverter::HandleBuiltinSend(const Invocation* node) {
   XLS_RETURN_IF_ERROR(Visit(channel));
   XLS_RETURN_IF_ERROR(Visit(payload));
   IrValue ir_value = node_to_ir_[channel];
-  if (!std::holds_alternative<Channel*>(ir_value)) {
-    return absl::InvalidArgumentError(
-        "Expected channel, got BValue or CValue.");
-  }
+  XLS_RETURN_IF_ERROR(CheckValueIsChannel(ir_value));
   XLS_ASSIGN_OR_RETURN(BValue token_value, Use(token));
   XLS_ASSIGN_OR_RETURN(BValue data_value, Use(payload));
-  BValue result =
-      builder_ptr->Send(std::get<Channel*>(ir_value), token_value, data_value);
+
+  BValue result;
+  if (implicit_token_data_.has_value()) {
+    XLS_RET_CHECK(implicit_token_data_->create_control_predicate != nullptr);
+    result = builder_ptr->SendIf(
+        std::get<Channel*>(ir_value), token_value,
+        implicit_token_data_->create_control_predicate(), data_value);
+  } else {
+    result = builder_ptr->Send(std::get<Channel*>(ir_value), token_value,
+                               data_value);
+  }
   node_to_ir_[node] = result;
   tokens_.push_back(result);
   return absl::OkStatus();
@@ -1867,11 +2562,9 @@ absl::Status FunctionConverter::HandleBuiltinSend(const Invocation* node) {
 absl::Status FunctionConverter::HandleBuiltinSendIf(const Invocation* node) {
   ProcBuilder* builder_ptr =
       dynamic_cast<ProcBuilder*>(function_builder_.get());
-  if (builder_ptr == nullptr) {
-    return absl::InternalError(
-        "Send nodes should only be encountered during Proc conversion; "
-        "we seem to be in function conversion.");
-  }
+  XLS_RET_CHECK_NE(builder_ptr, nullptr)
+      << "Send nodes should only be encountered during Proc conversion; "
+         "we seem to be in function conversion.";
 
   Expr* token = node->args()[0];
   Expr* channel = node->args()[1];
@@ -1881,10 +2574,7 @@ absl::Status FunctionConverter::HandleBuiltinSendIf(const Invocation* node) {
   XLS_RETURN_IF_ERROR(Visit(token));
   XLS_RETURN_IF_ERROR(Visit(channel));
   IrValue ir_value = node_to_ir_[channel];
-  if (!std::holds_alternative<Channel*>(ir_value)) {
-    return absl::InvalidArgumentError(
-        "Expected channel, got BValue or CValue.");
-  }
+  XLS_RETURN_IF_ERROR(CheckValueIsChannel(ir_value));
 
   XLS_ASSIGN_OR_RETURN(BValue token_value, Use(token));
   XLS_RETURN_IF_ERROR(Visit(predicate));
@@ -1892,8 +2582,18 @@ absl::Status FunctionConverter::HandleBuiltinSendIf(const Invocation* node) {
 
   XLS_RETURN_IF_ERROR(Visit(payload));
   XLS_ASSIGN_OR_RETURN(BValue data_value, Use(payload));
-  BValue result = builder_ptr->SendIf(std::get<Channel*>(ir_value), token_value,
-                                      predicate_value, data_value);
+  BValue result;
+  if (implicit_token_data_.has_value()) {
+    XLS_RET_CHECK(implicit_token_data_->create_control_predicate != nullptr);
+    result = builder_ptr->SendIf(
+        std::get<Channel*>(ir_value), token_value,
+        builder_ptr->And({implicit_token_data_->create_control_predicate(),
+                          predicate_value}),
+        data_value);
+  } else {
+    result = builder_ptr->SendIf(std::get<Channel*>(ir_value), token_value,
+                                 predicate_value, data_value);
+  }
   node_to_ir_[node] = result;
   tokens_.push_back(result);
   return absl::OkStatus();
@@ -1909,18 +2609,19 @@ absl::Status FunctionConverter::HandleRange(const Range* node) {
     return absl::InvalidArgumentError(
         "Range expressions must resolve to array-of-bits type.");
   }
-  auto* element_type =
-      dynamic_cast<const BitsType*>(&array_type->element_type());
-  if (element_type == nullptr) {
+  std::optional<BitsLikeProperties> bits_like =
+      GetBitsLike(array_type->element_type());
+  if (!bits_like.has_value()) {
     return absl::InvalidArgumentError(
         "Range expressions must resolve to array-of-bits type.");
   }
 
+  XLS_ASSIGN_OR_RETURN(bool is_signed, bits_like->is_signed.GetAsBool());
   XLS_ASSIGN_OR_RETURN(RangeData range_data, GetRangeData(node));
   std::vector<Value> elements;
   for (int i = 0; i < range_data.trip_count; i++) {
     Value value =
-        element_type->is_signed()
+        is_signed
             ? Value(SBits(i + range_data.start_value, range_data.bit_width))
             : Value(UBits(i + range_data.start_value, range_data.bit_width));
     elements.push_back(value);
@@ -1934,22 +2635,25 @@ absl::Status FunctionConverter::HandleRange(const Range* node) {
 absl::Status FunctionConverter::HandleBuiltinRecv(const Invocation* node) {
   ProcBuilder* builder_ptr =
       dynamic_cast<ProcBuilder*>(function_builder_.get());
-  if (builder_ptr == nullptr) {
-    return absl::InternalError(
-        "Recv nodes should only be encountered during Proc conversion; "
-        "we seem to be in function conversion.");
-  }
+  XLS_RET_CHECK_NE(builder_ptr, nullptr)
+      << "Recv nodes should only be encountered during Proc conversion; "
+         "we seem to be in function conversion.";
 
   XLS_RETURN_IF_ERROR(Visit(node->args()[0]));
   XLS_RETURN_IF_ERROR(Visit(node->args()[1]));
   IrValue ir_value = node_to_ir_[node->args()[1]];
-  if (!std::holds_alternative<Channel*>(ir_value)) {
-    return absl::InvalidArgumentError(
-        "Expected channel, got BValue or CValue.");
-  }
+  XLS_RETURN_IF_ERROR(CheckValueIsChannel(ir_value));
 
   XLS_ASSIGN_OR_RETURN(BValue token, Use(node->args()[0]));
-  BValue value = builder_ptr->Receive(std::get<Channel*>(ir_value), token);
+  BValue value;
+  if (implicit_token_data_.has_value()) {
+    XLS_RET_CHECK(implicit_token_data_->create_control_predicate != nullptr);
+    value = builder_ptr->ReceiveIf(
+        std::get<Channel*>(ir_value), token,
+        implicit_token_data_->create_control_predicate());
+  } else {
+    value = builder_ptr->Receive(std::get<Channel*>(ir_value), token);
+  }
   BValue token_value = builder_ptr->TupleIndex(value, 0);
   tokens_.push_back(token_value);
   node_to_ir_[node] = value;
@@ -1960,26 +2664,28 @@ absl::Status FunctionConverter::HandleBuiltinRecvNonBlocking(
     const Invocation* node) {
   ProcBuilder* builder_ptr =
       dynamic_cast<ProcBuilder*>(function_builder_.get());
-  if (builder_ptr == nullptr) {
-    return absl::InternalError(
-        "Recv nodes should only be encountered during Proc conversion; "
-        "we seem to be in function conversion.");
-  }
+  XLS_RET_CHECK_NE(builder_ptr, nullptr)
+      << "Recv nodes should only be encountered during Proc conversion; "
+         "we seem to be in function conversion.";
 
   XLS_RETURN_IF_ERROR(Visit(node->args()[0]));
   XLS_RETURN_IF_ERROR(Visit(node->args()[1]));
   IrValue ir_value = node_to_ir_[node->args()[1]];
-  if (!std::holds_alternative<Channel*>(ir_value)) {
-    return absl::InvalidArgumentError(
-        "Expected channel, got BValue or CValue.");
-  }
+  XLS_RETURN_IF_ERROR(CheckValueIsChannel(ir_value));
   XLS_RETURN_IF_ERROR(Visit(node->args()[2]));
 
   XLS_ASSIGN_OR_RETURN(BValue token, Use(node->args()[0]));
   XLS_ASSIGN_OR_RETURN(BValue default_value, Use(node->args()[2]));
 
-  BValue recv =
-      builder_ptr->ReceiveNonBlocking(std::get<Channel*>(ir_value), token);
+  BValue recv;
+  if (implicit_token_data_.has_value()) {
+    XLS_RET_CHECK(implicit_token_data_->create_control_predicate != nullptr);
+    recv = builder_ptr->ReceiveIfNonBlocking(
+        std::get<Channel*>(ir_value), token,
+        implicit_token_data_->create_control_predicate());
+  } else {
+    recv = builder_ptr->ReceiveNonBlocking(std::get<Channel*>(ir_value), token);
+  }
   BValue token_value = builder_ptr->TupleIndex(recv, 0);
   BValue received_value = builder_ptr->TupleIndex(recv, 1);
   BValue receive_activated = builder_ptr->TupleIndex(recv, 2);
@@ -2000,19 +2706,14 @@ absl::Status FunctionConverter::HandleBuiltinRecvNonBlocking(
 absl::Status FunctionConverter::HandleBuiltinRecvIf(const Invocation* node) {
   ProcBuilder* builder_ptr =
       dynamic_cast<ProcBuilder*>(function_builder_.get());
-  if (builder_ptr == nullptr) {
-    return absl::InternalError(
-        "Recv nodes should only be encountered during Proc conversion; "
-        "we seem to be in function conversion.");
-  }
+  XLS_RET_CHECK_NE(builder_ptr, nullptr)
+      << "Recv nodes should only be encountered during Proc conversion; "
+         "we seem to be in function conversion.";
 
   XLS_RETURN_IF_ERROR(Visit(node->args()[0]));
   XLS_RETURN_IF_ERROR(Visit(node->args()[1]));
   IrValue ir_value = node_to_ir_[node->args()[1]];
-  if (!std::holds_alternative<Channel*>(ir_value)) {
-    return absl::InvalidArgumentError(
-        "Expected channel, got BValue or CValue.");
-  }
+  XLS_RETURN_IF_ERROR(CheckValueIsChannel(ir_value));
 
   XLS_RETURN_IF_ERROR(Visit(node->args()[2]));
   XLS_RETURN_IF_ERROR(Visit(node->args()[3]));
@@ -2021,8 +2722,17 @@ absl::Status FunctionConverter::HandleBuiltinRecvIf(const Invocation* node) {
   XLS_ASSIGN_OR_RETURN(BValue predicate, Use(node->args()[2]));
   XLS_ASSIGN_OR_RETURN(BValue default_value, Use(node->args()[3]));
 
-  BValue recv =
-      builder_ptr->ReceiveIf(std::get<Channel*>(ir_value), token, predicate);
+  BValue recv;
+  if (implicit_token_data_.has_value()) {
+    XLS_RET_CHECK(implicit_token_data_->create_control_predicate != nullptr);
+    recv = builder_ptr->ReceiveIf(
+        std::get<Channel*>(ir_value), token,
+        builder_ptr->And(
+            {implicit_token_data_->create_control_predicate(), predicate}));
+  } else {
+    recv =
+        builder_ptr->ReceiveIf(std::get<Channel*>(ir_value), token, predicate);
+  }
   BValue token_value = builder_ptr->TupleIndex(recv, 0);
   BValue received_value = builder_ptr->TupleIndex(recv, 1);
 
@@ -2041,19 +2751,14 @@ absl::Status FunctionConverter::HandleBuiltinRecvIfNonBlocking(
     const Invocation* node) {
   ProcBuilder* builder_ptr =
       dynamic_cast<ProcBuilder*>(function_builder_.get());
-  if (builder_ptr == nullptr) {
-    return absl::InternalError(
-        "Recv nodes should only be encountered during Proc conversion; "
-        "we seem to be in function conversion.");
-  }
+  XLS_RET_CHECK_NE(builder_ptr, nullptr)
+      << "Recv nodes should only be encountered during Proc conversion; "
+         "we seem to be in function conversion.";
 
   XLS_RETURN_IF_ERROR(Visit(node->args()[0]));
   XLS_RETURN_IF_ERROR(Visit(node->args()[1]));
   IrValue ir_value = node_to_ir_[node->args()[1]];
-  if (!std::holds_alternative<Channel*>(ir_value)) {
-    return absl::InvalidArgumentError(
-        "Expected channel, got BValue or CValue.");
-  }
+  XLS_RETURN_IF_ERROR(CheckValueIsChannel(ir_value));
 
   XLS_RETURN_IF_ERROR(Visit(node->args()[2]));
   XLS_RETURN_IF_ERROR(Visit(node->args()[3]));
@@ -2062,8 +2767,17 @@ absl::Status FunctionConverter::HandleBuiltinRecvIfNonBlocking(
   XLS_ASSIGN_OR_RETURN(BValue predicate, Use(node->args()[2]));
   XLS_ASSIGN_OR_RETURN(BValue default_value, Use(node->args()[3]));
 
-  BValue recv = builder_ptr->ReceiveIfNonBlocking(std::get<Channel*>(ir_value),
-                                                  token, predicate);
+  BValue recv;
+  if (implicit_token_data_.has_value()) {
+    XLS_RET_CHECK(implicit_token_data_->create_control_predicate != nullptr);
+    recv = builder_ptr->ReceiveIfNonBlocking(
+        std::get<Channel*>(ir_value), token,
+        builder_ptr->And(
+            {implicit_token_data_->create_control_predicate(), predicate}));
+  } else {
+    recv = builder_ptr->ReceiveIfNonBlocking(std::get<Channel*>(ir_value),
+                                             token, predicate);
+  }
   BValue token_value = builder_ptr->TupleIndex(recv, 0);
   BValue received_value = builder_ptr->TupleIndex(recv, 1);
   BValue receive_activated = builder_ptr->TupleIndex(recv, 2);
@@ -2083,11 +2797,9 @@ absl::Status FunctionConverter::HandleBuiltinRecvIfNonBlocking(
 absl::Status FunctionConverter::HandleBuiltinJoin(const Invocation* node) {
   ProcBuilder* builder_ptr =
       dynamic_cast<ProcBuilder*>(function_builder_.get());
-  if (builder_ptr == nullptr) {
-    return absl::InternalError(
-        "Join nodes should only be encountered during Proc conversion; "
-        "we seem to be in function conversion.");
-  }
+  XLS_RET_CHECK_NE(builder_ptr, nullptr)
+      << "Join nodes should only be encountered during Proc conversion; "
+         "we seem to be in function conversion.";
 
   std::vector<BValue> ir_tokens;
   ir_tokens.reserve(node->args().size());
@@ -2097,6 +2809,19 @@ absl::Status FunctionConverter::HandleBuiltinJoin(const Invocation* node) {
     ir_tokens.push_back(ir_token);
   }
   BValue value = builder_ptr->AfterAll(ir_tokens);
+  node_to_ir_[node] = value;
+  tokens_.push_back(value);
+  return absl::OkStatus();
+}
+
+absl::Status FunctionConverter::HandleBuiltinToken(const Invocation* node) {
+  ProcBuilder* builder_ptr =
+      dynamic_cast<ProcBuilder*>(function_builder_.get());
+  XLS_RET_CHECK_NE(builder_ptr, nullptr)
+      << "Token nodes should only be encountered during Proc conversion; "
+         "we seem to be in function conversion.";
+
+  BValue value = function_builder_->Literal(Value::Token());
   node_to_ir_[node] = value;
   tokens_.push_back(value);
   return absl::OkStatus();
@@ -2114,15 +2839,25 @@ absl::Status FunctionConverter::AddImplicitTokenParams() {
     // is whether this function has been activated at all.
     return implicit_token_data_->activated;
   };
+  XLS_RET_CHECK(function_proto_);
+
+  auto* tok_param = function_proto_.value()->add_parameters();
+  tok_param->set_name("__token");
+  *tok_param->mutable_type() = package()->GetTokenType()->ToProto();
+  auto* act_param = function_proto_.value()->add_parameters();
+  act_param->set_name("__activated");
+  *act_param->mutable_type() = package()->GetBitsType(1)->ToProto();
 
   return absl::OkStatus();
 }
 
 absl::Status FunctionConverter::HandleFunction(
     Function* node, TypeInfo* type_info, const ParametricEnv* parametric_env) {
-  XLS_RET_CHECK(type_info != nullptr);
+  XLS_RET_CHECK_NE(type_info, nullptr);
+  XLS_RET_CHECK_NE(node, nullptr);
+  Function& f = *node;
 
-  XLS_VLOG(5) << "HandleFunction: " << node->ToString();
+  VLOG(5) << "HandleFunction: " << f.ToString();
 
   if (parametric_env != nullptr) {
     SetParametricEnv(parametric_env);
@@ -2130,52 +2865,53 @@ absl::Status FunctionConverter::HandleFunction(
 
   ScopedTypeInfoSwap stis(this, type_info);
 
+  std::string scope = f.impl().has_value()
+                          ? ToAstNode((*f.impl())->struct_ref())->ToString()
+                          : "";
   // We use a function builder for the duration of converting this AST Function.
   const bool requires_implicit_token = GetRequiresImplicitToken(node);
-  std::string fn_name = node->identifier();
   XLS_ASSIGN_OR_RETURN(
       std::string mangled_name,
-      MangleDslxName(module_->name(), node->identifier(),
+      MangleDslxName(module_->name(), f.identifier(),
                      requires_implicit_token ? CallingConvention::kImplicitToken
                                              : CallingConvention::kTypical,
-                     node->GetFreeParametricKeySet(), parametric_env));
-  auto builder =
+                     f.GetFreeParametricKeySet(), parametric_env, scope));
+  auto ir_builder =
       std::make_unique<FunctionBuilder>(mangled_name, package(), true);
 
-  auto* builder_ptr = builder.get();
-  SetFunctionBuilder(std::move(builder));
+  auto* ir_builder_ptr = ir_builder.get();
+  SetFunctionBuilder(std::move(ir_builder));
   // Function is a top entity.
   if (is_top_ && !requires_implicit_token) {
-    XLS_RETURN_IF_ERROR(builder_ptr->SetAsTop());
+    XLS_RETURN_IF_ERROR(ir_builder_ptr->SetAsTop());
   }
 
-  XLS_VLOG(6) << "Function " << node->identifier()
-              << " requires_implicit_token? "
-              << (requires_implicit_token ? "true" : "false");
+  VLOG(6) << "Function " << f.identifier() << " requires_implicit_token? "
+          << (requires_implicit_token ? "true" : "false");
   if (requires_implicit_token) {
     XLS_RETURN_IF_ERROR(AddImplicitTokenParams());
     XLS_RET_CHECK(implicit_token_data_.has_value());
   }
 
-  for (Param* param : node->params()) {
+  for (Param* param : f.params()) {
     XLS_RETURN_IF_ERROR(Visit(param));
   }
 
   // Replace const values known here with their values in FFI template to
   // pass down templates with less variables.
-  FfiPartialValueSubstituteHelper const_prefill(node->extern_verilog_module());
+  FfiPartialValueSubstituteHelper const_prefill(f.extern_verilog_module());
 
-  for (ParametricBinding* parametric_binding : node->parametric_bindings()) {
-    XLS_VLOG(5) << "Resolving parametric binding: "
-                << parametric_binding->ToString();
+  for (ParametricBinding* parametric_binding : f.parametric_bindings()) {
+    VLOG(5) << "Resolving parametric binding: "
+            << parametric_binding->ToString();
 
     std::optional<InterpValue> parametric_value =
         GetParametricBinding(parametric_binding->identifier());
     XLS_RET_CHECK(parametric_value.has_value());
-    XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> parametric_type,
+    XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> parametric_type,
                          ResolveType(parametric_binding->name_def()));
     XLS_RET_CHECK(!parametric_type->IsMeta());
-    XLS_ASSIGN_OR_RETURN(ConcreteTypeDim parametric_width_ctd,
+    XLS_ASSIGN_OR_RETURN(TypeDim parametric_width_ctd,
                          parametric_type->GetTotalBitCount());
     XLS_ASSIGN_OR_RETURN(Value param_value,
                          InterpValueToValue(*parametric_value));
@@ -2187,18 +2923,31 @@ absl::Status FunctionConverter::HandleFunction(
   }
 
   // If there is foreign function data, all constant values are replaced now.
-  builder_ptr->SetForeignFunctionData(const_prefill.GetUpdatedFfiData());
+  ir_builder_ptr->SetForeignFunctionData(const_prefill.GetUpdatedFfiData());
 
-  XLS_VLOG(3) << "Function has " << constant_deps_.size() << " constant deps";
+  VLOG(5) << absl::StreamFormat(
+      "FunctionBuilder %p function `%s` has %d constant deps", ir_builder_ptr,
+      f.identifier(), constant_deps_.size());
   for (ConstantDef* dep : constant_deps_) {
-    XLS_VLOG(5) << "Visiting constant dep: " << dep->ToString();
+    VLOG(5) << "Visiting constant dep: " << dep->ToString();
+
+    // The constant dep may be from a different module than the module for the
+    // function we're currently converting.
+    XLS_ASSIGN_OR_RETURN(std::optional<ScopedTypeInfoSwap> stis,
+                         ScopedTypeInfoSwap::ForNode(this, dep));
+    XLS_RET_CHECK_EQ(current_type_info_->module(), dep->owner())
+        << absl::StreamFormat(
+               "handling ConstantDef `%s` from module `%s` but current type "
+               "info is for module `%s`",
+               dep->ToString(), dep->owner()->name(),
+               current_type_info_->module()->name());
     XLS_RETURN_IF_ERROR(Visit(dep));
   }
 
-  XLS_VLOG(5) << "body: " << node->body()->ToString();
-  XLS_RETURN_IF_ERROR(Visit(node->body()));
+  VLOG(5) << "body: " << f.body()->ToString();
+  XLS_RETURN_IF_ERROR(Visit(f.body()));
 
-  XLS_ASSIGN_OR_RETURN(BValue return_value, Use(node->body()));
+  XLS_ASSIGN_OR_RETURN(BValue return_value, Use(f.body()));
 
   if (requires_implicit_token) {
     // Now join all the assertion tokens together to make the output token.
@@ -2209,10 +2958,18 @@ absl::Status FunctionConverter::HandleFunction(
     return_value = function_builder_->Tuple(elements);
   }
 
-  XLS_ASSIGN_OR_RETURN(xls::Function * f,
-                       builder_ptr->BuildWithReturnValue(return_value));
-  XLS_VLOG(5) << "Built function: " << f->name();
-  XLS_RETURN_IF_ERROR(VerifyFunction(f));
+  XLS_ASSIGN_OR_RETURN(xls::Function * ir_fn,
+                       ir_builder_ptr->BuildWithReturnValue(return_value));
+  XLS_RET_CHECK(function_proto_);
+  *function_proto_.value()->mutable_result_type() =
+      return_value.GetType()->ToProto();
+  XLS_ASSIGN_OR_RETURN(std::optional<std::string> sv_type,
+                       current_type_info_->FindSvType(f.return_type()));
+  if (sv_type) {
+    *function_proto_.value()->mutable_sv_result_type() = *sv_type;
+  }
+  VLOG(5) << "Built function: " << ir_fn->name();
+  XLS_RETURN_IF_ERROR(VerifyFunction(ir_fn));
 
   // If it's a public fallible function, or it's the entry function for the
   // package, we make a wrapper so that the external world (e.g. JIT, verilog
@@ -2226,12 +2983,16 @@ absl::Status FunctionConverter::HandleFunction(
   // forgo exposing them here.
   if (requires_implicit_token && (node->is_public() || is_top_) &&
       !node->IsParametric()) {
-    XLS_ASSIGN_OR_RETURN(xls::Function * wrapper,
-                         EmitImplicitTokenEntryWrapper(f, node, is_top_));
+    XLS_ASSIGN_OR_RETURN(
+        xls::Function * wrapper,
+        EmitImplicitTokenEntryWrapper(ir_fn, node, is_top_,
+                                      &package_data_.conversion_info->interface,
+                                      **function_proto_));
     package_data_.wrappers.insert(wrapper);
   }
+  function_proto_.reset();
 
-  package_data_.ir_to_dslx[f] = node;
+  package_data_.ir_to_dslx[ir_fn] = node;
   return absl::OkStatus();
 }
 
@@ -2239,8 +3000,8 @@ absl::Status FunctionConverter::HandleProcNextFunction(
     Function* f, const Invocation* invocation, TypeInfo* type_info,
     ImportData* import_data, const ParametricEnv* parametric_env,
     const ProcId& proc_id, ProcConversionData* proc_data) {
-  XLS_RET_CHECK(type_info != nullptr);
-  XLS_VLOG(5) << "HandleProcNextFunction: " << f->ToString();
+  XLS_RET_CHECK_NE(type_info, nullptr);
+  VLOG(5) << "HandleProcNextFunction: " << f->ToString();
 
   if (parametric_env != nullptr) {
     SetParametricEnv(parametric_env);
@@ -2261,11 +3022,11 @@ absl::Status FunctionConverter::HandleProcNextFunction(
     initial_element = proc_data_->id_to_initial_value.at(proc_id);
   }
 
-  auto builder =
-      std::make_unique<ProcBuilder>(mangled_name, token_name, package());
-  builder->StateElement(state_name, initial_element);
-  tokens_.push_back(builder->GetTokenParam());
-  SetNodeToIr(f->params()[0]->name_def(), builder->GetTokenParam());
+  auto builder = std::make_unique<ProcBuilder>(mangled_name, package());
+  auto implicit_token =
+      builder->Literal(Value::Token(), SourceInfo(), token_name);
+  BValue state = builder->StateElement(state_name, initial_element);
+  tokens_.push_back(implicit_token);
   auto* builder_ptr = builder.get();
   SetFunctionBuilder(std::move(builder));
   // Proc is a top entity.
@@ -2273,37 +3034,42 @@ absl::Status FunctionConverter::HandleProcNextFunction(
     XLS_RETURN_IF_ERROR(builder_ptr->SetAsTop());
   }
 
-  // "next" functions actually have _explicit_ tokens. We can unconditionally
-  // hook into the implicit token stuff in case any downstream functions need
-  // it.
-  implicit_token_data_.emplace();
-  implicit_token_data_->entry_token = builder_ptr->GetTokenParam();
-  implicit_token_data_->activated = builder_ptr->Literal(Value::Bool(true));
-  implicit_token_data_->create_control_predicate = [this]() {
-    return implicit_token_data_->activated;
+  // Set the one state element.
+  XLS_RET_CHECK(proc_proto_);
+  PackageInterfaceProto::NamedValue* state_proto =
+      proc_proto_.value()->add_state();
+  *state_proto->mutable_name() = state_name;
+  *state_proto->mutable_type() = state.GetType()->ToProto();
+  // State elements aren't emitted in an observable way so no need to track sv
+  // types.
+
+  // We make an implicit token in case any downstream functions need it; if it's
+  // unused, it'll be optimized out later.
+  implicit_token_data_ = ImplicitTokenData{
+      .entry_token = implicit_token,
+      .activated = builder_ptr->Literal(Value::Bool(true)),
+      .create_control_predicate =
+          [this]() { return implicit_token_data_->activated; },
   };
 
-  // Now bind the recurrent state element.
-  // We need to shift indices by one to handle the token arg.
-  if (f->params().size() == 2) {
-    BValue state = builder_ptr->GetStateParam(0);
-    SetNodeToIr(f->params()[1]->name_def(), state);
-  }
+  // Bind the recurrent state element.
+  XLS_RET_CHECK_EQ(f->params().size(), 1);
+  SetNodeToIr(f->params()[0]->name_def(), state);
 
   proc_id_ = proc_id;
 
   for (ParametricBinding* parametric_binding : f->parametric_bindings()) {
-    XLS_VLOG(5) << "Resolving parametric binding: "
-                << parametric_binding->ToString();
+    VLOG(5) << "Resolving parametric binding: "
+            << parametric_binding->ToString();
 
     std::optional<InterpValue> parametric_value =
         GetParametricBinding(parametric_binding->identifier());
     XLS_RET_CHECK(parametric_value.has_value());
-    XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> parametric_type,
+    XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> parametric_type,
                          ResolveType(parametric_binding->name_def()));
     XLS_RET_CHECK(!parametric_type->IsMeta());
 
-    XLS_ASSIGN_OR_RETURN(ConcreteTypeDim parametric_width_ctd,
+    XLS_ASSIGN_OR_RETURN(TypeDim parametric_width_ctd,
                          parametric_type->GetTotalBitCount());
     XLS_ASSIGN_OR_RETURN(int64_t bit_count, parametric_width_ctd.GetAsInt64());
     Value param_value;
@@ -2321,25 +3087,22 @@ absl::Status FunctionConverter::HandleProcNextFunction(
         DefAlias(parametric_binding, /*to=*/parametric_binding->name_def()));
   }
 
-  XLS_VLOG(3) << "Proc has " << constant_deps_.size() << " constant deps";
+  VLOG(3) << "Proc has " << constant_deps_.size() << " constant deps";
   for (ConstantDef* dep : constant_deps_) {
-    XLS_VLOG(5) << "Visiting constant dep: " << dep->ToString();
+    VLOG(5) << "Visiting constant dep: " << dep->ToString();
+
+    // The constant dep may be from a different module than the module for the
+    // function we're currently converting.
+    XLS_ASSIGN_OR_RETURN(std::optional<ScopedTypeInfoSwap> stis,
+                         ScopedTypeInfoSwap::ForNode(this, dep));
     XLS_RETURN_IF_ERROR(Visit(dep));
   }
 
   XLS_RETURN_IF_ERROR(Visit(f->body()));
 
-  BValue result = std::get<BValue>(node_to_ir_[f->body()]);
+  builder_ptr->Next(state, std::get<BValue>(node_to_ir_[f->body()]));
 
-  // Join all explicit and implicit tokens for the final token.
-  std::vector<BValue> explicit_and_implicit_tokens = tokens_;
-  for (BValue t : implicit_token_data_->control_tokens) {
-    explicit_and_implicit_tokens.push_back(t);
-  }
-  BValue final_token = builder_ptr->AfterAll(explicit_and_implicit_tokens);
-
-  XLS_ASSIGN_OR_RETURN(xls::Proc * p,
-                       builder_ptr->Build(final_token, {result}));
+  XLS_ASSIGN_OR_RETURN(xls::Proc * p, builder_ptr->Build());
   package_data_.ir_to_dslx[p] = f;
   return absl::OkStatus();
 }
@@ -2348,30 +3111,38 @@ absl::Status FunctionConverter::HandleColonRef(const ColonRef* node) {
   // Implementation note: ColonRef "invocations" are handled in Invocation (by
   // resolving the mangled callee name, which should have been IR converted in
   // dependency order).
-  if (std::optional<Import*> import = node->ResolveImportSubject()) {
-    XLS_VLOG(6) << "ColonRef @ " << node->span()
-                << " was import subject; import: "
-                << import.value()->ToString();
+  if (std::optional<ImportSubject> import = node->ResolveImportSubject()) {
+    VLOG(6) << "ColonRef @ " << node->span().ToString(file_table())
+            << " was import subject; import: "
+            << ToAstNode(import.value())->ToString();
     std::optional<const ImportedInfo*> imported =
-        current_type_info_->GetImported(*import);
+        current_type_info_->GetImported(import.value());
     XLS_RET_CHECK(imported.has_value());
     Module* imported_mod = (*imported)->module;
-    ScopedTypeInfoSwap stis(this, (*imported)->type_info);
     XLS_ASSIGN_OR_RETURN(ConstantDef * constant_def,
                          imported_mod->GetConstantDef(node->attr()));
     // A constant may be defined in terms of other constants
     // (pub const MY_CONST = std::foo(ANOTHER_CONST);), so we need to collect
     // constants transitively so we can visit all dependees.
-    XLS_ASSIGN_OR_RETURN(auto constant_deps,
-                         GetConstantDepFreevars(constant_def));
-    for (const auto& dep : constant_deps) {
+    XLS_ASSIGN_OR_RETURN(
+        std::vector<ConstantDef*> constant_deps,
+        GetConstantDepFreevars(constant_def, *imported.value()->type_info));
+    for (ConstantDef* dep : constant_deps) {
+      XLS_ASSIGN_OR_RETURN(std::optional<ScopedTypeInfoSwap> stis,
+                           ScopedTypeInfoSwap::ForNode(this, dep));
       XLS_RETURN_IF_ERROR(Visit(dep));
     }
-    XLS_RETURN_IF_ERROR(HandleConstantDef(constant_def));
+    {
+      XLS_ASSIGN_OR_RETURN(std::optional<ScopedTypeInfoSwap> stis,
+                           ScopedTypeInfoSwap::ForNode(this, constant_def));
+      XLS_RETURN_IF_ERROR(HandleConstantDef(constant_def));
+    }
     return DefAlias(constant_def->name_def(), /*to=*/node);
   }
 
-  XLS_ASSIGN_OR_RETURN(auto subject,
+  using SubjectT = std::variant<Module*, EnumDef*, BuiltinNameDef*,
+                                ArrayTypeAnnotation*, Impl*>;
+  XLS_ASSIGN_OR_RETURN(SubjectT subject,
                        ResolveColonRefSubjectAfterTypeChecking(
                            import_data_, current_type_info_, node));
   return absl::visit(
@@ -2408,8 +3179,14 @@ absl::Status FunctionConverter::HandleColonRef(const ColonRef* node) {
           [&](ArrayTypeAnnotation* array_type) -> absl::Status {
             // Type checking currently ensures that we're not taking a '::' on
             // anything other than a bits type.
-            XLS_ASSIGN_OR_RETURN(xls::Type * input_type,
-                                 ResolveTypeToIr(array_type));
+            xls::Type* input_type;
+            {
+              XLS_ASSIGN_OR_RETURN(
+                  TypeInfo * type_info,
+                  import_data_->GetRootTypeInfo(array_type->owner()));
+              ScopedTypeInfoSwap stis(this, type_info);
+              XLS_ASSIGN_OR_RETURN(input_type, ResolveTypeToIr(array_type));
+            }
             xls::BitsType* bits_type = input_type->AsBitsOrDie();
             const int64_t bit_count = bits_type->bit_count();
             XLS_ASSIGN_OR_RETURN(
@@ -2419,7 +3196,13 @@ absl::Status FunctionConverter::HandleColonRef(const ColonRef* node) {
             DefConst(node, value);
             return absl::OkStatus();
           },
-      },
+          [&](Impl* impl) -> absl::Status {
+            XLS_ASSIGN_OR_RETURN(InterpValue iv,
+                                 current_type_info_->GetConstExpr(node));
+            XLS_ASSIGN_OR_RETURN(Value value, InterpValueToValue(iv));
+            DefConst(node, value);
+            return absl::OkStatus();
+          }},
       subject);
 }
 
@@ -2460,7 +3243,7 @@ absl::Status FunctionConverter::HandleStructInstance(
                        ToTypeDefinition(node->struct_ref()));
   XLS_ASSIGN_OR_RETURN(StructDef * struct_def, DerefStruct(type_definition));
   std::vector<Value> const_operands;
-  for (auto [_, member_expr] : node->GetOrderedMembers(struct_def)) {
+  for (const auto& [_, member_expr] : node->GetOrderedMembers(struct_def)) {
     XLS_RETURN_IF_ERROR(Visit(member_expr));
     XLS_ASSIGN_OR_RETURN(BValue operand, Use(member_expr));
     operands.push_back(operand);
@@ -2474,60 +3257,78 @@ absl::Status FunctionConverter::HandleStructInstance(
 
 absl::StatusOr<std::string> FunctionConverter::GetCalleeIdentifier(
     const Invocation* node) {
-  XLS_VLOG(5) << "Getting callee identifier for invocation: "
-              << node->ToString();
+  VLOG(5) << "Getting callee identifier for invocation: " << node->ToString();
   Expr* callee = node->callee();
-  std::string callee_name;
-  Module* m;
   if (auto* name_ref = dynamic_cast<NameRef*>(callee)) {
-    callee_name = name_ref->identifier();
-    m = module_;
-  } else if (auto* colon_ref = dynamic_cast<ColonRef*>(callee)) {
-    callee_name = colon_ref->attr();
-    std::optional<Import*> import = colon_ref->ResolveImportSubject();
-    XLS_RET_CHECK(import.has_value());
-    std::optional<const ImportedInfo*> info =
-        current_type_info_->GetImported(*import);
-    m = (*info)->module;
-  } else {
-    return absl::InternalError("Invalid callee: " + callee->ToString());
+    if (name_ref->IsBuiltin()) {
+      return name_ref->identifier();
+    }
   }
 
-  std::optional<Function*> maybe_f = m->GetFunction(callee_name);
-  if (!maybe_f.has_value()) {
-    // For e.g. builtins that are not in the module we just provide the name
-    // directly.
-    return callee_name;
+  std::optional<const InvocationData> inv_data =
+      current_type_info_->GetInvocationData(node);
+  XLS_RET_CHECK(inv_data.has_value() && (*inv_data).callee() != nullptr);
+
+  const Function* f = (*inv_data).callee();
+  std::string scope = "";
+  if (f->impl().has_value()) {
+    scope = (*f->impl())->struct_ref()->ToString();
   }
-  Function* f = maybe_f.value();
 
   // We have to mangle the parametric bindings into the name to get the fully
   // resolved symbol.
   absl::btree_set<std::string> free_keys = f->GetFreeParametricKeySet();
   const CallingConvention convention = GetCallingConvention(f);
+  Module* m = f->owner();
   if (!f->IsParametric()) {
-    return MangleDslxName(m->name(), f->identifier(), convention, free_keys);
+    return MangleDslxName(m->name(), f->identifier(), convention, free_keys,
+                          /*parametric_env=*/nullptr, scope);
   }
 
   std::optional<const ParametricEnv*> resolved_parametric_env =
       GetInvocationCalleeBindings(node);
   XLS_RET_CHECK(resolved_parametric_env.has_value());
-  XLS_VLOG(5) << absl::StreamFormat(
-      "Node `%s` (%s) @ %s parametric bindings %s", node->ToString(),
-      node->GetNodeTypeName(), node->span().ToString(),
-      (*resolved_parametric_env)->ToString());
+  VLOG(5) << absl::StreamFormat("Node `%s` (%s) @ %s parametric bindings %s",
+                                node->ToString(), node->GetNodeTypeName(),
+                                node->span().ToString(file_table()),
+                                (*resolved_parametric_env)->ToString());
   XLS_RET_CHECK(!(*resolved_parametric_env)->empty());
   return MangleDslxName(m->name(), f->identifier(), convention, free_keys,
-                        resolved_parametric_env.value());
+                        resolved_parametric_env.value(), scope);
+}
+
+std::optional<const Expr*> FunctionConverter::GetUnrolledForLoop(
+    const UnrollFor* loop) {
+  return current_type_info_->GetUnrolledLoop(
+      loop, ParametricEnv(parametric_env_map_));
+}
+
+absl::Status FunctionConverter::HandleUnrollFor(const UnrollFor* node) {
+  std::optional<const Expr*> unrolled_expr = GetUnrolledForLoop(node);
+  XLS_RET_CHECK(unrolled_expr.has_value());
+  SetNodeToIr(node, node_to_ir_.at(*unrolled_expr));
+  return absl::OkStatus();
 }
 
 absl::Status FunctionConverter::HandleBinop(const Binop* node) {
-  XLS_VLOG(5) << "HandleBinop: " << node->ToString();
-  std::optional<const ConcreteType*> lhs_type =
+  VLOG(5) << "HandleBinop: " << node->ToString();
+  std::optional<const Type*> lhs_type =
       current_type_info_->GetItem(node->lhs());
   XLS_RET_CHECK(lhs_type.has_value());
-  auto* bits_type = dynamic_cast<const BitsType*>(lhs_type.value());
-  bool signed_input = bits_type != nullptr && bits_type->is_signed();
+
+  // Helper lambda that does all the appropriate checking that we're only
+  // querying the signedness of our operand types when it's appropriate to do
+  // so.
+  auto is_signed_bits_like = [&]() -> bool {
+    std::optional<BitsLikeProperties> lhs_bits_like_properties =
+        GetBitsLike(*lhs_type.value());
+    CHECK(lhs_bits_like_properties.has_value());
+    const TypeDim& is_signed = lhs_bits_like_properties->is_signed;
+    absl::StatusOr<bool> result = is_signed.GetAsBool();
+    CHECK_OK(result);
+    return *result;
+  };
+
   XLS_ASSIGN_OR_RETURN(BValue lhs, Use(node->lhs()));
   XLS_ASSIGN_OR_RETURN(BValue rhs, Use(node->rhs()));
   std::function<BValue(const SourceInfo&)> ir_func;
@@ -2556,7 +3357,7 @@ absl::Status FunctionConverter::HandleBinop(const Binop* node) {
       break;
     case BinopKind::kMul:
       ir_func = [&](const SourceInfo& loc) {
-        if (signed_input) {
+        if (is_signed_bits_like()) {
           return function_builder_->SMul(lhs, rhs, loc);
         }
         return function_builder_->UMul(lhs, rhs, loc);
@@ -2564,7 +3365,7 @@ absl::Status FunctionConverter::HandleBinop(const Binop* node) {
       break;
     case BinopKind::kDiv:
       ir_func = [&](const SourceInfo& loc) {
-        if (signed_input) {
+        if (is_signed_bits_like()) {
           return function_builder_->SDiv(lhs, rhs, loc);
         }
         return function_builder_->UDiv(lhs, rhs, loc);
@@ -2572,7 +3373,7 @@ absl::Status FunctionConverter::HandleBinop(const Binop* node) {
       break;
     case BinopKind::kMod:
       ir_func = [&](const SourceInfo& loc) {
-        if (signed_input) {
+        if (is_signed_bits_like()) {
           return function_builder_->SMod(lhs, rhs, loc);
         }
         return function_builder_->UMod(lhs, rhs, loc);
@@ -2581,7 +3382,7 @@ absl::Status FunctionConverter::HandleBinop(const Binop* node) {
     // Non-equality comparisons.
     case BinopKind::kGe:
       ir_func = [&](const SourceInfo& loc) {
-        if (signed_input) {
+        if (is_signed_bits_like()) {
           return function_builder_->SGe(lhs, rhs, loc);
         }
         return function_builder_->UGe(lhs, rhs, loc);
@@ -2589,7 +3390,7 @@ absl::Status FunctionConverter::HandleBinop(const Binop* node) {
       break;
     case BinopKind::kGt:
       ir_func = [&](const SourceInfo& loc) {
-        if (signed_input) {
+        if (is_signed_bits_like()) {
           return function_builder_->SGt(lhs, rhs, loc);
         }
         return function_builder_->UGt(lhs, rhs, loc);
@@ -2597,7 +3398,7 @@ absl::Status FunctionConverter::HandleBinop(const Binop* node) {
       break;
     case BinopKind::kLe:
       ir_func = [&](const SourceInfo& loc) {
-        if (signed_input) {
+        if (is_signed_bits_like()) {
           return function_builder_->SLe(lhs, rhs, loc);
         }
         return function_builder_->ULe(lhs, rhs, loc);
@@ -2605,7 +3406,7 @@ absl::Status FunctionConverter::HandleBinop(const Binop* node) {
       break;
     case BinopKind::kLt:
       ir_func = [&](const SourceInfo& loc) {
-        if (signed_input) {
+        if (is_signed_bits_like()) {
           return function_builder_->SLt(lhs, rhs, loc);
         }
         return function_builder_->ULt(lhs, rhs, loc);
@@ -2614,7 +3415,7 @@ absl::Status FunctionConverter::HandleBinop(const Binop* node) {
     // Shifts.
     case BinopKind::kShr:
       ir_func = [&](const SourceInfo& loc) {
-        if (signed_input) {
+        if (is_signed_bits_like()) {
           return function_builder_->Shra(lhs, rhs, loc);
         }
         return function_builder_->Shrl(lhs, rhs, loc);
@@ -2658,10 +3459,10 @@ absl::Status FunctionConverter::HandleBinop(const Binop* node) {
 }
 
 absl::Status FunctionConverter::HandleAttr(const Attr* node) {
-  XLS_VLOG(5) << "FunctionConverter::HandleAttr: " << node->ToString() << " @ "
-              << node->span().ToString();
+  VLOG(5) << "FunctionConverter::HandleAttr: " << node->ToString() << " @ "
+          << node->span().ToString(file_table());
   XLS_RETURN_IF_ERROR(Visit(node->lhs()));
-  std::optional<const ConcreteType*> lhs_type =
+  std::optional<const Type*> lhs_type =
       current_type_info_->GetItem(node->lhs());
   XLS_RET_CHECK(lhs_type.has_value());
   auto* struct_type = dynamic_cast<const StructType*>(lhs_type.value());
@@ -2680,8 +3481,10 @@ absl::Status FunctionConverter::HandleAttr(const Attr* node) {
   return absl::OkStatus();
 }
 
-absl::Status FunctionConverter::HandleBlock(const Block* node) {
-  XLS_VLOG(5) << "FunctionConverter::HandleBlock; node: " << node->ToString();
+absl::Status FunctionConverter::HandleStatementBlock(
+    const StatementBlock* node) {
+  VLOG(5) << "FunctionConverter::HandleStatementBlock; node: "
+          << node->ToString();
   Expr* last_expr = nullptr;
 
   for (const Statement* s : node->statements()) {
@@ -2700,7 +3503,7 @@ absl::Status FunctionConverter::HandleBlock(const Block* node) {
       return function_builder_->Tuple({}, loc);
     });
   } else {
-    XLS_RET_CHECK(last_expr != nullptr);
+    XLS_RET_CHECK_NE(last_expr, nullptr);
     XLS_ASSIGN_OR_RETURN(BValue bvalue, Use(last_expr));
     SetNodeToIr(node, bvalue);
   }
@@ -2708,33 +3511,36 @@ absl::Status FunctionConverter::HandleBlock(const Block* node) {
 }
 
 absl::Status FunctionConverter::HandleStatement(const Statement* node) {
-  XLS_VLOG(5) << "FunctionConverter::HandleStatement; node: "
-              << node->ToString();
-  return absl::visit(Visitor{
-                         [&](Expr* e) -> absl::Status {
-                           XLS_RETURN_IF_ERROR(Visit(ToAstNode(e)));
-                           XLS_ASSIGN_OR_RETURN(BValue bvalue, Use(e));
-                           SetNodeToIr(node, bvalue);
-                           return absl::OkStatus();
-                         },
-                         [&](TypeAlias* n) -> absl::Status {
-                           // Nothing to do, all was resolved at type inference
-                           // time.
-                           return absl::OkStatus();
-                         },
-                         [&](ConstAssert* n) -> absl::Status {
-                           // Nothing to do, all was resolved at type inference
-                           // time.
-                           return absl::OkStatus();
-                         },
-                         [&](Let* let) -> absl::Status {
-                           XLS_RETURN_IF_ERROR(Visit(ToAstNode(let)));
-                           XLS_ASSIGN_OR_RETURN(BValue bvalue, Use(let));
-                           SetNodeToIr(node, bvalue);
-                           return absl::OkStatus();
-                         },
-                     },
-                     node->wrapped());
+  VLOG(5) << "FunctionConverter::HandleStatement; node: " << node->ToString();
+  return absl::visit(
+      Visitor{
+          [&](Expr* e) -> absl::Status {
+            XLS_RETURN_IF_ERROR(Visit(ToAstNode(e)));
+            XLS_ASSIGN_OR_RETURN(BValue bvalue, Use(e));
+            SetNodeToIr(node, bvalue);
+            return absl::OkStatus();
+          },
+          [&](TypeAlias*) {
+            // Nothing to do, all was resolved at type inference
+            // time.
+            return absl::OkStatus();
+          },
+          [&](ConstAssert*) {
+            // Nothing to do, all was resolved at type inference
+            // time.
+            return absl::OkStatus();
+          },
+          [&](Let* let) -> absl::Status {
+            XLS_RETURN_IF_ERROR(Visit(ToAstNode(let)));
+            XLS_ASSIGN_OR_RETURN(BValue bvalue, Use(let));
+            SetNodeToIr(node, bvalue);
+            return absl::OkStatus();
+          },
+          [](VerbatimNode*) {
+            return absl::UnimplementedError("Should not convert VerbatimNode");
+          },
+      },
+      node->wrapped());
   return absl::OkStatus();
 }
 
@@ -2746,7 +3552,7 @@ absl::Status FunctionConverter::HandleConditional(const Conditional* node) {
     ScopedControlPredicate scp(
         this, [&](const PredicateFun& orig_control_predicate) {
           BValue activated = orig_control_predicate();
-          XLS_CHECK_EQ(activated.GetType()->AsBitsOrDie()->bit_count(), 1);
+          CHECK_EQ(activated.GetType()->AsBitsOrDie()->bit_count(), 1);
           return function_builder_->And(activated, arg0);
         });
     XLS_RETURN_IF_ERROR(Visit(node->consequent()));
@@ -2758,7 +3564,7 @@ absl::Status FunctionConverter::HandleConditional(const Conditional* node) {
     ScopedControlPredicate scp(
         this, [&](const PredicateFun& orig_control_predicate) {
           BValue activated = orig_control_predicate();
-          XLS_CHECK_EQ(activated.GetType()->AsBitsOrDie()->bit_count(), 1);
+          CHECK_EQ(activated.GetType()->AsBitsOrDie()->bit_count(), 1);
           return function_builder_->And(orig_control_predicate(),
                                         function_builder_->Not(arg0));
         });
@@ -2808,6 +3614,32 @@ absl::Status FunctionConverter::HandleBuiltinArrayRev(const Invocation* node) {
   return absl::OkStatus();
 }
 
+absl::Status FunctionConverter::HandleBuiltinZip(const Invocation* node) {
+  XLS_RET_CHECK_EQ(node->args().size(), 2);
+  XLS_ASSIGN_OR_RETURN(BValue lhs, Use(node->args()[0]));
+  XLS_ASSIGN_OR_RETURN(BValue rhs, Use(node->args()[1]));
+
+  XLS_ASSIGN_OR_RETURN(xls::Type * result_type_base, ResolveTypeToIr(node));
+  // Should never fail, because type inference should ensure this is a array
+  // type.
+  xls::ArrayType* result_type = down_cast<xls::ArrayType*>(result_type_base);
+
+  Def(node, [&](const SourceInfo& loc) {
+    std::vector<BValue> elems;
+    int64_t result_size = result_type->size();
+    for (int64_t i = 0; i < result_size; ++i) {
+      BValue index = function_builder_->Literal(UBits(i, kUsizeBits));
+
+      BValue lhs_element = function_builder_->ArrayIndex(lhs, {index}, loc);
+      BValue rhs_element = function_builder_->ArrayIndex(rhs, {index}, loc);
+      elems.push_back(
+          function_builder_->Tuple({lhs_element, rhs_element}, loc));
+    }
+    return function_builder_->Array(elems, result_type->element_type(), loc);
+  });
+  return absl::OkStatus();
+}
+
 absl::Status FunctionConverter::HandleBuiltinArraySlice(
     const Invocation* node) {
   XLS_RET_CHECK_EQ(node->args().size(), 3);
@@ -2815,26 +3647,12 @@ absl::Status FunctionConverter::HandleBuiltinArraySlice(
   XLS_ASSIGN_OR_RETURN(BValue start, Use(node->args()[1]));
 
   const Expr* arg2 = node->args()[2];
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> output_type,
-                       ResolveType(arg2));
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> output_type, ResolveType(arg2));
   const auto* array_type = down_cast<const ArrayType*>(output_type.get());
   XLS_ASSIGN_OR_RETURN(int64_t width, array_type->size().GetAsInt64());
 
   Def(node, [&](const SourceInfo& loc) {
     return function_builder_->ArraySlice(arg, start, width, loc);
-  });
-  return absl::OkStatus();
-}
-
-absl::Status FunctionConverter::HandleBuiltinBitSlice(const Invocation* node) {
-  XLS_RET_CHECK_EQ(node->args().size(), 3);
-  XLS_ASSIGN_OR_RETURN(BValue arg, Use(node->args()[0]));
-  XLS_ASSIGN_OR_RETURN(Bits start_bits, GetConstBits(node->args()[1]));
-  XLS_ASSIGN_OR_RETURN(uint64_t start, start_bits.ToUint64());
-  XLS_ASSIGN_OR_RETURN(Bits width_bits, GetConstBits(node->args()[2]));
-  XLS_ASSIGN_OR_RETURN(uint64_t width, width_bits.ToUint64());
-  Def(node, [&](const SourceInfo& loc) {
-    return function_builder_->BitSlice(arg, start, width, loc);
   });
   return absl::OkStatus();
 }
@@ -2877,6 +3695,32 @@ absl::Status FunctionConverter::HandleBuiltinGate(const Invocation* node) {
   return absl::OkStatus();
 }
 
+absl::Status FunctionConverter::HandleBuiltinDecode(const Invocation* node) {
+  XLS_RET_CHECK_EQ(node->args().size(), 1);
+  XLS_RET_CHECK_EQ(node->explicit_parametrics().size(), 1);
+  XLS_ASSIGN_OR_RETURN(BValue input, Use(node->args()[0]));
+  XLS_ASSIGN_OR_RETURN(
+      xls::Type * return_type,
+      ResolveTypeToIr(ToAstNode(node->explicit_parametrics()[0])));
+  XLS_RET_CHECK(return_type->IsBits());
+  const int64_t width = return_type->AsBitsOrDie()->bit_count();
+
+  Def(node, [&](const SourceInfo& loc) {
+    return function_builder_->Decode(input, width, loc);
+  });
+  return absl::OkStatus();
+}
+
+absl::Status FunctionConverter::HandleBuiltinEncode(const Invocation* node) {
+  XLS_RET_CHECK_EQ(node->args().size(), 1);
+  XLS_ASSIGN_OR_RETURN(BValue input, Use(node->args()[0]));
+
+  Def(node, [&](const SourceInfo& loc) {
+    return function_builder_->Encode(input, loc);
+  });
+  return absl::OkStatus();
+}
+
 absl::Status FunctionConverter::HandleBuiltinOneHot(const Invocation* node) {
   XLS_RET_CHECK_EQ(node->args().size(), 2);
   XLS_ASSIGN_OR_RETURN(BValue input, Use(node->args()[0]));
@@ -2894,38 +3738,75 @@ absl::Status FunctionConverter::HandleBuiltinOneHotSel(const Invocation* node) {
   XLS_RET_CHECK_EQ(node->args().size(), 2);
   XLS_ASSIGN_OR_RETURN(BValue selector, Use(node->args()[0]));
 
+  // Implementation note:  During IR conversion, we will scalarize the
+  // array element into BValues using multiple ArrayIndex ops
+  // to create cases for the select operation.  This will bloat the
+  // unoptimized IR  -- especially in the case where we are given
+  // a literal array.
+  //
+  // For example, given a `one_hot_sel(sel, cases=[a, b, c])` the un-opt IR
+  // will redundantly create individual array_index ops for each element
+  // to then pass to the select op:
+  //   array_val: bits[32][4] = array(a, b, c)
+  //   literal_0: bits[32] = literal(value=0)
+  //   literal_1: bits[32] = literal(value=1)
+  //   literal_2: bits[32] = literal(value=2)
+  //   array_index_0: bits[32] = array_index(array_val, indices=[literal_0])
+  //   array_index_1: bits[32] = array_index(array_val, indices=[literal_1])
+  //   array_index_2: bits[32] = array_index(array_val, indices=[literal_2])
+  //   one_hot_sel_val: bits[32]
+  //     = one_hot_sel(s, cases=[array_index_0, array_index_1, array_index_2])
+  //
+  // This is ok as the optimizer will look through this and simplify to
+  //   one_hot_sel_val: bits[32] = one_hot_sel(s, cases=[a, b, c])
+  //
   const Expr* cases_arg = node->args()[1];
   std::vector<BValue> cases;
-  const auto* array = dynamic_cast<const Array*>(cases_arg);
-  XLS_RET_CHECK_NE(array, nullptr);
-  for (const auto& sel_case : array->members()) {
-    XLS_ASSIGN_OR_RETURN(BValue bvalue_case, Use(sel_case));
-    cases.push_back(bvalue_case);
-  }
+
+  XLS_ASSIGN_OR_RETURN(BValue bvalue_cases_arg, Use(cases_arg));
+  XLS_ASSIGN_OR_RETURN(xls::ArrayType * cases_arg_type,
+                       bvalue_cases_arg.GetType()->AsArray());
 
   Def(node, [&](const SourceInfo& loc) {
+    for (int64_t i = 0; i < cases_arg_type->size(); ++i) {
+      BValue index = function_builder_->Literal(UBits(i, kUsizeBits), loc);
+      BValue bvalue_case =
+          function_builder_->ArrayIndex(bvalue_cases_arg, {index}, loc);
+      cases.push_back(bvalue_case);
+    }
+
     return function_builder_->OneHotSelect(selector, cases, loc);
   });
+
   return absl::OkStatus();
 }
 
 absl::Status FunctionConverter::HandleBuiltinPrioritySel(
     const Invocation* node) {
-  XLS_RET_CHECK_EQ(node->args().size(), 2);
+  XLS_RET_CHECK_EQ(node->args().size(), 3);
   XLS_ASSIGN_OR_RETURN(BValue selector, Use(node->args()[0]));
 
+  // See implementation note for HandleBuiltinOneHotSel().
   const Expr* cases_arg = node->args()[1];
   std::vector<BValue> cases;
-  const auto* array = dynamic_cast<const Array*>(cases_arg);
-  XLS_RET_CHECK_NE(array, nullptr);
-  for (const auto& sel_case : array->members()) {
-    XLS_ASSIGN_OR_RETURN(BValue bvalue_case, Use(sel_case));
-    cases.push_back(bvalue_case);
-  }
+
+  XLS_ASSIGN_OR_RETURN(BValue bvalue_cases_arg, Use(cases_arg));
+  XLS_ASSIGN_OR_RETURN(xls::ArrayType * cases_arg_type,
+                       bvalue_cases_arg.GetType()->AsArray());
+  XLS_ASSIGN_OR_RETURN(BValue default_value, Use(node->args()[2]));
 
   Def(node, [&](const SourceInfo& loc) {
-    return function_builder_->PrioritySelect(selector, cases, loc);
+    for (int64_t i = 0; i < cases_arg_type->size(); ++i) {
+      BValue index = function_builder_->Literal(UBits(i, kUsizeBits), loc);
+      BValue bvalue_case =
+          function_builder_->ArrayIndex(bvalue_cases_arg, {index}, loc);
+      cases.push_back(bvalue_case);
+    }
+
+    return function_builder_->PrioritySelect(selector, cases, default_value,
+                                             loc);
   });
+
   return absl::OkStatus();
 }
 
@@ -2948,27 +3829,28 @@ absl::Status FunctionConverter::HandleBuiltinRev(const Invocation* node) {
 }
 
 absl::Status FunctionConverter::HandleBuiltinSignex(const Invocation* node) {
-  XLS_VLOG(5) << "FunctionConverter::HandleBuiltinSignex: " << node->ToString();
+  VLOG(5) << "FunctionConverter::HandleBuiltinSignex: " << node->ToString();
   XLS_RET_CHECK_EQ(node->args().size(), 2);
   XLS_ASSIGN_OR_RETURN(BValue arg, Use(node->args()[0]));
 
-  std::optional<const ConcreteType*> maybe_lhs_type =
+  std::optional<const Type*> maybe_lhs_type =
       current_type_info_->GetItem(node->args()[0]);
   XLS_RET_CHECK(maybe_lhs_type.has_value());
-  XLS_ASSIGN_OR_RETURN(ConcreteTypeDim lhs_total_bit_count,
+  XLS_ASSIGN_OR_RETURN(TypeDim lhs_total_bit_count,
                        maybe_lhs_type.value()->GetTotalBitCount());
   XLS_ASSIGN_OR_RETURN(int64_t old_bit_count, lhs_total_bit_count.GetAsInt64());
 
-  std::optional<const ConcreteType*> maybe_rhs_type =
+  std::optional<const Type*> maybe_rhs_type =
       current_type_info_->GetItem(node->args()[1]);
   XLS_RET_CHECK(maybe_rhs_type.has_value());
-  XLS_ASSIGN_OR_RETURN(ConcreteTypeDim rhs_total_bit_count,
+  XLS_ASSIGN_OR_RETURN(TypeDim rhs_total_bit_count,
                        maybe_rhs_type.value()->GetTotalBitCount());
   XLS_ASSIGN_OR_RETURN(int64_t new_bit_count, rhs_total_bit_count.GetAsInt64());
 
   Def(node, [&](const SourceInfo& loc) {
     if (new_bit_count < old_bit_count) {
-      return function_builder_->BitSlice(arg, 0, new_bit_count, loc);
+      return function_builder_->BitSlice(arg, /*start=*/0,
+                                         /*width=*/new_bit_count, loc);
     }
     return function_builder_->SignExtend(arg, new_bit_count, loc);
   });
@@ -2989,10 +3871,19 @@ absl::Status FunctionConverter::HandleBuiltinSMulp(const Invocation* node) {
 absl::Status FunctionConverter::HandleBuiltinUpdate(const Invocation* node) {
   XLS_RET_CHECK_EQ(node->args().size(), 3);
   XLS_ASSIGN_OR_RETURN(BValue arg, Use(node->args()[0]));
-  XLS_ASSIGN_OR_RETURN(BValue index, Use(node->args()[1]));
+  std::vector<BValue> indices;
+  if (node->args()[1]->kind() == AstNodeKind::kXlsTuple) {
+    for (auto c : node->args()[1]->GetChildren(false)) {
+      XLS_ASSIGN_OR_RETURN(BValue index, Use(c));
+      indices.push_back(index);
+    }
+  } else {
+    XLS_ASSIGN_OR_RETURN(BValue index, Use(node->args()[1]));
+    indices.push_back(index);
+  }
   XLS_ASSIGN_OR_RETURN(BValue new_value, Use(node->args()[2]));
   Def(node, [&](const SourceInfo& loc) {
-    return function_builder_->ArrayUpdate(arg, new_value, {index}, loc);
+    return function_builder_->ArrayUpdate(arg, new_value, indices, loc);
   });
   return absl::OkStatus();
 }
@@ -3019,19 +3910,24 @@ absl::Status FunctionConverter::HandleBuiltinXorReduce(const Invocation* node) {
 
 absl::Status FunctionConverter::CastToArray(const Cast* node,
                                             const ArrayType& output_type) {
+  XLS_RET_CHECK(!IsBitsConstructor(output_type.element_type()));
+
   XLS_ASSIGN_OR_RETURN(BValue bits, Use(node->expr()));
+
   std::vector<BValue> slices;
-  XLS_ASSIGN_OR_RETURN(ConcreteTypeDim element_bit_count_dim,
+  XLS_ASSIGN_OR_RETURN(TypeDim element_bit_count_dim,
                        output_type.element_type().GetTotalBitCount());
-  XLS_ASSIGN_OR_RETURN(
-      int64_t element_bit_count,
-      ConcreteTypeDim::GetAs64Bits(element_bit_count_dim.value()));
-  XLS_ASSIGN_OR_RETURN(int64_t array_size, ConcreteTypeDim::GetAs64Bits(
-                                               output_type.size().value()));
+  XLS_ASSIGN_OR_RETURN(int64_t element_bit_count,
+                       TypeDim::GetAs64Bits(element_bit_count_dim.value()));
+
+  XLS_ASSIGN_OR_RETURN(int64_t array_size,
+                       TypeDim::GetAs64Bits(output_type.size().value()));
   // MSb becomes lowest-indexed array element.
+  slices.reserve(array_size);
   for (int64_t i = 0; i < array_size; ++i) {
-    slices.push_back(function_builder_->BitSlice(bits, i * element_bit_count,
-                                                 element_bit_count));
+    slices.push_back(
+        function_builder_->BitSlice(bits, /*start=*/i * element_bit_count,
+                                    /*width=*/element_bit_count));
   }
   std::reverse(slices.begin(), slices.end());
   xls::Type* element_type = package()->GetBitsType(element_bit_count);
@@ -3042,14 +3938,14 @@ absl::Status FunctionConverter::CastToArray(const Cast* node,
 }
 
 absl::Status FunctionConverter::CastFromArray(const Cast* node,
-                                              const ConcreteType& output_type) {
+                                              const Type& output_type) {
   XLS_ASSIGN_OR_RETURN(BValue array, Use(node->expr()));
   XLS_ASSIGN_OR_RETURN(xls::Type * input_type, ResolveTypeToIr(node->expr()));
   xls::ArrayType* array_type = input_type->AsArrayOrDie();
   const int64_t array_size = array_type->size();
   std::vector<BValue> pieces;
   for (int64_t i = 0; i < array_size; ++i) {
-    BValue index = function_builder_->Literal(UBits(i, 32));
+    BValue index = function_builder_->Literal(UBits(i, kUsizeBits));
     pieces.push_back(function_builder_->ArrayIndex(array, {index}));
   }
   Def(node, [this, &pieces](const SourceInfo& loc) {
@@ -3062,14 +3958,14 @@ absl::StatusOr<FunctionConverter::DerefVariant>
 FunctionConverter::DerefStructOrEnum(TypeDefinition node) {
   while (std::holds_alternative<TypeAlias*>(node)) {
     auto* type_alias = std::get<TypeAlias*>(node);
-    TypeAnnotation* annotation = type_alias->type_annotation();
+    TypeAnnotation& annotation = type_alias->type_annotation();
     if (auto* type_ref_annotation =
-            dynamic_cast<TypeRefTypeAnnotation*>(annotation)) {
+            dynamic_cast<TypeRefTypeAnnotation*>(&annotation)) {
       node = type_ref_annotation->type_ref()->type_definition();
     } else {
       return absl::UnimplementedError(
-          "Unhandled typedef for resolving to struct-or-enum: " +
-          annotation->ToString());
+          absl::StrCat("Unhandled typedef for resolving to struct-or-enum: ",
+                       annotation.ToString()));
     }
   }
 
@@ -3082,10 +3978,10 @@ FunctionConverter::DerefStructOrEnum(TypeDefinition node) {
 
   XLS_RET_CHECK(std::holds_alternative<ColonRef*>(node));
   auto* colon_ref = std::get<ColonRef*>(node);
-  std::optional<Import*> import = colon_ref->ResolveImportSubject();
+  std::optional<ImportSubject> import = colon_ref->ResolveImportSubject();
   XLS_RET_CHECK(import.has_value());
   std::optional<const ImportedInfo*> info =
-      current_type_info_->GetImported(*import);
+      current_type_info_->GetImported(import.value());
   Module* imported_mod = (*info)->module;
   ScopedTypeInfoSwap stis(this, (*info)->type_info);
   XLS_ASSIGN_OR_RETURN(TypeDefinition td,
@@ -3106,19 +4002,21 @@ absl::StatusOr<EnumDef*> FunctionConverter::DerefEnum(TypeDefinition node) {
   return std::get<EnumDef*>(v);
 }
 
-absl::StatusOr<std::unique_ptr<ConcreteType>> FunctionConverter::ResolveType(
+absl::StatusOr<std::unique_ptr<Type>> FunctionConverter::ResolveType(
     const AstNode* node) {
-  XLS_RET_CHECK(current_type_info_ != nullptr);
-  std::optional<const ConcreteType*> t = current_type_info_->GetItem(node);
+  XLS_RET_CHECK_NE(current_type_info_, nullptr);
+  XLS_RET_CHECK_EQ(current_type_info_->module(), node->owner());
+  std::optional<const Type*> t = current_type_info_->GetItem(node);
   if (!t.has_value()) {
-    return ConversionErrorStatus(
+    return IrConversionErrorStatus(
         node->GetSpan(),
         absl::StrFormat("Failed to convert IR because type was missing for AST "
                         "node: %s (kind: %s)",
-                        node->ToString(), AstNodeKindToString(node->kind())));
+                        node->ToString(), AstNodeKindToString(node->kind())),
+        file_table());
   }
 
-  return t.value()->MapSize([this](const ConcreteTypeDim& dim) {
+  return t.value()->MapSize([this](const TypeDim& dim) {
     return ResolveDim(dim, ParametricEnv(parametric_env_map_));
   });
 }
@@ -3126,15 +4024,11 @@ absl::StatusOr<std::unique_ptr<ConcreteType>> FunctionConverter::ResolveType(
 absl::StatusOr<Value> FunctionConverter::GetConstValue(
     const AstNode* node) const {
   std::optional<IrValue> ir_value = GetNodeToIr(node);
-  if (!ir_value.has_value()) {
-    return absl::InternalError(
-        absl::StrFormat("AST node had no associated IR value: %s @ %s",
-                        node->ToString(), SpanToString(node->GetSpan())));
-  }
-  if (!std::holds_alternative<CValue>(*ir_value)) {
-    return absl::InternalError(absl::StrFormat(
-        "AST node had a non-const IR value: %s", node->ToString()));
-  }
+  XLS_RET_CHECK(ir_value.has_value())
+      << "AST node had no associated IR value: %s" << node->ToString() << "@"
+      << SpanToString(node->GetSpan(), file_table());
+  XLS_RET_CHECK(std::holds_alternative<CValue>(*ir_value))
+      << "AST node had a non-const IR value: " << node->ToString();
   return std::get<CValue>(*ir_value).ir_value;
 }
 
@@ -3144,18 +4038,10 @@ absl::StatusOr<Bits> FunctionConverter::GetConstBits(
   return value.GetBitsWithStatus();
 }
 
-absl::Status FunctionConverter::HandleConstantArray(const ConstantArray* node) {
-  // Note: previously we would force constant evaluation here, but because all
-  // constexprs should be evaluated during typechecking, we shouldn't need to
-  // forcibly do constant evaluation at IR conversion time; therefore, we just
-  // build BValues and let XLS opt constant fold them.
-  return HandleArray(node);
-}
-
-absl::StatusOr<xls::Type*> FunctionConverter::ResolveTypeToIr(AstNode* node) {
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> concrete_type,
-                       ResolveType(node));
-  return TypeToIr(package_data_.package, *concrete_type,
+absl::StatusOr<xls::Type*> FunctionConverter::ResolveTypeToIr(
+    const AstNode* node) {
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> type, ResolveType(node));
+  return TypeToIr(package_data_.conversion_info->package.get(), *type,
                   ParametricEnv(parametric_env_map_));
 }
 
@@ -3177,17 +4063,37 @@ absl::StatusOr<Value> InterpValueToValue(const InterpValue& iv) {
       }
       return Value::Array(ir_values);
     }
+    case InterpValueTag::kToken:
+      return Value::Token();
     default:
       return absl::InvalidArgumentError(
-          "Cannot convert interpreter value with tag: " +
-          TagToString(iv.tag()));
+          absl::StrCat("Cannot convert interpreter value with tag: ",
+                       TagToString(iv.tag())));
   }
 }
 
+absl::StatusOr<std::optional<ConstantDef*>> TryResolveConstantDef(
+    std::string_view identifier, UseTreeEntry* use_tree_entry,
+    TypeInfo& type_info) {
+  XLS_RET_CHECK_EQ(use_tree_entry->owner(), type_info.module());
+  XLS_ASSIGN_OR_RETURN(ImportedInfo * info,
+                       type_info.GetImportedOrError(use_tree_entry));
+  std::optional<ModuleMember*> member =
+      info->module->FindMemberWithName(identifier);
+  XLS_RET_CHECK(member.has_value())
+      << "Failed to find constant named: `" << identifier << "` in module: `"
+      << info->module->name() << "`";
+  if (std::holds_alternative<ConstantDef*>(*member.value())) {
+    auto* result = std::get<ConstantDef*>(*member.value());
+    return result;
+  }
+  return std::nullopt;
+}
+
 absl::StatusOr<std::vector<ConstantDef*>> GetConstantDepFreevars(
-    AstNode* node) {
+    AstNode* node, TypeInfo& type_info) {
   Span span = node->GetSpan().value();
-  FreeVariables free_variables = GetFreeVariables(node, &span.start());
+  FreeVariables free_variables = GetFreeVariablesByPos(node, &span.start());
   std::vector<std::pair<std::string, AnyNameDef>> freevars =
       free_variables.GetNameDefTuples();
   std::vector<ConstantDef*> constant_deps;
@@ -3196,14 +4102,35 @@ absl::StatusOr<std::vector<ConstantDef*>> GetConstantDepFreevars(
       continue;
     }
     const auto* name_def = std::get<const NameDef*>(any_name_def);
+
+    // If this is a direct module reference we skip it.
+    if (std::optional<Type*> type = type_info.GetItem(name_def);
+        type.has_value() && type.value()->IsModule()) {
+      continue;
+    }
+
     AstNode* definer = name_def->definer();
-    if (auto* constant_def = dynamic_cast<ConstantDef*>(definer)) {
-      XLS_ASSIGN_OR_RETURN(auto sub_deps, GetConstantDepFreevars(constant_def));
+    if (auto* use_tree_entry = dynamic_cast<UseTreeEntry*>(definer)) {
+      XLS_ASSIGN_OR_RETURN(
+          std::optional<ConstantDef*> constant_def,
+          TryResolveConstantDef(identifier, use_tree_entry, type_info));
+      if (constant_def.has_value()) {
+        XLS_ASSIGN_OR_RETURN(
+            auto sub_deps,
+            GetConstantDepFreevars(constant_def.value(), type_info));
+        constant_deps.insert(constant_deps.end(), sub_deps.begin(),
+                             sub_deps.end());
+        constant_deps.push_back(constant_def.value());
+      }
+    } else if (auto* constant_def = dynamic_cast<ConstantDef*>(definer)) {
+      XLS_ASSIGN_OR_RETURN(auto sub_deps,
+                           GetConstantDepFreevars(constant_def, type_info));
       constant_deps.insert(constant_deps.end(), sub_deps.begin(),
                            sub_deps.end());
       constant_deps.push_back(constant_def);
     } else if (auto* enum_def = dynamic_cast<EnumDef*>(definer)) {
-      XLS_ASSIGN_OR_RETURN(auto sub_deps, GetConstantDepFreevars(enum_def));
+      XLS_ASSIGN_OR_RETURN(auto sub_deps,
+                           GetConstantDepFreevars(enum_def, type_info));
       constant_deps.insert(constant_deps.end(), sub_deps.begin(),
                            sub_deps.end());
     } else {

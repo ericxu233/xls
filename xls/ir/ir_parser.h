@@ -22,6 +22,7 @@
 #ifndef XLS_IR_IR_PARSER_H_
 #define XLS_IR_IR_PARSER_H_
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -32,26 +33,51 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
+#include "xls/codegen/module_signature.pb.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/block.h"
 #include "xls/ir/channel.h"
+#include "xls/ir/foreign_function_data.pb.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/instantiation.h"
 #include "xls/ir/ir_scanner.h"
 #include "xls/ir/node.h"
 #include "xls/ir/nodes.h"
+#include "xls/ir/op.h"
 #include "xls/ir/package.h"
 #include "xls/ir/proc.h"
+#include "xls/ir/proc_instantiation.h"
 #include "xls/ir/register.h"
 #include "xls/ir/source_location.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
 
 namespace xls {
 
 class ArgParser;
 
-using DeclAttributes = absl::flat_hash_map<std::string, Token>;
+struct InitiationInterval {
+  int64_t value;
+};
+
+struct ResetAttribute {
+  std::string port_name;
+  ResetBehavior behavior;
+};
+
+using IrAttributePayload =
+    std::variant<InitiationInterval, ChannelPortMetadata, ForeignFunctionData,
+                 ResetAttribute, BlockProvenance,
+                 verilog::ModuleSignatureProto>;
+struct IrAttribute {
+  std::string name;
+  IrAttributePayload payload;
+};
 
 class Parser {
  public:
@@ -72,22 +98,23 @@ class Parser {
   // TODO(meheff): 2022/2/9 Remove `verify_function_only` argument.
   static absl::StatusOr<Function*> ParseFunction(
       std::string_view input_string, Package* package,
-      bool verify_function_only = false, const DeclAttributes& attributes = {});
+      bool verify_function_only = false,
+      absl::Span<const IrAttribute> outer_attributes = {});
 
   // Parse the input_string as a proc into the given package.
-  static absl::StatusOr<Proc*> ParseProc(std::string_view input_string,
-                                         Package* package,
-                                         const DeclAttributes& attributes = {});
+  static absl::StatusOr<Proc*> ParseProc(
+      std::string_view input_string, Package* package,
+      absl::Span<const IrAttribute> outer_attributes = {});
 
   // Parse the input_string as a block into the given package.
   static absl::StatusOr<Block*> ParseBlock(
       std::string_view input_string, Package* package,
-      const DeclAttributes& attributes = {});
+      absl::Span<const IrAttribute> outer_attributes = {});
 
   // Parse the input_string as a channel in the given package.
   static absl::StatusOr<Channel*> ParseChannel(
       std::string_view input_string, Package* package,
-      const DeclAttributes& attributes = {});
+      absl::Span<const IrAttribute> outer_attributes = {});
 
   // Parse the input_string as a function type into the given package.
   static absl::StatusOr<FunctionType*> ParseFunctionType(
@@ -132,19 +159,30 @@ class Parser {
 
   // Parse a function starting at the current scanner position.
   absl::StatusOr<Function*> ParseFunction(
-      Package* package, const DeclAttributes& attributes = {});
+      Package* package, absl::Span<const IrAttribute> outer_attributes = {});
 
   // Parse a proc starting at the current scanner position.
-  absl::StatusOr<Proc*> ParseProc(Package* package,
-                                  const DeclAttributes& attributes = {});
+  absl::StatusOr<Proc*> ParseProc(
+      Package* package, absl::Span<const IrAttribute> outer_attributes = {});
 
   // Parse a block starting at the current scanner position.
-  absl::StatusOr<Block*> ParseBlock(Package* package,
-                                    const DeclAttributes& attributes = {});
+  absl::StatusOr<Block*> ParseBlock(
+      Package* package, absl::Span<const IrAttribute> outer_attributes = {});
 
-  // Parse a proc starting at the current scanner position.
-  absl::StatusOr<Channel*> ParseChannel(Package* package,
-                                        const DeclAttributes& attributes = {});
+  // Parse a channel starting at the current scanner position. If `proc` is not
+  // null then this is a proc-scoped channel.
+  absl::StatusOr<Channel*> ParseChannel(
+      Package* package, absl::Span<const IrAttribute> outer_attributes = {},
+      Proc* proc = nullptr);
+
+  // Parse a channel interface starting at the current scanner position. The
+  // scanner must be positioned within the body of the proc `proc` with
+  // proc-scoped channels. Because of implementation details of the parser and
+  // proc API, this method does not actually add an interface to the proc (this
+  // is done when a channel is added or the signature is parsed). Rather, this
+  // method sets various attributes on the interface.
+  absl::StatusOr<ChannelInterface*> ParseChannelInterface(Package* package,
+                                                          Proc* proc);
 
   // Parse starting from a function type.
   absl::StatusOr<FunctionType*> ParseFunctionType(Package* package);
@@ -182,9 +220,15 @@ class Parser {
   // function signature. For example:
   //
   //   a: bits[32], b: bits[44], c: (bits[32][2], bits[1])
+  //
+  // Arguments can include optional unique ids:
+  //
+  //   a: bits[32] id=3, b: bits[44] id=4, c: (bits[32][2], bits[1]) id=5
+  //
   struct TypedArgument {
     std::string name;
     Type* type;
+    std::optional<int64_t> id;
     Token token;
   };
   absl::StatusOr<std::vector<TypedArgument>> ParseTypedArguments(
@@ -237,6 +281,14 @@ class Parser {
                                               std::string_view node_name,
                                               ArgParser* arg_parser);
 
+  // Reassign IDs of nodes which were *not* explicitly assigned in the IR (e.g.,
+  // `id=42`).
+  // TODO(https://github.com/google/xls/issues/1601): Consider alternate
+  // approaches if SetId is removed.
+  static constexpr int64_t kUnassignedNodeId = 0;
+  static void SetUnassignedNodeIds(
+      Package* package, std::optional<FunctionBase*> scope = std::nullopt);
+
   // Parses a node in a function/proc body. Example: "foo: bits[32] = add(x, y)"
   absl::StatusOr<BValue> ParseNode(
       BuilderBase* fb, absl::flat_hash_map<std::string, BValue>* name_to_value);
@@ -247,11 +299,20 @@ class Parser {
   // Parses an instantiation declaration. Only supported in blocks.
   absl::StatusOr<Instantiation*> ParseInstantiation(Block* block);
 
-  struct ProcNext {
-    BValue next_token;
+  // Parses a proc instantiation declaration. Only supported in procs.
+  absl::StatusOr<ProcInstantiation*> ParseProcInstantiation(Proc* proc);
+
+  struct ProcBodyResult {
     std::vector<BValue> next_state;
+    std::vector<ChannelInterface*> declared_channel_interfaces;
   };
-  using BodyResult = std::variant<BValue, ProcNext>;
+  struct FunctionBodyResult {
+    BValue return_value;
+  };
+  struct BlockBodyResult {};
+  using BodyResult =
+      std::variant<FunctionBodyResult, ProcBodyResult, BlockBodyResult>;
+
   // Parses the line-statements in the body of a function/proc. Returns the
   // return value if the body is a function, or the next token/state pair if the
   // body is a proc.
@@ -301,20 +362,30 @@ class Parser {
   //
   // And adds the mapping to the given `Package`.
   absl::Status ParseFileNumber(Package* package,
-                               const DeclAttributes& attributes = {});
+                               absl::Span<const IrAttribute> attributes = {});
 
-  // Parse a sequence of attributes of the form:
+  // Parse a sequence of outer attributes of the form:
   //
-  // #[<ident>(<literal>)]
-  absl::StatusOr<DeclAttributes> MaybeParseAttributes();
+  // #[Attr]
+  absl::StatusOr<std::vector<IrAttribute>> MaybeParseOuterAttributes(
+      Package* package);
+
+  // Parse a sequence of inner attributes of the form:
+  //
+  // #![Attr]
+  absl::StatusOr<std::vector<IrAttribute>> MaybeParseInnerAttributes(
+      Package* package);
+
+  // Parse an attribute. For example, this would be the `Attr` tokens in
+  // `#![Attr]`.
+  absl::StatusOr<IrAttribute> ParseAttribute(Package* package);
 
   bool AtEof() const { return scanner_.AtEof(); }
 
   Scanner scanner_;
 };
 
-/* static */
-template <typename PackageT>
+/* static */ template <typename PackageT>
 absl::StatusOr<std::unique_ptr<PackageT>> Parser::ParseDerivedPackageNoVerify(
     std::string_view input_string, std::optional<std::string_view> filename,
     std::optional<std::string_view> entry) {
@@ -328,8 +399,8 @@ absl::StatusOr<std::unique_ptr<PackageT>> Parser::ParseDerivedPackageNoVerify(
   std::string filename_str =
       (filename.has_value() ? std::string(filename.value()) : "<unknown file>");
   while (!parser.AtEof()) {
-    XLS_ASSIGN_OR_RETURN(DeclAttributes attributes,
-                         parser.MaybeParseAttributes());
+    XLS_ASSIGN_OR_RETURN(std::vector<IrAttribute> outer_attributes,
+                         parser.MaybeParseOuterAttributes(package.get()));
 
     XLS_ASSIGN_OR_RETURN(Token peek, parser.scanner_.PeekToken());
 
@@ -347,9 +418,9 @@ absl::StatusOr<std::unique_ptr<PackageT>> Parser::ParseDerivedPackageNoVerify(
       previous_top_token = peek;
     }
     if (peek.type() == LexicalTokenType::kKeyword && peek.value() == "fn") {
-      XLS_ASSIGN_OR_RETURN(Function * fn,
-                           parser.ParseFunction(package.get(), attributes),
-                           _ << "@ " << filename_str);
+      XLS_ASSIGN_OR_RETURN(
+          Function * fn, parser.ParseFunction(package.get(), outer_attributes),
+          _ << "@ " << filename_str);
       if (is_top) {
         XLS_RETURN_IF_ERROR(package->SetTop(fn));
       }
@@ -357,7 +428,7 @@ absl::StatusOr<std::unique_ptr<PackageT>> Parser::ParseDerivedPackageNoVerify(
     }
     if (peek.type() == LexicalTokenType::kKeyword && peek.value() == "proc") {
       XLS_ASSIGN_OR_RETURN(Proc * proc,
-                           parser.ParseProc(package.get(), attributes),
+                           parser.ParseProc(package.get(), outer_attributes),
                            _ << "@ " << filename_str);
       if (is_top) {
         XLS_RETURN_IF_ERROR(package->SetTop(proc));
@@ -366,7 +437,7 @@ absl::StatusOr<std::unique_ptr<PackageT>> Parser::ParseDerivedPackageNoVerify(
     }
     if (peek.type() == LexicalTokenType::kKeyword && peek.value() == "block") {
       XLS_ASSIGN_OR_RETURN(Block * block,
-                           parser.ParseBlock(package.get(), attributes),
+                           parser.ParseBlock(package.get(), outer_attributes),
                            _ << "@ " << filename_str);
       if (is_top) {
         XLS_RETURN_IF_ERROR(package->SetTop(block));
@@ -380,13 +451,14 @@ absl::StatusOr<std::unique_ptr<PackageT>> Parser::ParseDerivedPackageNoVerify(
     }
     if (peek.type() == LexicalTokenType::kKeyword && peek.value() == "chan") {
       XLS_RETURN_IF_ERROR(
-          parser.ParseChannel(package.get(), attributes).status())
+          parser.ParseChannel(package.get(), outer_attributes).status())
           << "@ " << filename_str;
       continue;
     }
     if (peek.type() == LexicalTokenType::kKeyword &&
         peek.value() == "file_number") {
-      XLS_RETURN_IF_ERROR(parser.ParseFileNumber(package.get(), attributes))
+      XLS_RETURN_IF_ERROR(
+          parser.ParseFileNumber(package.get(), outer_attributes))
           << "@ " << filename_str;
       continue;
     }
@@ -402,6 +474,7 @@ absl::StatusOr<std::unique_ptr<PackageT>> Parser::ParseDerivedPackageNoVerify(
     XLS_RETURN_IF_ERROR(package->SetTopByName(entry.value()));
     XLS_RETURN_IF_ERROR(package->GetFunction(*entry).status());
   }
+  SetUnassignedNodeIds(package.get());
   return package;
 }
 

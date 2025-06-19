@@ -14,42 +14,55 @@
 
 #include "xls/jit/jit_channel_queue.h"
 
+#include <cstdint>
+#include <cstring>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "xls/common/status/matchers.h"
-#include "xls/interpreter/channel_queue.h"
 #include "xls/interpreter/channel_queue_test_base.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/channel.h"
+#include "xls/ir/channel_ops.h"
 #include "xls/ir/package.h"
+#include "xls/ir/proc_elaboration.h"
+#include "xls/ir/value.h"
+#include "xls/jit/jit_runtime.h"
+#include "xls/jit/orc_jit.h"
 
 namespace xls {
 namespace {
 
-using status_testing::StatusIs;
+using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
 
 JitRuntime* GetJitRuntime() {
+  static auto orc_jit = OrcJit::Create().value();
   static auto jit_runtime =
-      std::make_unique<JitRuntime>(OrcJit::CreateDataLayout().value());
+      std::make_unique<JitRuntime>(orc_jit->CreateDataLayout().value());
   return jit_runtime.get();
 }
 
 INSTANTIATE_TEST_SUITE_P(
     ThreadSafeJitChannelQueueTest, ChannelQueueTestBase,
-    testing::Values(ChannelQueueTestParam([](Channel* channel) {
-      return std::make_unique<ThreadSafeJitChannelQueue>(channel,
-                                                         GetJitRuntime());
-    })));
+    testing::Values(
+        ChannelQueueTestParam([](ChannelInstance* channel_instance) {
+          return std::make_unique<ThreadSafeJitChannelQueue>(channel_instance,
+                                                             GetJitRuntime());
+        })));
 
 INSTANTIATE_TEST_SUITE_P(
     LockLessJitChannelQueueTest, ChannelQueueTestBase,
-    testing::Values(ChannelQueueTestParam([](Channel* channel) {
-      return std::make_unique<ThreadUnsafeJitChannelQueue>(channel,
-                                                           GetJitRuntime());
-    })));
+    testing::Values(
+        ChannelQueueTestParam([](ChannelInstance* channel_instance) {
+          return std::make_unique<ThreadUnsafeJitChannelQueue>(channel_instance,
+                                                               GetJitRuntime());
+        })));
 
 template <typename QueueT>
 class JitChannelQueueTest : public ::testing::Test {};
@@ -65,7 +78,11 @@ TYPED_TEST(JitChannelQueueTest, ChannelWithEmptyTuple) {
       Channel * channel,
       package.CreateStreamingChannel("my_channel", ChannelOps::kSendReceive,
                                      package.GetTupleType({})));
-  TypeParam queue(channel, GetJitRuntime());
+  XLS_ASSERT_OK_AND_ASSIGN(ProcElaboration elaboration,
+                           ProcElaboration::ElaborateOldStylePackage(&package));
+
+  TypeParam queue(elaboration.GetUniqueInstance(channel).value(),
+                  GetJitRuntime());
 
   EXPECT_TRUE(queue.IsEmpty());
   std::vector<uint8_t> send_buffer(0);
@@ -96,7 +113,11 @@ TYPED_TEST(JitChannelQueueTest, BasicAccess) {
       Channel * channel,
       package.CreateStreamingChannel("my_channel", ChannelOps::kSendReceive,
                                      package.GetBitsType(32)));
-  TypeParam queue(channel, GetJitRuntime());
+  XLS_ASSERT_OK_AND_ASSIGN(ProcElaboration elaboration,
+                           ProcElaboration::ElaborateOldStylePackage(&package));
+
+  TypeParam queue(elaboration.GetUniqueInstance(channel).value(),
+                  GetJitRuntime());
 
   EXPECT_TRUE(queue.IsEmpty());
   std::vector<uint8_t> send_buffer(4);
@@ -131,7 +152,11 @@ TYPED_TEST(JitChannelQueueTest, IotaGeneratorWithRawApi) {
       Channel * channel,
       package.CreateStreamingChannel("my_channel", ChannelOps::kSendReceive,
                                      package.GetBitsType(32)));
-  TypeParam queue(channel, GetJitRuntime());
+  XLS_ASSERT_OK_AND_ASSIGN(ProcElaboration elaboration,
+                           ProcElaboration::ElaborateOldStylePackage(&package));
+
+  TypeParam queue(elaboration.GetUniqueInstance(channel).value(),
+                  GetJitRuntime());
 
   int64_t counter = 42;
   XLS_ASSERT_OK(queue.AttachGenerator(

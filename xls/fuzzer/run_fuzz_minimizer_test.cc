@@ -20,15 +20,16 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/get_runfile_path.h"
 #include "xls/common/file/temp_directory.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/subprocess.h"
-#include "xls/dslx/interp_value_helpers.h"
+#include "xls/dslx/interp_value_utils.h"
 #include "xls/fuzzer/cpp_run_fuzz.h"
 #include "xls/fuzzer/cpp_sample_runner.h"
 #include "xls/fuzzer/run_fuzz.h"
@@ -38,11 +39,11 @@ namespace xls {
 namespace {
 
 absl::StatusOr<std::filesystem::path> GetParseIrPath() {
-  return GetXlsRunfilePath("xls/tools/parse_ir");
+  return GetXlsRunfilePath("xls/dev_tools/parse_ir");
 }
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::AllOf;
 using ::testing::Contains;
 using ::testing::HasSubstr;
@@ -77,7 +78,7 @@ class RunFuzzMinimizerTest : public ::testing::Test {
     if (test_info == nullptr) {
       return;
     }
-    XLS_CHECK(test_info->name() != nullptr);
+    CHECK(test_info->name() != nullptr);
 
     std::filesystem::path test_outputs_path =
         undeclared_outputs_dir / test_info->name();
@@ -87,7 +88,7 @@ class RunFuzzMinimizerTest : public ::testing::Test {
     if (test_info->value_param() != nullptr) {
       test_outputs_path /= test_info->value_param();
     }
-    XLS_CHECK(std::filesystem::create_directories(test_outputs_path));
+    CHECK(std::filesystem::create_directories(test_outputs_path));
     std::filesystem::copy(temp_dir.path(), test_outputs_path,
                           std::filesystem::copy_options::recursive);
   }
@@ -114,7 +115,7 @@ TEST_F(RunFuzzMinimizerTest, MinimizeIRMinimizationPossible) {
   ASSERT_THAT(
       RunSample(sample, GetTempPath()),
       StatusIs(absl::StatusCode::kInternal,
-               HasSubstr("codegen_main returned non-zero exit status")));
+               HasSubstr("codegen_main returned a non-zero exit status")));
   XLS_ASSERT_OK_AND_ASSIGN(
       std::optional<std::filesystem::path> minimized_ir_path,
       MinimizeIr(sample, GetTempPath()));

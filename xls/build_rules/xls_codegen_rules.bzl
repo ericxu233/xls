@@ -21,15 +21,23 @@ load(
     "//xls/build_rules:xls_common_rules.bzl",
     "append_default_to_args",
     "args_to_string",
+    "get_input_infos",
     "get_output_filename_value",
     "get_runfiles_for_xls",
+    "get_src_ir_for_xls",
     "get_transitive_built_files_for_xls",
     "is_args_valid",
     "split_filename",
 )
 load("//xls/build_rules:xls_config_rules.bzl", "CONFIG")
 load("//xls/build_rules:xls_ir_rules.bzl", "xls_ir_common_attrs")
-load("//xls/build_rules:xls_providers.bzl", "CodegenInfo", "OptIRInfo")
+load(
+    "//xls/build_rules:xls_providers.bzl",
+    "CODEGEN_FIELDS",
+    "CodegenInfo",
+    "ConvIrInfo",
+    "SCHEDULING_FIELDS",
+)
 load(
     "//xls/build_rules:xls_toolchains.bzl",
     "xls_toolchain_attrs",
@@ -40,6 +48,8 @@ _DEFAULT_SCHEDULING_ARGS = {
 }
 
 _DEFAULT_CODEGEN_ARGS = {
+    "register_merge_strategy": "IdentityOnly",
+    "emit_sv_types": True,
 }
 
 _SYSTEM_VERILOG_FILE_EXTENSION = "sv"
@@ -47,9 +57,14 @@ _VERILOG_FILE_EXTENSION = "v"
 _SIGNATURE_TEXTPROTO_FILE_EXTENSION = ".sig.textproto"
 _SCHEDULE_TEXTPROTO_FILE_EXTENSION = ".schedule.textproto"
 _VERILOG_LINE_MAP_TEXTPROTO_FILE_EXTENSION = ".verilog_line_map.textproto"
+_BLOCK_METRICS_FILE_EXTENSION = ".metrics.textproto"
 _BLOCK_IR_FILE_EXTENSION = ".block.ir"
 _SCHEDULE_IR_FILE_EXTENSION = ".schedule.opt.ir"
 _CODEGEN_LOG_FILE_EXTENSION = ".codegen.log"
+_CODEGEN_OPTIONS_USED_TEXTPROTO_FILE_EXTENSION = ".codegen_options.textproto"
+_SCHEDULING_OPTIONS_USED_TEXTPROTO_FILE_EXTENSION = ".schedule_options.textproto"
+_CODEGEN_FLAGS = CODEGEN_FIELDS.keys()
+_SCHEDULING_FLAGS = SCHEDULING_FIELDS.keys()
 
 xls_ir_verilog_attrs = {
     "codegen_args": attr.string_dict(
@@ -113,6 +128,26 @@ xls_ir_verilog_attrs = {
               "If not specified, the basename of the Verilog file followed " +
               "by a " + _CODEGEN_LOG_FILE_EXTENSION + " extension is used.",
     ),
+    "codegen_options_used_textproto_file": attr.output(
+        doc = "The filename to write the full configuration options used for " +
+              "this codegen. If not specified, the basename of the Verilog " +
+              "file followed by a " +
+              _CODEGEN_OPTIONS_USED_TEXTPROTO_FILE_EXTENSION + " extension " +
+              "is used.",
+    ),
+    "scheduling_options_used_textproto_file": attr.output(
+        doc = "The filename to write the full configuration options used for " +
+              "this scheduling. If not specified, the basename of the Verilog " +
+              "file followed by a " +
+              _SCHEDULING_OPTIONS_USED_TEXTPROTO_FILE_EXTENSION + " extension " +
+              "is used.",
+    ),
+    "block_metrics_file": attr.output(
+        doc = "The filename to write the metrics, including the bill of materials, " +
+              "for the generated Verilog file. If not specified, the basename of the " +
+              "Verilog file followed by a " +
+              _BLOCK_METRICS_FILE_EXTENSION + " extension is used.",
+    ),
 }
 
 def _is_combinational_generator(arguments):
@@ -171,6 +206,18 @@ def append_xls_ir_verilog_generated_files(args, basename, arguments):
         "codegen_log_file",
         basename + _CODEGEN_LOG_FILE_EXTENSION,
     )
+    args.setdefault(
+        "codegen_options_used_textproto_file",
+        basename + _CODEGEN_OPTIONS_USED_TEXTPROTO_FILE_EXTENSION,
+    )
+    args.setdefault(
+        "scheduling_options_used_textproto_file",
+        basename + _SCHEDULING_OPTIONS_USED_TEXTPROTO_FILE_EXTENSION,
+    )
+    args.setdefault(
+        "block_metrics_file",
+        basename + _BLOCK_METRICS_FILE_EXTENSION,
+    )
     return args
 
 def get_xls_ir_verilog_generated_files(args, arguments):
@@ -214,7 +261,7 @@ def validate_verilog_filename(verilog_filename, use_system_verilog):
         fail("Verilog filename must contain the '%s' extension." %
              _VERILOG_FILE_EXTENSION)
 
-def xls_ir_verilog_impl(ctx, src):
+def xls_ir_verilog_impl(ctx, src, conv_info):
     """The core implementation of the 'xls_ir_verilog' rule.
 
     Generates a Verilog file, module signature file, block file, Verilog line
@@ -223,6 +270,7 @@ def xls_ir_verilog_impl(ctx, src):
     Args:
       ctx: The current rule's context object.
       src: The source file.
+      conv_info: The ConvIrInfo for the source containing original input files and any interface proto.
 
     Returns:
       A tuple with the following elements in the order presented:
@@ -232,6 +280,7 @@ def xls_ir_verilog_impl(ctx, src):
     """
     codegen_tool = ctx.executable._xls_codegen_tool
     my_generated_files = []
+    runfiles_list = [src.ir_file] + conv_info.original_input_files
 
     # default arguments
     if ctx.file.codegen_options_proto == None:
@@ -249,69 +298,17 @@ def xls_ir_verilog_impl(ctx, src):
         )
 
     # parse arguments
-    CODEGEN_FLAGS = (
-        "top",
-        "generator",
-        "input_valid_signal",
-        "output_valid_signal",
-        "manual_load_enable_signal",
-        "flop_inputs",
-        "flop_inputs_kind",
-        "flop_outputs",
-        "flop_outputs_kind",
-        "flop_single_value_channels",
-        "add_idle_output",
-        "module_name",
-        "assert_format",
-        "gate_format",
-        "reset",
-        "reset_active_low",
-        "reset_asynchronous",
-        "reset_data_path",
-        "use_system_verilog",
-        "separate_lines",
-        "streaming_channel_data_suffix",
-        "streaming_channel_ready_suffix",
-        "streaming_channel_valid_suffix",
-        "assert_format",
-        "gate_format",
-        "smulp_format",
-        "umulp_format",
-        "ram_configurations",
-        "gate_recvs",
-        "array_index_bounds_checking",
-        "inline_procs",
-    )
 
-    SCHEDULING_FLAGS = (
-        "clock_period_ps",
-        "pipeline_stages",
-        "delay_model",
-        "clock_margin_percent",
-        "period_relaxation_percent",
-        "minimize_clock_on_error",
-        "worst_case_throughput",
-        "additional_input_delay_ps",
-        "ffi_fallback_delay_ps",
-        "io_constraints",
-        "receives_first_sends_last",
-        "mutual_exclusion_z3_rlimit",
-        "use_fdo",
-        "fdo_iteration_number",
-        "fdo_delay_driven_path_number",
-        "fdo_fanout_driven_path_number",
-        "fdo_refinement_stochastic_ratio",
-        "fdo_path_evaluate_strategy",
-        "fdo_synthesizer_name",
-        "fdo_yosys_path",
-        "fdo_sta_path",
-        "fdo_synthesis_libraries",
-    )
-
-    is_args_valid(codegen_args, CODEGEN_FLAGS + SCHEDULING_FLAGS)
-    codegen_str_args = args_to_string(codegen_args, CODEGEN_FLAGS + SCHEDULING_FLAGS)
+    is_args_valid(codegen_args, _CODEGEN_FLAGS + _SCHEDULING_FLAGS)
+    codegen_str_args = args_to_string(codegen_args, _CODEGEN_FLAGS + _SCHEDULING_FLAGS)
     uses_combinational_generator = _is_combinational_generator(codegen_args)
     final_args = codegen_str_args
+    if (ctx.file.codegen_options_proto == None and conv_info.ir_interface != None):
+        # Mixing proto options and normal ones is not supported. If proto
+        # options are being used the user will need to have put the interface
+        # proto in manually.
+        final_args += " --ir_interface_proto={}".format(conv_info.ir_interface.path)
+        runfiles_list.append(conv_info.ir_interface)
 
     uses_fdo = _uses_fdo(codegen_args)
     if (uses_fdo):
@@ -378,7 +375,6 @@ def xls_ir_verilog_impl(ctx, src):
     # Get runfiles
     codegen_tool_runfiles = ctx.attr._xls_codegen_tool[DefaultInfo].default_runfiles
 
-    runfiles_list = [src]
     if ctx.file.codegen_options_proto:
         final_args += " --codegen_options_proto={}".format(ctx.file.codegen_options_proto.path)
         runfiles_list.append(ctx.file.codegen_options_proto)
@@ -399,33 +395,73 @@ def xls_ir_verilog_impl(ctx, src):
     log_file = ctx.actions.declare_file(codegen_log_filename)
     my_generated_files.append(log_file)
 
+    block_metrics_filename = get_output_filename_value(
+        ctx,
+        "block_metrics_file",
+        verilog_basename + _BLOCK_METRICS_FILE_EXTENSION,
+    )
+    block_metrics_file = ctx.actions.declare_file(block_metrics_filename)
+    my_generated_files.append(block_metrics_file)
+    final_args += " --block_metrics_path={}".format(
+        block_metrics_file.path,
+    )
+
+    codegen_config_textproto_file = get_output_filename_value(
+        ctx,
+        "codegen_options_used_textproto_file",
+        verilog_basename + _CODEGEN_OPTIONS_USED_TEXTPROTO_FILE_EXTENSION,
+    )
+    config_textproto_file = ctx.actions.declare_file(codegen_config_textproto_file)
+    my_generated_files.append(config_textproto_file)
+    final_args += " --codegen_options_used_textproto_file={}".format(
+        config_textproto_file.path,
+    )
+    schedule_config_textproto_file = get_output_filename_value(
+        ctx,
+        "scheduling_options_used_textproto_file",
+        verilog_basename + _SCHEDULING_OPTIONS_USED_TEXTPROTO_FILE_EXTENSION,
+    )
+    sched_config_textproto_file = ctx.actions.declare_file(schedule_config_textproto_file)
+    my_generated_files.append(sched_config_textproto_file)
+    final_args += " --scheduling_options_used_textproto_file={}".format(
+        sched_config_textproto_file.path,
+    )
+
+    if "local" in ctx.attr.tags:
+        execution_requirements = {"no-remote-exec": "1"}
+    else:
+        execution_requirements = None
+
     ctx.actions.run_shell(
         outputs = my_generated_files,
         tools = tools,
         inputs = runfiles.files,
-        command = "{} {} {} 2>{}".format(
+        execution_requirements = execution_requirements,
+        command = "set -o pipefail; {} {} {} 2>&1 | tee {}".format(
             codegen_tool.path,
-            src.path,
+            src.ir_file.path,
             final_args,
             log_file.path,
         ),
-        mnemonic = "Codegen",
-        progress_message = "Building Verilog file: %s" % (verilog_file.path),
+        mnemonic = "GenerateVerilog",
+        progress_message = "Compiling %s" % verilog_file.short_path,
         toolchain = None,
     )
+
+    # Set top to match module_name if it is set
+    if "module_name" in codegen_args:
+        codegen_args = {k: v for k, v in codegen_args.items()}
+        codegen_args["top"] = codegen_args["module_name"]
     return [
         CodegenInfo(
+            input_ir = src,
             verilog_file = verilog_file,
             module_sig_file = module_sig_file,
             verilog_line_map_file = verilog_line_map_file,
             schedule_file = schedule_file,
             schedule_ir_file = schedule_ir_file,
             block_ir_file = block_ir_file,
-            delay_model = codegen_args.get("delay_model"),
-            top = codegen_args.get("module_name", codegen_args.get("top")),
-            pipeline_stages = codegen_args.get("pipeline_stages"),
-            clock_period_ps = codegen_args.get("clock_period_ps"),
-            use_fdo = codegen_args.get("use_fdo"),
+            **codegen_args
         ),
         my_generated_files,
         runfiles,
@@ -442,9 +478,15 @@ def _xls_ir_verilog_impl_wrapper(ctx):
       CodegenInfo provider
       DefaultInfo provider
     """
+    if ConvIrInfo in ctx.attr.src:
+        conv_info = ctx.attr.src[ConvIrInfo]
+    else:
+        conv_info = ConvIrInfo(original_input_files = ctx.files.src, ir_interface = None)
+
     codegen_info, built_files_list, runfiles = xls_ir_verilog_impl(
         ctx,
-        ctx.file.src,
+        get_src_ir_for_xls(ctx),
+        conv_info,
     )
 
     return [
@@ -459,7 +501,7 @@ def _xls_ir_verilog_impl_wrapper(ctx):
             ),
             runfiles = runfiles,
         ),
-    ]
+    ] + get_input_infos(ctx.attr.src)
 
 xls_ir_verilog = rule(
     doc = """A build rule that generates a Verilog file from an IR file.
@@ -505,23 +547,24 @@ def _xls_benchmark_verilog_impl(ctx):
     """
     benchmark_codegen_tool = ctx.executable._xls_benchmark_codegen_tool
     codegen_info = ctx.attr.verilog_target[CodegenInfo]
-    opt_ir_info = ctx.attr.verilog_target[OptIRInfo]
-    if not codegen_info.top:
+    opt_ir_info = codegen_info.input_ir
+    if not hasattr(codegen_info, "top"):
         fail("Verilog target '%s' does not provide a top value" %
              ctx.attr.verilog_target.label.name)
     cmd = "{tool} {opt_ir} {block_ir} {verilog} --top={top}".format(
-        opt_ir = opt_ir_info.opt_ir_file.short_path,
+        opt_ir = opt_ir_info.ir_file.short_path,
         verilog = codegen_info.verilog_file.short_path,
         top = codegen_info.top,
         tool = benchmark_codegen_tool.short_path,
         block_ir = codegen_info.block_ir_file.short_path,
     )
-    if codegen_info.delay_model:
-        cmd += " --delay_model={}".format(codegen_info.delay_model)
-    if codegen_info.pipeline_stages:
-        cmd += " --pipeline_stages={}".format(codegen_info.pipeline_stages)
-    if codegen_info.clock_period_ps:
-        cmd += " --clock_period_ps={}".format(codegen_info.clock_period_ps)
+    for flag in _CODEGEN_FLAGS + _SCHEDULING_FLAGS:
+        if flag in ["input_ir", "top", "verilog_file", "block_ir_file"]:
+            # already handled above
+            continue
+        value = getattr(codegen_info, flag, None)
+        if value != None:
+            cmd += " --{flag}={value}".format(flag = flag, value = value)
     executable_file = ctx.actions.declare_file(ctx.label.name + ".sh")
 
     # Get runfiles
@@ -532,7 +575,7 @@ def _xls_benchmark_verilog_impl(ctx):
         ctx,
         [benchmark_codegen_tool_runfiles],
         [
-            opt_ir_info.opt_ir_file,
+            opt_ir_info.ir_file,
             codegen_info.block_ir_file,
             codegen_info.verilog_file,
         ],
@@ -560,7 +603,7 @@ def _xls_benchmark_verilog_impl(ctx):
             ),
             executable = executable_file,
         ),
-    ]
+    ] + get_input_infos(ctx.attr.verilog_target)
 
 xls_benchmark_verilog_attrs = {
     "verilog_target": attr.label(

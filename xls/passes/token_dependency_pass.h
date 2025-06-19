@@ -15,9 +15,12 @@
 #ifndef XLS_PASSES_TOKEN_DEPENDENCY_PASS_H_
 #define XLS_PASSES_TOKEN_DEPENDENCY_PASS_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
@@ -27,8 +30,9 @@ namespace xls {
 // no such token dependency already exists.
 class TokenDependencyPass : public OptimizationFunctionBasePass {
  public:
+  static constexpr std::string_view kName = "token_dependency";
   TokenDependencyPass()
-      : OptimizationFunctionBasePass("token_dependency",
+      : OptimizationFunctionBasePass(kName,
                                      "Convert data dependencies between "
                                      "effectful operations into token "
                                      "dependencies") {}
@@ -37,7 +41,7 @@ class TokenDependencyPass : public OptimizationFunctionBasePass {
  protected:
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
 };
 
 }  // namespace xls

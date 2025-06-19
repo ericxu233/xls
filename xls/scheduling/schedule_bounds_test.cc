@@ -14,22 +14,24 @@
 
 #include "xls/scheduling/schedule_bounds.h"
 
+#include <cstdint>
 #include <limits>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/statusor.h"
 #include "xls/common/status/matchers.h"
-#include "xls/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_test_base.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/ir/op.h"
+#include "xls/ir/value.h"
 
 namespace xls {
 namespace sched {
 namespace {
 
-using testing::Pair;
+using ::testing::Pair;
 
 class TestDelayEstimator : public DelayEstimator {
  public:
@@ -38,9 +40,11 @@ class TestDelayEstimator : public DelayEstimator {
   absl::StatusOr<int64_t> GetOperationDelayInPs(Node* node) const override {
     switch (node->op()) {
       case Op::kParam:
+      case Op::kStateRead:
       case Op::kLiteral:
       case Op::kBitSlice:
       case Op::kConcat:
+      case Op::kMinDelay:
         return 0;
       default:
         return 1;
@@ -91,6 +95,32 @@ TEST_F(ScheduleBoundsTest, SimpleExpressionAsapAndAlap) {
   EXPECT_THAT(bounds.bounds(x_plus_y.node()), Pair(0, 0));
   EXPECT_THAT(bounds.bounds(not_x_plus_y.node()), Pair(1, 1));
   EXPECT_THAT(bounds.bounds(result.node()), Pair(2, 2));
+}
+
+TEST_F(ScheduleBoundsTest, SimpleExpressionAndAssertAsapAndAlap) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  auto x = fb.Param("x", p->GetBitsType(32));
+  auto y = fb.Param("y", p->GetBitsType(32));
+  auto not_x = fb.Not(x);
+  auto x_plus_y = fb.Add(x, y);
+  auto not_x_plus_y = fb.Not(x_plus_y);
+  auto result = fb.Add(not_x, not_x_plus_y);
+  auto assert = fb.Assert(fb.Literal(Value::Token()), fb.UGe(result, y),
+                          "expensive assert");
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.BuildWithReturnValue(result));
+
+  XLS_ASSERT_OK_AND_ASSIGN(ScheduleBounds bounds,
+                           ScheduleBounds::ComputeAsapAndAlapBounds(
+                               f,
+                               /*clock_period_ps=*/1, delay_estimator_));
+  EXPECT_THAT(bounds.bounds(x.node()), Pair(0, 0));
+  EXPECT_THAT(bounds.bounds(y.node()), Pair(0, 0));
+  EXPECT_THAT(bounds.bounds(not_x.node()), Pair(0, 1));
+  EXPECT_THAT(bounds.bounds(x_plus_y.node()), Pair(0, 0));
+  EXPECT_THAT(bounds.bounds(not_x_plus_y.node()), Pair(1, 1));
+  EXPECT_THAT(bounds.bounds(result.node()), Pair(2, 2));
+  EXPECT_THAT(bounds.bounds(assert.node()), Pair(2, 2));
 }
 
 TEST_F(ScheduleBoundsTest, SimpleExpressionTightenBounds) {

@@ -13,19 +13,19 @@
 // limitations under the License.
 #include "xls/modules/aes/aes_test_common.h"
 
-#include <arpa/inet.h>
-
-#include <array>
-#include <filesystem>
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <vector>
 
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
+#include "xls/ir/value.h"
 
 namespace xls::aes {
 
@@ -63,10 +63,9 @@ void PrintFailure(const Block& expected_block, const Block& actual_block,
   std::cout << "Mismatch in " << type_str << " at byte " << index << ": "
             << std::hex << "expected: 0x"
             << static_cast<uint32_t>(expected_block[index]) << "; actual: 0x"
-            << static_cast<uint32_t>(actual_block[index]) << std::endl;
-  std::cout << " - Expected block: " << FormatBlock(expected_block)
-            << std::endl;
-  std::cout << " - Actual block  : " << FormatBlock(actual_block) << std::endl;
+            << static_cast<uint32_t>(actual_block[index]) << '\n';
+  std::cout << " - Expected block: " << FormatBlock(expected_block) << '\n';
+  std::cout << " - Actual block  : " << FormatBlock(actual_block) << '\n';
 }
 
 Value InitVectorToValue(const InitVector& iv) {
@@ -104,13 +103,6 @@ absl::StatusOr<Block> ValueToBlock(const Value& value) {
   }
 
   return result;
-}
-
-static void InitVectorToBuffer(const InitVector& iv,
-                               std::array<uint8_t, kInitVectorBytes>* buffer) {
-  for (int i = kInitVectorBytes - 1; i >= 0; i--) {
-    buffer->data()[i] = iv[kInitVectorBytes - 1 - i];
-  }
 }
 
 absl::StatusOr<Value> KeyToValue(const Key& key) {

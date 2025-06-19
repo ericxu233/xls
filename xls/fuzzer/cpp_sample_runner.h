@@ -15,12 +15,12 @@
 #ifndef XLS_FUZZER_CPP_SAMPLE_RUNNER_H_
 #define XLS_FUZZER_CPP_SAMPLE_RUNNER_H_
 
-#include <optional>
 #include <string>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
+#include "absl/types/span.h"
 #include "xls/dslx/interp_value.h"
 
 namespace xls {

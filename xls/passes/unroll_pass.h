@@ -15,21 +15,24 @@
 #ifndef XLS_PASSES_UNROLL_PASS_H_
 #define XLS_PASSES_UNROLL_PASS_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
 class UnrollPass : public OptimizationFunctionBasePass {
  public:
-  UnrollPass()
-      : OptimizationFunctionBasePass("loop_unroll", "Unroll counted loops") {}
+  static constexpr std::string_view kName = "loop_unroll";
+  UnrollPass() : OptimizationFunctionBasePass(kName, "Unroll counted loops") {}
 
  protected:
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
 };
 
 }  // namespace xls

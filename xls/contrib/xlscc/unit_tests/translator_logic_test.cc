@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdint>
 #include <cstdio>
 #include <list>
 #include <memory>
@@ -19,30 +20,34 @@
 #include <ostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/substitute.h"
-#include "google/protobuf/message.h"
-#include "google/protobuf/text_format.h"
+#include "absl/types/span.h"
 #include "xls/common/file/temp_file.h"
+#include "xls/common/source_location.h"
 #include "xls/common/status/matchers.h"
-#include "xls/common/status/status_macros.h"
 #include "xls/contrib/xlscc/hls_block.pb.h"
 #include "xls/contrib/xlscc/metadata_output.pb.h"
 #include "xls/contrib/xlscc/translator.h"
 #include "xls/contrib/xlscc/unit_tests/unit_test.h"
 #include "xls/interpreter/function_interpreter.h"
 #include "xls/ir/bits.h"
-#include "xls/ir/ir_test_base.h"
+#include "xls/ir/events.h"
+#include "xls/ir/fileno.h"
+#include "xls/ir/node.h"
 #include "xls/ir/nodes.h"
+#include "xls/ir/package.h"
+#include "xls/ir/source_location.h"
 #include "xls/ir/value.h"
-
-using xls::status_testing::IsOkAndHolds;
 
 // TODO(seanhaskell): Reimplement unsequenced assignment detection
 #define UNSEQUENCED_TESTS 0
@@ -50,14 +55,14 @@ using xls::status_testing::IsOkAndHolds;
 namespace xlscc {
 namespace {
 
-using xls::status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 
 class TranslatorLogicTest : public XlsccTestBase {
  public:
 };
 
 TEST_F(TranslatorLogicTest, IntConst) {
-  const std::string content = R"(
+  std::string_view content = R"(
     int my_package(int a) {
       return 123;
     })";
@@ -65,7 +70,7 @@ TEST_F(TranslatorLogicTest, IntConst) {
 }
 
 TEST_F(TranslatorLogicTest, LongConst) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         return 123L;
       })";
@@ -74,7 +79,7 @@ TEST_F(TranslatorLogicTest, LongConst) {
 }
 
 TEST_F(TranslatorLogicTest, LongLongConst) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a) {
         return 123L;
       })";
@@ -83,7 +88,7 @@ TEST_F(TranslatorLogicTest, LongLongConst) {
 }
 
 TEST_F(TranslatorLogicTest, LongLongTrueConst) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a) {
         return 123LL;
       })";
@@ -92,20 +97,20 @@ TEST_F(TranslatorLogicTest, LongLongTrueConst) {
 }
 
 TEST_F(TranslatorLogicTest, SyntaxError) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         return a+
       })";
 
-  ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kFailedPrecondition,
-                  testing::HasSubstr("Unable to parse text")));
+  ASSERT_THAT(
+      SourceToIr(content).status(),
+      absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                             testing::HasSubstr("expected expression")));
 }
 
 TEST_F(TranslatorLogicTest, Assignment) {
   {
-    const std::string content = R"(
+    std::string_view content = R"(
         int my_package(int a) {
           a = 5;
           return a;
@@ -114,7 +119,7 @@ TEST_F(TranslatorLogicTest, Assignment) {
     Run({{"a", 1000}}, 5, content);
   }
   {
-    const std::string content = R"(
+    std::string_view content = R"(
         int my_package(int a) {
           a = 5;
           return a = 10;
@@ -125,7 +130,7 @@ TEST_F(TranslatorLogicTest, Assignment) {
 }
 
 TEST_F(TranslatorLogicTest, ChainedAssignment) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         a += 5;
         a += 10;
@@ -136,7 +141,7 @@ TEST_F(TranslatorLogicTest, ChainedAssignment) {
 }
 
 TEST_F(TranslatorLogicTest, UnsignedChar) {
-  const std::string content = R"(
+  std::string_view content = R"(
       unsigned char my_package(unsigned char a) {
         return a+5;
       })";
@@ -145,7 +150,7 @@ TEST_F(TranslatorLogicTest, UnsignedChar) {
 }
 
 TEST_F(TranslatorLogicTest, SignedChar) {
-  const std::string content = R"(
+  std::string_view content = R"(
       bool my_package(signed char a) {
         return a < 1;
       })";
@@ -155,7 +160,7 @@ TEST_F(TranslatorLogicTest, SignedChar) {
 }
 
 TEST_F(TranslatorLogicTest, Bool) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(long long a) {
         return bool(a);
       })";
@@ -166,7 +171,7 @@ TEST_F(TranslatorLogicTest, Bool) {
 }
 
 TEST_F(TranslatorLogicTest, DeclGroup) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         long long aa=a, bb=b;
         return aa+bb;
@@ -176,7 +181,7 @@ TEST_F(TranslatorLogicTest, DeclGroup) {
 }
 
 TEST_F(TranslatorLogicTest, Short) {
-  const std::string content = R"(
+  std::string_view content = R"(
       short my_package(short a, short b) {
         return a+b;
       })";
@@ -185,7 +190,7 @@ TEST_F(TranslatorLogicTest, Short) {
 }
 
 TEST_F(TranslatorLogicTest, UShort) {
-  const std::string content = R"(
+  std::string_view content = R"(
       unsigned short my_package(unsigned short a, unsigned short b) {
         return a+b;
       })";
@@ -194,7 +199,7 @@ TEST_F(TranslatorLogicTest, UShort) {
 }
 
 TEST_F(TranslatorLogicTest, Typedef) {
-  const std::string content = R"(
+  std::string_view content = R"(
       typedef long long my_int;
       my_int my_package(my_int a) {
         return a*10;
@@ -204,7 +209,7 @@ TEST_F(TranslatorLogicTest, Typedef) {
 }
 
 TEST_F(TranslatorLogicTest, IrAsm) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a) {
        int asm_out;
        asm (
@@ -219,7 +224,7 @@ TEST_F(TranslatorLogicTest, IrAsm) {
 }
 
 TEST_F(TranslatorLogicTest, ArrayParam) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(const long long arr[2]) {
          return arr[0]+arr[1];
        })";
@@ -241,7 +246,7 @@ TEST_F(TranslatorLogicTest, ArrayParam) {
 }
 
 TEST_F(TranslatorLogicTest, ArraySet) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          long long arr[4];
          arr[0] = a;
@@ -253,7 +258,7 @@ TEST_F(TranslatorLogicTest, ArraySet) {
 }
 
 TEST_F(TranslatorLogicTest, IncrementInArrayIndex1) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          int arr[4];
          arr[a++] = 5;
@@ -264,7 +269,7 @@ TEST_F(TranslatorLogicTest, IncrementInArrayIndex1) {
 }
 
 TEST_F(TranslatorLogicTest, IncrementInArrayIndex2) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Blah {
          int operator=(int x) {
            return 0;
@@ -280,7 +285,7 @@ TEST_F(TranslatorLogicTest, IncrementInArrayIndex2) {
 }
 
 TEST_F(TranslatorLogicTest, IncrementInArrayIndex3) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          int arr[4];
          arr[a] = arr[a++];
@@ -291,7 +296,7 @@ TEST_F(TranslatorLogicTest, IncrementInArrayIndex3) {
 }
 
 TEST_F(TranslatorLogicTest, ThisExprWithCallByReference) {
-  const std::string content = R"(
+  std::string_view content = R"(
     struct Blah {
       int val() {
         return 2;
@@ -312,7 +317,7 @@ TEST_F(TranslatorLogicTest, ThisExprWithCallByReference) {
 }
 
 TEST_F(TranslatorLogicTest, ThisExprWithCallByReference2) {
-  const std::string content = R"(
+  std::string_view content = R"(
     struct Blah {
       operator int() {
         return 2;
@@ -333,7 +338,7 @@ TEST_F(TranslatorLogicTest, ThisExprWithCallByReference2) {
 }
 
 TEST_F(TranslatorLogicTest, ThisExprWithCallByReference3) {
-  const std::string content = R"(
+  std::string_view content = R"(
     struct Blah {
       Blah val() {
         return *this;
@@ -357,7 +362,7 @@ TEST_F(TranslatorLogicTest, ThisExprWithCallByReference3) {
 }
 
 TEST_F(TranslatorLogicTest, ThisExprWithCallByReference4) {
-  const std::string content = R"(
+  std::string_view content = R"(
     struct Blah {
       int val()const {
         return 2;
@@ -378,7 +383,7 @@ TEST_F(TranslatorLogicTest, ThisExprWithCallByReference4) {
 }
 
 TEST_F(TranslatorLogicTest, ByReferenceSubExpr) {
-  const std::string content = R"(
+  std::string_view content = R"(
 
     int byref(int offset, int& out) {
       out = out + offset;
@@ -395,7 +400,7 @@ TEST_F(TranslatorLogicTest, ByReferenceSubExpr) {
 }
 
 TEST_F(TranslatorLogicTest, ArrayParamAssign) {
-  const std::string content = R"(
+  std::string_view content = R"(
     void addto(int v[6]) {
       v[3] += 3;
     }
@@ -411,7 +416,7 @@ TEST_F(TranslatorLogicTest, ArrayParamAssign) {
 }
 
 TEST_F(TranslatorLogicTest, DerefPointerToArrayAssign) {
-  const std::string content = R"(
+  std::string_view content = R"(
     int my_package(bool configured) {
       (void)configured;
       int brr[6] = {10,20,30,40,50,60};
@@ -423,14 +428,14 @@ TEST_F(TranslatorLogicTest, DerefPointerToArrayAssign) {
   auto ret = SourceToIr(content);
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kUnimplemented,
                   testing::HasSubstr("Only array subscript assignments "
                                      "directly to arrays supported")));
 }
 
 TEST_F(TranslatorLogicTest, ArrayPointerParam) {
-  const std::string content = R"(
+  std::string_view content = R"(
     void addto(int* v) {
       v[3] += 3;
     }
@@ -444,13 +449,13 @@ TEST_F(TranslatorLogicTest, ArrayPointerParam) {
 
   ASSERT_THAT(
       SourceToIr(content).status(),
-      xls::status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kUnimplemented,
           testing::HasSubstr("Pointer function parameters unsupported")));
 }
 
 TEST_F(TranslatorLogicTest, Array2D) {
-  const std::string content = R"(
+  std::string_view content = R"(
        int my_package(int a, int b) {
          int x[2][2] = {{b,b}, {b,b}};
          x[1][0] += a;
@@ -461,7 +466,7 @@ TEST_F(TranslatorLogicTest, Array2D) {
 }
 
 TEST_F(TranslatorLogicTest, Array2DParam) {
-  const std::string content = R"(
+  std::string_view content = R"(
        int access_it(int x[2][2]) {
          return x[1][0];
        }
@@ -475,7 +480,7 @@ TEST_F(TranslatorLogicTest, Array2DParam) {
 }
 
 TEST_F(TranslatorLogicTest, Array2DConstParam) {
-  const std::string content = R"(
+  std::string_view content = R"(
        int access_it(const int x[2][2]) {
          return x[1][0];
        }
@@ -489,7 +494,7 @@ TEST_F(TranslatorLogicTest, Array2DConstParam) {
 }
 
 TEST_F(TranslatorLogicTest, Array2DInit) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct ts {
          ts(int v) : x(v) { };
          operator int () const { return x; }
@@ -505,7 +510,7 @@ TEST_F(TranslatorLogicTest, Array2DInit) {
 }
 
 TEST_F(TranslatorLogicTest, Array2DClass) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct ts {
          ts(int v) : x(v) { };
          operator int () const { return x; }
@@ -521,7 +526,7 @@ TEST_F(TranslatorLogicTest, Array2DClass) {
 }
 
 TEST_F(TranslatorLogicTest, ArrayInitList) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          long long arr[2] = {10, 20};
          arr[0] += a;
@@ -532,7 +537,7 @@ TEST_F(TranslatorLogicTest, ArrayInitList) {
 }
 
 TEST_F(TranslatorLogicTest, ArrayRefParam) {
-  const std::string content = R"(
+  std::string_view content = R"(
        void asd(int b[2]) {
          b[0] += 5;
        }
@@ -545,7 +550,7 @@ TEST_F(TranslatorLogicTest, ArrayRefParam) {
 }
 
 TEST_F(TranslatorLogicTest, ArrayInitListWrongSize) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          long long arr[4] = {10, 20};
          return a;
@@ -554,60 +559,36 @@ TEST_F(TranslatorLogicTest, ArrayInitListWrongSize) {
 }
 
 TEST_F(TranslatorLogicTest, ArrayTooManyInitListValues) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package() {
          long long arr[1] = {4, 5};
          return arr[0];
        })";
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kFailedPrecondition,
-                  testing::HasSubstr("Unable to parse text")));
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                                     testing::HasSubstr("excess elements")));
 }
 
 TEST_F(TranslatorLogicTest, ArrayInitListMismatchedSizeMultipleZeros) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package() {
          long long arr[4] = {0, 0};
          return arr[3];
        })";
-  ASSERT_FALSE(SourceToIr(content).ok());
+  XLS_ASSERT_OK(SourceToIr(content));
 }
 
 TEST_F(TranslatorLogicTest, ArrayInitListMismatchedSizeOneNonZeros) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package() {
          long long arr[4] = {9};
          return arr[3];
        })";
-  ASSERT_FALSE(SourceToIr(content).ok());
-}
-
-TEST_F(TranslatorLogicTest, ArrayInitListMismatchedSizeOneWithZeros) {
-  const std::string content = R"(
-       long long my_package() {
-         #pragma hls_array_allow_default_pad
-         long long arr[4] = {0};
-         return arr[3];
-       })";
-  Run({}, 0, content);
-}
-
-TEST_F(TranslatorLogicTest, ArrayInitListMismatchedSizeOneWithDefaultStruct) {
-  const std::string content = R"(
-       struct x {
-         int a;
-       };
-       long long my_package() {
-         #pragma hls_array_allow_default_pad
-         x arr[4] = {{}};
-         return arr[3].a;
-       })";
-  Run({}, 0, content);
+  XLS_ASSERT_OK(SourceToIr(content));
 }
 
 TEST_F(TranslatorLogicTest, ConstInitListExpr) {
-  const std::string content = R"(
+  std::string_view content = R"(
     int my_package(int a) {
       const int test_arr[][6] = {
           {  10,  0,  0,  0,  0,  0 },
@@ -619,7 +600,7 @@ TEST_F(TranslatorLogicTest, ConstInitListExpr) {
 }
 
 TEST_F(TranslatorLogicTest, InitListExpr) {
-  const std::string content = R"(
+  std::string_view content = R"(
     int my_package(int a) {
       int test_arr[][6] = {
           {  10,  0,  0,  0,  0,  0 },
@@ -631,7 +612,7 @@ TEST_F(TranslatorLogicTest, InitListExpr) {
 }
 
 TEST_F(TranslatorLogicTest, ArrayInitLoop) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct tss {
          tss() : ss(15) {}
          tss(const tss &o) : ss(o.ss) {}
@@ -648,7 +629,7 @@ TEST_F(TranslatorLogicTest, ArrayInitLoop) {
 }
 
 TEST_F(TranslatorLogicTest, StringConstantArray) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          const char foo[] = "A";
          return a+foo[0];
@@ -657,7 +638,7 @@ TEST_F(TranslatorLogicTest, StringConstantArray) {
 }
 
 TEST_F(TranslatorLogicTest, GlobalInt) {
-  const std::string content = R"(
+  std::string_view content = R"(
        const int off = 60;
        int foo() {
          // Reference it from another function to test context management
@@ -677,7 +658,7 @@ TEST_F(TranslatorLogicTest, GlobalInt) {
 }
 
 TEST_F(TranslatorLogicTest, GlobalEnum) {
-  const std::string content = R"(
+  std::string_view content = R"(
        enum BlahE {
          A=2,B,C
        };
@@ -688,7 +669,7 @@ TEST_F(TranslatorLogicTest, GlobalEnum) {
 }
 
 TEST_F(TranslatorLogicTest, MaximumEnum) {
-  const std::string content = R"(
+  std::string_view content = R"(
        enum BlahE {
          A=2,
          B=0xFFFFFFFF
@@ -700,7 +681,7 @@ TEST_F(TranslatorLogicTest, MaximumEnum) {
 }
 
 TEST_F(TranslatorLogicTest, CheckRepeatedGlobals) {
-  const std::string content = R"(
+  std::string_view content = R"(
        enum Values {
         A=1000, B=10
        };
@@ -715,7 +696,7 @@ TEST_F(TranslatorLogicTest, CheckRepeatedGlobals) {
 }
 
 TEST_F(TranslatorLogicTest, EnumVarDecl) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package() {
           enum BlahE {
             A=2,B,C
@@ -726,7 +707,7 @@ TEST_F(TranslatorLogicTest, EnumVarDecl) {
 }
 
 TEST_F(TranslatorLogicTest, SetGlobal) {
-  const std::string content = R"(
+  std::string_view content = R"(
        int off = 60;
        long long my_package(long long a) {
          off = 5;
@@ -738,21 +719,21 @@ TEST_F(TranslatorLogicTest, SetGlobal) {
 }
 
 TEST_F(TranslatorLogicTest, UnsequencedAssign) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         return (a=7)+a;
       })";
   auto ret = SourceToIr(content);
 
   // Clang catches this one and fails parsing
-  ASSERT_THAT(
-      SourceToIr(content).status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
-                                    testing::HasSubstr("parse")));
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(
+                  absl::StatusCode::kFailedPrecondition,
+                  testing::HasSubstr("unsequenced modification and access")));
 }
 
 TEST_F(TranslatorLogicTest, TestXlsccCheck) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         return a+a;
       })";
@@ -760,7 +741,9 @@ TEST_F(TranslatorLogicTest, TestXlsccCheck) {
   EXPECT_DEATH(
       {
         auto ret = ScanFile(
-            content, {}, false, false,
+            content, {}, /*io_test_mode=*/false,
+            /*error_on_init_interval=*/false,
+            /*error_on_uninitialized=*/false,
             xls::SourceLocation(xls::Fileno(0), xls::Lineno(1), xls::Colno(1)),
             true);
       },
@@ -770,7 +753,7 @@ TEST_F(TranslatorLogicTest, TestXlsccCheck) {
 #if UNSEQUENCED_TESTS
 
 TEST_F(TranslatorLogicTest, UnsequencedRefParam) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int make7(int &a) {
         return a=7;
       }
@@ -781,11 +764,11 @@ TEST_F(TranslatorLogicTest, UnsequencedRefParam) {
   auto ret = SourceToIr(content);
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                            testing::HasSubstr("unsequenced")));
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("unsequenced")));
 }
 TEST_F(TranslatorLogicTest, UnsequencedRefParam2) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int make7(int &a) {
         return a=7;
       }
@@ -796,12 +779,12 @@ TEST_F(TranslatorLogicTest, UnsequencedRefParam2) {
   auto ret = SourceToIr(content);
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                            testing::HasSubstr("unsequenced")));
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("unsequenced")));
 }
 
 TEST_F(TranslatorLogicTest, UnsequencedRefParam3) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int make7(int &a) {
         return a=7;
       }
@@ -812,36 +795,36 @@ TEST_F(TranslatorLogicTest, UnsequencedRefParam3) {
   auto ret = SourceToIr(content);
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                            testing::HasSubstr("unsequenced")));
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("unsequenced")));
 }
 
 TEST_F(TranslatorLogicTest, UnsequencedRefParam4) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         return (a=7)?a:11;
       })";
   auto ret = SourceToIr(content);
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                            testing::HasSubstr("unsequenced")));
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("unsequenced")));
 }
 TEST_F(TranslatorLogicTest, UnsequencedRefParam5) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         return a?a:(a=7);
       })";
   auto ret = SourceToIr(content);
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                            testing::HasSubstr("unsequenced")));
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("unsequenced")));
 }
 
 // Okay with one parameter
 TEST_F(TranslatorLogicTest, AvoidUnsequencedRefParamUnary) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long nop(long long a) {
         return a;
       }
@@ -853,7 +836,7 @@ TEST_F(TranslatorLogicTest, AvoidUnsequencedRefParamUnary) {
 }
 
 TEST_F(TranslatorLogicTest, UnsequencedRefParamBinary) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int nop(int a, int b) {
         return a;
       }
@@ -863,14 +846,14 @@ TEST_F(TranslatorLogicTest, UnsequencedRefParamBinary) {
   auto ret = SourceToIr(content);
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                            testing::HasSubstr("unsequenced")));
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("unsequenced")));
 }
 
 #endif  // UNSEQUENCED_TESTS
 
 TEST_F(TranslatorLogicTest, OpAssignmentResult) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         return a+=5;
       })";
@@ -879,7 +862,7 @@ TEST_F(TranslatorLogicTest, OpAssignmentResult) {
 }
 
 TEST_F(TranslatorLogicTest, UndefinedConditionalAssign) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         int ret;
         if(a) {
@@ -888,14 +871,13 @@ TEST_F(TranslatorLogicTest, UndefinedConditionalAssign) {
         return ret;
       })";
 
-  ASSERT_THAT(
-      SourceToIr(content).status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
-                                    testing::HasSubstr("Unable to parse")));
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                                     testing::HasSubstr("uninitialized")));
 }
 
 TEST_F(TranslatorLogicTest, IfStmt) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a) {
         if(a<-100) a = 1;
         else if(a<-10) a += 3;
@@ -909,7 +891,7 @@ TEST_F(TranslatorLogicTest, IfStmt) {
 }
 
 TEST_F(TranslatorLogicTest, IfAssignOverrideCondition) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         if(a>1000) {
           if(b)
@@ -925,7 +907,7 @@ TEST_F(TranslatorLogicTest, IfAssignOverrideCondition) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchStmt) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          long long ret;
          switch(a) {
@@ -948,7 +930,7 @@ TEST_F(TranslatorLogicTest, SwitchStmt) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchStmtWithUnrollInCase) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          long long ret;
          switch(a) {
@@ -976,8 +958,31 @@ TEST_F(TranslatorLogicTest, SwitchStmtWithUnrollInCase) {
   Run({{"a", 3}}, 300, content);
 }
 
+TEST_F(TranslatorLogicTest, SwitchConditionalBreakReturn) {
+  std::string_view content = R"(
+       long long my_package(long long a, long long b) {
+         long long ret;
+         switch(a) {
+           case 1:
+             ret = 100;
+             break;
+           case 2:
+             ret = 200;
+             if(b) return 55;
+           default:
+             return 300;
+         }
+         return ret;
+       })";
+
+  Run({{"a", 1}, {"b", 0}}, 100, content);
+  Run({{"a", 2}, {"b", 0}}, 300, content);
+  Run({{"a", 2}, {"b", 1}}, 55, content);
+  Run({{"a", 3}, {"b", 0}}, 300, content);
+}
+
 TEST_F(TranslatorLogicTest, SwitchConditionalBreak) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          long long ret;
          switch(a) {
@@ -994,14 +999,14 @@ TEST_F(TranslatorLogicTest, SwitchConditionalBreak) {
          return ret;
        })";
 
-  ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kUnimplemented,
-                  testing::HasSubstr("Conditional breaks are not supported")));
+  Run({{"a", 1}, {"b", 0}}, 100, content);
+  Run({{"a", 2}, {"b", 0}}, 300, content);
+  Run({{"a", 2}, {"b", 1}}, 200, content);
+  Run({{"a", 3}, {"b", 0}}, 300, content);
 }
 
 TEST_F(TranslatorLogicTest, SwitchStmtDefaultTop) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          long long ret;
          switch(a) {
@@ -1024,7 +1029,7 @@ TEST_F(TranslatorLogicTest, SwitchStmtDefaultTop) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchMultiCaseMultiLine) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          long long ret=0;
          switch(a) {
@@ -1045,7 +1050,7 @@ TEST_F(TranslatorLogicTest, SwitchMultiCaseMultiLine) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchMultiCaseMultiLineBrace) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          long long ret=0;
          switch(a) {
@@ -1067,7 +1072,7 @@ TEST_F(TranslatorLogicTest, SwitchMultiCaseMultiLineBrace) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchDoubleBreak) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          long long ret=0;
          switch(a) {
@@ -1092,7 +1097,7 @@ TEST_F(TranslatorLogicTest, SwitchDoubleBreak) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchMultiCase) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          long long ret=0;
          switch(a) {
@@ -1111,7 +1116,7 @@ TEST_F(TranslatorLogicTest, SwitchMultiCase) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchReturnStmt) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          switch(a) {
            case 1:
@@ -1129,7 +1134,7 @@ TEST_F(TranslatorLogicTest, SwitchReturnStmt) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchDeepFlatten) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          switch(a) {
            case 1:
@@ -1145,7 +1150,7 @@ TEST_F(TranslatorLogicTest, SwitchDeepFlatten) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchReturnStmt2) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          switch(a) {
            case 1:
@@ -1163,7 +1168,7 @@ TEST_F(TranslatorLogicTest, SwitchReturnStmt2) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchDefaultPlusCase) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          switch(a) {
            default:
@@ -1182,7 +1187,7 @@ TEST_F(TranslatorLogicTest, SwitchDefaultPlusCase) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchInFor) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          #pragma hls_unroll yes
          for(int i=0;i<2;++i) {
@@ -1202,7 +1207,7 @@ TEST_F(TranslatorLogicTest, SwitchInFor) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchBreakAfterReturn) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          long long ret=0;
          switch(a) {
@@ -1220,7 +1225,7 @@ TEST_F(TranslatorLogicTest, SwitchBreakAfterReturn) {
 }
 
 TEST_F(TranslatorLogicTest, ForInSwitch) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a) {
          switch(a) {
            case 0:
@@ -1245,7 +1250,7 @@ TEST_F(TranslatorLogicTest, ForInSwitch) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchDeclareInCase) {
-  const std::string content = R"(
+  std::string_view content = R"(
       #pragma hls_top
       long long foo(long long in) {
         switch(in) {
@@ -1263,7 +1268,7 @@ TEST_F(TranslatorLogicTest, SwitchDeclareInCase) {
 }
 
 TEST_F(TranslatorLogicTest, SwitchDeclareInCaseWithoutBraces) {
-  const std::string content = R"(
+  std::string_view content = R"(
       #pragma hls_top
       long long foo(long long in) {
         switch(in) {
@@ -1280,7 +1285,7 @@ TEST_F(TranslatorLogicTest, SwitchDeclareInCaseWithoutBraces) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnroll) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         #pragma hls_unroll yes
         for(int i=1;i<=10;++i) {
@@ -1292,8 +1297,96 @@ TEST_F(TranslatorLogicTest, ForUnroll) {
   Run({{"a", 11}, {"b", 20}}, 611, content);
 }
 
-TEST_F(TranslatorLogicTest, ForUnrollLabel) {
+TEST_F(TranslatorLogicTest, PragmaScoped) {
+  std::string_view content = R"(
+      long long my_package(long long a, long long b) {
+        {
+          #pragma hls_unroll yes
+        }
+        for(int i=1;i<=10;++i) {
+          a += b;
+          a += 2*b;
+        }
+        return a;
+      })";
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                                     testing::HasSubstr("expected statement")));
+}
+
+TEST_F(TranslatorLogicTest, ForUnrollInTemplateFunc) {
+  std::string_view content = R"(
+      template<typename T>
+      T doit(T a, T b) {
+        #pragma hls_unroll yes
+        for(int i=1;i<=10;++i) {
+          a += b;
+          a += 2*b;
+        }
+        return a;
+      }
+
+      long long my_package(long long a, long long b) {
+        return doit<long long>(a, b);
+      })";
+  Run({{"a", 11}, {"b", 20}}, 611, content);
+}
+
+TEST_F(TranslatorLogicTest, PragmaInDefineAppliesOnlyInDefine) {
   const std::string content = R"(
+    #define some_macro(x) { \
+          int i = 0;                 \
+          _Pragma("hls_unroll yes")  \
+          while (i < 2) {            \
+            x[i] += 1;               \
+            ++i;                     \
+          }                          \
+        }
+
+    #pragma hls_top
+    int bar(int (&a)[5], int b) {
+      some_macro(a);
+      some_macro(a);
+
+      for (int i = 0; i < 5; ++i) a[i] = b;
+      return true;
+    }
+  )";
+
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("missing")));
+}
+
+TEST_F(TranslatorLogicTest, NestedLoopsNoBraces) {
+  std::string_view content = R"(
+      #define HLS_PRAGMA(x) _Pragma(#x)
+
+      long long my_package(long long a, long long b) {
+        HLS_PRAGMA(hls_unroll yes)
+        for(int j=1;j<=2;++j)
+          HLS_PRAGMA(hls_unroll yes)
+          for(int i=1;i<=5;++i) a += 3*b;
+        return a;
+      })";
+  Run({{"a", 11}, {"b", 20}}, 611, content);
+}
+
+TEST_F(TranslatorLogicTest, NestedLoopsNoBraces2) {
+  std::string_view content = R"(
+      #define HLS_PRAGMA(x) _Pragma(#x)
+
+      long long my_package(long long a, long long b) {
+        if(a > 10)
+          HLS_PRAGMA(hls_unroll yes)
+          for(int i=1;i<=10;++i) a += 3*b;
+        return a;
+      })";
+  Run({{"a", 11}, {"b", 20}}, 611, content);
+}
+
+TEST_F(TranslatorLogicTest, ForUnrollLabel) {
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         #pragma hls_unroll yes
         label:
@@ -1306,8 +1399,27 @@ TEST_F(TranslatorLogicTest, ForUnrollLabel) {
   Run({{"a", 11}, {"b", 20}}, 611, content);
 }
 
+TEST_F(TranslatorLogicTest, ForUnrollBeforeLabelAndStatement) {
+  std::string_view content = R"(
+      long long my_package(long long a, long long b) {
+        #pragma hls_unroll yes
+        label:
+        int x = 0;
+        for(int i=1;i<=10;++i) {
+          a += b;
+          a += 2*b;
+        }
+        (void)x;
+        return a;
+      })";
+
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("missing")));
+}
+
 TEST_F(TranslatorLogicTest, ForUnrollAssignAfterBreak) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         int i=1;
         #pragma hls_unroll yes
@@ -1324,7 +1436,7 @@ TEST_F(TranslatorLogicTest, ForUnrollAssignAfterBreak) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollAssignAfterReturn) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         int i=1;
         #pragma hls_unroll yes
@@ -1341,7 +1453,7 @@ TEST_F(TranslatorLogicTest, ForUnrollAssignAfterReturn) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollNoIncrementOnBreak) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         int i=0;
         #pragma hls_unroll yes
@@ -1356,7 +1468,7 @@ TEST_F(TranslatorLogicTest, ForUnrollNoIncrementOnBreak) {
 }
 
 TEST_F(TranslatorLogicTest, WhileUnroll) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         int i=1;
         #pragma hls_unroll yes
@@ -1371,7 +1483,7 @@ TEST_F(TranslatorLogicTest, WhileUnroll) {
 }
 
 TEST_F(TranslatorLogicTest, DoWhileUnroll) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         int i=1;
         #pragma hls_unroll yes
@@ -1387,7 +1499,7 @@ TEST_F(TranslatorLogicTest, DoWhileUnroll) {
 }
 
 TEST_F(TranslatorLogicTest, WhileUnrollShortCircuit) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         int i=1;
         #pragma hls_unroll yes
@@ -1404,7 +1516,7 @@ TEST_F(TranslatorLogicTest, WhileUnrollShortCircuit) {
 }
 
 TEST_F(TranslatorLogicTest, WhileUnrollFalseCond) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         int i=1;
         #pragma hls_unroll yes
@@ -1419,7 +1531,7 @@ TEST_F(TranslatorLogicTest, WhileUnrollFalseCond) {
 }
 
 TEST_F(TranslatorLogicTest, WhileUnrollFalseCond2) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         int i=1;
         #pragma hls_unroll yes
@@ -1434,7 +1546,7 @@ TEST_F(TranslatorLogicTest, WhileUnrollFalseCond2) {
 }
 
 TEST_F(TranslatorLogicTest, WhileUnrollFalseCond3) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         int i=1;
         #pragma hls_unroll yes
@@ -1448,7 +1560,7 @@ TEST_F(TranslatorLogicTest, WhileUnrollFalseCond3) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollShortCircuit) {
-  const std::string content = R"(
+  std::string_view content = R"(
 
         long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
@@ -1461,7 +1573,7 @@ TEST_F(TranslatorLogicTest, ForUnrollShortCircuit) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollShortCircuit2) {
-  const std::string content = R"(
+  std::string_view content = R"(
 
         long long my_package(long long a, long long b) {
         int i=0;
@@ -1476,7 +1588,7 @@ TEST_F(TranslatorLogicTest, ForUnrollShortCircuit2) {
 
 // Check that continue doesn't skip loop increment
 TEST_F(TranslatorLogicTest, ForUnrollShortCircuit2A) {
-  const std::string content = R"(
+  std::string_view content = R"(
         long long my_package(long long a, long long b) {
          int i=0;
          #pragma hls_unroll yes
@@ -1490,12 +1602,14 @@ TEST_F(TranslatorLogicTest, ForUnrollShortCircuit2A) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollShortCircuit3) {
-  const std::string content = R"(
+  std::string_view content = R"(
         template<int N>
         long sum(long in[N], int n) {
           long sum = 0;
           #pragma hls_unroll yes
-          for (int i = 0; i < N && i < n; ++i) sum += in[i];
+          for (int i = 0; i < N && i < n; ++i) {
+            sum += in[i];
+          }
           return sum;
         }
 
@@ -1507,7 +1621,7 @@ TEST_F(TranslatorLogicTest, ForUnrollShortCircuit3) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollShortCircuit4) {
-  const std::string content = R"(
+  std::string_view content = R"(
          struct TestInt {
            TestInt(long long v) : x(v) { }
            int operator[](int i)const {
@@ -1543,7 +1657,7 @@ TEST_F(TranslatorLogicTest, ForUnrollShortCircuit4) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollShortCircuitClass) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct TestInt {
          TestInt(int v) : x(v) { }
          operator int()const {
@@ -1569,8 +1683,79 @@ TEST_F(TranslatorLogicTest, ForUnrollShortCircuitClass) {
   Run({{"a", 11}, {"b", 20}}, 611, content);
 }
 
-TEST_F(TranslatorLogicTest, ForUnrollMultiCondBreak) {
+TEST_F(TranslatorLogicTest, ForUnrollShortCircuitClass2) {
   const std::string content = R"(
+       struct TestInt {
+         TestInt(int v) : x(v) { }
+         operator int()const {
+           return x;
+         }
+         int x;
+       };
+       long long my_package(long long a, long long b) {
+         TestInt bounds[2] = {3,4};
+
+         int x = 0;
+
+         #pragma hls_unroll yes
+         for(int i=0;i<bounds[a];++i) {
+           x += b;
+         }
+         return x;
+       })";
+  Run({{"a", 1}, {"b", 20}}, 4L * 20L, content);
+}
+
+TEST_F(TranslatorLogicTest, ForPipelinedConstantPropagation) {
+  const std::string content = R"(
+    #pragma hls_top
+    void foo(__xls_channel<int>& in,
+             __xls_channel<int>& out) {
+      int a = in.read();
+
+      const short max_iters = 5;
+
+      #pragma hls_pipeline_init_interval 1
+      for(long i=1;i<=4;++i) {
+        #pragma hls_unroll yes
+        for(int j=0;j<max_iters;++j) {
+          a += i;
+        }
+      }
+
+      out.write(a);
+    })";
+
+  HLSBlock block_spec;
+  {
+    block_spec.set_name("foo");
+
+    HLSChannel* ch_in = block_spec.add_channels();
+    ch_in->set_name("in");
+    ch_in->set_is_input(true);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
+
+    HLSChannel* ch_out1 = block_spec.add_channels();
+    ch_out1->set_name("out");
+    ch_out1->set_is_input(false);
+    ch_out1->set_type(CHANNEL_TYPE_FIFO);
+  }
+
+  absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
+  inputs["in"] = {xls::Value(xls::SBits(80, 32)),
+                  xls::Value(xls::SBits(100, 32))};
+
+  {
+    absl::flat_hash_map<std::string, std::list<xls::Value>> outputs;
+    outputs["out"] = {xls::Value(xls::SBits(80 + 5 * 10, 32)),
+                      xls::Value(xls::SBits(100 + 5 * 10, 32))};
+
+    ProcTest(content, block_spec, inputs, outputs, /* min_ticks = */ 8);
+  }
+}
+
+TEST_F(TranslatorLogicTest, ForUnrollMultiCondBreak) {
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         #pragma hls_unroll yes
         for(int i=1;i<10;++i) {
@@ -1589,7 +1774,7 @@ TEST_F(TranslatorLogicTest, ForUnrollMultiCondBreak) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollNestedCondBreak) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         #pragma hls_unroll yes
         for(int i=1;i<10;++i) {
@@ -1608,7 +1793,7 @@ TEST_F(TranslatorLogicTest, ForUnrollNestedCondBreak) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollClass) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct TestInt {
          TestInt(int v) : x(v) { }
          operator int()const {
@@ -1635,7 +1820,7 @@ TEST_F(TranslatorLogicTest, ForUnrollClass) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollConditionallyAssignLoopVar) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<10;++i) {
@@ -1650,7 +1835,7 @@ TEST_F(TranslatorLogicTest, ForUnrollConditionallyAssignLoopVar) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollNoInit) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         int i=1;
         #pragma hls_unroll yes
@@ -1664,7 +1849,7 @@ TEST_F(TranslatorLogicTest, ForUnrollNoInit) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollNoInc) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         #pragma hls_unroll yes
         for(int i=1;i<=10;) {
@@ -1678,7 +1863,7 @@ TEST_F(TranslatorLogicTest, ForUnrollNoInc) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollNoCond) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         #pragma hls_unroll yes
         for(int i=1;;++i) {
@@ -1687,14 +1872,13 @@ TEST_F(TranslatorLogicTest, ForUnrollNoCond) {
         }
         return a;
       })";
-  ASSERT_THAT(
-      SourceToIr(content).status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kResourceExhausted,
-                                    testing::HasSubstr("maximum")));
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kResourceExhausted,
+                                     testing::HasSubstr("maximum")));
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollNoCondBreakInBody) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         #pragma hls_unroll yes
         for(int i=1;;++i) {
@@ -1710,7 +1894,7 @@ TEST_F(TranslatorLogicTest, ForUnrollNoCondBreakInBody) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollNoPragma) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         for(int i=1;i<=10;++i) {
           a += b;
@@ -1721,13 +1905,34 @@ TEST_F(TranslatorLogicTest, ForUnrollNoPragma) {
   auto ret = SourceToIr(content);
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kUnimplemented,
-                  testing::HasSubstr("loop missing #pragma")));
+                  testing::HasSubstr("missing #pragma or attribute")));
+}
+
+TEST_F(TranslatorLogicTest, ForUnrollBadNumber) {
+  std::string_view content = R"(
+      long long my_package(long long a, long long b) {
+        #pragma hls_unroll yes
+        for(int i=1;i<=10;++i) {
+          #pragma hls_unroll -4
+          for(int j=0;j<4;++j) {
+            int l = b;
+            a += l;
+          }
+        }
+        return a;
+      })";
+  auto ret = SourceToIr(content);
+
+  EXPECT_THAT(
+      SourceToIr(content).status(),
+      absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                             testing::HasSubstr("must be an integer >= 0")));
 }
 
 TEST_F(TranslatorLogicTest, ForNestedUnroll) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         #pragma hls_unroll yes
         for(int i=1;i<=10;++i) {
@@ -1743,7 +1948,7 @@ TEST_F(TranslatorLogicTest, ForNestedUnroll) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollInfinite) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=1;i<=10;--i) {
@@ -1752,14 +1957,13 @@ TEST_F(TranslatorLogicTest, ForUnrollInfinite) {
          }
          return a;
        })";
-  ASSERT_THAT(
-      SourceToIr(content).status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kResourceExhausted,
-                                    testing::HasSubstr("maximum")));
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kResourceExhausted,
+                                     testing::HasSubstr("maximum")));
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollBreak) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<9;++i) {
@@ -1775,7 +1979,7 @@ TEST_F(TranslatorLogicTest, ForUnrollBreak) {
 
 // Only one break condition is true, not all conditions after
 TEST_F(TranslatorLogicTest, ForUnrollBreakOnEquals) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<9;++i) {
@@ -1790,7 +1994,7 @@ TEST_F(TranslatorLogicTest, ForUnrollBreakOnEquals) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollBreakAfterAssignNested) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<4;++i) {
@@ -1807,7 +2011,7 @@ TEST_F(TranslatorLogicTest, ForUnrollBreakAfterAssignNested) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollContinueNested) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<6;++i) {
@@ -1827,7 +2031,7 @@ TEST_F(TranslatorLogicTest, ForUnrollContinueNested) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollBreakAfterAssign) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<3;++i) {
@@ -1842,7 +2046,7 @@ TEST_F(TranslatorLogicTest, ForUnrollBreakAfterAssign) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollBreakAfterAssign2) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<2;++i) {
@@ -1857,7 +2061,7 @@ TEST_F(TranslatorLogicTest, ForUnrollBreakAfterAssign2) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollBreakTest) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<3;++i) {
@@ -1873,7 +2077,7 @@ TEST_F(TranslatorLogicTest, ForUnrollBreakTest) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollBreak2) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<50;++i) {
@@ -1886,7 +2090,7 @@ TEST_F(TranslatorLogicTest, ForUnrollBreak2) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollBreak2Nested) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<50;++i) {
@@ -1901,7 +2105,7 @@ TEST_F(TranslatorLogicTest, ForUnrollBreak2Nested) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollBreak3) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<50;++i) {
@@ -1914,7 +2118,7 @@ TEST_F(TranslatorLogicTest, ForUnrollBreak3) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollBreak4) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<50;++i) {
@@ -1927,7 +2131,7 @@ TEST_F(TranslatorLogicTest, ForUnrollBreak4) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollContinue) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<11;++i) {
@@ -1940,7 +2144,7 @@ TEST_F(TranslatorLogicTest, ForUnrollContinue) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollContinue2) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<11;++i) {
@@ -1953,7 +2157,7 @@ TEST_F(TranslatorLogicTest, ForUnrollContinue2) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollContinue3) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<11;++i) {
@@ -1966,7 +2170,7 @@ TEST_F(TranslatorLogicTest, ForUnrollContinue3) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollContinue4) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<11;++i) {
@@ -1981,7 +2185,7 @@ TEST_F(TranslatorLogicTest, ForUnrollContinue4) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollContinue5) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<11;++i) {
@@ -1996,7 +2200,7 @@ TEST_F(TranslatorLogicTest, ForUnrollContinue5) {
 }
 
 TEST_F(TranslatorLogicTest, ForUnrollContinue6) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<11;++i) {
@@ -2011,7 +2215,7 @@ TEST_F(TranslatorLogicTest, ForUnrollContinue6) {
 }
 
 TEST_F(TranslatorLogicTest, ReturnFromFor) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<11;++i) {
@@ -2024,7 +2228,7 @@ TEST_F(TranslatorLogicTest, ReturnFromFor) {
 }
 
 TEST_F(TranslatorLogicTest, ReturnFromFor2) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<11;++i) {
@@ -2037,7 +2241,7 @@ TEST_F(TranslatorLogicTest, ReturnFromFor2) {
 }
 
 TEST_F(TranslatorLogicTest, ReturnFromFor3) {
-  const std::string content = R"(
+  std::string_view content = R"(
        long long my_package(long long a, long long b) {
          #pragma hls_unroll yes
          for(int i=0;i<10;++i) {
@@ -2050,7 +2254,7 @@ TEST_F(TranslatorLogicTest, ReturnFromFor3) {
 }
 
 TEST_F(TranslatorLogicTest, MaxUnrollItersError) {
-  const std::string content = R"(
+  std::string_view content = R"(
     #pragma hls_top
     int foo(int b) {
       int ret = 0;
@@ -2061,17 +2265,16 @@ TEST_F(TranslatorLogicTest, MaxUnrollItersError) {
       }
       return ret;
     })";
-  ASSERT_THAT(
-      SourceToIr(content, /*pfunc=*/nullptr,
-                 /*clang_argv=*/{}, /*io_test_mode=*/false,
-                 /*max_unroll_iters=*/4)
-          .status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kResourceExhausted,
-                                    testing::HasSubstr("broke at maximum")));
+  ASSERT_THAT(SourceToIr(content, /*pfunc=*/nullptr,
+                         /*clang_argv=*/{}, /*io_test_mode=*/false,
+                         /*max_unroll_iters=*/4)
+                  .status(),
+              absl_testing::StatusIs(absl::StatusCode::kResourceExhausted,
+                                     testing::HasSubstr("broke at maximum")));
 }
 
 TEST_F(TranslatorLogicTest, MaxUnrollItersEquals) {
-  const std::string content = R"(
+  std::string_view content = R"(
     #pragma hls_top
     int foo(int b) {
       int ret = 0;
@@ -2089,7 +2292,7 @@ TEST_F(TranslatorLogicTest, MaxUnrollItersEquals) {
 }
 
 TEST_F(TranslatorLogicTest, ReturnFromForStopsUnrolling) {
-  const std::string content = R"(
+  std::string_view content = R"(
     #pragma hls_top
     int foo(int b) {
       int ret = 0;
@@ -2110,7 +2313,7 @@ TEST_F(TranslatorLogicTest, ReturnFromForStopsUnrolling) {
 }
 
 TEST_F(TranslatorLogicTest, ReturnFromForInSwitchStopsUnrolling) {
-  const std::string content = R"(
+  std::string_view content = R"(
     #pragma hls_top
     int foo(int b) {
       int ret = 0;
@@ -2134,7 +2337,7 @@ TEST_F(TranslatorLogicTest, ReturnFromForInSwitchStopsUnrolling) {
 }
 
 TEST_F(TranslatorLogicTest, BreakFromForStopsUnrolling) {
-  const std::string content = R"(
+  std::string_view content = R"(
     #pragma hls_top
     int foo(int b) {
       int ret = 0;
@@ -2155,7 +2358,7 @@ TEST_F(TranslatorLogicTest, BreakFromForStopsUnrolling) {
 }
 
 TEST_F(TranslatorLogicTest, ConditionalReturnStmt) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         if(b) {
           if(a<200) return 2200;
@@ -2173,7 +2376,7 @@ TEST_F(TranslatorLogicTest, ConditionalReturnStmt) {
 }
 
 TEST_F(TranslatorLogicTest, DoubleReturn) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         if(b) {
           return b;
@@ -2188,7 +2391,7 @@ TEST_F(TranslatorLogicTest, DoubleReturn) {
 }
 
 TEST_F(TranslatorLogicTest, TripleReturn) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         return 66;
         return 66;
@@ -2200,7 +2403,7 @@ TEST_F(TranslatorLogicTest, TripleReturn) {
 }
 
 TEST_F(TranslatorLogicTest, VoidReturn) {
-  const std::string content = R"(
+  std::string_view content = R"(
       void my_package(int &a) {
         a = 22;
       })";
@@ -2210,7 +2413,7 @@ TEST_F(TranslatorLogicTest, VoidReturn) {
 }
 
 TEST_F(TranslatorLogicTest, AssignAfterReturn) {
-  const std::string content = R"(
+  std::string_view content = R"(
       void my_package(int &a) {
         return;
         a = 22;
@@ -2220,7 +2423,7 @@ TEST_F(TranslatorLogicTest, AssignAfterReturn) {
 }
 
 TEST_F(TranslatorLogicTest, AssignAfterReturnInIf) {
-  const std::string content = R"(
+  std::string_view content = R"(
       void my_package(int &a) {
         if(a == 5) {
           return;
@@ -2234,7 +2437,7 @@ TEST_F(TranslatorLogicTest, AssignAfterReturnInIf) {
 }
 
 TEST_F(TranslatorLogicTest, AssignAfterReturn3) {
-  const std::string content = R"(
+  std::string_view content = R"(
       void ff(int x[8]) {
        x[4] = x[2];
        return;
@@ -2258,7 +2461,7 @@ TEST_F(TranslatorLogicTest, AssignAfterReturn3) {
 }
 
 TEST_F(TranslatorLogicTest, CapitalizeFirstLetter) {
-  const std::string content = R"(
+  std::string_view content = R"(
        class State {
         public:
            State()
@@ -2310,7 +2513,7 @@ TEST_F(TranslatorLogicTest, CapitalizeFirstLetter) {
 }
 
 TEST_F(TranslatorLogicTest, AssignmentInBlock) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         int r = a;
         {
@@ -2323,7 +2526,7 @@ TEST_F(TranslatorLogicTest, AssignmentInBlock) {
 }
 
 TEST_F(TranslatorLogicTest, AssignmentInParens) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         int r = a;
         (r) = 55;
@@ -2333,8 +2536,8 @@ TEST_F(TranslatorLogicTest, AssignmentInParens) {
   Run({{"a", 100}}, 55, content);
 }
 
-TEST_F(TranslatorLogicTest, ShadowAssigment) {
-  const std::string content = R"(
+TEST_F(TranslatorLogicTest, ShadowAssignment) {
+  std::string_view content = R"(
       int my_package(int a) {
         int r = a;
         {
@@ -2349,7 +2552,7 @@ TEST_F(TranslatorLogicTest, ShadowAssigment) {
 }
 
 TEST_F(TranslatorLogicTest, CompoundStructAccess) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct TestX {
          int x;
        };
@@ -2389,7 +2592,7 @@ TEST_F(TranslatorLogicTest, SubstTemplateType) {
 }
 
 TEST_F(TranslatorLogicTest, TemplateStruct) {
-  const std::string content = R"(
+  std::string_view content = R"(
        template<typename T>
        struct TestX {
          T x;
@@ -2403,7 +2606,7 @@ TEST_F(TranslatorLogicTest, TemplateStruct) {
 }
 
 TEST_F(TranslatorLogicTest, ArrayOfStructsAccess) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct TestX {
          int x;
        };
@@ -2419,7 +2622,7 @@ TEST_F(TranslatorLogicTest, ArrayOfStructsAccess) {
 }
 
 TEST_F(TranslatorLogicTest, StructWithArrayAccess) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct TestX {
          int x[3];
        };
@@ -2435,7 +2638,7 @@ TEST_F(TranslatorLogicTest, StructWithArrayAccess) {
 }
 
 TEST_F(TranslatorLogicTest, StructInitList) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          long long x;
          long long y;
@@ -2449,7 +2652,7 @@ TEST_F(TranslatorLogicTest, StructInitList) {
 }
 
 TEST_F(TranslatorLogicTest, StructConditionalAssign) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          long long x;
          long long y;
@@ -2467,7 +2670,7 @@ TEST_F(TranslatorLogicTest, StructConditionalAssign) {
 }
 
 TEST_F(TranslatorLogicTest, StructInitListWrongCount) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          long long x;
          long long y;
@@ -2481,7 +2684,7 @@ TEST_F(TranslatorLogicTest, StructInitListWrongCount) {
 }
 
 TEST_F(TranslatorLogicTest, StructInitListWithDefaultnt) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          long long x;
          long long y;
@@ -2495,7 +2698,7 @@ TEST_F(TranslatorLogicTest, StructInitListWithDefaultnt) {
 }
 
 TEST_F(TranslatorLogicTest, StructInitListWithDefaultWrongCount) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          long long x;
          long long y;
@@ -2509,9 +2712,8 @@ TEST_F(TranslatorLogicTest, StructInitListWithDefaultWrongCount) {
 }
 
 TEST_F(TranslatorLogicTest, NoTupleStruct) {
-  const std::string content = R"(
-       #pragma hls_no_tuple
-       struct Test {
+  std::string_view content = R"(
+      struct [[hls_no_tuple]] Test {
          int x;
        };
        Test my_package(int a) {
@@ -2523,9 +2725,8 @@ TEST_F(TranslatorLogicTest, NoTupleStruct) {
 }
 
 TEST_F(TranslatorLogicTest, NoTupleMultiField) {
-  const std::string content = R"(
-       #pragma hls_no_tuple
-       struct Test {
+  std::string_view content = R"(
+       struct [[hls_no_tuple]] Test {
          int x;
          int y;
        };
@@ -2536,45 +2737,13 @@ TEST_F(TranslatorLogicTest, NoTupleMultiField) {
        })";
   auto ret = SourceToIr(content);
 
-  ASSERT_THAT(
-      SourceToIr(content).status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
-                                    testing::HasSubstr("only 1 field")));
-}
-
-TEST_F(TranslatorLogicTest, NoTupleMultiFieldLineComment) {
-  const std::string content = R"(
-       //#pragma hls_no_tuple
-       struct Test {
-         int x;
-         int y;
-       };
-       int my_package(int a) {
-         Test s;
-         s.x=a;
-         return s.x;
-       })";
-  Run({{"a", 311}}, 311, content);
-}
-
-TEST_F(TranslatorLogicTest, NoTupleMultiFieldBlockComment) {
-  const std::string content = R"(
-       /*
-       #pragma hls_no_tuple*/
-       struct Test {
-         int x;
-         int y;
-       };
-       int my_package(int a) {
-         Test s;
-         s.x=a;
-         return s.x;
-       })";
-  Run({{"a", 311}}, 311, content);
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                                     testing::HasSubstr("only 1 field")));
 }
 
 TEST_F(TranslatorLogicTest, StructMemberOrder) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          int x;
          long y;
@@ -2598,7 +2767,7 @@ TEST_F(TranslatorLogicTest, StructMemberOrder) {
 }
 
 TEST_F(TranslatorLogicTest, ImplicitConversion) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          Test(int v) : x(v) {
            this->y = 10;
@@ -2617,7 +2786,7 @@ TEST_F(TranslatorLogicTest, ImplicitConversion) {
 }
 
 TEST_F(TranslatorLogicTest, OperatorOverload) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          Test(int v) : x(v) {
            this->y = 10;
@@ -2642,7 +2811,7 @@ TEST_F(TranslatorLogicTest, OperatorOverload) {
 }
 
 TEST_F(TranslatorLogicTest, OperatorOnBuiltin) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          Test(int v) : x(v) {
          }
@@ -2659,7 +2828,7 @@ TEST_F(TranslatorLogicTest, OperatorOnBuiltin) {
 }
 
 TEST_F(TranslatorLogicTest, UnaryOperatorAvoidUnsequencedError2) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          Test(int v) : x(v) {
            this->y = 10;
@@ -2686,7 +2855,7 @@ TEST_F(TranslatorLogicTest, UnaryOperatorAvoidUnsequencedError2) {
 }
 
 TEST_F(TranslatorLogicTest, UnaryOperatorAvoidUnsequencedError3) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          Test(int v) : x(v) {
            this->y = 10;
@@ -2714,7 +2883,7 @@ TEST_F(TranslatorLogicTest, UnaryOperatorAvoidUnsequencedError3) {
 }
 
 TEST_F(TranslatorLogicTest, TypedefStruct) {
-  const std::string content = R"(
+  std::string_view content = R"(
        typedef struct {
          int x;
          int y;
@@ -2729,7 +2898,7 @@ TEST_F(TranslatorLogicTest, TypedefStruct) {
 }
 
 TEST_F(TranslatorLogicTest, ConvertToVoid) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct ts {int x;};
        long long my_package(long long a) {
          ts t;
@@ -2740,7 +2909,7 @@ TEST_F(TranslatorLogicTest, ConvertToVoid) {
 }
 
 TEST_F(TranslatorLogicTest, AvoidDoubleAssignmentFromBackwardsEval) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          Test(int v) : x(v) {
            this->y = 10;
@@ -2768,7 +2937,7 @@ TEST_F(TranslatorLogicTest, AvoidDoubleAssignmentFromBackwardsEval) {
 }
 
 TEST_F(TranslatorLogicTest, CompoundAvoidUnsequenced) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          int x;
        };
@@ -2782,7 +2951,7 @@ TEST_F(TranslatorLogicTest, CompoundAvoidUnsequenced) {
 }
 
 TEST_F(TranslatorLogicTest, CompoundAvoidUnsequenced2) {
-  const std::string content = R"(
+  std::string_view content = R"(
        int my_package(int a) {
          int s1[2] = {a, a};
          s1[0] = ++s1[1];
@@ -2792,7 +2961,7 @@ TEST_F(TranslatorLogicTest, CompoundAvoidUnsequenced2) {
 }
 
 TEST_F(TranslatorLogicTest, DefaultValues) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          int x;
          int y;
@@ -2805,7 +2974,7 @@ TEST_F(TranslatorLogicTest, DefaultValues) {
 }
 
 TEST_F(TranslatorLogicTest, StructMemberReferenceParameter) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          int p;
        };
@@ -2823,7 +2992,7 @@ TEST_F(TranslatorLogicTest, StructMemberReferenceParameter) {
 }
 
 TEST_F(TranslatorLogicTest, AnonStruct) {
-  const std::string content = R"(
+  std::string_view content = R"(
        int my_package(int a) {
          struct {
            int x;
@@ -2837,7 +3006,7 @@ TEST_F(TranslatorLogicTest, AnonStruct) {
 }
 
 TEST_F(TranslatorLogicTest, Inheritance) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Base {
          int x;
        };
@@ -2855,7 +3024,7 @@ TEST_F(TranslatorLogicTest, Inheritance) {
 }
 
 TEST_F(TranslatorLogicTest, BaseConstructor) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Base {
          Base() : x(88) { }
           int x;
@@ -2870,14 +3039,12 @@ TEST_F(TranslatorLogicTest, BaseConstructor) {
 }
 
 TEST_F(TranslatorLogicTest, BaseConstructorNoTuple) {
-  const std::string content = R"(
-       #pragma hls_no_tuple
-       struct Base {
+  std::string_view content = R"(
+       struct [[hls_no_tuple]] Base {
          Base() : x(88) { }
           int x;
        };
-       #pragma hls_no_tuple
-       struct Derived : public Base {
+       struct [[hls_no_tuple]] Derived : public Base {
        };
        int my_package(int x) {
          Derived b;
@@ -2887,12 +3054,11 @@ TEST_F(TranslatorLogicTest, BaseConstructorNoTuple) {
 }
 
 TEST_F(TranslatorLogicTest, InheritanceNoTuple) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Base {
          int x;
        };
-       #pragma hls_no_tuple
-       struct Derived : public Base {
+       struct [[hls_no_tuple]] Derived : public Base {
          int foo()const {
            return x;
          }
@@ -2906,13 +3072,11 @@ TEST_F(TranslatorLogicTest, InheritanceNoTuple) {
 }
 
 TEST_F(TranslatorLogicTest, InheritanceNoTuple2) {
-  const std::string content = R"(
-       #pragma hls_no_tuple
-       struct Base {
+  std::string_view content = R"(
+       struct [[hls_no_tuple]] Base {
          int x;
        };
-       #pragma hls_no_tuple
-       struct Derived : public Base {
+       struct [[hls_no_tuple]] Derived : public Base {
          int foo()const {
            return x;
          }
@@ -2926,15 +3090,13 @@ TEST_F(TranslatorLogicTest, InheritanceNoTuple2) {
 }
 
 TEST_F(TranslatorLogicTest, InheritanceNoTuple4) {
-  const std::string content = R"(
-       #pragma hls_no_tuple
-       struct Base {
+  std::string_view content = R"(
+       struct [[hls_no_tuple]] Base {
          int x;
          void set(int v) { x=v; }
          int get()const { return x; }
        };
-       #pragma hls_no_tuple
-       struct Derived : public Base {
+       struct [[hls_no_tuple]] Derived : public Base {
          void setd(int v) { x=v; }
          int getd()const { return x; }
        };
@@ -2949,7 +3111,7 @@ TEST_F(TranslatorLogicTest, InheritanceNoTuple4) {
 }
 
 TEST_F(TranslatorLogicTest, InheritanceTuple) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Base {
          int x;
          void set(int v) { x=v; }
@@ -2970,7 +3132,7 @@ TEST_F(TranslatorLogicTest, InheritanceTuple) {
 }
 
 TEST_F(TranslatorLogicTest, Constructor) {
-  const std::string content = R"(
+  std::string_view content = R"(
       struct Test {
         Test() : x(5) {
           y = 10;
@@ -2986,7 +3148,7 @@ TEST_F(TranslatorLogicTest, Constructor) {
 }
 
 TEST_F(TranslatorLogicTest, Destructor) {
-  const std::string content = R"(
+  std::string_view content = R"(
       struct Test {
         Test() : x(5) {
           y = 10;
@@ -3001,14 +3163,13 @@ TEST_F(TranslatorLogicTest, Destructor) {
         Test s;
         return s.x+s.y;
       })";
-  ASSERT_THAT(
-      SourceToIr(content).status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                    testing::HasSubstr("aren't yet called")));
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("aren't yet called")));
 }
 
 TEST_F(TranslatorLogicTest, ConstructorWithArg) {
-  const std::string content = R"(
+  std::string_view content = R"(
       struct Test {
         Test(int v) : x(v) {
           y = 10;
@@ -3024,7 +3185,7 @@ TEST_F(TranslatorLogicTest, ConstructorWithArg) {
 }
 
 TEST_F(TranslatorLogicTest, ConstructorWithThis) {
-  const std::string content = R"(
+  std::string_view content = R"(
       struct Test {
         Test(int v) : x(v) {
           this->y = 10;
@@ -3040,7 +3201,7 @@ TEST_F(TranslatorLogicTest, ConstructorWithThis) {
 }
 
 TEST_F(TranslatorLogicTest, ExplicitDefaultConstructor) {
-  const std::string content = R"(
+  std::string_view content = R"(
          struct TestR {
            int bb;
          };
@@ -3053,7 +3214,7 @@ TEST_F(TranslatorLogicTest, ExplicitDefaultConstructor) {
 }
 
 TEST_F(TranslatorLogicTest, ConditionallyAssignThis) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct ts {
          void blah() {
            return;
@@ -3072,7 +3233,7 @@ TEST_F(TranslatorLogicTest, ConditionallyAssignThis) {
 }
 
 TEST_F(TranslatorLogicTest, SetMemberInnerContext) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
          void set_x(int v) {
            { x = v; }
@@ -3090,7 +3251,7 @@ TEST_F(TranslatorLogicTest, SetMemberInnerContext) {
 }
 
 TEST_F(TranslatorLogicTest, StaticMethod) {
-  const std::string content = R"(
+  std::string_view content = R"(
        struct Test {
           static int foo(int a) {
             return a+5;
@@ -3104,7 +3265,7 @@ TEST_F(TranslatorLogicTest, StaticMethod) {
 
 TEST_F(TranslatorLogicTest, SignExtend) {
   {
-    const std::string content = R"(
+    std::string_view content = R"(
         unsigned long long my_package(long long a) {
           return long(a);
         })";
@@ -3112,7 +3273,7 @@ TEST_F(TranslatorLogicTest, SignExtend) {
     Run({{"a", 3}}, 3, content);
   }
   {
-    const std::string content = R"(
+    std::string_view content = R"(
         long long my_package(long long a) {
           return (unsigned long)a;
         })";
@@ -3123,7 +3284,7 @@ TEST_F(TranslatorLogicTest, SignExtend) {
 }
 
 TEST_F(TranslatorLogicTest, TopFunctionByName) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         return a + 1;
       })";
@@ -3132,7 +3293,7 @@ TEST_F(TranslatorLogicTest, TopFunctionByName) {
 }
 
 TEST_F(TranslatorLogicTest, TopFunctionPragma) {
-  const std::string content = R"(
+  std::string_view content = R"(
       #pragma hls_top
       int asdf(int a) {
         return a + 1;
@@ -3142,18 +3303,18 @@ TEST_F(TranslatorLogicTest, TopFunctionPragma) {
 }
 
 TEST_F(TranslatorLogicTest, TopFunctionNoPragma) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int asdf(int a) {
         return a + 1;
       })";
-  ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kNotFound,
-                  testing::HasSubstr("No top function found")));
+  ASSERT_THAT(
+      SourceToIr(content).status(),
+      absl_testing::StatusIs(absl::StatusCode::kNotFound,
+                             testing::HasSubstr("No top function found")));
 }
 
 TEST_F(TranslatorLogicTest, Function) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int do_something(int a) {
         return a;
       }
@@ -3165,7 +3326,7 @@ TEST_F(TranslatorLogicTest, Function) {
 }
 
 TEST_F(TranslatorLogicTest, FunctionNoOutputs) {
-  const std::string content = R"(
+  std::string_view content = R"(
       void do_nothing(int a) {
         (void)a;
       }
@@ -3178,18 +3339,16 @@ TEST_F(TranslatorLogicTest, FunctionNoOutputs) {
 }
 
 TEST_F(TranslatorLogicTest, TopFunctionNoOutputs) {
-  const std::string content = R"(
+  std::string_view content = R"(
       void my_package(int a) {
         (void)a;
       })";
 
-  ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kInvalidArgument,
-                                            testing::HasSubstr("no outputs")));
+  Run({{"a", xls::Value(xls::SBits(3, 32))}}, xls::Value::Tuple({}), content);
 }
 
 TEST_F(TranslatorLogicTest, DefaultArg) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int do_something(int a, int b=2) {
         return a+b;
       }
@@ -3201,7 +3360,7 @@ TEST_F(TranslatorLogicTest, DefaultArg) {
 }
 
 TEST_F(TranslatorLogicTest, FunctionInline) {
-  const std::string content = R"(
+  std::string_view content = R"(
       inline int do_something(int a) {
         return a;
       }
@@ -3213,7 +3372,7 @@ TEST_F(TranslatorLogicTest, FunctionInline) {
 }
 
 TEST_F(TranslatorLogicTest, TemplateFunction) {
-  const std::string content = R"(
+  std::string_view content = R"(
       template<int N>
       int do_something(int a) {
         return a+N;
@@ -3239,7 +3398,7 @@ TEST_F(TranslatorLogicTest, TemplateFunctionBool) {
 }
 
 TEST_F(TranslatorLogicTest, FunctionDeclOrder) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int do_something(int a);
       int my_package(int a) {
         return do_something(a);
@@ -3252,20 +3411,20 @@ TEST_F(TranslatorLogicTest, FunctionDeclOrder) {
 }
 
 TEST_F(TranslatorLogicTest, FunctionDeclMissing) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int do_something(int a);
       int my_package(int a) {
         return do_something(a);
       })";
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kNotFound,
                   testing::HasSubstr("do_something used but has no body")));
 }
 
 TEST_F(TranslatorLogicTest, ReferenceParameter) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int do_something(int &x, int a) {
         x += a;
         return x;
@@ -3279,7 +3438,7 @@ TEST_F(TranslatorLogicTest, ReferenceParameter) {
 }
 
 TEST_F(TranslatorLogicTest, Namespace) {
-  const std::string content = R"(
+  std::string_view content = R"(
       namespace test {
       int do_something(int a) {
         return a;
@@ -3293,7 +3452,7 @@ TEST_F(TranslatorLogicTest, Namespace) {
 }
 
 TEST_F(TranslatorLogicTest, NamespaceFailure) {
-  const std::string content = R"(
+  std::string_view content = R"(
       namespace test {
       int do_something(int a) {
         return a;
@@ -3305,13 +3464,12 @@ TEST_F(TranslatorLogicTest, NamespaceFailure) {
   auto ret = SourceToIr(content);
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kFailedPrecondition,
-                  testing::HasSubstr("Unable to parse text")));
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                                     testing::HasSubstr("undeclared")));
 }
 
 TEST_F(TranslatorLogicTest, Ternary) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         return a ? a : 11;
       })";
@@ -3322,12 +3480,11 @@ TEST_F(TranslatorLogicTest, Ternary) {
 
 // This is here mainly to check for graceful exit with no memory leaks
 TEST_F(TranslatorLogicTest, ParseFailure) {
-  const std::string content = "int my_package(int a) {";
+  std::string_view content = "int my_package(int a) {";
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kFailedPrecondition,
-                  testing::HasSubstr("Unable to parse text")));
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                                     testing::HasSubstr("expected")));
 }
 
 std::string NativeOperatorTestIr(const std::string& op) {
@@ -3470,7 +3627,7 @@ TEST_F(TranslatorLogicTest, NativeOperatorXor) {
 }
 
 TEST_F(TranslatorLogicTest, NativeOperatorNot) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(unsigned long long a) {
         return (long long)(~a);
       })";
@@ -3481,7 +3638,7 @@ TEST_F(TranslatorLogicTest, NativeOperatorNot) {
 }
 
 TEST_F(TranslatorLogicTest, NativeOperatorNeg) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a) {
         return (long long)(-a);
       })";
@@ -3492,7 +3649,7 @@ TEST_F(TranslatorLogicTest, NativeOperatorNeg) {
 }
 
 TEST_F(TranslatorLogicTest, NativeOperatorPlus) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a) {
         return (long long)(+a);
       })";
@@ -3516,13 +3673,17 @@ TEST_F(TranslatorLogicTest, NativeOperatorShrSigned) {
   }
 }
 TEST_F(TranslatorLogicTest, NativeOperatorShrUnsigned) {
-  const std::string content = R"(
+  std::string_view content = R"(
       unsigned long long my_package(unsigned long long a, unsigned long long b)
       {
         return a >> b;
       })";
-  { Run({{"a", 10}, {"b", 1}}, 5, content); }
-  { Run({{"a", -20}, {"b", 2}}, 4611686018427387899L, content); }
+  {
+    Run({{"a", 10}, {"b", 1}}, 5, content);
+  }
+  {
+    Run({{"a", -20}, {"b", 2}}, 4611686018427387899L, content);
+  }
 }
 TEST_F(TranslatorLogicTest, NativeOperatorShl) {
   const std::string op = "<<";
@@ -3539,7 +3700,7 @@ TEST_F(TranslatorLogicTest, NativeOperatorShl) {
 }
 TEST_F(TranslatorLogicTest, NativeOperatorPreInc) {
   {
-    const std::string content = R"(
+    std::string_view content = R"(
         int my_package(int a) {
           return ++a;
         })";
@@ -3547,7 +3708,7 @@ TEST_F(TranslatorLogicTest, NativeOperatorPreInc) {
     Run({{"a", 10}}, 11, content);
   }
   {
-    const std::string content = R"(
+    std::string_view content = R"(
         int my_package(int a) {
           ++a;
           return a;
@@ -3558,7 +3719,7 @@ TEST_F(TranslatorLogicTest, NativeOperatorPreInc) {
 }
 TEST_F(TranslatorLogicTest, NativeOperatorPostInc) {
   {
-    const std::string content = R"(
+    std::string_view content = R"(
         int my_package(int a) {
           return a++;
         })";
@@ -3566,7 +3727,7 @@ TEST_F(TranslatorLogicTest, NativeOperatorPostInc) {
     Run({{"a", 10}}, 10, content);
   }
   {
-    const std::string content = R"(
+    std::string_view content = R"(
         int my_package(int a) {
           a++;
           return a;
@@ -3577,7 +3738,7 @@ TEST_F(TranslatorLogicTest, NativeOperatorPostInc) {
 }
 TEST_F(TranslatorLogicTest, NativeOperatorPreDec) {
   {
-    const std::string content = R"(
+    std::string_view content = R"(
         int my_package(int a) {
           return --a;
         })";
@@ -3585,7 +3746,7 @@ TEST_F(TranslatorLogicTest, NativeOperatorPreDec) {
     Run({{"a", 10}}, 9, content);
   }
   {
-    const std::string content = R"(
+    std::string_view content = R"(
         int my_package(int a) {
           --a;
           return a;
@@ -3596,7 +3757,7 @@ TEST_F(TranslatorLogicTest, NativeOperatorPreDec) {
 }
 TEST_F(TranslatorLogicTest, NativeOperatorPostDec) {
   {
-    const std::string content = R"(
+    std::string_view content = R"(
         int my_package(int a) {
           return a--;
         })";
@@ -3604,7 +3765,7 @@ TEST_F(TranslatorLogicTest, NativeOperatorPostDec) {
     Run({{"a", 10}}, 10, content);
   }
   {
-    const std::string content = R"(
+    std::string_view content = R"(
         int my_package(int a) {
           a--;
           return a;
@@ -3747,7 +3908,7 @@ TEST_F(TranslatorLogicTest, NativeOperatorLOr) {
 }
 
 TEST_F(TranslatorLogicTest, NativeOperatorLNot) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(unsigned long long a) {
         return (long long)(!a);
       })";
@@ -3758,7 +3919,7 @@ TEST_F(TranslatorLogicTest, NativeOperatorLNot) {
 }
 
 TEST_F(TranslatorLogicTest, SizeOf) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package() {
         short foo[3] = {2,3,4};
         return sizeof(foo) / sizeof(foo[0]);
@@ -3768,7 +3929,7 @@ TEST_F(TranslatorLogicTest, SizeOf) {
 }
 
 TEST_F(TranslatorLogicTest, SizeOfDeep) {
-  const std::string content = R"(
+  std::string_view content = R"(
       struct TestInner {
         short foo;
       };
@@ -3784,7 +3945,7 @@ TEST_F(TranslatorLogicTest, SizeOfDeep) {
 }
 
 TEST_F(TranslatorLogicTest, ParenType) {
-  const std::string content = R"(
+  std::string_view content = R"(
     int thing(const int (&arr)[2]) {
       return arr[0] + arr[1];
     }
@@ -3797,7 +3958,7 @@ TEST_F(TranslatorLogicTest, ParenType) {
 }
 
 TEST_F(TranslatorLogicTest, DefaultArrayInit) {
-  const std::string content = R"(
+  std::string_view content = R"(
     struct Val {
       Val() : v(0) { }
       Val(const Val&o) : v(o.v) {
@@ -3816,14 +3977,13 @@ TEST_F(TranslatorLogicTest, DefaultArrayInit) {
       return 1+y.a[1].v;
     })";
 
-  ASSERT_THAT(
-      SourceToIr(content).status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kNotFound,
-                                    testing::HasSubstr("__builtin_memcpy")));
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kNotFound,
+                                     testing::HasSubstr("__builtin_memcpy")));
 }
 
 TEST_F(TranslatorLogicTest, ZeroIterationForLoop) {
-  const std::string content = R"(
+  std::string_view content = R"(
     long long my_package(long long a) {
       for(;0;) {}
       return a;
@@ -3832,34 +3992,33 @@ TEST_F(TranslatorLogicTest, ZeroIterationForLoop) {
 }
 
 TEST_F(TranslatorLogicTest, OnlyUnrolledLoops) {
-  const std::string content = R"(
+  std::string_view content = R"(
     long long my_package(long long a) {
       for(;1;) {}
       return a;
     })";
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kUnimplemented,
-                  testing::HasSubstr("loop missing #pragma")));
+                  testing::HasSubstr("missing #pragma or attribute")));
 }
 
 TEST_F(TranslatorLogicTest, InvalidUnrolledLoop) {
-  const std::string content = R"(
+  std::string_view content = R"(
     long long my_package(long long a) {
       #pragma hls_unroll yes
       for(;1;) {}
       return a;
     })";
 
-  ASSERT_THAT(
-      SourceToIr(content).status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kResourceExhausted,
-                                    testing::HasSubstr("maximum")));
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kResourceExhausted,
+                                     testing::HasSubstr("maximum")));
 }
 
 TEST_F(TranslatorLogicTest, NonPragmaNestedLoop) {
-  const std::string content = R"(
+  std::string_view content = R"(
     long long my_package(long long a) {
       #pragma hls_unroll yes
       for(int i = 0; i < 10; i++) {
@@ -3871,13 +4030,13 @@ TEST_F(TranslatorLogicTest, NonPragmaNestedLoop) {
     })";
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kUnimplemented,
-                  testing::HasSubstr("loop missing #pragma")));
+                  testing::HasSubstr("missing #pragma or attribute")));
 }
 
 TEST_F(TranslatorLogicTest, Label) {
-  const std::string content = R"(
+  std::string_view content = R"(
       long long my_package(long long a, long long b) {
         this_loop:
         #pragma hls_unroll yes
@@ -3891,34 +4050,33 @@ TEST_F(TranslatorLogicTest, Label) {
 }
 
 TEST_F(TranslatorLogicTest, DisallowUsed) {
-  const std::string content = R"(
+  std::string_view content = R"(
       #include "/xls_builtin.h"
 
       int foo(int a) {
         (void)__xlscc_unimplemented();
         return a+3;
       }
-  
+
       int my_package(int a) {
         return foo(a);
       })";
   auto ret = SourceToIr(content);
 
-  ASSERT_THAT(
-      SourceToIr(content).status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                    testing::HasSubstr("Unimplemented")));
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("Unimplemented")));
 }
 
 TEST_F(TranslatorLogicTest, DisallowUnused) {
-  const std::string content = R"(
+  std::string_view content = R"(
       #include "/xls_builtin.h"
 
       int foo(int a) {
         __xlscc_unimplemented();
         return a+3;
       }
-  
+
       int my_package(int a) {
         return a+5;
       })";
@@ -3930,7 +4088,7 @@ TEST_F(TranslatorLogicTest, DisallowUnused) {
 // This won't cause logical incorrectness, but it overcomplicates the IR
 // and can cause loop unrolling to fail.
 TEST_F(TranslatorLogicTest, ConditionsPerVariable) {
-  const std::string content = R"(
+  std::string_view content = R"(
     #pragma hls_top
     int my_package(int a, int b) {
       if(b) {
@@ -3944,10 +4102,11 @@ TEST_F(TranslatorLogicTest, ConditionsPerVariable) {
   xlscc::GeneratedFunction* pfunc = nullptr;
   XLS_ASSERT_OK(SourceToIr(content, &pfunc).status());
   ASSERT_NE(pfunc, nullptr);
-  xls::Node* return_node = pfunc->xls_func->return_value();
+  ASSERT_EQ(pfunc->slices.size(), 1);
+  xls::Node* return_node = pfunc->slices.front().function->return_value();
   ASSERT_NE(return_node, nullptr);
+  ASSERT_TRUE(return_node->Is<xls::Select>());
   xls::Select* select_node = return_node->As<xls::Select>();
-  ASSERT_NE(select_node, nullptr);
   const absl::Span<xls::Node* const>& cases = select_node->cases();
   ASSERT_EQ(cases.size(), 2);
   // Check for direct reference to parameter
@@ -3955,7 +4114,7 @@ TEST_F(TranslatorLogicTest, ConditionsPerVariable) {
 }
 
 TEST_F(TranslatorLogicTest, FileNumbersIncluded) {
-  const std::string content = R"(
+  std::string_view content = R"(
   #include "/xls_builtin.h"
 
   #pragma hls_top
@@ -3972,7 +4131,7 @@ TEST_F(TranslatorLogicTest, FileNumbersIncluded) {
 }
 
 TEST_F(TranslatorLogicTest, BooleanOrAssign) {
-  const std::string content = R"(
+  std::string_view content = R"(
   #pragma hls_top
   bool st(bool b) {
     b |= false;
@@ -3983,7 +4142,7 @@ TEST_F(TranslatorLogicTest, BooleanOrAssign) {
 }
 
 TEST_F(TranslatorLogicTest, BooleanAndAssign) {
-  const std::string content = R"(
+  std::string_view content = R"(
   #pragma hls_top
   bool st(bool b) {
     b &= true;
@@ -3994,7 +4153,7 @@ TEST_F(TranslatorLogicTest, BooleanAndAssign) {
 }
 
 TEST_F(TranslatorLogicTest, EnumConstant) {
-  const std::string content = R"(
+  std::string_view content = R"(
   struct Values{
    enum { zero = 2 };
   };
@@ -4008,7 +4167,7 @@ TEST_F(TranslatorLogicTest, EnumConstant) {
 }
 
 TEST_F(TranslatorLogicTest, NonInitEnumConstant) {
-  const std::string content = R"(
+  std::string_view content = R"(
   struct Values{
    enum { zero, one };
   };
@@ -4022,7 +4181,7 @@ TEST_F(TranslatorLogicTest, NonInitEnumConstant) {
 }
 
 TEST_F(TranslatorLogicTest, NonInitOneEnumConstant) {
-  const std::string content = R"(
+  std::string_view content = R"(
   struct Values{
    enum { zero, one };
   };
@@ -4036,7 +4195,7 @@ TEST_F(TranslatorLogicTest, NonInitOneEnumConstant) {
 }
 
 TEST_F(TranslatorLogicTest, TopMemberAccess) {
-  const std::string content = R"(
+  std::string_view content = R"(
       #include "/xls_builtin.h"
 
       struct Test {
@@ -4057,25 +4216,25 @@ TEST_F(TranslatorLogicTest, TopMemberAccess) {
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out1 = block_spec.add_channels();
     ch_out1->set_name("out");
     ch_out1->set_is_input(false);
-    ch_out1->set_type(FIFO);
+    ch_out1->set_type(CHANNEL_TYPE_FIFO);
   }
 
   XLS_ASSERT_OK(ScanFile(content));
-  package_.reset(new xls::Package("my_package"));
+  package_ = std::make_unique<xls::Package>("my_package");
   ASSERT_THAT(
       translator_->GenerateIR_Block(package_.get(), block_spec).status(),
-      xls::status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kUnimplemented,
           testing::HasSubstr("top level methods are not supported")));
 }
 
 TEST_F(TranslatorLogicTest, ParameterPack) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int inner(int a, int b, int c) {
           return a+2*b+5*c;
       }
@@ -4093,7 +4252,7 @@ TEST_F(TranslatorLogicTest, ParameterPack) {
 }
 
 TEST_F(TranslatorLogicTest, FunctionEnum) {
-  const std::string content = R"(
+  std::string_view content = R"(
     #pragma hls_top
     int sum(int a) {
         enum b { B0 = 0, B1 = 1 };
@@ -4104,7 +4263,7 @@ TEST_F(TranslatorLogicTest, FunctionEnum) {
 }
 
 TEST_F(TranslatorLogicTest, UnusedTemplate) {
-  const std::string content = R"(
+  std::string_view content = R"(
       template<typename T, int N>
       struct StructVal { T data[N]; };
 
@@ -4132,7 +4291,7 @@ TEST_F(TranslatorLogicTest, UnusedTemplate) {
 }
 
 TEST_F(TranslatorLogicTest, BinaryOpComma) {
-  const std::string content = R"(
+  std::string_view content = R"(
       #pragma hls_top
       int test(int a) {
           return (a=5,a+1);
@@ -4142,7 +4301,7 @@ TEST_F(TranslatorLogicTest, BinaryOpComma) {
 
 // Check that hls_array_allow_default_pad pragma fills with 0's
 TEST_F(TranslatorLogicTest, ArrayZeroExtendFillsZeros) {
-  const std::string content = R"(
+  std::string_view content = R"(
         #pragma hls_top
         int my_package(int a) {
          #pragma hls_array_allow_default_pad
@@ -4153,7 +4312,7 @@ TEST_F(TranslatorLogicTest, ArrayZeroExtendFillsZeros) {
 }
 
 TEST_F(TranslatorLogicTest, ArrayZeroExtendFillsZerosLargeMultidimension) {
-  const std::string content = R"(
+  std::string_view content = R"(
         #pragma hls_top
         int my_package(int a) {
          #pragma hls_array_allow_default_pad
@@ -4177,19 +4336,43 @@ TEST_F(TranslatorLogicTest, ArrayZeroExtendFillsZerosLargeMultidimension) {
 
 // Check that hls_array_allow_default_pad pragma maintains supplied values
 TEST_F(TranslatorLogicTest, ArrayZeroExtendMaintainsValues) {
-  const std::string content = R"(
+  std::string_view content = R"(
         #pragma hls_top
         int my_package(int a) {
          #pragma hls_array_allow_default_pad
          int x[4] = {1,2};
-         return x[1];
+         return x[a];
        })";
-  Run({{"a", 5}}, 2, content);
+  Run({{"a", 1}}, 2, content);
+  Run({{"a", 2}}, 0, content);
+}
+
+TEST_F(TranslatorLogicTest, ArrayExtendError) {
+  std::string_view content = R"(
+    class Foo {
+        #pragma hls_top
+        void my_package() {
+         int x[4] = {1,2};
+         (void)x;
+       }
+    };)";
+
+  XLS_ASSERT_OK(ScanFile(content, /*clang_argv=*/{},
+                         /*io_test_mode=*/false,
+                         /*error_on_init_interval=*/false,
+                         /*error_on_uninitialized=*/true));
+  package_ = std::make_unique<xls::Package>("my_package");
+  HLSBlock block_spec;
+  ASSERT_THAT(
+      translator_->GenerateIR_BlockFromClass(package_.get(), &block_spec,
+                                             /*top_level_init_interval=*/0),
+      absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                             testing::HasSubstr("number of initializers")));
 }
 
 // Check that hls_array_allow_default_pad pragma maintains supplied values
 TEST_F(TranslatorLogicTest, ArrayZeroExtendStruct) {
-  const std::string content = R"(
+  std::string_view content = R"(
         struct y {
           int z;
         };
@@ -4205,7 +4388,7 @@ TEST_F(TranslatorLogicTest, ArrayZeroExtendStruct) {
 // Check that hls_array_allow_default_pad pragma
 // works on structs with constructors
 TEST_F(TranslatorLogicTest, ArrayZeroExtendStructWithConstructor) {
-  const std::string content = R"(
+  std::string_view content = R"(
         struct y {
           int z;
           y() : z(7) {}
@@ -4222,7 +4405,7 @@ TEST_F(TranslatorLogicTest, ArrayZeroExtendStructWithConstructor) {
 
 // Check that enum array initializers function properly
 TEST_F(TranslatorLogicTest, EnumArrayInitializer) {
-  const std::string content = R"(
+  std::string_view content = R"(
         typedef enum {
           VAL_1,
           VAL_2
@@ -4236,7 +4419,7 @@ TEST_F(TranslatorLogicTest, EnumArrayInitializer) {
 }
 
 TEST_F(TranslatorLogicTest, ChannelTemplateType) {
-  const std::string content = R"(
+  std::string_view content = R"(
       #include "/xls_builtin.h"
       #pragma hls_top
       void test(int& in, int& out) {
@@ -4251,29 +4434,29 @@ TEST_F(TranslatorLogicTest, ChannelTemplateType) {
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out1 = block_spec.add_channels();
     ch_out1->set_name("out");
     ch_out1->set_is_input(false);
-    ch_out1->set_type(FIFO);
+    ch_out1->set_type(CHANNEL_TYPE_FIFO);
   }
   XLS_ASSERT_OK_AND_ASSIGN(xls::TempFile temp,
                            xls::TempFile::CreateWithContent(content, ".cc"));
   XLS_ASSERT_OK(ScanFile(temp));
-  package_.reset(new xls::Package("my_package"));
+  package_ = std::make_unique<xls::Package>("my_package");
   ASSERT_THAT(translator_
                   ->GenerateIR_Block(package_.get(), block_spec,
                                      /*top_level_init_interval=*/1)
                   .status(),
-              xls::status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kUnimplemented,
                   testing::HasSubstr(
                       "Channel type should be a template specialization")));
 }
 
 TEST_F(TranslatorLogicTest, ClassMemberInit) {
-  const std::string content = R"(
+  std::string_view content = R"(
     struct Foo {
       int x = 10;
     };
@@ -4286,7 +4469,7 @@ TEST_F(TranslatorLogicTest, ClassMemberInit) {
 }
 
 TEST_F(TranslatorLogicTest, CXXRecordDecl) {
-  const std::string content = R"(
+  std::string_view content = R"(
   int my_package(int a) {
    struct foo {
      int bar;
@@ -4299,10 +4482,10 @@ TEST_F(TranslatorLogicTest, CXXRecordDecl) {
 
 std::string GenerateEnumDef(std::vector<std::optional<int64_t>> variants) {
   const std::string src_template = R"(
-  #pragma hls_top
   enum class MyEnum {
     $0
   };
+  #pragma hls_top
   MyEnum my_package() {
     return (MyEnum)0;
   }
@@ -4429,7 +4612,7 @@ TEST_F(TranslatorLogicTest, EnumAutoNumberedNegative) {
 }
 
 TEST_F(TranslatorLogicTest, TypeAlias) {
-  const std::string content = R"(
+  std::string_view content = R"(
     template<class T>
     struct Bar {
       T val;
@@ -4446,7 +4629,7 @@ TEST_F(TranslatorLogicTest, TypeAlias) {
 }
 
 TEST_F(TranslatorLogicTest, AssignmentInInitialization) {
-  const std::string content = R"(
+  std::string_view content = R"(
         struct LeafBlock {
           int a;
           int b = a;
@@ -4461,7 +4644,7 @@ TEST_F(TranslatorLogicTest, AssignmentInInitialization) {
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingInitialization) {
-  const std::string content = R"(
+  std::string_view content = R"(
         struct LeafBlock {
           int a;
           int b = a;
@@ -4475,7 +4658,7 @@ TEST_F(TranslatorLogicTest, SelfReferencingInitialization) {
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingInitialization2) {
-  const std::string content = R"(
+  std::string_view content = R"(
         struct LeafBlock {
           int a = 55;
           int b = a;
@@ -4489,7 +4672,7 @@ TEST_F(TranslatorLogicTest, SelfReferencingInitialization2) {
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingInitialization3) {
-  const std::string content = R"(
+  std::string_view content = R"(
         struct LeafBlock {
           int a = 55;
           int b;
@@ -4504,7 +4687,7 @@ TEST_F(TranslatorLogicTest, SelfReferencingInitialization3) {
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingInitializationLValue) {
-  const std::string content = R"(
+  std::string_view content = R"(
         struct LeafBlock {
           int& a;
           int& b = a;
@@ -4520,7 +4703,7 @@ TEST_F(TranslatorLogicTest, SelfReferencingInitializationLValue) {
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingInitializationCtor) {
-  const std::string content = R"(
+  std::string_view content = R"(
         struct LeafBlock {
           LeafBlock(int a) : a_(a) {
           }
@@ -4537,7 +4720,7 @@ TEST_F(TranslatorLogicTest, SelfReferencingInitializationCtor) {
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingInitializationCtorLValue) {
-  const std::string content = R"(
+  std::string_view content = R"(
         struct LeafBlock {
           LeafBlock(int& a) : a_(a) {
           }
@@ -4552,14 +4735,14 @@ TEST_F(TranslatorLogicTest, SelfReferencingInitializationCtorLValue) {
         aa = 11;
         return block.b_;
        })";
-  ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kUnimplemented,
-                  testing::HasSubstr("Don't know how to create")));
+  ASSERT_THAT(
+      SourceToIr(content).status(),
+      absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                             testing::HasSubstr("Don't know how to create")));
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingInitializationHierarchical) {
-  const std::string content = R"(
+  std::string_view content = R"(
         struct LeafBlock {
           int a;
           int b;
@@ -4579,7 +4762,7 @@ TEST_F(TranslatorLogicTest, SelfReferencingInitializationHierarchical) {
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingInitializationHierarchical2) {
-  const std::string content = R"(
+  std::string_view content = R"(
         struct LeafBlock {
           int a;
           int b;
@@ -4602,7 +4785,7 @@ TEST_F(TranslatorLogicTest, SelfReferencingInitializationHierarchical2) {
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingInitializationHierarchicalLValues) {
-  const std::string content = R"(
+  std::string_view content = R"(
 
         struct LeafBlock {
           int& a;
@@ -4619,7 +4802,7 @@ TEST_F(TranslatorLogicTest, SelfReferencingInitializationHierarchicalLValues) {
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingInitializationAssignment) {
-  const std::string content = R"(
+  std::string_view content = R"(
         struct LeafBlock {
           int a;
           int b;
@@ -4639,7 +4822,7 @@ TEST_F(TranslatorLogicTest, SelfReferencingInitializationAssignment) {
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingInitializationHierarchicalLValue) {
-  const std::string content = R"(
+  std::string_view content = R"(
         struct LeafBlock {
           int& a;
           int& b;
@@ -4657,16 +4840,16 @@ TEST_F(TranslatorLogicTest, SelfReferencingInitializationHierarchicalLValue) {
        })";
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kUnimplemented,
                   testing::HasSubstr("Tried to access 'this' in a context")));
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingInitializationBlockFromClass) {
-  const std::string content = R"(
+  std::string_view content = R"(
     struct LeafBlock {
       int a;
-      int b;  
+      int b;
     };
 
     struct HierBlock {
@@ -4692,10 +4875,10 @@ TEST_F(TranslatorLogicTest, SelfReferencingInitializationBlockFromClass) {
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingInitializationBlockFromClass2) {
-  const std::string content = R"(
+  std::string_view content = R"(
     struct LeafBlock {
       int a;
-      int b;  
+      int b;
     };
 
     struct HierBlock {
@@ -4722,7 +4905,7 @@ TEST_F(TranslatorLogicTest, SelfReferencingInitializationBlockFromClass2) {
 }
 
 TEST_F(TranslatorLogicTest, SelfReferencingHierarchicalChannelsGenerates) {
-  const std::string content = R"(
+  std::string_view content = R"(
     struct LeafBlock {
       __xls_channel<long, __xls_channel_dir_Out> out;
     };
@@ -4741,7 +4924,7 @@ TEST_F(TranslatorLogicTest, SelfReferencingHierarchicalChannelsGenerates) {
   XLS_ASSERT_OK(ScanFile(content, /*clang_argv=*/{},
                          /*io_test_mode=*/false,
                          /*error_on_init_interval=*/false));
-  package_.reset(new xls::Package("my_package"));
+  package_ = std::make_unique<xls::Package>("my_package");
   HLSBlock block_spec;
   XLS_ASSERT_OK(
       translator_->GenerateIR_BlockFromClass(package_.get(), &block_spec,
@@ -4749,7 +4932,7 @@ TEST_F(TranslatorLogicTest, SelfReferencingHierarchicalChannelsGenerates) {
 }
 
 TEST_F(TranslatorLogicTest, DoubleSupportToInt) {
-  const std::string content = R"(
+  std::string_view content = R"(
     long long my_package() {
       const auto x = 5.5;
       return (int)x;
@@ -4758,7 +4941,7 @@ TEST_F(TranslatorLogicTest, DoubleSupportToInt) {
 }
 
 TEST_F(TranslatorLogicTest, FloatSupportToInt) {
-  const std::string content = R"(
+  std::string_view content = R"(
     long long my_package() {
       const auto x = 5.5f;
       return (int)x;
@@ -4767,7 +4950,7 @@ TEST_F(TranslatorLogicTest, FloatSupportToInt) {
 }
 
 TEST_F(TranslatorLogicTest, FloatConvertToInt) {
-  const std::string content = R"(
+  std::string_view content = R"(
     long long convert(float value) {
       return (long long)value;
     }
@@ -4778,7 +4961,7 @@ TEST_F(TranslatorLogicTest, FloatConvertToInt) {
 }
 
 TEST_F(TranslatorLogicTest, ConstexprBinaryOperatorsForDouble) {
-  const std::string content = R"(
+  std::string_view content = R"(
     long long my_package() {
       const double x = 5.5 + 1.0;
       return (int)(x * 3);
@@ -4787,7 +4970,7 @@ TEST_F(TranslatorLogicTest, ConstexprBinaryOperatorsForDouble) {
 }
 
 TEST_F(TranslatorLogicTest, ConstexprBinaryOperatorsForFloat) {
-  const std::string content = R"(
+  std::string_view content = R"(
     long long my_package() {
       const float x = 5.5f + 1.0f;
       return (int)(x * 3);
@@ -4795,38 +4978,8 @@ TEST_F(TranslatorLogicTest, ConstexprBinaryOperatorsForFloat) {
   Run({}, 19, content);
 }
 
-TEST_F(TranslatorLogicTest, WarnIfKnownPragmaIncorrectlyFormatted) {
-  const std::string content = R"(
-  #pragma top
-  int st() {
-    return 1;
-  })";
-  ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kNotFound,
-                  testing::HasSubstr("No top function found")));
-  ASSERT_EQ(this->log_entries_.size(), 1);
-  ASSERT_TRUE(absl::StrContains(this->log_entries_[0].text_message,
-                                "#pragma 'top' requires 'hls_' prefix"));
-}
-
-TEST_F(TranslatorLogicTest, WarnIfKnownPragmaIsUppercase) {
-  const std::string content = R"(
-  #pragma HLS_TOP
-  int st() {
-    return 1;
-  })";
-  ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kNotFound,
-                  testing::HasSubstr("No top function found")));
-  ASSERT_EQ(this->log_entries_.size(), 1);
-  ASSERT_TRUE(absl::StrContains(this->log_entries_[0].text_message,
-                                "#pragma must be lowercase:"));
-}
-
 TEST_F(TranslatorLogicTest, PragmaAllowsCommentsBetween) {
-  const std::string content = R"(
+  std::string_view content = R"(
   #pragma hls_top
   // some comment
   int st() {
@@ -4836,7 +4989,7 @@ TEST_F(TranslatorLogicTest, PragmaAllowsCommentsBetween) {
 }
 
 TEST_F(TranslatorLogicTest, PragmaAllowsBlankLines) {
-  const std::string content = R"(
+  std::string_view content = R"(
   #pragma hls_top
 
   int st() {
@@ -4846,43 +4999,29 @@ TEST_F(TranslatorLogicTest, PragmaAllowsBlankLines) {
 }
 
 TEST_F(TranslatorLogicTest, PragmaIgnoresSpaces) {
-  const std::string content = R"(
-  #pragma    hls_top  
+  std::string_view content = R"(
+  #pragma    hls_top
   int st() {
     return 1;
   })";
   Run({}, 1, content);
 }
 
-TEST_F(TranslatorLogicTest, PragmaHlsPartialUnrollTreatedAsFullUnroll) {
-  const std::string content = R"(
-  #pragma hls_top  
-  int st() {
-    int sum = 0;
-    #pragma hls_unroll  4
-    for (int i = 0; i < 4; i++) {
-      sum += i;
-    }
-    return sum;
-  })";
-  Run({}, 0 + 1 + 2 + 3, content);
-}
-
 TEST_F(TranslatorLogicTest, CommentedPragmaIgnored) {
-  const std::string content = R"(
-  // #pragma    hls_top  
+  std::string_view content = R"(
+  // #pragma    hls_top
   int st() {
     return 1;
   })";
-  ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kNotFound,
-                  testing::HasSubstr("No top function found")));
+  ASSERT_THAT(
+      SourceToIr(content).status(),
+      absl_testing::StatusIs(absl::StatusCode::kNotFound,
+                             testing::HasSubstr("No top function found")));
 }
 
 TEST_F(TranslatorLogicTest, AllowEmptyInitializerList) {
-  const std::string content = R"(
-  #pragma hls_top  
+  std::string_view content = R"(
+  #pragma hls_top
   int st() {
     int a[20] = {};
     return a[14];
@@ -4891,38 +5030,35 @@ TEST_F(TranslatorLogicTest, AllowEmptyInitializerList) {
 }
 
 TEST_F(TranslatorLogicTest, UnknownPragmasIgnored) {
-  const std::string content = R"(
+  std::string_view content = R"(
   #pragma unknown pragma
   #pragma top
-  
-  #pragma hls_top  
-  int st() {
-    return 1;
-  })";
-  ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kOk));
-  ASSERT_EQ(this->log_entries_.size(), 1);
-  ASSERT_TRUE(absl::StrContains(this->log_entries_[0].text_message,
-                                "#pragma 'top' requires 'hls_' prefix"));
-}
-
-TEST_F(TranslatorLogicTest, OnlyUnknownPragmasGiveNoWarnings) {
-  const std::string content = R"(
-  #pragma unknown pragma
-  
-  #pragma once
 
   #pragma hls_top
   int st() {
     return 1;
   })";
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kOk));
-  ASSERT_EQ(this->log_entries_.size(), 0);
+              absl_testing::StatusIs(absl::StatusCode::kOk));
+}
+
+TEST_F(TranslatorLogicTest, OnlyUnknownPragmasGiveNoWarnings) {
+  std::string_view content = R"(
+  #pragma unknown pragma
+
+  #pragma once
+
+  #pragma hls_top
+  int st() {
+    return 1;
+  })";
+  EXPECT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kOk));
+  EXPECT_EQ(this->log_entries_.size(), 0);
 }
 
 TEST_F(TranslatorLogicTest, OnlyValidPragmasGiveNoWarnings) {
-  const std::string content = R"(
+  std::string_view content = R"(
   #pragma hls_top
   int st() {
     #pragma hls_array_allow_default_pad
@@ -4930,12 +5066,12 @@ TEST_F(TranslatorLogicTest, OnlyValidPragmasGiveNoWarnings) {
     return x[1];
   })";
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kOk));
+              absl_testing::StatusIs(absl::StatusCode::kOk));
   ASSERT_EQ(this->log_entries_.size(), 0);
 }
 
 TEST_F(TranslatorLogicTest, MultipleCallsInTree) {
-  const std::string content = R"(
+  std::string_view content = R"(
     int xls_int(int x) {
       return x;
     }
@@ -4951,7 +5087,7 @@ TEST_F(TranslatorLogicTest, MultipleCallsInTree) {
 }
 
 TEST_F(TranslatorLogicTest, Recursion) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int do_something(int a) {
         if(a > 100) {
           return do_something(a / 2);
@@ -4964,12 +5100,12 @@ TEST_F(TranslatorLogicTest, Recursion) {
   auto ret = SourceToIr(content);
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                            testing::HasSubstr("ecursion")));
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("ecursion")));
 }
 
 TEST_F(TranslatorLogicTest, TopRecursion) {
-  const std::string content = R"(
+  std::string_view content = R"(
       int my_package(int a) {
         if(a > 100) {
           return my_package(a / 2);
@@ -4979,8 +5115,365 @@ TEST_F(TranslatorLogicTest, TopRecursion) {
   auto ret = SourceToIr(content);
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                            testing::HasSubstr("ecursion")));
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("ecursion")));
+}
+
+TEST_F(TranslatorLogicTest, ErrorOnUninitializedBasic) {
+  std::string_view content = R"(
+    struct HierBlock {
+      __xls_channel<long, __xls_channel_dir_Out> out;
+
+      #pragma hls_top
+      void Run() {
+        int y;
+        (void)y;
+        out.write(y);
+      }
+    };)";
+
+  ASSERT_THAT(ScanFile(content, /*clang_argv=*/{},
+                       /*io_test_mode=*/false,
+                       /*error_on_init_interval=*/false,
+                       /*error_on_uninitialized=*/true),
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                                     testing::HasSubstr("uninitialized")));
+}
+
+TEST_F(TranslatorLogicTest, ErrorOnUninitializedArray) {
+  std::string_view content = R"(
+    struct HierBlock {
+      __xls_channel<long, __xls_channel_dir_Out> out;
+
+      #pragma hls_top
+      void Run() {
+        int y[2];
+        out.write(y[1]);
+      }
+    };)";
+
+  XLS_ASSERT_OK(ScanFile(content, /*clang_argv=*/{},
+                         /*io_test_mode=*/false,
+                         /*error_on_init_interval=*/false,
+                         /*error_on_uninitialized=*/true));
+  package_ = std::make_unique<xls::Package>("my_package");
+  HLSBlock block_spec;
+  ASSERT_THAT(translator_
+                  ->GenerateIR_BlockFromClass(package_.get(), &block_spec,
+                                              /*top_level_init_interval=*/0)
+                  .status(),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     testing::HasSubstr("efault init")));
+}
+
+TEST_F(TranslatorLogicTest, ErrorOnUninitializedWrongCount) {
+  std::string_view content = R"(
+    struct HierBlock {
+      __xls_channel<long, __xls_channel_dir_Out> out;
+
+      #pragma hls_top
+      void Run() {
+        int y[2] = {1};
+        out.write(y[1]);
+      }
+    };)";
+
+  XLS_ASSERT_OK(ScanFile(content, /*clang_argv=*/{},
+                         /*io_test_mode=*/false,
+                         /*error_on_init_interval=*/false,
+                         /*error_on_uninitialized=*/true));
+  package_ = std::make_unique<xls::Package>("my_package");
+  HLSBlock block_spec;
+  ASSERT_THAT(translator_
+                  ->GenerateIR_BlockFromClass(package_.get(), &block_spec,
+                                              /*top_level_init_interval=*/0)
+                  .status(),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     testing::HasSubstr("number of init")));
+}
+
+TEST_F(TranslatorLogicTest, ErrorOnUninitializedWrongCountPragma) {
+  std::string_view content = R"(
+    struct HierBlock {
+      __xls_channel<long, __xls_channel_dir_Out> out;
+
+      #pragma hls_top
+      void Run() {
+        #pragma hls_array_allow_default_pad
+        int y[2] = {1};
+        out.write(y[1]);
+      }
+    };)";
+
+  XLS_ASSERT_OK(ScanFile(content, /*clang_argv=*/{},
+                         /*io_test_mode=*/false,
+                         /*error_on_init_interval=*/false,
+                         /*error_on_uninitialized=*/true));
+  package_ = std::make_unique<xls::Package>("my_package");
+  HLSBlock block_spec;
+  ASSERT_THAT(translator_
+                  ->GenerateIR_BlockFromClass(package_.get(), &block_spec,
+                                              /*top_level_init_interval=*/0)
+                  .status(),
+              absl_testing::StatusIs(absl::StatusCode::kOk));
+}
+
+TEST_F(TranslatorLogicTest, ErrorOnUninitializedDefaultMember) {
+  std::string_view content = R"(
+    struct HierBlock {
+      __xls_channel<long, __xls_channel_dir_Out> out;
+
+      int y;
+
+      #pragma hls_top
+      void Run() {
+        out.write(y);
+      }
+    };)";
+
+  XLS_ASSERT_OK(ScanFile(content, /*clang_argv=*/{},
+                         /*io_test_mode=*/false,
+                         /*error_on_init_interval=*/false,
+                         /*error_on_uninitialized=*/true));
+  package_ = std::make_unique<xls::Package>("my_package");
+  HLSBlock block_spec;
+  ASSERT_THAT(translator_
+                  ->GenerateIR_BlockFromClass(package_.get(), &block_spec,
+                                              /*top_level_init_interval=*/0)
+                  .status(),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     testing::HasSubstr("not init")));
+}
+
+TEST_F(TranslatorLogicTest, CtorInArray) {
+  std::string_view content = R"(
+    struct DefaultUnrollInner {
+        DefaultUnrollInner() {
+            x = 10;
+        }
+        int x;
+    };
+
+    struct DefaultUnroll {
+    public:
+        DefaultUnrollInner i[4];
+    };
+
+    #pragma hls_top
+    int foo() {
+      DefaultUnroll d;
+      return d.i[0].x;
+    }
+)";
+  Run({}, 10, content);
+}
+
+TEST_F(TranslatorLogicTest, NoCtorInArray) {
+  std::string_view content = R"(
+    struct DefaultUnrollInner {
+        int x;
+    };
+
+    struct DefaultUnroll {
+    public:
+        DefaultUnrollInner i[4];
+    };
+
+    #pragma hls_top
+    int foo() {
+      DefaultUnroll d;
+      return d.i[0].x;
+    }
+)";
+  Run({}, 0, content);
+}
+
+TEST_F(TranslatorLogicTest, CtorInMultidimensionalArray) {
+  std::string_view content = R"(
+    struct DefaultUnrollInner {
+        DefaultUnrollInner() {
+            x = 10;
+        }
+        int x;
+    };
+
+    struct DefaultUnroll {
+    public:
+        DefaultUnrollInner i[4][2];
+    };
+
+    #pragma hls_top
+    int foo() {
+      DefaultUnroll d;
+      return d.i[0][0].x;
+    }
+)";
+  Run({}, 10, content);
+}
+
+TEST_F(TranslatorLogicTest, DelegatingCtorInArray) {
+  std::string_view content = R"(
+    struct DefaultUnrollInner {
+        DefaultUnrollInner(int value) {
+          x = value; 
+        }
+        DefaultUnrollInner(): DefaultUnrollInner(10) {}
+        int x;
+    };
+
+    struct DefaultUnroll {
+    public:
+        DefaultUnrollInner i[4];
+    };
+
+    #pragma hls_top
+    int foo() {
+      DefaultUnroll d;
+      return d.i[0].x;
+    }
+)";
+  Run({}, 10, content);
+}
+
+TEST_F(TranslatorLogicTest, DelegatingCtor) {
+  std::string_view content = R"(
+    struct DefaultUnrollInner {
+        DefaultUnrollInner(int value) {
+          x = value;
+        }
+        DefaultUnrollInner(int value, bool b) : DefaultUnrollInner(value) {}
+        DefaultUnrollInner(): DefaultUnrollInner(10, true) {}
+        int x;
+    };
+
+    #pragma hls_top
+    int foo() {
+      DefaultUnrollInner d;
+      return d.x;
+    }
+)";
+  Run({}, 10, content);
+}
+
+TEST_F(TranslatorLogicTest, MixedCtorSettingValueAndBase) {
+  std::string_view content = R"(
+  class A {
+  public:
+    int x = 7;
+  };
+  class B : public A {
+  public:
+    int f;
+    B(A& a) : A(a), f(3) { }
+  };
+
+  #pragma hls_top
+    int foo() {
+      A d;
+      B b(d);
+      return b.x + b.f;
+    }
+)";
+  Run({}, 10, content);
+}
+
+TEST_F(TranslatorLogicTest, ArrayAsTuple) {
+  std::string_view content = R"(
+       long long my_package(long long a, long long b) {
+         long long arr[4] [[clang::annotate_type("hls_array_as_tuple")]];
+         arr[0] = a;
+         arr[1] = b;
+         return arr[0]+arr[1];
+       })";
+
+  Run({{"a", 11}, {"b", 50}}, 61, content);
+}
+
+TEST_F(TranslatorLogicTest, ArrayAsTupleCall) {
+  std::string_view content = R"(
+       long long add_it(
+        long long arr[4] [[clang::annotate_type("hls_array_as_tuple")]]) {
+        return arr[0]+arr[1];
+       }
+
+       long long my_package(long long a, long long b) {
+         long long arr[4] [[clang::annotate_type("hls_array_as_tuple")]];
+         arr[0] = a;
+         arr[1] = b;
+         return add_it(arr);
+       })";
+
+  Run({{"a", 11}, {"b", 50}}, 61, content);
+
+  const xls::FunctionBase* add_it = nullptr;
+  for (const xls::FunctionBase* f : package_->GetFunctionBases()) {
+    if (absl::StrContains(f->name(), "add_it")) {
+      add_it = f;
+      break;
+    }
+  }
+
+  ASSERT_NE(add_it, nullptr);
+  ASSERT_EQ(add_it->params().size(), 1);
+  EXPECT_TRUE(add_it->params()[0]->GetType()->IsTuple());
+}
+
+TEST_F(TranslatorLogicTest, ArrayAsTupleCallMixed) {
+  std::string_view content = R"(
+       long long add_it(
+        long long arr[4]) {
+        return arr[0]+arr[1];
+       }
+
+       long long my_package(long long a, long long b) {
+         long long arr[4] [[clang::annotate_type("hls_array_as_tuple")]];
+         arr[0] = a;
+         arr[1] = b;
+         return add_it(arr);
+       })";
+
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("tuple vs array")));
+}
+
+TEST_F(TranslatorLogicTest, ArrayAsTupleCallMixed2) {
+  std::string_view content = R"(
+       long long add_it(
+        long long arr[4] [[clang::annotate_type("hls_array_as_tuple")]]) {
+        return arr[0]+arr[1];
+       }
+
+       long long my_package(long long a, long long b) {
+         long long arr[4];
+         arr[0] = a;
+         arr[1] = b;
+         return add_it(arr);
+       })";
+
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("tuple vs array")));
+}
+
+TEST_F(TranslatorLogicTest, ArrayAsTupleSlice) {
+  std::string_view content = R"(
+       long long add_it(
+        long long arr[2] [[clang::annotate_type("hls_array_as_tuple")]]) {
+        return arr[0]+arr[1];
+       }
+
+       long long my_package(long long a, long long b) {
+         long long arr[4] [[clang::annotate_type("hls_array_as_tuple")]];
+         arr[0] = a;
+         arr[1] = b;
+         return add_it(&arr[0]);
+       })";
+
+  ASSERT_THAT(
+      SourceToIr(content).status(),
+      absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                             testing::HasSubstr("Slicing not supported")));
 }
 
 }  // namespace

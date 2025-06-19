@@ -19,14 +19,15 @@
 #include <functional>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
 #include "xls/codegen/codegen_options.h"
 #include "xls/codegen/flattening.h"
-#include "xls/codegen/vast.h"
-#include "xls/common/logging/logging.h"
+#include "xls/codegen/vast/vast.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/bits.h"
@@ -46,7 +47,8 @@ bool OperandMustBeNamedReference(Node* node, int64_t operand_no) {
   // necessarily indexable. Generally, if the expression emitted for a node is
   // an indexing operation and the operand is emitted as an indexable expression
   // then there is no need to make the operand a declared expression because
-  // indexing/slicing can be chained.
+  // indexing/slicing can be chained... unless we might need to narrow it if it
+  // uses more bits than the size of the array.
   //
   // For example, a kArrayIndex of a kArrayIndex can be emitted as a chained
   // VAST Index expression like so:
@@ -67,11 +69,37 @@ bool OperandMustBeNamedReference(Node* node, int64_t operand_no) {
   };
   switch (node->op()) {
     case Op::kBitSlice:
-      XLS_CHECK_EQ(operand_no, 0);
+      CHECK_EQ(operand_no, 0);
       return !operand_is_indexable();
     case Op::kDynamicBitSlice:
       return operand_no == 0 && !operand_is_indexable();
-    case Op::kArrayIndex:
+    case Op::kArrayIndex: {
+      if (operand_is_indexable()) {
+        return false;
+      }
+      if (operand_no == ArrayIndex::kArgOperand) {
+        // The array needs to be indexable.
+        return true;
+      }
+      // Each index must be indexable if and only if we might need to truncate
+      // it to ensure we don't use too many bits for the array's indexing
+      // operation.
+      Type* array_type = node->As<ArrayIndex>()->array()->GetType();
+      // Indices start at operand_no 1, with the array at operand_no 0.
+      for (int64_t i = 1; i < operand_no; ++i) {
+        array_type = array_type->AsArrayOrDie()->element_type();
+      }
+      CHECK(array_type->IsArray());
+
+      Node* operand = node->operand(operand_no);
+      if (operand->Is<::xls::Literal>()) {
+        return bits_ops::UGreaterThanOrEqual(
+            operand->As<::xls::Literal>()->value().bits(),
+            array_type->AsArrayOrDie()->size());
+      }
+      return operand->BitCountOrDie() >=
+             Bits::MinBitCountUnsigned(array_type->AsArrayOrDie()->size());
+    }
     case Op::kArrayUpdate:
       return operand_no == 0 && !operand_is_indexable();
     case Op::kOneHot:
@@ -90,9 +118,8 @@ bool OperandMustBeNamedReference(Node* node, int64_t operand_no) {
       // For operands wider than one bit, sign extend slices out the sign bit of
       // the operand so its operand needs to be a reference.
       // TODO(meheff): It might be better to have a unified place to hold both
-      // the Verilog expression and constraints for the Ops, a la
-      // op_specification.py
-      XLS_CHECK_EQ(operand_no, 0);
+      // the Verilog expression and constraints for the Ops.
+      CHECK_EQ(operand_no, 0);
       return node->operand(operand_no)->BitCountOrDie() > 1 &&
              !operand_is_indexable();
     case Op::kEncode:
@@ -283,28 +310,12 @@ absl::StatusOr<Expression*> EmitShift(Node* shift, Expression* operand,
                                       Expression* shift_amount,
                                       VerilogFile* file) {
   Expression* shifted_operand;
-  if (shift->op() == Op::kShra) {
-    // To perform an arithmetic shift right the left operand must be cast to a
-    // signed value, ie:
-    //
-    //   $signed(x) >>> y
-    //
-    // Also, wrap the expression in $unsigned to prevent the signed property
-    // from leaking out into the rest of the expression.
-    //
-    //   $unsigned($signed(x) >>> y) op ...
-    //
-    // Without the unsigned the '>>>' expression would be treated as a signed
-    // value potentially affecting the evaluation of 'op'.  This unsigned cast
-    // is also necessary for correctness of the shift evaluation when the shift
-    // appears in a ternary expression because of Verilog type rules.
-    shifted_operand = file->Make<UnsignedCast>(
-        shift->loc(), file->Shra(file->Make<SignedCast>(shift->loc(), operand),
-                                 shift_amount, shift->loc()));
-  } else if (shift->op() == Op::kShrl) {
+  XLS_RET_CHECK_NE(shift->op(), Op::kShra)
+      << absl::StreamFormat("Shra is handled by emitting a function.");
+  if (shift->op() == Op::kShrl) {
     shifted_operand = file->Shrl(operand, shift_amount, shift->loc());
   } else {
-    XLS_CHECK_EQ(shift->op(), Op::kShll);
+    CHECK_EQ(shift->op(), Op::kShll);
     shifted_operand = file->Shll(operand, shift_amount, shift->loc());
   }
 
@@ -348,7 +359,7 @@ absl::StatusOr<Expression*> EmitDecode(Decode* decode, Expression* operand,
     // to guard the input to avoid overshifting.
     return result;
   }
-  // If operand value is greater than the width of the output, zero shoud be
+  // If operand value is greater than the width of the output, zero should be
   // emitted.
   return file->Ternary(
       file->GreaterThanEquals(
@@ -417,6 +428,7 @@ absl::StatusOr<Expression*> EmitEqOrNe(Node* node,
   DecomposeExpression(inputs[1], node->operand(1)->GetType(), file, node->loc(),
                       &rhs_parts);
   std::vector<Expression*> comparisons;
+  comparisons.reserve(lhs_parts.size());
   for (int64_t i = 0; i < lhs_parts.size(); ++i) {
     comparisons.push_back(
         node->op() == Op::kEq
@@ -443,7 +455,7 @@ absl::StatusOr<Expression*> NodeToExpression(
                         node->ToString()));
   };
   auto do_nary_op =
-      [&](const std::function<Expression*(Expression*, Expression*)> &f) {
+      [&](const std::function<Expression*(Expression*, Expression*)>& f) {
         Expression* accum = inputs[0];
         for (int64_t i = 1; i < inputs.size(); ++i) {
           accum = f(accum, inputs[i]);
@@ -581,8 +593,17 @@ absl::StatusOr<Expression*> NodeToExpression(
       return EmitOneHotSelect(node->As<OneHotSelect>(),
                               inputs[0]->AsIndexableExpressionOrDie(),
                               inputs.subspan(1), file);
-    case Op::kPrioritySel:
-      return unimplemented();
+    case Op::kPrioritySel: {
+      PrioritySelect* sel = node->As<PrioritySelect>();
+      if (sel->cases().size() > 1) {
+        return unimplemented();
+      }
+      XLS_RET_CHECK_EQ(inputs.size(), 3);
+      Expression* selector = inputs[0];
+      Expression* on_true = inputs[1];
+      Expression* on_false = inputs[2];
+      return file->Ternary(selector, on_true, on_false, sel->loc());
+    }
     case Op::kOr:
       return do_nary_op([file, node](Expression* lhs, Expression* rhs) {
         return file->BitwiseOr(lhs, rhs, node->loc());
@@ -590,6 +611,10 @@ absl::StatusOr<Expression*> NodeToExpression(
     case Op::kOrReduce:
       return file->OrReduce(inputs[0], node->loc());
     case Op::kParam:
+      return unimplemented();
+    case Op::kStateRead:
+      return unimplemented();
+    case Op::kNext:
       return unimplemented();
     case Op::kRegisterRead:
       return unimplemented();
@@ -696,7 +721,7 @@ absl::StatusOr<Expression*> NodeToExpression(
     case Op::kGate:
       return unimplemented();
   }
-  XLS_LOG(FATAL) << "Invalid op: " << static_cast<int64_t>(node->op());
+  LOG(FATAL) << "Invalid op: " << static_cast<int64_t>(node->op());
 }
 
 bool ShouldInlineExpressionIntoMultipleUses(Node* node) {
@@ -718,30 +743,57 @@ absl::StatusOr<IndexableExpression*> ArrayIndexExpression(
     Expression* clamped_index;
     // Out-of-bounds accesses return the final element of the array. Clamp the
     // index to the maximum index value. In some cases, clamping is not
-    // necessary (index is a literal or not wide enough to express an OOB
-    // index). This testing about whether a bounds check would be better handled
-    // via another mechanism (e.g., an annotation on the array operation
-    // indicating that the access is inbounds).
+    // necessary (index is a literal, or not wide enough to express an OOB
+    // index, or other analyses have already proven the access is good).
     // TODO(meheff) 2021-03-25 Simplify this when we have a better way of
     // handling OOB accesses.
-    if (!options.array_index_bounds_checking() ||
+    if (array_index->assumed_in_bounds() ||
+        !options.array_index_bounds_checking() ||
         Bits::MinBitCountUnsigned(array_type->size()) >
             index_type->bit_count()) {
-      // Index cannot be out-of-bounds because it is not wide enough to express
-      // an out-of-bounds value.
+      // Index has been proven/assumed to be in bounds.
       clamped_index = index;
     } else if (index->IsLiteral() &&
                bits_ops::ULessThan(index->AsLiteralOrDie()->bits(),
                                    array_type->size())) {
       // Index is an in-bounds literal.
-      clamped_index = index;
+      const int64_t short_index_width = std::max(
+          int64_t{1}, Bits::MinBitCountUnsigned(array_type->size() - 1));
+      if (index_type->bit_count() <= short_index_width) {
+        clamped_index = index;
+      } else {
+        XLS_RET_CHECK(index->AsLiteralOrDie()->bits().FitsInUint64());
+        clamped_index =
+            file->Literal(*index->AsLiteralOrDie()->bits().ToUint64(),
+                          short_index_width, array_index->loc());
+      }
     } else {
       Expression* max_index =
           file->Literal(UBits(array_type->size() - 1, index_type->bit_count()),
                         array_index->loc());
+
+      Expression* short_index = index;
+      Expression* short_max_index = max_index;
+      const int64_t short_index_width = std::max(
+          int64_t{1}, Bits::MinBitCountUnsigned(array_type->size() - 1));
+      if (index_type->bit_count() > short_index_width) {
+        if (!index->IsIndexableExpression()) {
+          return absl::InvalidArgumentError(absl::StrFormat(
+              "Index %d of array_index %s is not indexable, "
+              "and is too wide for array %s; was %s",
+              i, array_index->GetName(), array_index->array()->GetName(),
+              array_index->indices()[i]->GetType()->ToString()));
+        }
+        short_index = file->Slice(index->AsIndexableExpressionOrDie(),
+                                  short_index_width - 1, 0, array_index->loc());
+        short_max_index =
+            file->Literal(UBits(array_type->size() - 1, short_index_width),
+                          array_index->loc());
+      }
+
       clamped_index =
           file->Ternary(file->GreaterThan(index, max_index, array_index->loc()),
-                        max_index, index, array_index->loc());
+                        short_max_index, short_index, array_index->loc());
     }
     value = file->Index(value, clamped_index, array_index->loc());
     type = array_type->element_type();

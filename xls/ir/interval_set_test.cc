@@ -15,19 +15,28 @@
 #include "xls/ir/interval_set.h"
 
 #include <cstdint>
-#include <functional>
 #include <limits>
 #include <optional>
+#include <utility>
 #include <vector>
 
+#include "benchmark/benchmark.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "fuzztest/fuzztest.h"
+#include "xls/common/fuzzing/fuzztest.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/status/status_matchers.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/interval.h"
-#include "xls/ir/interval_set_test_helpers.h"
+#include "xls/ir/interval_set_test_utils.h"
 
+using ::absl_testing::IsOk;
+using ::testing::ExplainMatchResult;
+using ::testing::IsTrue;
+using ::testing::Not;
 using ::testing::Optional;
 using ::testing::SizeIs;
 using ::testing::UnorderedElementsAreArray;
@@ -35,8 +44,30 @@ using ::testing::UnorderedElementsAreArray;
 namespace xls {
 namespace {
 
+IntervalSet OracleCombine(const IntervalSet& lhs, const IntervalSet& rhs) {
+  IntervalSet res(lhs.BitCount());
+  CHECK_EQ(lhs.BitCount(), rhs.BitCount());
+  for (const Interval& interval : lhs.Intervals()) {
+    res.AddInterval(interval);
+  }
+  for (const Interval& interval : rhs.Intervals()) {
+    res.AddInterval(interval);
+  }
+  res.Normalize();
+  return res;
+}
+
 Interval MakeInterval(uint64_t start, uint64_t end, int64_t width) {
   return Interval(UBits(start, width), UBits(end, width));
+}
+Interval MakeSignedInterval(uint64_t start, uint64_t end, int64_t width) {
+  return Interval(SBits(start, width), SBits(end, width));
+}
+MATCHER_P3(IsInterval, low, high, bits,
+           absl::StrFormat("Matches interval [%d, %d] (width: %d)", low, high,
+                           bits)) {
+  return testing::ExplainMatchResult(MakeInterval(low, high, bits), arg,
+                                     result_listener);
 }
 
 TEST(IntervalTest, Normalize) {
@@ -266,16 +297,19 @@ TEST(IntervalTest, Size) {
 }
 
 TEST(IntervalTest, IsTrueWhenMaskWith) {
-  IntervalSet example(3);
-  example.AddInterval(MakeInterval(0, 0, 3));
-  for (int64_t value = 0; value < 8; ++value) {
-    EXPECT_FALSE(example.IsTrueWhenMaskWith(UBits(value, 3)));
+  IntervalSet example(4);
+  example.AddInterval(MakeInterval(0, 0, 4));
+  for (int64_t value = 0; value < 16; ++value) {
+    EXPECT_FALSE(example.IsTrueWhenMaskWith(UBits(value, 4)));
   }
-  example.AddInterval(MakeInterval(2, 4, 3));
-  EXPECT_FALSE(example.IsTrueWhenMaskWith(UBits(0, 3)));
-  EXPECT_FALSE(example.IsTrueWhenMaskWith(UBits(1, 3)));
-  for (int64_t value = 2; value < 8; ++value) {
-    EXPECT_TRUE(example.IsTrueWhenMaskWith(UBits(value, 3)));
+  example.AddInterval(MakeInterval(2, 4, 4));
+  EXPECT_FALSE(example.IsTrueWhenMaskWith(UBits(0, 4)));
+  for (int64_t value = 1; value < 8; ++value) {
+    EXPECT_TRUE(example.IsTrueWhenMaskWith(UBits(value, 4)));
+  }
+  EXPECT_FALSE(example.IsTrueWhenMaskWith(UBits(8, 4)));
+  for (int64_t value = 9; value < 16; ++value) {
+    EXPECT_TRUE(example.IsTrueWhenMaskWith(UBits(value, 4)));
   }
 }
 
@@ -438,6 +472,180 @@ TEST(IntervalTest, ZeroExtend) {
   EXPECT_EQ(extended.BitCount(), 60);
 }
 
+IntervalSet SignedIntervals(absl::Span<std::pair<int64_t, int64_t> const> v,
+                            int64_t bit_count = 32) {
+  IntervalSet set(bit_count);
+  for (const auto& [l, h] : v) {
+    set.AddInterval(MakeSignedInterval(l, h, bit_count));
+  }
+  set.Normalize();
+  return set;
+}
+IntervalSet Intervals(absl::Span<std::pair<int64_t, int64_t> const> v,
+                      int64_t bit_count = 32) {
+  IntervalSet set(bit_count);
+  for (const auto& [l, h] : v) {
+    set.AddInterval(MakeInterval(l, h, bit_count));
+  }
+  set.Normalize();
+  return set;
+}
+
+MATCHER_P(DisjointWith, other,
+          absl::StrFormat("Is %sdisjoint with %s", negation ? "not " : "",
+                          other.ToString())) {
+  const IntervalSet& rhs = other;
+  const IntervalSet& lhs = arg;
+  return ExplainMatchResult(IsTrue(), IntervalSet::Disjoint(lhs, rhs),
+                            result_listener);
+}
+
+TEST(IntervalSetTest, Disjoint) {
+  {
+    IntervalSet low = Intervals({{1, 1}});
+    IntervalSet high = Intervals({{10, 10}});
+    EXPECT_THAT(low, DisjointWith(high));
+    EXPECT_THAT(high, DisjointWith(low));
+  }
+  {
+    IntervalSet l = Intervals({{1, 10}});
+    IntervalSet r = Intervals({{10, 10}});
+    EXPECT_THAT(l, Not(DisjointWith(r)));
+  }
+  {
+    IntervalSet l = Intervals({{1, 1}, {3, 3}, {5, 5}});
+    IntervalSet r = Intervals({{2, 2}, {4, 4}, {6, 6}});
+    EXPECT_THAT(l, DisjointWith(r));
+  }
+}
+
+TEST(IntervalSetTest, SignedIterator) {
+  {
+    IntervalSet all_positive = Intervals({{0, 4}, {8, 12}, {18, 127}}, 8);
+    auto rng = all_positive.SignedIntervals();
+    auto it = rng.begin();
+    EXPECT_THAT(*it, IsInterval(0, 4, 8));
+    ++it;
+    EXPECT_THAT(*it, IsInterval(8, 12, 8));
+    ++it;
+    EXPECT_THAT(*it, IsInterval(18, 127, 8));
+    ++it;
+    EXPECT_TRUE(it == rng.end());
+  }
+  {
+    IntervalSet all_neg = Intervals({{128, 133}, {138, 144}, {155, 255}}, 8);
+    auto rng = all_neg.SignedIntervals();
+    auto it = rng.begin();
+    EXPECT_THAT(*it, IsInterval(128, 133, 8));
+    ++it;
+    EXPECT_THAT(*it, IsInterval(138, 144, 8));
+    ++it;
+    EXPECT_THAT(*it, IsInterval(155, 255, 8));
+    ++it;
+    EXPECT_TRUE(it == rng.end());
+  }
+  {
+    IntervalSet cov =
+        Intervals({{0, 4}, {8, 12}, {18, 133}, {138, 144}, {155, 255}}, 8);
+    auto rng = cov.SignedIntervals();
+    auto it = rng.begin();
+    EXPECT_THAT(*it, IsInterval(0, 4, 8));
+    ++it;
+    EXPECT_THAT(*it, IsInterval(8, 12, 8));
+    ++it;
+    EXPECT_THAT(*it, IsInterval(18, 127, 8));
+    ++it;
+    EXPECT_THAT(*it, IsInterval(128, 133, 8));
+    ++it;
+    EXPECT_THAT(*it, IsInterval(138, 144, 8));
+    ++it;
+    EXPECT_THAT(*it, IsInterval(155, 255, 8));
+    ++it;
+    EXPECT_TRUE(it == rng.end());
+  }
+
+  {
+    IntervalSet unbound = Intervals({{0, 255}}, 8);
+    auto rng = unbound.SignedIntervals();
+    auto it = rng.begin();
+    EXPECT_THAT(*it, IsInterval(0, 127, 8));
+    ++it;
+    EXPECT_THAT(*it, IsInterval(128, 255, 8));
+    ++it;
+    EXPECT_TRUE(it == rng.end());
+  }
+}
+
+TEST(IntervalSetTest, PositiveIntervals) {
+  {
+    IntervalSet all_positive = SignedIntervals({{0, 4}, {8, 12}, {18, 127}}, 8);
+    EXPECT_EQ(all_positive, all_positive.PositiveIntervals(/*with_zero=*/true));
+  }
+  {
+    IntervalSet all_positive = SignedIntervals({{0, 4}, {8, 12}, {18, 127}}, 8);
+    EXPECT_EQ(Intervals({{1, 4}, {8, 12}, {18, 127}}, 8),
+              all_positive.PositiveIntervals(/*with_zero=*/false));
+  }
+  {
+    IntervalSet pos_and_neg =
+        SignedIntervals({{0, 4}, {8, 12}, {18, 127}, {-12, -1}}, 8);
+    EXPECT_EQ(Intervals({{0, 4}, {8, 12}, {18, 127}}, 8),
+              pos_and_neg.PositiveIntervals(/*with_zero=*/true));
+  }
+  {
+    IntervalSet neg = SignedIntervals({{-127, -22}, {-12, -1}}, 8);
+    EXPECT_EQ(Intervals({}, 8), neg.PositiveIntervals(/*with_zero=*/true));
+  }
+  {
+    IntervalSet tiny_range = SignedIntervals({{-1, 0}}, 1);
+    EXPECT_EQ(Intervals({{0, 0}}, 1),
+              tiny_range.PositiveIntervals(/*with_zero=*/true));
+    EXPECT_EQ(Intervals({}, 1),
+              tiny_range.PositiveIntervals(/*with_zero=*/false));
+  }
+}
+
+TEST(IntervalSetTest, NegativeIntervals) {
+  {
+    IntervalSet all_negative = SignedIntervals({{-12, -8}, {-127, -18}}, 8);
+    EXPECT_EQ(Intervals({{8, 12}, {18, 127}}, 8),
+              all_negative.NegativeAbsoluteIntervals());
+  }
+  {
+    IntervalSet pos_and_neg =
+        SignedIntervals({{0, 4}, {8, 12}, {18, 127}, {-12, -1}}, 8);
+    EXPECT_EQ(Intervals({{1, 12}}, 8), pos_and_neg.NegativeAbsoluteIntervals());
+  }
+  {
+    IntervalSet tiny_range = SignedIntervals({{-1, 0}}, 1);
+    EXPECT_EQ(Intervals({{1, 1}}, 1), tiny_range.NegativeAbsoluteIntervals());
+  }
+}
+
+TEST(IntervalSetTest, IterateWithEndAndStartAdjacent) {
+  IntervalSet set = Intervals({{0, 7}, {15, 15}}, 4);
+  auto it = set.Values().begin();
+  EXPECT_THAT(*it, UBits(0, 4));
+  ++it;
+  EXPECT_THAT(*it, UBits(1, 4));
+  ++it;
+  EXPECT_THAT(*it, UBits(2, 4));
+  ++it;
+  EXPECT_THAT(*it, UBits(3, 4));
+  ++it;
+  EXPECT_THAT(*it, UBits(4, 4));
+  ++it;
+  EXPECT_THAT(*it, UBits(5, 4));
+  ++it;
+  EXPECT_THAT(*it, UBits(6, 4));
+  ++it;
+  EXPECT_THAT(*it, UBits(7, 4));
+  ++it;
+  EXPECT_THAT(*it, UBits(15, 4));
+  ++it;
+  EXPECT_TRUE(it == set.Values().end());
+}
+
 void IntersectionIsSmaller(const IntervalSet& lhs, const IntervalSet& rhs) {
   IntervalSet intersection = IntervalSet::Intersect(lhs, rhs);
   std::optional<uint64_t> intersection_size = intersection.Size();
@@ -476,6 +684,67 @@ void UnionIsLarger(const IntervalSet& lhs, const IntervalSet& rhs) {
 FUZZ_TEST(IntervalFuzzTest, UnionIsLarger)
     .WithDomains(ArbitraryNormalizedIntervalSet(32),
                  ArbitraryNormalizedIntervalSet(32));
+
+void DisjointEquivalentToEmptyIntersection(const IntervalSet& lhs,
+                                           const IntervalSet& rhs) {
+  IntervalSet intersection = IntervalSet::Intersect(lhs, rhs);
+  EXPECT_EQ(IntervalSet::Disjoint(lhs, rhs), intersection.IsEmpty());
+}
+
+FUZZ_TEST(IntervalFuzzTest, DisjointEquivalentToEmptyIntersection)
+    .WithDomains(ArbitraryNormalizedIntervalSet(32),
+                 ArbitraryNormalizedIntervalSet(32));
+
+void CombineMatchesOracle(const IntervalSet& lhs, const IntervalSet& rhs) {
+  auto combo = IntervalSet::Combine(lhs, rhs);
+  EXPECT_THAT(combo.CheckIsNormalizedForTesting(), IsOk());
+  EXPECT_EQ(OracleCombine(lhs, rhs), combo);
+}
+
+const auto& CombineMatchesOracle8 = CombineMatchesOracle;
+const auto& CombineMatchesOracle32 = CombineMatchesOracle;
+
+FUZZ_TEST(IntervalFuzzTest, CombineMatchesOracle8)
+    .WithDomains(ArbitraryNormalizedIntervalSet(8),
+                 ArbitraryNormalizedIntervalSet(8));
+FUZZ_TEST(IntervalFuzzTest, CombineMatchesOracle32)
+    .WithDomains(ArbitraryNormalizedIntervalSet(32),
+                 ArbitraryNormalizedIntervalSet(32));
+
+template <typename F>
+void CombineBenchmark(benchmark::State& state, F f) {
+  static constexpr int64_t kSize = 10000;
+  std::vector<std::pair<int64_t, int64_t>> v1;
+  std::vector<std::pair<int64_t, int64_t>> v2;
+  v1.reserve(kSize / 2);
+  v2.reserve(kSize / 2);
+  for (int64_t i = 10; i < kSize; i += 2) {
+    if (i % 4 == 0) {
+      v1.push_back({i, i + 1});
+    } else {
+      v2.push_back({i, i + 1});
+    }
+  }
+  auto i1 = Intervals(v1, 32);
+  auto i2 = Intervals(v2, 32);
+  i1.Normalize();
+  i2.Normalize();
+  for (auto s : state) {
+    f(i1, i2);
+  }
+}
+void BM_CombineOracle(benchmark::State& state) {
+  CombineBenchmark(state, [](const IntervalSet& lhs, const IntervalSet& rhs) {
+    benchmark::DoNotOptimize(OracleCombine(lhs, rhs));
+  });
+}
+void BM_Combine(benchmark::State& state) {
+  CombineBenchmark(state, [](const IntervalSet& lhs, const IntervalSet& rhs) {
+    benchmark::DoNotOptimize(IntervalSet::Combine(lhs, rhs));
+  });
+}
+BENCHMARK(BM_CombineOracle);
+BENCHMARK(BM_Combine);
 
 }  // namespace
 }  // namespace xls

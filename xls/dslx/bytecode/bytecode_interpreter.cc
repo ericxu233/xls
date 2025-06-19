@@ -26,6 +26,9 @@
 #include <variant>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/log/die_if_null.h"
+#include "absl/log/log.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -33,22 +36,27 @@
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/dslx/bytecode/builtins.h"
 #include "xls/dslx/bytecode/bytecode.h"
 #include "xls/dslx/bytecode/bytecode_cache_interface.h"
-#include "xls/dslx/bytecode/bytecode_emitter.h"
+#include "xls/dslx/bytecode/bytecode_interpreter_options.h"
 #include "xls/dslx/bytecode/frame.h"
 #include "xls/dslx/bytecode/interpreter_stack.h"
+#include "xls/dslx/dslx_builtins.h"
 #include "xls/dslx/errors.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/frontend/proc_id.h"
+#include "xls/dslx/import_data.h"
 #include "xls/dslx/interp_value.h"
-#include "xls/dslx/interp_value_helpers.h"
-#include "xls/dslx/type_system/concrete_type.h"
+#include "xls/dslx/interp_value_utils.h"
 #include "xls/dslx/type_system/parametric_env.h"
+#include "xls/dslx/type_system/type.h"
 #include "xls/dslx/type_system/type_info.h"
+#include "xls/dslx/type_system/unwrap_meta_type.h"
+#include "xls/dslx/value_format_descriptor.h"
 #include "xls/ir/big_int.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
@@ -61,15 +69,70 @@ namespace {
 // Returns the given InterpValue formatted using the given format descriptor (if
 // it is not null).
 absl::StatusOr<std::string> ToStringMaybeFormatted(
-    const InterpValue& value, const ValueFormatDescriptor* value_fmt_desc,
+    const InterpValue& value,
+    std::optional<ValueFormatDescriptor> value_fmt_desc,
     int64_t indentation = 0) {
-  if (value_fmt_desc != nullptr) {
+  if (value_fmt_desc.has_value()) {
     XLS_ASSIGN_OR_RETURN(std::string value_str,
                          value.ToFormattedString(*value_fmt_desc, indentation));
     return std::string(indentation, ' ') + value_str;
   }
   return std::string(indentation, ' ') +
          value.ToString(/*humanize=*/false, FormatPreference::kDefault);
+}
+
+// Casts an InterpValue representable as Bits to a new InterpValue
+// with the given BitsType.
+absl::StatusOr<InterpValue> ResizeBitsValue(const InterpValue& from,
+                                            const BitsLikeProperties& to_bits,
+                                            const Type& to_type,
+                                            bool is_checked,
+                                            const Span& source_span,
+                                            const FileTable& file_table) {
+  VLOG(3) << "ResizeBitsValue; from: " << from << " to: " << to_type << " @ "
+          << source_span.ToString(file_table);
+  XLS_ASSIGN_OR_RETURN(int64_t to_bit_count, to_bits.size.GetAsInt64());
+  XLS_ASSIGN_OR_RETURN(bool is_signed, to_bits.is_signed.GetAsBool());
+
+  // Check if it fits.
+  // Case A: to unsigned of N-bits
+  //   Be within [0, 2^N)
+  // Case B: to signed of N-bits
+  //   Be within [-2^(N-1), 2^(N-1))
+  if (is_checked) {
+    bool does_fit = false;
+
+    if (!is_signed) {
+      does_fit = !from.IsNegative() && from.FitsInNBitsUnsigned(to_bit_count);
+    } else if (is_signed && !from.IsNegative()) {
+      does_fit = from.FitsInNBitsUnsigned(to_bit_count - 1);
+    } else {  // to_bits->is_signed() && from.IsNegative()
+      does_fit = from.FitsInNBitsSigned(to_bit_count);
+    }
+
+    if (!does_fit) {
+      return CheckedCastErrorStatus(source_span, from, &to_type, file_table);
+    }
+  }
+
+  Bits result_bits;
+
+  int64_t from_bit_count = from.GetBits().value().bit_count();
+  if (from_bit_count == to_bit_count) {
+    result_bits = from.GetBitsOrDie();
+  } else {
+    if (from.IsSigned()) {
+      // Despite the name, InterpValue::SignExt also shrinks.
+      XLS_ASSIGN_OR_RETURN(InterpValue tmp, from.SignExt(to_bit_count));
+      result_bits = tmp.GetBitsOrDie();
+    } else {
+      // Same for ZeroExt.
+      XLS_ASSIGN_OR_RETURN(InterpValue tmp, from.ZeroExt(to_bit_count));
+      result_bits = tmp.GetBitsOrDie();
+    }
+  }
+
+  return InterpValue::MakeBits(is_signed, result_bits);
 }
 
 }  // namespace
@@ -81,23 +144,32 @@ constexpr int64_t kChannelTraceIndentation = 2;
 /* static */ absl::StatusOr<InterpValue> BytecodeInterpreter::Interpret(
     ImportData* import_data, BytecodeFunction* bf,
     const std::vector<InterpValue>& args,
+    std::optional<InterpValueChannelManager*> channel_manager,
     const BytecodeInterpreterOptions& options) {
-  XLS_ASSIGN_OR_RETURN(auto interpreter, BytecodeInterpreter::CreateUnique(
-                                             import_data, bf, args, options));
-  XLS_RETURN_IF_ERROR(interpreter->Run());
+  BytecodeInterpreter interpreter(import_data,
+                                  /*proc_id=*/std::nullopt, channel_manager,
+                                  options);
+  XLS_RETURN_IF_ERROR(interpreter.InitFrame(bf, args, bf->type_info()));
+  XLS_RETURN_IF_ERROR(interpreter.Run());
   if (options.validate_final_stack_depth()) {
-    XLS_RET_CHECK_EQ(interpreter->stack_.size(), 1);
+    XLS_RET_CHECK_EQ(interpreter.stack_.size(), 1);
   }
-  return interpreter->stack_.PeekOrDie();
+  return interpreter.stack_.PeekOrDie();
 }
 
 BytecodeInterpreter::BytecodeInterpreter(
-    ImportData* import_data, const BytecodeInterpreterOptions& options)
-    : import_data_(import_data), options_(options) {}
+    ImportData* import_data, const std::optional<ProcId>& proc_id,
+    std::optional<InterpValueChannelManager*> channel_manager,
+    const BytecodeInterpreterOptions& options)
+    : import_data_(ABSL_DIE_IF_NULL(import_data)),
+      proc_id_(proc_id),
+      stack_(import_data_->file_table()),
+      channel_manager_(channel_manager),
+      options_(options) {}
 
-absl::Status BytecodeInterpreter::InitFrame(
-    BytecodeFunction* bf, const std::vector<InterpValue>& args,
-    const TypeInfo* type_info) {
+absl::Status BytecodeInterpreter::InitFrame(BytecodeFunction* bf,
+                                            absl::Span<const InterpValue> args,
+                                            const TypeInfo* type_info) {
   XLS_RET_CHECK(frames_.empty());
 
   // In "mission mode" we expect type_info to be non-null in the frame, but for
@@ -105,44 +177,49 @@ absl::Status BytecodeInterpreter::InitFrame(
   if (type_info == nullptr && bf->owner() != nullptr) {
     type_info = import_data_->GetRootTypeInfo(bf->owner()).value();
   }
-  frames_.push_back(
-      Frame(bf, args, type_info, std::nullopt, /*initial_args=*/{}));
+  frames_.push_back(Frame(bf,
+                          std::vector<InterpValue>(args.begin(), args.end()),
+                          type_info, std::nullopt, /*initial_args=*/{}));
   return absl::OkStatus();
 }
 
 /* static */ absl::StatusOr<std::unique_ptr<BytecodeInterpreter>>
-BytecodeInterpreter::CreateUnique(ImportData* import_data, BytecodeFunction* bf,
-                                  const std::vector<InterpValue>& args,
-                                  const BytecodeInterpreterOptions& options) {
-  auto interp = absl::WrapUnique(new BytecodeInterpreter(import_data, options));
+BytecodeInterpreter::CreateUnique(
+    ImportData* import_data, const std::optional<ProcId>& proc_id,
+    BytecodeFunction* bf, const std::vector<InterpValue>& args,
+    std::optional<InterpValueChannelManager*> channel_manager,
+    const BytecodeInterpreterOptions& options) {
+  auto interp = absl::WrapUnique(
+      new BytecodeInterpreter(import_data, proc_id, channel_manager, options));
   XLS_RETURN_IF_ERROR(interp->InitFrame(bf, args, bf->type_info()));
   return interp;
 }
 
 absl::Status BytecodeInterpreter::Run(bool* progress_made) {
-  blocked_channel_name_ = std::nullopt;
+  blocked_channel_info_ = std::nullopt;
   while (!frames_.empty()) {
     Frame* frame = &frames_.back();
     while (frame->pc() < frame->bf()->bytecodes().size()) {
       const std::vector<Bytecode>& bytecodes = frame->bf()->bytecodes();
       const Bytecode& bytecode = bytecodes.at(frame->pc());
-      XLS_VLOG(2) << std::hex << "PC: " << frame->pc() << " : "
-                  << bytecode.ToString();
-      XLS_VLOG(3) << absl::StreamFormat(" - stack depth %d [%s]", stack_.size(),
-                                        stack_.ToString());
+      VLOG(2) << "Bytecode: " << bytecode.ToString(file_table());
+      VLOG(2) << std::hex << "PC: " << frame->pc() << " : "
+              << bytecode.ToString(file_table());
+      VLOG(3) << absl::StreamFormat(" - stack depth %d [%s]", stack_.size(),
+                                    stack_.ToString());
       int64_t old_pc = frame->pc();
       XLS_RETURN_IF_ERROR(EvalNextInstruction());
-      XLS_VLOG(3) << absl::StreamFormat(" - stack depth %d [%s]", stack_.size(),
-                                        stack_.ToString());
+      VLOG(3) << absl::StreamFormat(" - stack depth %d [%s]", stack_.size(),
+                                    stack_.ToString());
 
       if (bytecode.op() == Bytecode::Op::kCall) {
         frame = &frames_.back();
       } else if (frame->pc() != old_pc + 1) {
         XLS_RET_CHECK(bytecodes.at(frame->pc()).op() == Bytecode::Op::kJumpDest)
             << "Jumping from PC " << old_pc << " to PC: " << frame->pc()
-            << " bytecode: " << bytecodes.at(frame->pc()).ToString()
-            << " not a jump_dest or old bytecode: " << bytecode.ToString()
-            << " was not a call op.";
+            << " bytecode: " << bytecodes.at(frame->pc()).ToString(file_table())
+            << " not a jump_dest or old bytecode: "
+            << bytecode.ToString(file_table()) << " was not a call op.";
       }
       if (progress_made != nullptr) {
         *progress_made = true;
@@ -153,10 +230,9 @@ absl::Status BytecodeInterpreter::Run(bool* progress_made) {
     // actually have a hook.
     const Function* source_fn = frame->bf()->source_fn();
     if (source_fn != nullptr) {
-      std::optional<ConcreteType*> fn_return =
-          frame->type_info()->GetItem(source_fn);
+      std::optional<Type*> fn_return = frame->type_info()->GetItem(source_fn);
       if (fn_return.has_value()) {
-        bool fn_returns_value = *fn_return.value() != *ConcreteType::MakeUnit();
+        bool fn_returns_value = *fn_return.value() != *Type::MakeUnit();
         if (options_.post_fn_eval_hook() != nullptr && fn_returns_value) {
           ParametricEnv holder;
           const ParametricEnv* bindings = &holder;
@@ -176,6 +252,16 @@ absl::Status BytecodeInterpreter::Run(bool* progress_made) {
   return absl::OkStatus();
 }
 
+absl::StatusOr<std::vector<InterpValue>>
+BytecodeInterpreter::PopArgsRightToLeft(size_t count) {
+  std::vector<InterpValue> args(count, InterpValue::MakeToken());
+  for (int i = 0; i < count; i++) {
+    XLS_ASSIGN_OR_RETURN(InterpValue arg, Pop());
+    args[count - i - 1] = arg;
+  }
+  return args;
+}
+
 absl::Status BytecodeInterpreter::EvalNextInstruction() {
   Frame* frame = &frames_.back();
   const std::vector<Bytecode>& bytecodes = frame->bf()->bytecodes();
@@ -185,8 +271,8 @@ absl::Status BytecodeInterpreter::EvalNextInstruction() {
                         frame->pc(), bytecodes.size()));
   }
   const Bytecode& bytecode = bytecodes.at(frame->pc());
-  XLS_VLOG(10) << "Running bytecode: " << bytecode.ToString()
-               << " depth before: " << stack_.size();
+  VLOG(10) << "Running bytecode: " << bytecode.ToString(file_table())
+           << " depth before: " << stack_.size();
   switch (bytecode.op()) {
     case Bytecode::Op::kUAdd: {
       XLS_RETURN_IF_ERROR(EvalAdd(bytecode, /*is_signed=*/false));
@@ -222,6 +308,10 @@ absl::Status BytecodeInterpreter::EvalNextInstruction() {
     }
     case Bytecode::Op::kCreateTuple: {
       XLS_RETURN_IF_ERROR(EvalCreateTuple(bytecode));
+      break;
+    }
+    case Bytecode::Op::kDecode: {
+      XLS_RETURN_IF_ERROR(EvalDecode(bytecode));
       break;
     }
     case Bytecode::Op::kDiv: {
@@ -385,8 +475,12 @@ absl::Status BytecodeInterpreter::EvalNextInstruction() {
       XLS_RETURN_IF_ERROR(EvalSwap(bytecode));
       break;
     }
-    case Bytecode::Op::kTrace: {
-      XLS_RETURN_IF_ERROR(EvalTrace(bytecode));
+    case Bytecode::Op::kTraceFmt: {
+      XLS_RETURN_IF_ERROR(EvalTraceFmt(bytecode));
+      break;
+    }
+    case Bytecode::Op::kTraceArg: {
+      XLS_RETURN_IF_ERROR(EvalTraceArg(bytecode));
       break;
     }
     case Bytecode::Op::kWidthSlice: {
@@ -444,38 +538,64 @@ absl::Status BytecodeInterpreter::EvalAnd(const Bytecode& bytecode) {
 }
 
 absl::StatusOr<BytecodeFunction*> BytecodeInterpreter::GetBytecodeFn(
-    Function* f, const Invocation* invocation,
-    const std::optional<ParametricEnv>& caller_bindings) {
+    Function& f, const Invocation* invocation,
+    const ParametricEnv& caller_bindings) {
   const Frame& frame = frames_.back();
-  const TypeInfo* type_info = frame.type_info();
+  const TypeInfo* caller_type_info = frame.type_info();
 
   BytecodeCacheInterface* cache = import_data_->bytecode_cache();
-  if (cache == nullptr) {
-    return absl::InvalidArgumentError("Bytecode cache is NULL.");
-  }
+  XLS_RET_CHECK(cache != nullptr);
 
-  if (f->IsParametric() || f->tag() == Function::Tag::kProcInit) {
-    XLS_RET_CHECK(caller_bindings.has_value());
-    std::optional<TypeInfo*> maybe_type_info =
-        type_info->GetInvocationTypeInfo(invocation,
-                                            caller_bindings.value());
-    if (!maybe_type_info.has_value()) {
-      return absl::InternalError(absl::StrCat(
-          "Could not find type info for invocation ", invocation->ToString(),
-          " : ", invocation->span().ToString()));
+  std::optional<ParametricEnv> callee_bindings;
+
+  TypeInfo* callee_type_info = nullptr;
+  if (f.IsParametric() || f.tag() == FunctionTag::kProcInit) {
+    if (!caller_type_info->GetRootInvocations().contains(invocation)) {
+      return absl::InternalError(absl::StrFormat(
+          "BytecodeInterpreter::GetBytecodeFn; could not find information for "
+          "invocation `%s` "
+          "callee: %s (tag: %v), caller_bindings: %s span: %s",
+          invocation->ToString(), f.identifier(), f.tag(),
+          caller_bindings.ToString(),
+          invocation->span().ToString(file_table())));
     }
-    type_info = maybe_type_info.value();
-  } else if (f->owner() != type_info->module()) {
-    // If the new function is in a different module and it's NOT parametric,
-    // then we need the root TypeInfo for the new module.
-    XLS_ASSIGN_OR_RETURN(type_info, import_data_->GetRootTypeInfo(f->owner()));
+
+    const InvocationData& invocation_data =
+        caller_type_info->GetRootInvocations().at(invocation);
+    // If the invocation data doesn't contain these bindings, it may be a set of
+    // outer bindings that were resolved before adding the invocation to type
+    // info. Check to see if callee data is available for default bindings.
+    XLS_RET_CHECK(
+        (invocation_data.env_to_callee_data().contains(caller_bindings)) ||
+        invocation_data.env_to_callee_data().contains(ParametricEnv()))
+        << "invocation: `" << invocation_data.node()->ToString() << "` @ "
+        << invocation_data.node()->span().ToString(file_table()) << " caller: `"
+        << (invocation_data.caller() == nullptr
+                ? "nullptr"
+                : invocation_data.caller()->identifier())
+        << "`"
+        << " caller_bindings: " << caller_bindings;
+
+    const InvocationCalleeData& callee_data =
+        invocation_data.env_to_callee_data().contains(caller_bindings)
+            ? invocation_data.env_to_callee_data().at(caller_bindings)
+            : invocation_data.env_to_callee_data().at(ParametricEnv());
+    callee_type_info = callee_data.derived_type_info;
+    callee_bindings = callee_data.callee_bindings;
+  } else {
+    // If it's NOT parametric, then we need the root TypeInfo for the new
+    // module.
+    XLS_ASSIGN_OR_RETURN(callee_type_info,
+                         import_data_->GetRootTypeInfo(f.owner()));
   }
 
-  return cache->GetOrCreateBytecodeFunction(f, type_info, caller_bindings);
+  return cache->GetOrCreateBytecodeFunction(*import_data(), f, callee_type_info,
+                                            callee_bindings);
 }
 
 absl::Status BytecodeInterpreter::EvalCall(const Bytecode& bytecode) {
-  XLS_VLOG(3) << "BytecodeInterpreter::EvalCall: " << bytecode.ToString();
+  VLOG(3) << "BytecodeInterpreter::EvalCall: "
+          << bytecode.ToString(file_table());
   XLS_ASSIGN_OR_RETURN(InterpValue callee, Pop());
   if (callee.IsBuiltinFunction()) {
     frames_.back().IncrementPc();
@@ -489,23 +609,33 @@ absl::Status BytecodeInterpreter::EvalCall(const Bytecode& bytecode) {
   XLS_ASSIGN_OR_RETURN(Bytecode::InvocationData data,
                        bytecode.invocation_data());
 
-  XLS_ASSIGN_OR_RETURN(
-      BytecodeFunction * bf,
-      GetBytecodeFn(user_fn_data.function, data.invocation, data.bindings));
+  const ParametricEnv& caller_bindings = data.caller_bindings().has_value()
+                                             ? data.caller_bindings().value()
+                                             : ParametricEnv();
+  XLS_ASSIGN_OR_RETURN(BytecodeFunction * bf,
+                       GetBytecodeFn(*user_fn_data.function, data.invocation(),
+                                     caller_bindings));
 
   // Store the _return_ PC.
   frames_.back().IncrementPc();
 
-  int64_t num_args = user_fn_data.function->params().size();
-  std::vector<InterpValue> args(num_args, InterpValue::MakeToken());
-  for (int i = 0; i < num_args; i++) {
-    XLS_ASSIGN_OR_RETURN(InterpValue arg, Pop());
-    args[num_args - i - 1] = arg;
+  // If `user_fn` is a method (first arg is `self`), then the first arg will be
+  // the most recent value pushed. Handle that case first.
+  std::optional<InterpValue> first_arg;
+  int remaining_args = user_fn_data.function->params().size();
+  if (user_fn_data.function->IsMethod()) {
+    XLS_ASSIGN_OR_RETURN(first_arg, Pop());
+    remaining_args--;
+  }
+  XLS_ASSIGN_OR_RETURN(std::vector<InterpValue> args,
+                       PopArgsRightToLeft(remaining_args));
+  if (first_arg.has_value()) {
+    args.insert(args.begin(), *first_arg);
   }
 
   std::vector<InterpValue> args_copy = args;
-  frames_.push_back(Frame(bf, std::move(args), bf->type_info(), data.bindings,
-                          std::move(args_copy)));
+  frames_.push_back(Frame(bf, std::move(args), bf->type_info(),
+                          data.callee_bindings(), std::move(args_copy)));
 
   return absl::OkStatus();
 }
@@ -513,52 +643,74 @@ absl::Status BytecodeInterpreter::EvalCall(const Bytecode& bytecode) {
 absl::Status BytecodeInterpreter::EvalCast(const Bytecode& bytecode,
                                            bool is_checked) {
   if (!bytecode.data().has_value() ||
-      !std::holds_alternative<std::unique_ptr<ConcreteType>>(
-          bytecode.data().value())) {
-    return absl::InternalError("Cast op requires ConcreteType data.");
+      !std::holds_alternative<std::unique_ptr<Type>>(bytecode.data().value())) {
+    return absl::InternalError("Cast op requires Type data.");
   }
 
-  XLS_ASSIGN_OR_RETURN(InterpValue from, Pop());
+  XLS_ASSIGN_OR_RETURN(InterpValue from_value, Pop());
 
   if (!bytecode.data().has_value()) {
     return absl::InternalError("Cast op is missing its data element!");
   }
 
-  ConcreteType* to =
-      std::get<std::unique_ptr<ConcreteType>>(bytecode.data().value()).get();
-  if (from.IsArray()) {
+  const Type& to = *std::get<std::unique_ptr<Type>>(bytecode.data().value());
+  if (from_value.IsArray()) {
     // From array to bits.
-    BitsType* to_bits = dynamic_cast<BitsType*>(to);
-    if (to_bits == nullptr) {
+    std::optional<BitsLikeProperties> to_bits_like = GetBitsLike(to);
+    if (!to_bits_like.has_value()) {
       return absl::InvalidArgumentError(
           "Array types can only be cast to bits.");
     }
-    XLS_ASSIGN_OR_RETURN(InterpValue converted, from.Flatten());
+    XLS_ASSIGN_OR_RETURN(InterpValue converted, from_value.Flatten());
+
+    // Soundness check that the "to" type has the same number of bits as our new
+    // flattened value.
+    XLS_RET_CHECK_EQ(converted.GetBitCount().value(),
+                     to_bits_like->size.GetAsInt64().value());
+
     stack_.Push(converted);
     return absl::OkStatus();
   }
 
-  if (from.IsEnum()) {
+  if (from_value.IsEnum()) {
     // From enum to bits.
-    BitsType* to_bits = dynamic_cast<BitsType*>(to);
-    if (to_bits == nullptr) {
+    std::optional<BitsLikeProperties> to_bits_like = GetBitsLike(to);
+    if (!to_bits_like.has_value()) {
       return absl::InvalidArgumentError("Enum types can only be cast to bits.");
     }
 
-    stack_.Push(InterpValue::MakeBits(from.IsSigned(), from.GetBitsOrDie()));
+    XLS_ASSIGN_OR_RETURN(
+        InterpValue result,
+        ResizeBitsValue(from_value, to_bits_like.value(), to, is_checked,
+                        bytecode.source_span(), file_table()));
+    stack_.Push(result);
     return absl::OkStatus();
   }
 
-  if (!from.IsBits()) {
+  if (!from_value.IsBits()) {
     return absl::InvalidArgumentError(
         "Bytecode interpreter only supports casts from arrays, enums, and "
         "bits; got: " +
-        from.ToString());
+        from_value.ToString());
   }
 
-  int64_t from_bit_count = from.GetBits().value().bit_count();
+  int64_t from_bit_count = from_value.GetBits().value().bit_count();
+
+  // If the thing we're casting from is bits like, and the thing we're casting
+  // to is bits, like, we use the `ResizeBitsValue` helper.
+  if (std::optional<BitsLikeProperties> to_bits_like = GetBitsLike(to);
+      to_bits_like.has_value()) {
+    XLS_ASSIGN_OR_RETURN(
+        InterpValue result,
+        ResizeBitsValue(from_value, to_bits_like.value(), to, is_checked,
+                        bytecode.source_span(), file_table()));
+    stack_.Push(result);
+    return absl::OkStatus();
+  }
+
   // From bits to array.
-  if (ArrayType* to_array = dynamic_cast<ArrayType*>(to); to_array != nullptr) {
+  if (const ArrayType* to_array = dynamic_cast<const ArrayType*>(&to);
+      to_array != nullptr) {
     XLS_ASSIGN_OR_RETURN(int64_t to_bit_count,
                          to_array->GetTotalBitCount().value().GetAsInt64());
     if (from_bit_count != to_bit_count) {
@@ -566,67 +718,24 @@ absl::Status BytecodeInterpreter::EvalCast(const Bytecode& bytecode,
           "Cast to array had mismatching bit counts: from %d to %d.",
           from_bit_count, to_bit_count));
     }
-    XLS_ASSIGN_OR_RETURN(InterpValue casted, CastBitsToArray(from, *to_array));
+    XLS_ASSIGN_OR_RETURN(InterpValue casted,
+                         CastBitsToArray(from_value, *to_array));
     stack_.Push(casted);
     return absl::OkStatus();
   }
 
   // From bits to enum.
-  if (EnumType* to_enum = dynamic_cast<EnumType*>(to); to_enum != nullptr) {
-    XLS_ASSIGN_OR_RETURN(InterpValue converted, CastBitsToEnum(from, *to_enum));
+  if (const EnumType* to_enum = dynamic_cast<const EnumType*>(&to);
+      to_enum != nullptr) {
+    XLS_ASSIGN_OR_RETURN(InterpValue converted,
+                         CastBitsToEnum(from_value, *to_enum));
     stack_.Push(converted);
     return absl::OkStatus();
   }
 
-  BitsType* to_bits = dynamic_cast<BitsType*>(to);
-  if (to_bits == nullptr) {
-    return absl::InvalidArgumentError(
-        "Bits can only be cast to arrays, enums, or other bits types.");
-  }
-
-  XLS_ASSIGN_OR_RETURN(int64_t to_bit_count,
-                       to_bits->GetTotalBitCount().value().GetAsInt64());
-
-  // Check if it fits.
-  // Case A: to unsigned of N-bits
-  //   Be within [0, 2^N)
-  // Case B: to signed of N-bits
-  //   Be within [-2^(N-1), 2^(N-1))
-  if (is_checked) {
-    bool does_fit = false;
-
-    if (!to_bits->is_signed()) {
-      does_fit = !from.IsNegative() && from.FitsInNBitsUnsigned(to_bit_count);
-    } else if (to_bits->is_signed() && !from.IsNegative()) {
-      does_fit = from.FitsInNBitsUnsigned(to_bit_count - 1);
-    } else {  // to_bits->is_signed() && from.IsNegative()
-      does_fit = from.FitsInNBitsSigned(to_bit_count);
-    }
-
-    if (!does_fit) {
-      return CheckedCastErrorStatus(bytecode.source_span(), from, to_bits);
-    }
-  }
-
-  Bits result_bits;
-  if (from_bit_count == to_bit_count) {
-    result_bits = from.GetBitsOrDie();
-  } else {
-    if (from.IsSigned()) {
-      // Despite the name, InterpValue::SignExt also shrinks.
-      XLS_ASSIGN_OR_RETURN(InterpValue tmp, from.SignExt(to_bit_count));
-      result_bits = tmp.GetBitsOrDie();
-    } else {
-      // Same for ZeroExt.
-      XLS_ASSIGN_OR_RETURN(InterpValue tmp, from.ZeroExt(to_bit_count));
-      result_bits = tmp.GetBitsOrDie();
-    }
-  }
-  InterpValue result = InterpValue::MakeBits(to_bits->is_signed(), result_bits);
-
-  stack_.Push(result);
-
-  return absl::OkStatus();
+  return absl::UnimplementedError(absl::StrFormat(
+      "BytecodeInterpreter; cast of value %s to type %s is not yet implemented",
+      from_value.ToString(), to.ToString()));
 }
 
 absl::Status BytecodeInterpreter::EvalConcat(const Bytecode& bytecode) {
@@ -662,12 +771,42 @@ absl::Status BytecodeInterpreter::EvalCreateTuple(const Bytecode& bytecode) {
   elements.reserve(tuple_size.value());
   for (int64_t i = 0; i < tuple_size.value(); i++) {
     XLS_ASSIGN_OR_RETURN(InterpValue value, Pop());
-    elements.push_back(value);
+    elements.push_back(std::move(value));
   }
 
   std::reverse(elements.begin(), elements.end());
 
-  stack_.Push(InterpValue::MakeTuple(elements));
+  stack_.Push(InterpValue::MakeTuple(std::move(elements)));
+  return absl::OkStatus();
+}
+
+absl::Status BytecodeInterpreter::EvalDecode(const Bytecode& bytecode) {
+  if (!bytecode.data().has_value() ||
+      !std::holds_alternative<std::unique_ptr<Type>>(bytecode.data().value())) {
+    return absl::InternalError("Decode op requires Type data.");
+  }
+
+  XLS_ASSIGN_OR_RETURN(InterpValue from, Pop());
+  if (!from.IsBits() || from.IsSigned()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Decode op requires UBits-type input, was: ", from.ToString()));
+  }
+
+  Type* to = std::get<std::unique_ptr<Type>>(bytecode.data().value()).get();
+  std::optional<BitsLikeProperties> to_bits_like = GetBitsLike(*to);
+  if (!to_bits_like.has_value()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Decode op requires bits-like output type, was: ", to->ToString()));
+  }
+  XLS_ASSIGN_OR_RETURN(bool is_signed, to_bits_like->is_signed.GetAsBool());
+  XLS_ASSIGN_OR_RETURN(int64_t new_bit_count, to_bits_like->size.GetAsInt64());
+  if (is_signed) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Decode op requires UBits-type output, was: ", to->ToString()));
+  }
+
+  XLS_ASSIGN_OR_RETURN(InterpValue decoded, from.Decode(new_bit_count));
+  stack_.Push(std::move(decoded));
   return absl::OkStatus();
 }
 
@@ -701,7 +840,8 @@ absl::Status BytecodeInterpreter::EvalExpandTuple(const Bytecode& bytecode) {
     return FailureErrorStatus(
         bytecode.source_span(),
         absl::StrCat("Stack top for ExpandTuple was not a tuple, was: ",
-                     TagToString(tuple.tag())));
+                     TagToString(tuple.tag())),
+        file_table());
   }
 
   // Note that we destructure the tuple in "reverse" order, with the first
@@ -721,7 +861,7 @@ absl::Status BytecodeInterpreter::EvalFail(const Bytecode& bytecode) {
                        bytecode.trace_data());
   XLS_ASSIGN_OR_RETURN(std::string message,
                        TraceDataToString(*trace_data, stack_));
-  return FailureErrorStatus(bytecode.source_span(), message);
+  return FailureErrorStatus(bytecode.source_span(), message, file_table());
 }
 
 absl::Status BytecodeInterpreter::EvalGe(const Bytecode& bytecode) {
@@ -747,8 +887,9 @@ absl::Status BytecodeInterpreter::EvalTupleIndex(const Bytecode& bytecode) {
         basis.ToString());
   }
 
-  XLS_ASSIGN_OR_RETURN(InterpValue result, basis.Index(index),
-                       _ << " while processing " << bytecode.ToString());
+  XLS_ASSIGN_OR_RETURN(
+      InterpValue result, basis.Index(index),
+      _ << " while processing " << bytecode.ToString(file_table()));
   stack_.Push(result);
   return absl::OkStatus();
 }
@@ -764,8 +905,10 @@ absl::Status BytecodeInterpreter::EvalIndex(const Bytecode& bytecode) {
         basis.ToString());
   }
 
-  XLS_ASSIGN_OR_RETURN(InterpValue result, basis.Index(index),
-                       _ << " while processing " << bytecode.ToString());
+  XLS_ASSIGN_OR_RETURN(
+      InterpValue result, basis.Index(index),
+      _ << " while processing "
+        << bytecode.ToString(file_table(), /*source_locs=*/true));
   stack_.Push(result);
   return absl::OkStatus();
 }
@@ -785,7 +928,9 @@ absl::Status BytecodeInterpreter::EvalLe(const Bytecode& bytecode) {
 
 absl::Status BytecodeInterpreter::EvalLiteral(const Bytecode& bytecode) {
   XLS_ASSIGN_OR_RETURN(InterpValue value, bytecode.value_data());
-  stack_.Push(value);
+  stack_.PushFormattedValue(InterpreterStack::FormattedInterpValue{
+      .value = std::move(value),
+      .format_descriptor = bytecode.format_descriptor()});
   return absl::OkStatus();
 }
 
@@ -860,16 +1005,16 @@ absl::StatusOr<bool> BytecodeInterpreter::MatchArmEqualsInterpValue(
     case Kind::kRange: {
       XLS_ASSIGN_OR_RETURN(Bytecode::MatchArmItem::RangeData range,
                            item.range());
-      XLS_VLOG(10) << "value: " << value.ToString()
-                   << " start: " << range.start.ToString()
-                   << " limit: " << range.limit.ToString();
+      VLOG(10) << "value: " << value.ToString()
+               << " start: " << range.start.ToString()
+               << " limit: " << range.limit.ToString();
       XLS_ASSIGN_OR_RETURN(InterpValue val_ge_start, value.Ge(range.start));
       XLS_ASSIGN_OR_RETURN(InterpValue val_lt_limit, value.Lt(range.limit));
       XLS_ASSIGN_OR_RETURN(InterpValue conjunction,
                            val_ge_start.BitwiseAnd(val_lt_limit));
-      XLS_VLOG(10) << "val_ge_start: " << val_ge_start.ToString()
-                   << " val_lt_limit: " << val_lt_limit.ToString()
-                   << " conjunction: " << conjunction.ToString();
+      VLOG(10) << "val_ge_start: " << val_ge_start.ToString()
+               << " val_lt_limit: " << val_lt_limit.ToString()
+               << " conjunction: " << conjunction.ToString();
       return conjunction.IsTrue();
     }
     case Kind::kLoad: {
@@ -892,6 +1037,9 @@ absl::StatusOr<bool> BytecodeInterpreter::MatchArmEqualsInterpValue(
     case Kind::kWildcard:
       return true;
 
+    case Kind::kRestOfTuple:
+      return true;
+
     case Kind::kTuple: {
       // Otherwise, we're a tuple. Recurse.
       XLS_ASSIGN_OR_RETURN(auto item_elements, item.tuple_elements());
@@ -903,6 +1051,8 @@ absl::StatusOr<bool> BytecodeInterpreter::MatchArmEqualsInterpValue(
                          item.ToString(), " vs. ", value.ToString()));
       }
 
+      // We don't have to deal with rest-of-tuple processing because
+      // the matcher will have already handled that.
       for (int i = 0; i < item_elements.size(); i++) {
         XLS_ASSIGN_OR_RETURN(bool equal, MatchArmEqualsInterpValue(
                                              &frames_.back(), item_elements[i],
@@ -984,24 +1134,32 @@ absl::Status BytecodeInterpreter::EvalRecvNonBlocking(
   XLS_ASSIGN_OR_RETURN(InterpValue default_value, Pop());
   XLS_ASSIGN_OR_RETURN(InterpValue condition, Pop());
   XLS_ASSIGN_OR_RETURN(InterpValue channel_value, Pop());
-  XLS_ASSIGN_OR_RETURN(auto channel, channel_value.GetChannel());
+  XLS_ASSIGN_OR_RETURN(InterpValue::ChannelReference channel_reference,
+                       channel_value.GetChannelReference());
   XLS_ASSIGN_OR_RETURN(InterpValue token, Pop());
+
+  XLS_RET_CHECK(channel_reference.GetChannelId().has_value());
+  int64_t channel_id = channel_reference.GetChannelId().value();
+  XLS_RET_CHECK(channel_manager_.has_value());
+  InterpValueChannel& channel = (*channel_manager_)->GetChannel(channel_id);
 
   XLS_ASSIGN_OR_RETURN(const Bytecode::ChannelData* channel_data,
                        bytecode.channel_data());
-  if (condition.IsTrue() && !channel->empty()) {
-    if (options_.trace_channels() && options_.trace_hook() != nullptr) {
-      XLS_ASSIGN_OR_RETURN(std::string formatted_data,
-                           ToStringMaybeFormatted(
-                               channel->front(), channel_data->value_fmt_desc(),
-                               kChannelTraceIndentation));
+  if (condition.IsTrue() && !channel.IsEmpty()) {
+    InterpValue value = channel.Read();
+    if (options_.trace_channels() && options_.trace_hook()) {
+      XLS_ASSIGN_OR_RETURN(
+          std::string formatted_data,
+          ToStringMaybeFormatted(value, channel_data->value_fmt_desc(),
+                                 kChannelTraceIndentation));
       options_.trace_hook()(
+          bytecode.source_span(),
           absl::StrFormat("Received data on channel `%s`:\n%s",
-                          channel_data->channel_name(), formatted_data));
+                          FormatChannelNameForTracing(*channel_data),
+                          formatted_data));
     }
     stack_.Push(InterpValue::MakeTuple(
-        {token, channel->front(), InterpValue::MakeBool(true)}));
-    channel->pop_front();
+        {token, std::move(value), InterpValue::MakeBool(true)}));
   } else {
     stack_.Push(InterpValue::MakeTuple(
         {token, default_value, InterpValue::MakeBool(false)}));
@@ -1014,33 +1172,43 @@ absl::Status BytecodeInterpreter::EvalRecv(const Bytecode& bytecode) {
   XLS_ASSIGN_OR_RETURN(InterpValue default_value, Pop());
   XLS_ASSIGN_OR_RETURN(InterpValue condition, Pop());
   XLS_ASSIGN_OR_RETURN(InterpValue channel_value, Pop());
-  XLS_ASSIGN_OR_RETURN(auto channel, channel_value.GetChannel());
-
+  XLS_ASSIGN_OR_RETURN(auto channel_reference,
+                       channel_value.GetChannelReference());
   XLS_ASSIGN_OR_RETURN(const Bytecode::ChannelData* channel_data,
                        bytecode.channel_data());
+
+  XLS_RET_CHECK(channel_reference.GetChannelId().has_value());
+  int64_t channel_id = channel_reference.GetChannelId().value();
+  XLS_RET_CHECK(channel_manager_.has_value());
+  InterpValueChannel& channel = (*channel_manager_)->GetChannel(channel_id);
+
   if (condition.IsTrue()) {
-    if (channel->empty()) {
+    if (channel.IsEmpty()) {
       // Restore the stack!
       stack_.Push(channel_value);
       stack_.Push(condition);
       stack_.Push(default_value);
-      blocked_channel_name_ = channel_data->channel_name();
+      blocked_channel_info_ = BlockedChannelInfo{
+          .name = FormatChannelNameForTracing(*channel_data),
+          .span = bytecode.source_span(),
+      };
       return absl::UnavailableError("Channel is empty.");
     }
 
     XLS_ASSIGN_OR_RETURN(InterpValue token, Pop());
-
-    if (options_.trace_channels() && options_.trace_hook() != nullptr) {
-      XLS_ASSIGN_OR_RETURN(std::string formatted_data,
-                           ToStringMaybeFormatted(
-                               channel->front(), channel_data->value_fmt_desc(),
-                               kChannelTraceIndentation));
+    InterpValue value = channel.Read();
+    if (options_.trace_channels() && options_.trace_hook()) {
+      XLS_ASSIGN_OR_RETURN(
+          std::string formatted_data,
+          ToStringMaybeFormatted(value, channel_data->value_fmt_desc(),
+                                 kChannelTraceIndentation));
       options_.trace_hook()(
+          bytecode.source_span(),
           absl::StrFormat("Received data on channel `%s`:\n%s",
-                          channel_data->channel_name(), formatted_data));
+                          FormatChannelNameForTracing(*channel_data),
+                          formatted_data));
     }
-    stack_.Push(InterpValue::MakeTuple({token, channel->front()}));
-    channel->pop_front();
+    stack_.Push(InterpValue::MakeTuple({token, std::move(value)}));
   } else {
     XLS_ASSIGN_OR_RETURN(InterpValue token, Pop());
     stack_.Push(InterpValue::MakeTuple({token, default_value}));
@@ -1053,21 +1221,30 @@ absl::Status BytecodeInterpreter::EvalSend(const Bytecode& bytecode) {
   XLS_ASSIGN_OR_RETURN(InterpValue condition, Pop());
   XLS_ASSIGN_OR_RETURN(InterpValue payload, Pop());
   XLS_ASSIGN_OR_RETURN(InterpValue channel_value, Pop());
-  XLS_ASSIGN_OR_RETURN(auto channel, channel_value.GetChannel());
+  XLS_ASSIGN_OR_RETURN(auto channel_reference,
+                       channel_value.GetChannelReference());
   XLS_ASSIGN_OR_RETURN(InterpValue token, Pop());
+
+  XLS_RET_CHECK(channel_reference.GetChannelId().has_value());
+  int64_t channel_id = channel_reference.GetChannelId().value();
+  XLS_RET_CHECK(channel_manager_.has_value());
+  InterpValueChannel& channel = (*channel_manager_)->GetChannel(channel_id);
+
   if (condition.IsTrue()) {
-    if (options_.trace_channels() && options_.trace_hook() != nullptr) {
+    if (options_.trace_channels() && options_.trace_hook()) {
       XLS_ASSIGN_OR_RETURN(const Bytecode::ChannelData* channel_data,
                            bytecode.channel_data());
       XLS_ASSIGN_OR_RETURN(
           std::string formatted_data,
           ToStringMaybeFormatted(payload, channel_data->value_fmt_desc(),
                                  kChannelTraceIndentation));
-      options_.trace_hook()(absl::StrFormat("Sent data on channel `%s`:\n%s",
-                                            channel_data->channel_name(),
-                                            formatted_data));
+      options_.trace_hook()(
+          bytecode.source_span(),
+          absl::StrFormat("Sent data on channel `%s`:\n%s",
+                          FormatChannelNameForTracing(*channel_data),
+                          formatted_data));
     }
-    channel->push_back(payload);
+    channel.Write(payload);
   }
   stack_.Push(token);
   return absl::OkStatus();
@@ -1089,54 +1266,15 @@ absl::Status BytecodeInterpreter::EvalShr(const Bytecode& bytecode) {
 }
 
 absl::Status BytecodeInterpreter::EvalSlice(const Bytecode& bytecode) {
-  XLS_ASSIGN_OR_RETURN(InterpValue limit, Pop());
+  XLS_ASSIGN_OR_RETURN(InterpValue length, Pop());
   XLS_ASSIGN_OR_RETURN(InterpValue start, Pop());
   XLS_ASSIGN_OR_RETURN(InterpValue basis, Pop());
-  XLS_ASSIGN_OR_RETURN(int64_t basis_bit_count, basis.GetBitCount());
-  XLS_ASSIGN_OR_RETURN(int64_t start_bit_count, start.GetBitCount());
-
-  InterpValue zero = InterpValue::MakeSBits(start_bit_count, 0);
-  InterpValue basis_length =
-      InterpValue::MakeSBits(start_bit_count, basis_bit_count);
-
-  XLS_ASSIGN_OR_RETURN(InterpValue start_lt_zero, start.Lt(zero));
-  if (start_lt_zero.IsTrue()) {
-    // Remember, start is negative if we're here.
-    XLS_ASSIGN_OR_RETURN(start, basis_length.Add(start));
-    // If start is _still_ less than zero, then we clamp to zero.
-    XLS_ASSIGN_OR_RETURN(start_lt_zero, start.Lt(zero));
-    if (start_lt_zero.IsTrue()) {
-      start = zero;
-    }
-  }
-
-  XLS_ASSIGN_OR_RETURN(InterpValue limit_lt_zero, limit.Lt(zero));
-  if (limit_lt_zero.IsTrue()) {
-    // Ditto.
-    XLS_ASSIGN_OR_RETURN(limit, basis_length.Add(limit));
-    XLS_ASSIGN_OR_RETURN(limit_lt_zero, limit.Lt(zero));
-    if (limit_lt_zero.IsTrue()) {
-      limit = zero;
-    }
-  }
-
-  // If limit extends past the basis, then we truncate limit.
-  XLS_ASSIGN_OR_RETURN(InterpValue limit_ge_basis_length,
-                       limit.Ge(basis_length));
-  if (limit_ge_basis_length.IsTrue()) {
-    limit =
-        InterpValue::MakeSBits(start_bit_count, basis.GetBitCount().value());
-  }
-  XLS_ASSIGN_OR_RETURN(InterpValue length, limit.Sub(start));
-
-  // At this point, both start and length must be nonnegative, so we force them
-  // to UBits, since Slice expects that.
-  XLS_ASSIGN_OR_RETURN(int64_t start_value, start.GetBitValueViaSign());
-  XLS_ASSIGN_OR_RETURN(int64_t length_value, length.GetBitValueViaSign());
-  XLS_RET_CHECK_GE(start_value, 0);
-  XLS_RET_CHECK_GE(length_value, 0);
-  start = InterpValue::MakeBits(/*is_signed=*/false, start.GetBitsOrDie());
-  length = InterpValue::MakeBits(/*is_signed=*/false, length.GetBitsOrDie());
+  XLS_RET_CHECK(length.IsUBits())
+      << "Slice length is not unsigned bits: " << length.ToString();
+  XLS_RET_CHECK(start.IsUBits())
+      << "Slice start is not unsigned bits: " << start.ToString();
+  XLS_RET_CHECK(basis.IsUBits())
+      << "Slice basis is not unsigned bits: " << basis.ToString();
   XLS_ASSIGN_OR_RETURN(InterpValue result, basis.Slice(start, length));
   stack_.Push(result);
   return absl::OkStatus();
@@ -1157,7 +1295,7 @@ absl::Status BytecodeInterpreter::EvalStore(const Bytecode& bytecode) {
 absl::StatusOr<std::optional<int64_t>> BytecodeInterpreter::EvalJumpRelIf(
     int64_t pc, const Bytecode& bytecode) {
   XLS_ASSIGN_OR_RETURN(InterpValue top, Pop());
-  XLS_VLOG(2) << "jump_rel_if value: " << top.ToString();
+  VLOG(2) << "jump_rel_if value: " << top.ToString();
   if (top.IsTrue()) {
     XLS_ASSIGN_OR_RETURN(Bytecode::JumpTarget target, bytecode.jump_target());
     return pc + target.value();
@@ -1229,41 +1367,60 @@ absl::Status BytecodeInterpreter::EvalSwap(const Bytecode& bytecode) {
       pieces.push_back(std::get<std::string>(trace_element));
     } else {
       const InterpValue& value = args.at(argno);
-      if (argno < trace_data.value_fmt_descs().size() &&
-          trace_data.value_fmt_descs().at(argno) != nullptr) {
+      if (argno < trace_data.value_fmt_descs().size()) {
         XLS_ASSIGN_OR_RETURN(
             std::string formatted,
-            value.ToFormattedString(*trace_data.value_fmt_descs().at(argno)));
+            value.ToFormattedString(trace_data.value_fmt_descs()[argno]));
         pieces.push_back(formatted);
       } else {
         pieces.push_back(value.ToString(
             /*humanize=*/true, std::get<FormatPreference>(trace_element)));
       }
       argno += 1;
-      XLS_CHECK_LE(argno, argc);
+      CHECK_LE(argno, argc);
     }
   }
 
   return absl::StrJoin(pieces, "");
 }
 
-absl::Status BytecodeInterpreter::EvalTrace(const Bytecode& bytecode) {
+absl::Status BytecodeInterpreter::EvalTraceFmt(const Bytecode& bytecode) {
   XLS_ASSIGN_OR_RETURN(const Bytecode::TraceData* trace_data,
                        bytecode.trace_data());
   XLS_ASSIGN_OR_RETURN(std::string message,
                        TraceDataToString(*trace_data, stack_));
-  if (options_.trace_hook() != nullptr) {
-    options_.trace_hook()(message);
+  if (options_.trace_hook()) {
+    options_.trace_hook()(bytecode.source_span(), message);
   }
   stack_.Push(InterpValue::MakeToken());
   return absl::OkStatus();
 }
 
+absl::Status BytecodeInterpreter::EvalTraceArg(const Bytecode& bytecode) {
+  XLS_ASSIGN_OR_RETURN(const Bytecode::TraceData* trace_data,
+                       bytecode.trace_data());
+  // The trace operation acts as an identity function so we peek at the TOS to
+  // push it later.
+  InterpValue value = stack_.PeekOrDie();
+  XLS_ASSIGN_OR_RETURN(std::string message,
+                       TraceDataToString(*trace_data, stack_));
+  if (options_.trace_hook()) {
+    options_.trace_hook()(bytecode.source_span(), message);
+  }
+  stack_.Push(value);
+  return absl::OkStatus();
+}
+
 absl::Status BytecodeInterpreter::EvalWidthSlice(const Bytecode& bytecode) {
-  XLS_ASSIGN_OR_RETURN(const ConcreteType* type, bytecode.type_data());
-  const BitsType* bits_type = dynamic_cast<const BitsType*>(type);
-  XLS_RET_CHECK_NE(bits_type, nullptr);
-  XLS_ASSIGN_OR_RETURN(int64_t width_value, bits_type->size().GetAsInt64());
+  XLS_ASSIGN_OR_RETURN(const Type* type, bytecode.type_data());
+  XLS_ASSIGN_OR_RETURN(const Type* unwrapped_type, UnwrapMetaType(*type));
+
+  // Width slice only works on bits-like types.
+  std::optional<BitsLikeProperties> bits_like = GetBitsLike(*unwrapped_type);
+  XLS_RET_CHECK(bits_like.has_value())
+      << "Wide slice type is not bits-like: " << type->ToString();
+  XLS_ASSIGN_OR_RETURN(bool is_signed, bits_like->is_signed.GetAsBool());
+  XLS_ASSIGN_OR_RETURN(int64_t width_value, bits_like->size.GetAsInt64());
 
   InterpValue oob_value(InterpValue::MakeUBits(width_value, /*value=*/0));
   XLS_ASSIGN_OR_RETURN(InterpValue start, Pop());
@@ -1290,7 +1447,7 @@ absl::Status BytecodeInterpreter::EvalWidthSlice(const Bytecode& bytecode) {
 
   Bits result_bits = basis_bits.Slice(start_index, width_value);
   InterpValueTag tag =
-      bits_type->is_signed() ? InterpValueTag::kSBits : InterpValueTag::kUBits;
+      is_signed ? InterpValueTag::kSBits : InterpValueTag::kUBits;
   XLS_ASSIGN_OR_RETURN(InterpValue result,
                        InterpValue::MakeBits(tag, result_bits));
   stack_.Push(result);
@@ -1306,18 +1463,18 @@ absl::Status BytecodeInterpreter::EvalXor(const Bytecode& bytecode) {
 absl::Status BytecodeInterpreter::RunBuiltinFn(const Bytecode& bytecode,
                                                Builtin builtin) {
   switch (builtin) {
-    case Builtin::kAddWithCarry:
-      return RunBuiltinAddWithCarry(bytecode, stack_);
     case Builtin::kAndReduce:
       return RunBuiltinAndReduce(bytecode, stack_);
     case Builtin::kAssertEq:
-      return RunBuiltinAssertEq(bytecode, stack_, frames_.back(), options_);
+      return RunBuiltinAssertEq(bytecode, stack_, frames_.back(), options_,
+                                proc_id());
     case Builtin::kAssertLt:
-      return RunBuiltinAssertLt(bytecode, stack_, frames_.back(), options_);
-    case Builtin::kBitSlice:
-      return RunBuiltinBitSlice(bytecode, stack_);
+      return RunBuiltinAssertLt(bytecode, stack_, frames_.back(), options_,
+                                proc_id());
     case Builtin::kBitSliceUpdate:
       return RunBuiltinBitSliceUpdate(bytecode, stack_);
+    case Builtin::kCeilLog2:
+      return RunBuiltinCeilLog2(bytecode, stack_);
     case Builtin::kClz:
       return RunBuiltinClz(bytecode, stack_);
     case Builtin::kCover:
@@ -1328,12 +1485,39 @@ absl::Status BytecodeInterpreter::RunBuiltinFn(const Bytecode& bytecode,
       return RunBuiltinEnumerate(bytecode, stack_);
     case Builtin::kFail: {
       XLS_ASSIGN_OR_RETURN(InterpValue value, Pop());
-      return FailureErrorStatus(bytecode.source_span(), value.ToString());
+      std::string message{value.ToString()};
+      if (proc_id().has_value()) {
+        message += absl::StrFormat(" (called from %s)", proc_id()->ToString());
+      }
+      return FailureErrorStatus(bytecode.source_span(), message, file_table());
+    }
+    case Builtin::kAssert: {
+      XLS_ASSIGN_OR_RETURN(InterpValue label, Pop());
+      XLS_ASSIGN_OR_RETURN(InterpValue predicate, Pop());
+
+      XLS_ASSIGN_OR_RETURN(std::string label_as_string,
+                           InterpValueAsString(label));
+      if (predicate.IsFalse()) {
+        std::string message{label_as_string};
+        if (proc_id().has_value()) {
+          message +=
+              absl::StrFormat(" (called from %s)", proc_id()->ToString());
+        }
+        return FailureErrorStatus(bytecode.source_span(), message,
+                                  file_table());
+      }
+
+      stack_.Push(InterpValue::MakeUnit());
+      return absl::OkStatus();
     }
     case Builtin::kGate:
       return RunBuiltinGate(bytecode, stack_);
     case Builtin::kMap:
       return RunBuiltinMap(bytecode);
+    case Builtin::kZip:
+      return RunBuiltinZip(bytecode, stack_);
+    case Builtin::kEncode:
+      return RunBuiltinEncode(bytecode, stack_);
     case Builtin::kOneHot:
       return RunBuiltinOneHot(bytecode, stack_);
     case Builtin::kOneHotSel:
@@ -1352,8 +1536,8 @@ absl::Status BytecodeInterpreter::RunBuiltinFn(const Bytecode& bytecode,
       return RunBuiltinArraySize(bytecode, stack_);
     case Builtin::kSignex:
       return RunBuiltinSignex(bytecode, stack_);
-    case Builtin::kSlice:
-      return RunBuiltinSlice(bytecode, stack_);
+    case Builtin::kArraySlice:
+      return RunBuiltinArraySlice(bytecode, stack_);
     case Builtin::kSMulp:
       return RunBuiltinSMulp(bytecode, stack_);
     case Builtin::kTrace:
@@ -1368,15 +1552,18 @@ absl::Status BytecodeInterpreter::RunBuiltinFn(const Bytecode& bytecode,
     // Implementation note: some of these operations are implemented via
     // bytecodes; e.g. see `BytecodeEmitter::HandleBuiltin*`
     case Builtin::kJoin:
+    case Builtin::kToken:
     case Builtin::kSend:
     case Builtin::kSendIf:
     case Builtin::kRecv:
     case Builtin::kRecvIf:
     case Builtin::kRecvNonBlocking:
     case Builtin::kRecvIfNonBlocking:
+    case Builtin::kDecode:
     case Builtin::kCheckedCast:
     case Builtin::kWideningCast:
-    case Builtin::kSelect:
+    case Builtin::kBitCount:
+    case Builtin::kElementCount:
       return absl::UnimplementedError(absl::StrFormat(
           "BytecodeInterpreter: builtin function \"%s\" not yet implemented.",
           BuiltinToString(builtin)));
@@ -1393,7 +1580,7 @@ absl::Status BytecodeInterpreter::RunBuiltinMap(const Bytecode& bytecode) {
 
   XLS_ASSIGN_OR_RETURN(const std::vector<InterpValue>* elements,
                        inputs.GetValues());
-  Span span = invocation_data.invocation->span();
+  Span span = invocation_data.invocation()->span();
 
   // Rather than "unrolling" the map, we can implement a for-like loop here to
   // prevent the generated BytecodeFunction from being overlarge as the input
@@ -1408,7 +1595,7 @@ absl::Status BytecodeInterpreter::RunBuiltinMap(const Bytecode& bytecode) {
       Bytecode(span, Bytecode::Op::kStore, Bytecode::SlotIndex(1)));
 
   // Top-of-loop marker.
-  int top_of_loop_index = bytecodes.size();
+  size_t top_of_loop_index = bytecodes.size();
   bytecodes.push_back(Bytecode(span, Bytecode::Op::kJumpDest));
 
   // Extract element N and call the mapping fn on that value.
@@ -1434,16 +1621,15 @@ absl::Status BytecodeInterpreter::RunBuiltinMap(const Bytecode& bytecode) {
       Bytecode(span, Bytecode::Op::kLoad, Bytecode::SlotIndex(1)));
   bytecodes.push_back(
       Bytecode(span, Bytecode::Op::kLiteral,
-               InterpValue::MakeU32(elements->size())));
+               InterpValue::MakeU32(static_cast<uint32_t>(elements->size()))));
   bytecodes.push_back(Bytecode(span, Bytecode::Op::kLt));
 
   // If true, jump to top-of-loop, else create the result array.
   bytecodes.push_back(
       Bytecode(span, Bytecode::Op::kJumpRelIf,
                Bytecode::JumpTarget(top_of_loop_index - bytecodes.size())));
-  bytecodes.push_back(
-      Bytecode(span, Bytecode::Op::kCreateArray,
-               Bytecode::NumElements(elements->size())));
+  bytecodes.push_back(Bytecode(span, Bytecode::Op::kCreateArray,
+                               Bytecode::NumElements(elements->size())));
 
   // Now take the collected bytecodes and cram them into a BytecodeFunction,
   // then start executing it.
@@ -1453,170 +1639,28 @@ absl::Status BytecodeInterpreter::RunBuiltinMap(const Bytecode& bytecode) {
                            frames_.back().type_info(), std::move(bytecodes)));
   BytecodeFunction* bf_ptr = bf.get();
   frames_.push_back(Frame(bf_ptr, {inputs}, bf_ptr->type_info(),
-                          invocation_data.bindings,
+                          invocation_data.caller_bindings(),
                           /*initial_args=*/{}, std::move(bf)));
   return absl::OkStatus();
 }
 
-ProcConfigBytecodeInterpreter::ProcConfigBytecodeInterpreter(
-    ImportData* import_data, std::vector<ProcInstance>* proc_instances,
-    const BytecodeInterpreterOptions& options)
-    : BytecodeInterpreter(import_data, options),
-      proc_instances_(proc_instances) {}
-
-absl::Status ProcConfigBytecodeInterpreter::InitializeProcNetwork(
-    ImportData* import_data, TypeInfo* type_info, Proc* root_proc,
-    const InterpValue& terminator, std::vector<ProcInstance>* proc_instances,
-    const BytecodeInterpreterOptions& options) {
-  return EvalSpawn(import_data, type_info, std::nullopt, std::nullopt,
-                   root_proc,
-                   /*config_args=*/{terminator}, proc_instances, options);
-}
-
-absl::Status ProcConfigBytecodeInterpreter::EvalSpawn(
-    const Bytecode& bytecode) {
-  Frame& frame = frames().back();
-  XLS_ASSIGN_OR_RETURN(const Bytecode::SpawnData* spawn_data,
-                       bytecode.spawn_data());
-  return EvalSpawn(import_data(), frame.type_info(),
-                   spawn_data->caller_bindings, spawn_data->spawn,
-                   spawn_data->proc, spawn_data->config_args, proc_instances_,
-                   options());
-}
-
-/* static */ absl::Status ProcConfigBytecodeInterpreter::EvalSpawn(
-    ImportData* import_data, const TypeInfo* type_info,
-    const std::optional<ParametricEnv>& caller_bindings,
-    std::optional<const Spawn*> maybe_spawn, Proc* proc,
-    const std::vector<InterpValue>& config_args,
-    std::vector<ProcInstance>* proc_instances,
-    const BytecodeInterpreterOptions& options) {
-  const TypeInfo* parent_ti = type_info;
-  auto get_parametric_type_info =
-      [type_info](const Spawn* spawn, const Invocation* invoc,
-                  const std::optional<ParametricEnv>& caller_bindings)
-      -> absl::StatusOr<TypeInfo*> {
-    std::optional<TypeInfo*> maybe_type_info = type_info->GetInvocationTypeInfo(
-        invoc, caller_bindings.has_value() ? caller_bindings.value()
-                                           : ParametricEnv());
-    if (!maybe_type_info.has_value()) {
-      return absl::InternalError(
-          absl::StrCat("Could not find type info for invocation ",
-                       spawn->ToString(), " : ", spawn->span().ToString()));
+std::string BytecodeInterpreter::FormatChannelNameForTracing(
+    const Bytecode::ChannelData& channel) {
+  if (proc_id().has_value()) {
+    // Include a string describing the instantiation path to this channel
+    // instance. For example:
+    //   my_top->my_proc#1->your_proc#2::the_channel
+    std::string result;
+    for (auto [proc, instance] : proc_id()->proc_instance_stack) {
+      if (result.empty()) {
+        result += proc->identifier();
+      } else {
+        absl::StrAppendFormat(&result, "->%s#%d", proc->identifier(), instance);
+      }
     }
-    return maybe_type_info.value();
-  };
-
-  // We need to get a new TI if there's a spawn, i.e., this isn't a top-level
-  // proc instantiation, to avoid constexpr values from colliding between
-  // different proc instantiations.
-  if (maybe_spawn.has_value()) {
-    // We're guaranteed that these have values if the proc is parametric (the
-    // root proc can't be parametric).
-    XLS_ASSIGN_OR_RETURN(type_info,
-                         get_parametric_type_info(maybe_spawn.value(),
-                                                  maybe_spawn.value()->config(),
-                                                  caller_bindings));
+    return absl::StrCat(result, "::", channel.channel_name());
   }
-
-  XLS_ASSIGN_OR_RETURN(
-      std::unique_ptr<BytecodeFunction> config_bf,
-      BytecodeEmitter::Emit(
-          import_data, type_info, proc->config(), caller_bindings,
-          BytecodeEmitterOptions{.format_preference =
-                                     options.format_preference()}));
-
-  ProcConfigBytecodeInterpreter cbi(import_data, proc_instances, options);
-  XLS_RETURN_IF_ERROR(cbi.InitFrame(config_bf.get(), config_args, type_info));
-  XLS_RETURN_IF_ERROR(cbi.Run());
-  XLS_RET_CHECK_EQ(cbi.stack().size(), 1);
-  InterpValue constants_tuple = cbi.stack().PeekOrDie();
-  XLS_RET_CHECK(constants_tuple.IsTuple());
-  XLS_ASSIGN_OR_RETURN(const std::vector<InterpValue>* constants,
-                       constants_tuple.GetValues());
-
-  // The Proc's "next" state includes all proc members (i.e., constants) as well
-  // as the implicit token and the _actual_ state args themselves.
-  std::vector<InterpValue> full_next_args = *constants;
-  full_next_args.push_back(InterpValue::MakeToken());
-  InterpValue initial_state(InterpValue::MakeToken());
-  if (maybe_spawn.has_value()) {
-    XLS_ASSIGN_OR_RETURN(
-        initial_state,
-        parent_ti->GetConstExpr(maybe_spawn.value()->next()->args()[0]));
-  } else {
-    // If this is the top-level proc, then we can get its initial state from the
-    // ModuleMember typechecking, since A) top-level procs can't be
-    // parameterized and B) typechecking will eagerly constexpr evaluate init
-    // functions.
-    XLS_ASSIGN_OR_RETURN(initial_state,
-                         parent_ti->GetConstExpr(proc->init()->body()));
-  }
-
-  full_next_args.insert(full_next_args.end(), initial_state);
-
-  std::vector<NameDef*> member_defs;
-  member_defs.reserve(proc->members().size());
-  for (const ProcMember* param : proc->members()) {
-    member_defs.push_back(param->name_def());
-  }
-
-  if (maybe_spawn.has_value()) {
-    XLS_ASSIGN_OR_RETURN(
-        type_info,
-        get_parametric_type_info(maybe_spawn.value(),
-                                 maybe_spawn.value()->next(), caller_bindings));
-  }
-
-  XLS_ASSIGN_OR_RETURN(
-      std::unique_ptr<BytecodeFunction> next_bf,
-      BytecodeEmitter::EmitProcNext(
-          import_data, type_info, proc->next(), caller_bindings, member_defs,
-          BytecodeEmitterOptions{.format_preference =
-                                     options.format_preference()}));
-  XLS_ASSIGN_OR_RETURN(
-      std::unique_ptr<BytecodeInterpreter> next_interpreter,
-      CreateUnique(import_data, next_bf.get(), full_next_args, options));
-  proc_instances->push_back(ProcInstance{proc, std::move(next_interpreter),
-                                         std::move(next_bf), full_next_args,
-                                         type_info});
-  return absl::OkStatus();
-}
-
-absl::StatusOr<ProcRunResult> ProcInstance::Run() {
-  bool progress_made = false;
-  absl::Status result_status = interpreter_->Run(&progress_made);
-
-  if (result_status.ok()) {
-    InterpValue result_value = interpreter_->stack_.PeekOrDie();
-    // If we're starting from next fn top, then set [non-member] args for the
-    // next go-around.
-    // Don't forget to add the [implicit] token!
-    // If we get an empty tuple and the proc has no recurrent state, then don't
-    // add it.
-    if (next_args_.size() == proc_->members().size() + 2) {
-      next_args_[proc_->members().size() + 1] = result_value;
-    } else {
-      XLS_QCHECK(result_value.IsTuple() &&
-                 result_value.GetLength().value() == 0);
-    }
-
-    XLS_RETURN_IF_ERROR(interpreter_->InitFrame(next_fn_.get(), next_args_,
-                                                type_info_));
-    return ProcRunResult{.execution_state = ProcExecutionState::kCompleted,
-                         .blocked_channel_name = std::nullopt,
-                         .progress_made = progress_made};
-  }
-
-  if (result_status.code() == absl::StatusCode::kUnavailable) {
-    // Empty recv channel. Just return Ok and we'll try again next time.
-    return ProcRunResult{
-        .execution_state = ProcExecutionState::kBlockedOnReceive,
-        .blocked_channel_name = interpreter_->blocked_channel_name(),
-        .progress_made = progress_made};
-  }
-
-  return result_status;
+  return std::string(channel.channel_name());
 }
 
 }  // namespace xls::dslx

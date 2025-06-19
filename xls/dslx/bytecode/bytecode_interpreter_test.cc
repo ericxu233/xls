@@ -24,24 +24,30 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
-#include "xls/common/file/temp_file.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
+#include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/dslx/bytecode/builtins.h"
+#include "xls/dslx/bytecode/bytecode.h"
 #include "xls/dslx/bytecode/bytecode_emitter.h"
 #include "xls/dslx/bytecode/bytecode_interpreter_options.h"
 #include "xls/dslx/bytecode/interpreter_stack.h"
 #include "xls/dslx/command_line_utils.h"
 #include "xls/dslx/create_import_data.h"
+#include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/import_data.h"
 #include "xls/dslx/interp_value.h"
 #include "xls/dslx/parse_and_typecheck.h"
-#include "xls/dslx/run_routines.h"
-#include "xls/dslx/type_system/type_info.h"
+#include "xls/dslx/type_system/parametric_env.h"
+#include "xls/dslx/virtualizable_file_system.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/format_preference.h"
+#include "xls/ir/format_strings.h"
 
 namespace xls::dslx {
 namespace {
@@ -49,26 +55,34 @@ namespace {
 absl::StatusOr<TypecheckedModule> ParseAndTypecheckOrPrintError(
     std::string_view program, ImportData* import_data) {
   // Parse/typecheck and print a helpful error.
-  absl::StatusOr<TypecheckedModule> tm_or =
+  absl::StatusOr<TypecheckedModule> tm =
       ParseAndTypecheck(program, "test.x", "test", import_data);
-  if (!tm_or.ok()) {
-    TryPrintError(tm_or.status(),
-                  [&](std::string_view) -> absl::StatusOr<std::string> {
-                    return std::string{program};
-                  });
+  if (!tm.ok()) {
+    UniformContentFilesystem vfs(program);
+    TryPrintError(tm.status(), import_data->file_table(), vfs);
   }
-  return tm_or;
+  return tm;
 }
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
-using testing::HasSubstr;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
+using ::testing::HasSubstr;
 
-TEST(BytecodeInterpreterTest, TraceDataToString) {
-  auto stack = InterpreterStack::CreateForTest(std::vector<InterpValue>{
-      InterpValue::MakeUBits(8, /*value=*/0x42),
-      InterpValue::MakeUBits(3, /*value=*/4),
-  });
+class BytecodeInterpreterTest : public ::testing::Test {
+ public:
+  void SetUp() override { import_data_.emplace(CreateImportDataForTest()); }
+
+ protected:
+  std::optional<ImportData> import_data_;
+};
+
+TEST_F(BytecodeInterpreterTest, TraceDataToString) {
+  FileTable file_table;
+  auto stack = InterpreterStack::CreateForTest(
+      file_table, std::vector<InterpValue>{
+                      InterpValue::MakeUBits(8, /*value=*/0x42),
+                      InterpValue::MakeUBits(3, /*value=*/4),
+                  });
   XLS_ASSERT_OK_AND_ASSIGN(std::vector<FormatStep> steps,
                            ParseFormatString("x: {:x} y: {}"));
   XLS_ASSERT_OK_AND_ASSIGN(std::string result,
@@ -83,27 +97,37 @@ TEST(BytecodeInterpreterTest, TraceDataToString) {
 static absl::StatusOr<InterpValue> Interpret(
     std::string_view program, std::string_view entry,
     const std::vector<InterpValue>& args = {},
-    const BytecodeInterpreterOptions& options = BytecodeInterpreterOptions()) {
-  ImportData import_data(CreateImportDataForTest());
+    const BytecodeInterpreterOptions& options = BytecodeInterpreterOptions(),
+    ImportData* import_data = nullptr) {
+  std::optional<ImportData> local_import_data;
+  if (import_data == nullptr) {
+    local_import_data.emplace(CreateImportDataForTest());
+    import_data = &local_import_data.value();
+  }
+
   XLS_ASSIGN_OR_RETURN(TypecheckedModule tm,
-                       ParseAndTypecheckOrPrintError(program, &import_data));
+                       ParseAndTypecheckOrPrintError(program, import_data));
 
   XLS_ASSIGN_OR_RETURN(Function * f,
                        tm.module->GetMemberOrError<Function>(entry));
+  XLS_RET_CHECK(f != nullptr);
   XLS_ASSIGN_OR_RETURN(
       std::unique_ptr<BytecodeFunction> bf,
       BytecodeEmitter::Emit(
-          &import_data, tm.type_info, f, ParametricEnv(),
+          import_data, tm.type_info, *f, ParametricEnv(),
           BytecodeEmitterOptions{.format_preference =
                                      options.format_preference()}));
+  XLS_RET_CHECK_EQ(bf->owner(), f->owner());
 
-  return BytecodeInterpreter::Interpret(&import_data, bf.get(), args, options);
+  return BytecodeInterpreter::Interpret(import_data, bf.get(), args,
+                                        /*channel_manager=*/std::nullopt,
+                                        options);
 }
 
-static const Pos kFakePos("fake.x", 0, 0);
+static const Pos kFakePos(Fileno(0), 0, 0);
 static const Span kFakeSpan = Span(kFakePos, kFakePos);
 
-TEST(BytecodeInterpreterTest, DupLiteral) {
+TEST_F(BytecodeInterpreterTest, DupLiteral) {
   std::vector<Bytecode> bytecodes;
   bytecodes.emplace_back(kFakeSpan, Bytecode::Op::kLiteral,
                          InterpValue::MakeU32(42));
@@ -114,13 +138,17 @@ TEST(BytecodeInterpreterTest, DupLiteral) {
                                /*type_info=*/nullptr, std::move(bytecodes)));
   BytecodeInterpreterOptions options;
   options.set_validate_final_stack_depth(false);
-  XLS_ASSERT_OK_AND_ASSIGN(InterpValue result, BytecodeInterpreter::Interpret(
-                                                   /*import_data=*/nullptr,
-                                                   bfunc.get(), {}, options));
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue result,
+                           BytecodeInterpreter::Interpret(
+                               &import_data_.value(), bfunc.get(), {},
+                               /*channel_manager=*/std::nullopt, options));
   EXPECT_EQ(result.ToString(), "u32:42");
 }
 
-TEST(BytecodeInterpreterTest, DupEmptyStack) {
+// Note: this test case spews a stack trace as the `!stack_.empty()` error comes
+// from a `XLS_RET_CHECK`, this is really an internals-flags-an-error test not a
+// behavioral test.
+TEST_F(BytecodeInterpreterTest, DupEmptyStack) {
   std::vector<Bytecode> bytecodes;
   bytecodes.emplace_back(kFakeSpan, Bytecode::Op::kDup);
   XLS_ASSERT_OK_AND_ASSIGN(
@@ -128,12 +156,12 @@ TEST(BytecodeInterpreterTest, DupEmptyStack) {
       BytecodeFunction::Create(/*owner=*/nullptr, /*source_fn=*/nullptr,
                                /*type_info=*/nullptr, std::move(bytecodes)));
   ASSERT_THAT(
-      BytecodeInterpreter::Interpret(/*import_data=*/nullptr, bfunc.get(), {}),
+      BytecodeInterpreter::Interpret(&import_data_.value(), bfunc.get(), {}),
       StatusIs(absl::StatusCode::kInternal,
                ::testing::HasSubstr("!stack_.empty()")));
 }
 
-TEST(BytecodeInterpreterTest, TraceBitsValueDefaultFormat) {
+TEST_F(BytecodeInterpreterTest, TraceBitsValueDefaultFormat) {
   constexpr std::string_view kProgram = R"(
 fn main() -> () {
   trace!(u32:42);
@@ -143,15 +171,14 @@ fn main() -> () {
   XLS_ASSERT_OK_AND_ASSIGN(
       InterpValue value, Interpret(kProgram, "main", /*args=*/{},
                                    BytecodeInterpreterOptions().trace_hook(
-                                       [&](std::string_view s) {
+                                       [&](const Span&, std::string_view s) {
                                          trace_output.push_back(std::string{s});
                                        })));
-  EXPECT_THAT(trace_output,
-              testing::ElementsAre("trace of u32:42 @ test.x:3:9-3:17: 42"));
+  EXPECT_THAT(trace_output, testing::ElementsAre("trace of u32:42: 42"));
   EXPECT_EQ(value, InterpValue::MakeUnit());
 }
 
-TEST(BytecodeInterpreterTest, TraceBitsValueHexFormat) {
+TEST_F(BytecodeInterpreterTest, TraceBitsValueHexFormat) {
   constexpr std::string_view kProgram = R"(
 fn main() -> () {
   trace!(u32:42);
@@ -162,16 +189,25 @@ fn main() -> () {
       InterpValue value,
       Interpret(kProgram, "main", /*args=*/{},
                 BytecodeInterpreterOptions()
-                    .trace_hook([&](std::string_view s) {
+                    .trace_hook([&](const Span&, std::string_view s) {
                       trace_output.push_back(std::string{s});
                     })
                     .format_preference(FormatPreference::kHex)));
-  EXPECT_THAT(trace_output,
-              testing::ElementsAre("trace of u32:42 @ test.x:3:9-3:17: 0x2a"));
+  EXPECT_THAT(trace_output, testing::ElementsAre("trace of u32:42: 0x2a"));
   EXPECT_EQ(value, InterpValue::MakeUnit());
 }
 
-TEST(BytecodeInterpreterTest, TraceFmtBitsValueDefaultFormat) {
+TEST_F(BytecodeInterpreterTest, TraceActsAsIdentity) {
+  constexpr std::string_view kProgram = R"(
+fn main() -> u32 {
+  trace!(u32:42) >> trace!(u32:1)
+}
+)";
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue value, Interpret(kProgram, "main"));
+  EXPECT_EQ(value, InterpValue::MakeU32(42 >> 1));
+}
+
+TEST_F(BytecodeInterpreterTest, TraceFmtBitsValueDefaultFormat) {
   constexpr std::string_view kProgram = R"(
 fn main() -> () {
   trace_fmt!("{}", u32:42);
@@ -181,14 +217,14 @@ fn main() -> () {
   XLS_ASSERT_OK_AND_ASSIGN(
       InterpValue value, Interpret(kProgram, "main", /*args=*/{},
                                    BytecodeInterpreterOptions().trace_hook(
-                                       [&](std::string_view s) {
+                                       [&](const Span&, std::string_view s) {
                                          trace_output.push_back(std::string{s});
                                        })));
   EXPECT_THAT(trace_output, testing::ElementsAre("42"));
   EXPECT_EQ(value, InterpValue::MakeUnit());
 }
 
-TEST(BytecodeInterpreterTest, TraceFmtBitsValueHexFormat) {
+TEST_F(BytecodeInterpreterTest, TraceFmtBitsValueHexFormat) {
   constexpr std::string_view kProgram = R"(
 fn main() -> () {
   trace_fmt!("{}", u32:42);
@@ -199,7 +235,7 @@ fn main() -> () {
       InterpValue value,
       Interpret(kProgram, "main", /*args=*/{},
                 BytecodeInterpreterOptions()
-                    .trace_hook([&](std::string_view s) {
+                    .trace_hook([&](const Span&, std::string_view s) {
                       trace_output.push_back(std::string{s});
                     })
                     .format_preference(FormatPreference::kHex)));
@@ -207,7 +243,7 @@ fn main() -> () {
   EXPECT_EQ(value, InterpValue::MakeUnit());
 }
 
-TEST(BytecodeInterpreterTest, TraceFmtBitsValueBinaryFormat) {
+TEST_F(BytecodeInterpreterTest, TraceFmtBitsValueBinaryFormat) {
   constexpr std::string_view kProgram = R"(
 fn main() -> () {
   trace_fmt!("{}", u32:42);
@@ -218,7 +254,7 @@ fn main() -> () {
       InterpValue value,
       Interpret(kProgram, "main", /*args=*/{},
                 BytecodeInterpreterOptions()
-                    .trace_hook([&](std::string_view s) {
+                    .trace_hook([&](const Span&, std::string_view s) {
                       trace_output.push_back(std::string{s});
                     })
                     .format_preference(FormatPreference::kBinary)));
@@ -226,7 +262,7 @@ fn main() -> () {
   EXPECT_EQ(value, InterpValue::MakeUnit());
 }
 
-TEST(BytecodeInterpreterTest, TraceFmtStructValueDefaultFormat) {
+TEST_F(BytecodeInterpreterTest, TraceFmtStructValueDefaultFormat) {
   constexpr std::string_view kProgram = R"(
 struct Point {
   x: u32,
@@ -241,17 +277,17 @@ fn main() -> () {
   XLS_ASSERT_OK_AND_ASSIGN(
       InterpValue value, Interpret(kProgram, "main", /*args=*/{},
                                    BytecodeInterpreterOptions().trace_hook(
-                                       [&](std::string_view s) {
+                                       [&](const Span&, std::string_view s) {
                                          trace_output.push_back(std::string{s});
                                        })));
   EXPECT_THAT(trace_output, testing::ElementsAre(R"(Point {
-  x: 42,
-  y: 64
+    x: 42,
+    y: 64
 })"));
   EXPECT_EQ(value, InterpValue::MakeUnit());
 }
 
-TEST(BytecodeInterpreterTest, TraceFmtStructValueHexFormat) {
+TEST_F(BytecodeInterpreterTest, TraceFmtStructValueHexFormat) {
   constexpr std::string_view kProgram = R"(
 struct Point {
   x: u32,
@@ -267,18 +303,18 @@ fn main() -> () {
       InterpValue value,
       Interpret(kProgram, "main", /*args=*/{},
                 BytecodeInterpreterOptions()
-                    .trace_hook([&](std::string_view s) {
+                    .trace_hook([&](const Span&, std::string_view s) {
                       trace_output.push_back(std::string{s});
                     })
                     .format_preference(FormatPreference::kHex)));
   EXPECT_THAT(trace_output, testing::ElementsAre(R"(Point {
-  x: 0x2a,
-  y: 0x40
+    x: 0x2a,
+    y: 0x40
 })"));
   EXPECT_EQ(value, InterpValue::MakeUnit());
 }
 
-TEST(BytecodeInterpreterTest, TraceFmtStructValueBinaryFormat) {
+TEST_F(BytecodeInterpreterTest, TraceFmtStructValueBinaryFormat) {
   constexpr std::string_view kProgram = R"(
 struct Point {
   x: u32,
@@ -294,18 +330,18 @@ fn main() -> () {
       InterpValue value,
       Interpret(kProgram, "main", /*args=*/{},
                 BytecodeInterpreterOptions()
-                    .trace_hook([&](std::string_view s) {
+                    .trace_hook([&](const Span&, std::string_view s) {
                       trace_output.push_back(std::string{s});
                     })
                     .format_preference(FormatPreference::kBinary)));
   EXPECT_THAT(trace_output, testing::ElementsAre(R"(Point {
-  x: 0b10_1010,
-  y: 0b100_0000
+    x: 0b10_1010,
+    y: 0b100_0000
 })"));
   EXPECT_EQ(value, InterpValue::MakeUnit());
 }
 
-TEST(BytecodeInterpreterTest, NestedTraceFmtStructValueDefaultFormat) {
+TEST_F(BytecodeInterpreterTest, NestedTraceFmtStructValueDefaultFormat) {
   constexpr std::string_view kProgram = R"(
 struct Point {
   x: u32,
@@ -326,20 +362,20 @@ fn main() -> () {
   XLS_ASSERT_OK_AND_ASSIGN(
       InterpValue value, Interpret(kProgram, "main", /*args=*/{},
                                    BytecodeInterpreterOptions().trace_hook(
-                                       [&](std::string_view s) {
+                                       [&](const Span&, std::string_view s) {
                                          trace_output.push_back(std::string{s});
                                        })));
   EXPECT_THAT(trace_output, testing::ElementsAre(R"(Foo {
-  p: Point {
-    x: 42,
-    y: 64
-  },
-  z: 123
+    p: Point {
+        x: 42,
+        y: 64
+    },
+    z: 123
 })"));
   EXPECT_EQ(value, InterpValue::MakeUnit());
 }
 
-TEST(BytecodeInterpreterTest, NestedTraceFmtStructValueHexFormat) {
+TEST_F(BytecodeInterpreterTest, NestedTraceFmtStructValueHexFormat) {
   constexpr std::string_view kProgram = R"(
 struct Point {
   x: u32,
@@ -361,24 +397,24 @@ fn main() -> () {
       InterpValue value,
       Interpret(kProgram, "main", /*args=*/{},
                 BytecodeInterpreterOptions()
-                    .trace_hook([&](std::string_view s) {
+                    .trace_hook([&](const Span&, std::string_view s) {
                       trace_output.push_back(std::string{s});
                     })
                     .format_preference(FormatPreference::kHex)));
 
   EXPECT_THAT(trace_output, testing::ElementsAre(R"(Foo {
-  p: Point {
-    x: 0x2a,
-    y: 0x40
-  },
-  z: 0x7b
+    p: Point {
+        x: 0x2a,
+        y: 0x40
+    },
+    z: 0x7b
 })"));
   EXPECT_EQ(value, InterpValue::MakeUnit());
 }
 
 // Interprets a nearly-minimal bytecode program; the same from
 // BytecodeEmitterTest.SimpleTranslation.
-TEST(BytecodeInterpreterTest, PositiveSmokeTest) {
+TEST_F(BytecodeInterpreterTest, PositiveSmokeTest) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32 {
   let a = u32:1;
@@ -392,7 +428,7 @@ fn main() -> u32 {
 
 // Tests that a failing assert_eq is interpreted correctly. Again, a
 // continuation of a test from BytecodeEmitterTest. Get used to it.
-TEST(BytecodeInterpreterTest, AssertEqFail) {
+TEST_F(BytecodeInterpreterTest, AssertEqFail) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32{
   let a = u32:3;
@@ -409,7 +445,7 @@ fn main() -> u32{
                                       HasSubstr("rhs: u32:2"))));
 }
 
-TEST(BytecodeInterpreterTest, AssertEqFailHexFormat) {
+TEST_F(BytecodeInterpreterTest, AssertEqFailHexFormat) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32{
   let a = u32:10;
@@ -428,7 +464,84 @@ fn main() -> u32{
                                       HasSubstr("rhs: u32:0x14"))));
 }
 
-TEST(BytecodeInterpreterTest, AssertLtFail) {
+TEST_F(BytecodeInterpreterTest, AssertEqFailAutoFormatHex) {
+  constexpr std::string_view kProgram = R"(
+fn main() -> u32{
+  let a = u32:10;
+  assert_eq(a, u32:0x12);
+  a
+}
+)";
+
+  absl::StatusOr<InterpValue> value = Interpret(kProgram, "main");
+  EXPECT_THAT(value.status(),
+              StatusIs(absl::StatusCode::kInternal,
+                       testing::AllOf(HasSubstr("were not equal"),
+                                      HasSubstr("lhs: u32:0xa"),
+                                      HasSubstr("rhs: u32:0x12"))));
+}
+
+TEST_F(BytecodeInterpreterTest, AssertEqFailAutoFormatBinary) {
+  constexpr std::string_view kProgram = R"(
+fn main() -> u32{
+  let a = u32:10;
+  assert_eq(a, u32:0b1010_1100);
+  a
+}
+)";
+
+  absl::StatusOr<InterpValue> value = Interpret(kProgram, "main");
+  EXPECT_THAT(value.status(),
+              StatusIs(absl::StatusCode::kInternal,
+                       testing::AllOf(HasSubstr("were not equal"),
+                                      HasSubstr("lhs: u32:0b1010"),
+                                      HasSubstr("rhs: u32:0b1010_1100"))));
+}
+
+TEST_F(BytecodeInterpreterTest, AssertLtFailAutoFormatBinary) {
+  constexpr std::string_view kProgram = R"(
+fn main() -> u32{
+  let a = u32:100;
+  assert_lt(a, u32:0b1010);
+  a
+}
+)";
+
+  absl::StatusOr<InterpValue> value = Interpret(kProgram, "main");
+  EXPECT_THAT(value.status(),
+              StatusIs(absl::StatusCode::kInternal,
+                       testing::AllOf(HasSubstr("was not less than"),
+                                      HasSubstr("lhs: u32:0b110_0100"),
+                                      HasSubstr("rhs: u32:0b1010"))));
+}
+
+// TODO(meheff): 2024/06/25 Enable auto-formatting of assert_eq messages in
+// structs.
+TEST(DISABLED_BytecodeInterpreterTest, AssertEqFailStructAutoFormatMixed) {
+  constexpr std::string_view kProgram = R"(
+struct MyStruct {
+  x: u32,
+  y: u32,
+}
+
+fn main() -> () {
+  let a = MyStruct{x: u32:10, y: u32:20};
+  assert_eq(a, MyStruct{x: u32:0b1011, y: u32:0x1234});
+  ()
+}
+)";
+
+  absl::StatusOr<InterpValue> value = Interpret(kProgram, "main");
+  EXPECT_THAT(
+      value.status(),
+      StatusIs(absl::StatusCode::kInternal,
+               testing::AllOf(
+                   HasSubstr("were not equal"), HasSubstr("< x: u32:0b1011"),
+                   HasSubstr("> x: u32:0b1010"), HasSubstr("< y: u32:0x14"),
+                   HasSubstr("> y: u32:0x1234"))));
+}
+
+TEST_F(BytecodeInterpreterTest, AssertLtFail) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32{
   let a = u32:3;
@@ -442,8 +555,179 @@ fn main() -> u32{
                                        HasSubstr("not less than")));
 }
 
-// This test won't work unless BytecodeEmitterTest.DestructuringLet works!
-TEST(BytecodeInterpreterTest, DestructuringLet) {
+TEST_F(BytecodeInterpreterTest, DestructuringNonConstantTupleWithRestOfTuple) {
+  constexpr std::string_view kProgram = R"(
+fn tuple_not_constant() -> u32 {
+  let t = (u32:2, u8:3, u4:1);
+
+  let (a, ..) = t;
+  assert_eq(u32:2, a);
+  a
+})";
+
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue value,
+                           Interpret(kProgram, "tuple_not_constant"));
+  EXPECT_EQ(value, InterpValue::MakeU32(2));
+}
+
+TEST_F(BytecodeInterpreterTest, TupleAssignsValues) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  let (x, y): (u32, s8) = (u32:7, s8:3);
+  assert_eq(x, u32:7);
+  assert_eq(y, s8:3);
+}
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+
+TEST_F(BytecodeInterpreterTest, RestOfTupleSkipsMiddle) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  let (x, .., y) = (u32:7, u12:4, s8:3);
+  assert_eq(x, u32:7);
+  assert_eq(y, s8:3);
+}
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+
+TEST_F(BytecodeInterpreterTest, RestOfTupleSkipsNone) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  let (x, .., y) = (u32:7, s8:3);
+  assert_eq(x, u32:7);
+  assert_eq(y, s8:3);
+}
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+
+TEST_F(BytecodeInterpreterTest, RestOfTuplekSkipsNoneWithThree) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  let (x, y, .., z) = (u32:7, u12:4, s8:3);
+  assert_eq(x, u32:7);
+  assert_eq(y, u12:4);
+  assert_eq(z, s8:3);
+}
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+
+TEST_F(BytecodeInterpreterTest, RestOfTupleSkipsEnd) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  let (x, y, ..) = (u32:7, s8:3, u12:4);
+  assert_eq(x, u32:7);
+  assert_eq(y, s8:3);
+}
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+
+TEST_F(BytecodeInterpreterTest, RestOfTupleSkipsManyAtEnd) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  let (x, y, ..) = (u32:7, s8:3, u12:4, u32:0);
+  assert_eq(x, u32:7);
+  assert_eq(y, s8:3);
+}
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+
+TEST_F(BytecodeInterpreterTest, RestOfTupleSkipsManyInMiddle) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  let (x, .., y) = (u32:7, u8:3, u12:4, s8:3);
+  assert_eq(x, u32:7);
+  assert_eq(y, s8:3);
+}
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+
+TEST_F(BytecodeInterpreterTest, RestOfTupleSkipsBeginning) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  let (.., x, y) = (u12:7, u8:3, u32:4, s8:3);
+  assert_eq(x, u32:4);
+  assert_eq(y, s8:3);
+}
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+
+TEST_F(BytecodeInterpreterTest, RestOfTupleSkipsManyAtBeginning) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  let (.., x) = (u8:3, u12:4, u32:7);
+  assert_eq(x, u32:7);
+}
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+
+TEST_F(BytecodeInterpreterTest, RestOfTupleNested) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  let (x, .., (.., y)) = (u32:7, u8:3, u18:5, (u12:4, u11:5, s8:3));
+  assert_eq(x, u32:7);
+  assert_eq(y, s8:3);
+}
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+
+TEST_F(BytecodeInterpreterTest, RestOfTupleNestedSingleton) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  let (x, .., (y,)) = (u32:7, u8:3, (s8:3,));
+  assert_eq(x, u32:7);
+  assert_eq(y, s8:3);
+}
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+
+TEST_F(BytecodeInterpreterTest, RestOfTupleIsLikeWildcard) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  let (x, .., (.., y)) = (u32:7, u18:5, (u12:4, s8:3));
+  assert_eq(x, u32:7);
+  assert_eq(y, s8:3);
+}
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+
+TEST_F(BytecodeInterpreterTest, RestOfTupleDeeplyNested) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  let (x, y, .., ((.., z), .., d)) = (u32:7, u8:1,
+                            ((u32:3, u64:4, uN[128]:5), u12:4, s8:3));
+  assert_eq(x, u32:7);
+  assert_eq(y, u8:1);
+  assert_eq(z, uN[128]:5);
+  }
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+
+TEST_F(BytecodeInterpreterTest, RestOfTupleDeeplyNestedNonConstants) {
+  constexpr std::string_view kProgram = R"(
+fn main() {
+  // Initial values
+  let (xi, yi, zi): (u32, u8, uN[128]) = (u32:7, u8:1, uN[128]:5);
+  let (x, y, .., ((.., z), .., d)) = (xi, yi,
+                            ((u32:3, u64:4, zi), u12:4, s8:3));
+  let (xx, yy, zz): (u32, u8, uN[128]) = (x, y, z);
+  }
+)";
+  XLS_EXPECT_OK(Interpret(kProgram, "main"));
+}
+TEST_F(BytecodeInterpreterTest, DestructuringLet) {
   constexpr std::string_view kProgram = R"(
 fn has_name_def_tree() -> (u32, u64, uN[128]) {
   let (a, b, (c, d)) = (u4:0, u8:1, (u16:2, (u32:3, u64:4, uN[128]:5)));
@@ -474,7 +758,69 @@ fn has_name_def_tree() -> (u32, u64, uN[128]) {
   EXPECT_EQ(bit_value, 5);
 }
 
-TEST(BytecodeInterpreterTest, RunMatchArms) {
+TEST_F(BytecodeInterpreterTest, DestructuringLetWithRestOfTuple) {
+  constexpr std::string_view kProgram = R"(
+fn has_name_def_tree() -> (u32, u64, uN[128]) {
+  let (a, b, .., (c, .., d)) = (u4:0, u8:1, u9:2, u10:3, (u16:2, u17:2, (u32:3, u64:4, uN[128]:5)));
+  assert_eq(a, u4:0);
+  assert_eq(b, u8:1);
+  assert_eq(c, u16:2);
+  assert_eq(d, (u32:3, u64:4, uN[128]:5));
+  d
+})";
+
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue value,
+                           Interpret(kProgram, "has_name_def_tree"));
+
+  ASSERT_TRUE(value.IsTuple());
+  XLS_ASSERT_OK_AND_ASSIGN(int64_t num_elements, value.GetLength());
+  ASSERT_EQ(num_elements, 3);
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue element,
+                           value.Index(InterpValue::MakeU32(0)));
+  XLS_ASSERT_OK_AND_ASSIGN(int64_t bit_value, element.GetBitValueViaSign());
+  EXPECT_EQ(bit_value, 3);
+
+  XLS_ASSERT_OK_AND_ASSIGN(element, value.Index(InterpValue::MakeU32(1)));
+  XLS_ASSERT_OK_AND_ASSIGN(bit_value, element.GetBitValueViaSign());
+  EXPECT_EQ(bit_value, 4);
+
+  XLS_ASSERT_OK_AND_ASSIGN(element, value.Index(InterpValue::MakeU32(2)));
+  XLS_ASSERT_OK_AND_ASSIGN(bit_value, element.GetBitValueViaSign());
+  EXPECT_EQ(bit_value, 5);
+}
+
+TEST_F(BytecodeInterpreterTest, DestructuringLetWithRestOfTupleSkipsZero) {
+  constexpr std::string_view kProgram = R"(
+fn has_name_def_tree() -> (u32, u64, uN[128]) {
+  let (a, b, .., (c, .., d)) = (u4:0, u8:1, (u16:2, (u32:3, u64:4, uN[128]:5)));
+  assert_eq(a, u4:0);
+  assert_eq(b, u8:1);
+  assert_eq(c, u16:2);
+  assert_eq(d, (u32:3, u64:4, uN[128]:5));
+  d
+})";
+
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue value,
+                           Interpret(kProgram, "has_name_def_tree"));
+
+  ASSERT_TRUE(value.IsTuple());
+  XLS_ASSERT_OK_AND_ASSIGN(int64_t num_elements, value.GetLength());
+  ASSERT_EQ(num_elements, 3);
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue element,
+                           value.Index(InterpValue::MakeU32(0)));
+  XLS_ASSERT_OK_AND_ASSIGN(int64_t bit_value, element.GetBitValueViaSign());
+  EXPECT_EQ(bit_value, 3);
+
+  XLS_ASSERT_OK_AND_ASSIGN(element, value.Index(InterpValue::MakeU32(1)));
+  XLS_ASSERT_OK_AND_ASSIGN(bit_value, element.GetBitValueViaSign());
+  EXPECT_EQ(bit_value, 4);
+
+  XLS_ASSERT_OK_AND_ASSIGN(element, value.Index(InterpValue::MakeU32(2)));
+  XLS_ASSERT_OK_AND_ASSIGN(bit_value, element.GetBitValueViaSign());
+  EXPECT_EQ(bit_value, 5);
+}
+
+TEST_F(BytecodeInterpreterTest, RunMatchArms) {
   constexpr std::string_view kProgram = R"(
 fn main(x: u32) -> u32 {
   match x {
@@ -498,7 +844,7 @@ fn main(x: u32) -> u32 {
   EXPECT_EQ(value, InterpValue::MakeU32(78)) << value.ToString();
 }
 
-TEST(BytecodeInterpreterTest, RunMatchArmsTuplePattern) {
+TEST_F(BytecodeInterpreterTest, RunMatchArmsTuplePattern) {
   constexpr std::string_view kProgram = R"(
 fn main(t: (u32, u32)) -> u32 {
   match t {
@@ -531,7 +877,7 @@ fn main(t: (u32, u32)) -> u32 {
   EXPECT_EQ(value, InterpValue::MakeU32(3)) << value.ToString();
 }
 
-TEST(BytecodeInterpreterTest, RunMatchArmIrrefutablePattern) {
+TEST_F(BytecodeInterpreterTest, RunMatchArmIrrefutablePattern) {
   constexpr std::string_view kProgram = R"(
 fn main(x: u32) -> u32 {
   match x {
@@ -551,7 +897,7 @@ fn main(x: u32) -> u32 {
   EXPECT_EQ(value, InterpValue::MakeU32(44)) << value.ToString();
 }
 
-TEST(BytecodeInterpreterTest, RunMatchNoTrailingWildcard) {
+TEST_F(BytecodeInterpreterTest, RunMatchNoTrailingWildcard) {
   constexpr std::string_view kProgram = R"(
 fn main(x: u32) -> u32 {
   match x {
@@ -565,7 +911,7 @@ fn main(x: u32) -> u32 {
   EXPECT_EQ(value, InterpValue::MakeU32(2));
 }
 
-TEST(BytecodeInterpreterTest, RunMatchNoMatch) {
+TEST_F(BytecodeInterpreterTest, RunMatchNoMatch) {
   constexpr std::string_view kProgram = R"(
 fn main(x: u32) -> u32 {
   match x {
@@ -575,11 +921,12 @@ fn main(x: u32) -> u32 {
 
   absl::StatusOr<InterpValue> value =
       Interpret(kProgram, "main", {InterpValue::MakeU32(2)});
-  EXPECT_THAT(value.status(), StatusIs(absl::StatusCode::kInternal,
-                                       HasSubstr("The value was not matched")));
+  EXPECT_THAT(value.status(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Match pattern is not exhaustive")));
 }
 
-TEST(BytecodeInterpreterTest, RunMatchWithNameRefs) {
+TEST_F(BytecodeInterpreterTest, RunMatchWithNameRefs) {
   constexpr std::string_view kProgram = R"(
 fn main(x: u32, y: u32, z: u32) -> u32 {
   match x {
@@ -606,7 +953,103 @@ fn main(x: u32, y: u32, z: u32) -> u32 {
   EXPECT_EQ(value, InterpValue::MakeU32(0xdeadbeef)) << value.ToString();
 }
 
-TEST(BytecodeInterpreterTest, RunTernaryConsequent) {
+TEST_F(BytecodeInterpreterTest, RunMatchWithRestOfTuple) {
+  constexpr std::string_view kProgram = R"(
+fn main(x: (u32, u32, u32, u32)) -> u32 {
+  match x {
+    (.., u32:1, y) => y,
+    (u32:2, y, ..) => y,
+    (u32:3, .., y) => y,
+    (u32:4, .., y, _) => y,
+    _ => u32:0xdeadbeef,
+  }
+}
+)";
+
+  InterpValue one(InterpValue::MakeU32(1));
+  InterpValue two(InterpValue::MakeU32(2));
+  InterpValue three(InterpValue::MakeU32(3));
+  InterpValue four(InterpValue::MakeU32(4));
+
+  // 1, 1, 1, 3 should return 3 (.., 1, y)
+  auto tuple = InterpValue::MakeTuple({one, one, one, three});
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue value,
+                           Interpret(kProgram, "main", {tuple}));
+  EXPECT_EQ(value, three);
+
+  // 2, 3, 4, 1 should return 3 (2, y, ..)
+  tuple = InterpValue::MakeTuple({two, three, four, one});
+  XLS_ASSERT_OK_AND_ASSIGN(value, Interpret(kProgram, "main", {tuple}));
+  EXPECT_EQ(value, three);
+
+  //  3, 4, 1, 2 should return 2 (3, .., y)
+  tuple = InterpValue::MakeTuple({three, four, one, two});
+  XLS_ASSERT_OK_AND_ASSIGN(value, Interpret(kProgram, "main", {tuple}));
+  EXPECT_EQ(value, two);
+
+  //  4, 1, 2, 3 should return 2 (4, .., y, _)
+  tuple = InterpValue::MakeTuple({four, one, two, three});
+  XLS_ASSERT_OK_AND_ASSIGN(value, Interpret(kProgram, "main", {tuple}));
+  EXPECT_EQ(value, two);
+
+  // 1, 1, 2, 3 should match none.
+  tuple = InterpValue::MakeTuple({one, one, two, three});
+  XLS_ASSERT_OK_AND_ASSIGN(value, Interpret(kProgram, "main", {tuple}));
+  EXPECT_EQ(value, InterpValue::MakeU32(0xdeadbeef));
+}
+
+TEST_F(BytecodeInterpreterTest, RunMatchWithTupleOfTuples) {
+  constexpr std::string_view kProgram = R"(
+fn main(x: (u32, (u32, u32, u32), u32, u32)) -> u32 {
+  match x {
+    (.., u32:1, a) => a,
+    (u32:2, (u32:0, _, b), ..) => b,
+    (u32:3, (.., c), ..) => c,
+    (u32:4, d, ..) => d.0,
+    _ => u32:0xdeadbeef,
+  }
+}
+)";
+
+  InterpValue zero(InterpValue::MakeU32(0));
+  InterpValue one(InterpValue::MakeU32(1));
+  InterpValue two(InterpValue::MakeU32(2));
+  InterpValue three(InterpValue::MakeU32(3));
+  InterpValue four(InterpValue::MakeU32(4));
+
+  // 1, 1, 1, 3 should return 3: matches on (.., u32:1, y) => y
+  auto tuple = InterpValue::MakeTuple({one, one, one, three});
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue value,
+                           Interpret(kProgram, "main", {tuple}));
+  EXPECT_EQ(value, three);
+
+  // 2, (0, 3, 4), 0, 0 should return 4:
+  // matches on (u32:2, (u32:0, _, b), ..) => b
+  tuple = InterpValue::MakeTuple(
+      {two, InterpValue::MakeTuple({zero, three, four}), zero, zero});
+  XLS_ASSERT_OK_AND_ASSIGN(value, Interpret(kProgram, "main", {tuple}));
+  EXPECT_EQ(value, four);
+
+  // 3, (0, 3, 4), 2, 2 should return 4: matches on (u32:3, (.., b), ..) => b
+  tuple = InterpValue::MakeTuple(
+      {two, InterpValue::MakeTuple({zero, three, four}), two, two});
+  XLS_ASSERT_OK_AND_ASSIGN(value, Interpret(kProgram, "main", {tuple}));
+  EXPECT_EQ(value, four);
+
+  // 4, (2, 3, 4), 4, 4 should return 2: matches on (u32:4, z, ..) => z.0
+  tuple = InterpValue::MakeTuple(
+      {four, InterpValue::MakeTuple({two, three, four}), four, four});
+  XLS_ASSERT_OK_AND_ASSIGN(value, Interpret(kProgram, "main", {tuple}));
+  EXPECT_EQ(value, two);
+
+  // 0, (2, 3, 4), 4, 4 should return 0xdeadbeef, no match.
+  tuple = InterpValue::MakeTuple(
+      {zero, InterpValue::MakeTuple({two, three, four}), four, four});
+  XLS_ASSERT_OK_AND_ASSIGN(value, Interpret(kProgram, "main", {tuple}));
+  EXPECT_EQ(value, InterpValue::MakeU32(0xdeadbeef));
+}
+
+TEST_F(BytecodeInterpreterTest, RunTernaryConsequent) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32 {
   if true { u32:42 } else { u32:64 }
@@ -617,7 +1060,7 @@ fn main() -> u32 {
   EXPECT_EQ(value, InterpValue::MakeU32(42)) << value.ToString();
 }
 
-TEST(BytecodeInterpreterTest, RunTernaryAlternate) {
+TEST_F(BytecodeInterpreterTest, RunTernaryAlternate) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32 {
   if false { u32:42 } else { u32:64 }
@@ -628,7 +1071,7 @@ fn main() -> u32 {
   EXPECT_EQ(value, InterpValue::MakeU32(64)) << value.ToString();
 }
 
-TEST(BytecodeInterpreterTest, BinopAnd) {
+TEST_F(BytecodeInterpreterTest, BinopAnd) {
   constexpr std::string_view kProgram = R"(
 fn do_and() -> u32 {
   let a = u32:0xa5a5a5a5;
@@ -639,10 +1082,10 @@ fn do_and() -> u32 {
   XLS_ASSERT_OK_AND_ASSIGN(InterpValue value, Interpret(kProgram, "do_and"));
   XLS_ASSERT_OK_AND_ASSIGN(Bits bits, value.GetBits());
   XLS_ASSERT_OK_AND_ASSIGN(uint64_t int_val, bits.ToUint64());
-  EXPECT_EQ(int_val, 0xa5a5a5a5ll);
+  EXPECT_EQ(int_val, uint64_t{0xa5a5a5a5});
 }
 
-TEST(BytecodeInterpreterTest, BinopConcat) {
+TEST_F(BytecodeInterpreterTest, BinopConcat) {
   constexpr std::string_view kProgram = R"(
 fn do_concat() -> u64 {
   let a = u32:0xa5a5a5a5;
@@ -653,10 +1096,10 @@ fn do_concat() -> u64 {
   XLS_ASSERT_OK_AND_ASSIGN(InterpValue value, Interpret(kProgram, "do_concat"));
   XLS_ASSERT_OK_AND_ASSIGN(Bits bits, value.GetBits());
   XLS_ASSERT_OK_AND_ASSIGN(uint64_t int_val, bits.ToUint64());
-  EXPECT_EQ(int_val, 0xa5a5a5a5ffffffffll);
+  EXPECT_EQ(int_val, uint64_t{0xa5a5a5a5ffffffff});
 }
 
-TEST(BytecodeInterpreterTest, BinopDiv) {
+TEST_F(BytecodeInterpreterTest, BinopDiv) {
   constexpr std::string_view kProgram = R"(
 fn do_div() -> u32 {
   let a = u32:0x84208420;
@@ -670,7 +1113,7 @@ fn do_div() -> u32 {
   EXPECT_EQ(int_val, 0x21082108);
 }
 
-TEST(BytecodeInterpreterTest, BinopMul) {
+TEST_F(BytecodeInterpreterTest, BinopMul) {
   constexpr std::string_view kProgram = R"(
 fn do_mul() -> u32 {
   let a = u32:0x21082108;
@@ -684,7 +1127,7 @@ fn do_mul() -> u32 {
   EXPECT_EQ(int_val, 0x84208420);
 }
 
-TEST(BytecodeInterpreterTest, BinopOr) {
+TEST_F(BytecodeInterpreterTest, BinopOr) {
   constexpr std::string_view kProgram = R"(
 fn do_or() -> u32 {
   let a = u32:0xa5a5a5a5;
@@ -698,7 +1141,7 @@ fn do_or() -> u32 {
   EXPECT_EQ(int_val, 0xffffffff);
 }
 
-TEST(BytecodeInterpreterTest, BinopShll) {
+TEST_F(BytecodeInterpreterTest, BinopShll) {
   constexpr std::string_view kProgram = R"(
 fn do_shll() -> u32 {
   let a = u32:0x21082108;
@@ -712,7 +1155,7 @@ fn do_shll() -> u32 {
   EXPECT_EQ(int_val, 0x84208420);
 }
 
-TEST(BytecodeInterpreterTest, BinopShra) {
+TEST_F(BytecodeInterpreterTest, BinopShra) {
   constexpr std::string_view kProgram = R"(
 fn do_shrl() -> s32 {
   let a = s32:-128;
@@ -726,7 +1169,7 @@ fn do_shrl() -> s32 {
   EXPECT_EQ(int_val, -32);
 }
 
-TEST(BytecodeInterpreterTest, BinopShrl) {
+TEST_F(BytecodeInterpreterTest, BinopShrl) {
   constexpr std::string_view kProgram = R"(
 fn do_shrl() -> u32 {
   let a = u32:0x84208420;
@@ -740,7 +1183,7 @@ fn do_shrl() -> u32 {
   EXPECT_EQ(int_val, 0x21082108);
 }
 
-TEST(BytecodeInterpreterTest, BinopSub) {
+TEST_F(BytecodeInterpreterTest, BinopSub) {
   constexpr std::string_view kProgram = R"(
 fn do_sub() -> u32 {
   let a = u32:0xa5a5a5a5;
@@ -754,7 +1197,7 @@ fn do_sub() -> u32 {
   EXPECT_EQ(int_val, 0x4b4b4b4b);
 }
 
-TEST(BytecodeInterpreterTest, BinopXor) {
+TEST_F(BytecodeInterpreterTest, BinopXor) {
   constexpr std::string_view kProgram = R"(
 fn do_xor() -> u32 {
   let a = u32:0xa5a5ffff;
@@ -768,7 +1211,7 @@ fn do_xor() -> u32 {
   EXPECT_EQ(int_val, 0xffff0000);
 }
 
-TEST(BytecodeInterpreterTest, Unops) {
+TEST_F(BytecodeInterpreterTest, Unops) {
   constexpr std::string_view kProgram = R"(
 fn unops() -> s32 {
   let a = s32:1;
@@ -782,7 +1225,7 @@ fn unops() -> s32 {
   EXPECT_EQ(int_val, 0x2);
 }
 
-TEST(BytecodeInterpreterTest, CreateArray) {
+TEST_F(BytecodeInterpreterTest, CreateArray) {
   constexpr std::string_view kProgram = R"(
 fn arrays() -> u32[3] {
   let a = u32:32;
@@ -808,7 +1251,7 @@ fn arrays() -> u32[3] {
   EXPECT_EQ(bit_value, 32);
 }
 
-TEST(BytecodeInterpreterTest, IndexArray) {
+TEST_F(BytecodeInterpreterTest, IndexArray) {
   constexpr std::string_view kProgram = R"(
 fn index_array() -> u32 {
   let a = u32[3]:[0, 1, 2];
@@ -824,7 +1267,7 @@ fn index_array() -> u32 {
   EXPECT_EQ(int_value, 4);
 }
 
-TEST(BytecodeInterpreterTest, IndexTuple) {
+TEST_F(BytecodeInterpreterTest, IndexTuple) {
   constexpr std::string_view kProgram = R"(
 fn index_tuple() -> u32 {
   let a = (u32:0, (u32:1, u32:2));
@@ -840,7 +1283,7 @@ fn index_tuple() -> u32 {
   EXPECT_EQ(int_value, 6);
 }
 
-TEST(BytecodeInterpreterTest, SimpleBitSlice) {
+TEST_F(BytecodeInterpreterTest, SimpleBitSlice) {
   constexpr std::string_view kProgram = R"(
 fn simple_slice() -> u16 {
   let a = u32:0xdeadbeef;
@@ -856,7 +1299,7 @@ fn simple_slice() -> u16 {
 }
 
 // Tests a slice from the start: a[-x:].
-TEST(BytecodeInterpreterTest, NegativeStartSlice) {
+TEST_F(BytecodeInterpreterTest, NegativeStartSlice) {
   constexpr std::string_view kProgram = R"(
 fn negative_start_slice() -> u16 {
   let a = u32:0xdeadbeef;
@@ -872,7 +1315,7 @@ fn negative_start_slice() -> u16 {
 }
 
 // Tests a slice from the end: a[:-x].
-TEST(BytecodeInterpreterTest, NegativeEndSlice) {
+TEST_F(BytecodeInterpreterTest, NegativeEndSlice) {
   constexpr std::string_view kProgram = R"(
 fn negative_end_slice() -> u16 {
   let a = u32:0xdeadbeef;
@@ -887,7 +1330,26 @@ fn negative_end_slice() -> u16 {
   EXPECT_EQ(int_value, 0xbeef);
 }
 
-TEST(BytecodeInterpreterTest, WidthSlice) {
+// https://github.com/google/xls/issues/1784 -- note that the size of a slice
+// can never be negative, but the bytecode interpreter can have inflated
+// expectations that don't line up with what the type checker will accept. This
+// test is to ensure that we don't crash when we encounter this case.
+TEST_F(BytecodeInterpreterTest, NegativeSizeSlice) {
+  constexpr std::string_view kProgram = R"(
+fn negative_size_slice() -> bits[0] {
+  (u32:0x42)[5:3]
+}
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue value,
+                           Interpret(kProgram, "negative_size_slice"));
+  ASSERT_TRUE(value.IsUBits());
+  const Bits& bits = value.GetBitsOrDie();
+  EXPECT_EQ(bits.bit_count(), 0);
+  EXPECT_EQ(bits.ToUint64().value(), 0);
+}
+
+TEST_F(BytecodeInterpreterTest, WidthSlice) {
   constexpr std::string_view kProgram = R"(
 fn width_slice() -> s16 {
   let a = u32:0xdeadbeef;
@@ -904,7 +1366,7 @@ fn width_slice() -> s16 {
 
 // Makes sure we properly handle an OOB width slice and don't leave an extra
 // value on the stack.
-TEST(BytecodeInterpreterTest, OobWidthSlice) {
+TEST_F(BytecodeInterpreterTest, OobWidthSlice) {
   constexpr std::string_view kProgram = R"(
 fn oob_slicer(a: u32) -> (u32, u32) {
   let b = u32:0xfeedf00d;
@@ -934,7 +1396,7 @@ fn oob_width_slice() -> (u32, u32)[4] {
   }
 }
 
-TEST(BytecodeInterpreterTest, WidthSliceWithZext) {
+TEST_F(BytecodeInterpreterTest, WidthSliceWithZext) {
   constexpr std::string_view kProgram = R"(
 fn width_slice() -> u32 {
   let a = u32:0xdeadbeef;
@@ -949,7 +1411,7 @@ fn width_slice() -> u32 {
 }
 
 // Tests a slice from both ends: a[-x:-y].
-TEST(BytecodeInterpreterTest, BothNegativeSlice) {
+TEST_F(BytecodeInterpreterTest, BothNegativeSlice) {
   constexpr std::string_view kProgram = R"(
 fn both_negative_slice() -> u8 {
   let a = u32:0xdeadbeef;
@@ -964,7 +1426,7 @@ fn both_negative_slice() -> u8 {
   EXPECT_EQ(int_value, 0xad);
 }
 
-TEST(BytecodeInterpreterTest, CastBits_Extend) {
+TEST_F(BytecodeInterpreterTest, CastBitsExtend) {
   constexpr std::string_view kProgram = R"(
 fn cast_extend() -> u32 {
   let a = u16:0xa5a5;
@@ -980,7 +1442,7 @@ fn cast_extend() -> u32 {
   EXPECT_EQ(int_val, 0x25a5);
 }
 
-TEST(BytecodeInterpreterTest, CastBits_SignExtend) {
+TEST_F(BytecodeInterpreterTest, CastBitsSignExtend) {
   constexpr std::string_view kProgram = R"(
 fn cast_sign_extend() -> s32 {
   let a = s16:0xffff;
@@ -995,7 +1457,7 @@ fn cast_sign_extend() -> s32 {
   EXPECT_EQ(int_val, -1);
 }
 
-TEST(BytecodeInterpreterTest, CastBits_Shrink) {
+TEST_F(BytecodeInterpreterTest, CastBitsShrink) {
   constexpr std::string_view kProgram = R"(
 fn cast_shrink() -> u16 {
   let a = u32:0x0000a5a5;
@@ -1009,7 +1471,7 @@ fn cast_shrink() -> u16 {
   EXPECT_EQ(int_val, 0xffff);
 }
 
-TEST(BytecodeInterpreterTest, CastArrayToBits) {
+TEST_F(BytecodeInterpreterTest, CastArrayToBits) {
   constexpr std::string_view kProgram = R"(
 fn cast_array_to_bits() -> u32 {
   let a = u8[4]:[0xc, 0xa, 0xf, 0xe];
@@ -1023,7 +1485,7 @@ fn cast_array_to_bits() -> u32 {
   EXPECT_EQ(int_val, 0x0c0a0f0e);
 }
 
-TEST(BytecodeInterpreterTest, CastBitsToArray) {
+TEST_F(BytecodeInterpreterTest, CastBitsToArray) {
   constexpr std::string_view kProgram = R"(
 fn cast_bits_to_array() -> u8 {
   let a = u32:0x0c0a0f0e;
@@ -1038,7 +1500,7 @@ fn cast_bits_to_array() -> u8 {
   EXPECT_EQ(int_val, 0x0f);
 }
 
-TEST(BytecodeInterpreterTest, CastEnumToBits) {
+TEST_F(BytecodeInterpreterTest, CastEnumToBits) {
   constexpr std::string_view kProgram = R"(enum MyEnum : u3 {
   VAL_0 = 0,
   VAL_1 = 1,
@@ -1058,7 +1520,29 @@ fn cast_enum_to_bits() -> u3 {
   EXPECT_EQ(int_val, 3);
 }
 
-TEST(BytecodeInterpreterTest, CastBitsToEnum) {
+TEST_F(BytecodeInterpreterTest, CastEnumSignExtendToBits) {
+  constexpr std::string_view kProgram = R"(enum MyEnum : s3 {
+  VAL_0 = 0,
+}
+
+struct EnumInStruct {
+  e: MyEnum,
+}
+
+fn cast_enum_to_bits() -> s32 {
+  let foo = zero!<EnumInStruct>();
+  let a = (foo.e as s32) - s32:1;
+  a
+})";
+
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue value,
+                           Interpret(kProgram, "cast_enum_to_bits"));
+  XLS_ASSERT_OK_AND_ASSIGN(Bits bits, value.GetBits());
+  XLS_ASSERT_OK_AND_ASSIGN(int64_t int_val, bits.ToInt64());
+  EXPECT_EQ(int_val, -1);
+}
+
+TEST_F(BytecodeInterpreterTest, CastBitsToEnum) {
   constexpr std::string_view kProgram = R"(enum MyEnum : u3 {
   VAL_0 = 0,
   VAL_1 = 1,
@@ -1078,7 +1562,7 @@ fn cast_bits_to_enum() -> MyEnum {
   EXPECT_EQ(int_val, 2);
 }
 
-TEST(BytecodeInterpreterTest, CastWithMissingData) {
+TEST_F(BytecodeInterpreterTest, CastWithMissingData) {
   constexpr std::string_view kProgram = R"(enum MyEnum : u3 {
   VAL_0 = 0,
   VAL_1 = 1,
@@ -1097,9 +1581,10 @@ fn cast_bits_to_enum() -> MyEnum {
 
   XLS_ASSERT_OK_AND_ASSIGN(
       Function * f, tm.module->GetMemberOrError<Function>("cast_bits_to_enum"));
+  ASSERT_TRUE(f != nullptr);
   XLS_ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<BytecodeFunction> bf,
-      BytecodeEmitter::Emit(&import_data, tm.type_info, f, ParametricEnv()));
+      BytecodeEmitter::Emit(&import_data, tm.type_info, *f, ParametricEnv()));
 
   // Get a modifiable copy of the bytecodes.
   std::vector<Bytecode> bytecodes = bf->CloneBytecodes();
@@ -1113,10 +1598,10 @@ fn cast_bits_to_enum() -> MyEnum {
       BytecodeInterpreter::Interpret(&import_data, bf.get(), {});
   EXPECT_THAT(result.status(),
               StatusIs(absl::StatusCode::kInternal,
-                       HasSubstr("Cast op requires ConcreteType data.")));
+                       HasSubstr("Cast op requires Type data.")));
 }
 
-TEST(BytecodeInterpreterTest, Params) {
+TEST_F(BytecodeInterpreterTest, Params) {
   constexpr std::string_view kProgram = R"(
 fn has_params(x: u32, y: u64) -> u48 {
   let a = u48:100;
@@ -1136,7 +1621,7 @@ fn has_params(x: u32, y: u64) -> u48 {
   EXPECT_EQ(int_val, 212);
 }
 
-TEST(BytecodeInterpreterTest, SimpleFnCall) {
+TEST_F(BytecodeInterpreterTest, SimpleFnCall) {
   constexpr std::string_view kProgram = R"(
 fn callee(x: u32, y: u32) -> u32 {
   x + y
@@ -1154,7 +1639,7 @@ fn caller() -> u32{
   EXPECT_EQ(int_val, 300);
 }
 
-TEST(BytecodeInterpreterTest, NestedFnCalls) {
+TEST_F(BytecodeInterpreterTest, NestedFnCalls) {
   constexpr std::string_view kProgram = R"(
 fn callee_callee(x: u32) -> u32 {
   x + u32:100
@@ -1179,7 +1664,7 @@ fn caller(a: u32) -> u32{
   EXPECT_EQ(int_val, 400);
 }
 
-TEST(BytecodeInterpreterTest, SimpleParametric) {
+TEST_F(BytecodeInterpreterTest, SimpleParametric) {
   constexpr std::string_view kProgram = R"(
 fn foo<N: u32>(x: uN[N]) -> uN[N] {
   x * x
@@ -1196,7 +1681,7 @@ fn main() -> u32 {
   EXPECT_EQ(int_value, 80);
 }
 
-TEST(BytecodeInterpreterTest, NestedParametric) {
+TEST_F(BytecodeInterpreterTest, NestedParametric) {
   constexpr std::string_view kProgram = R"(
 fn second<N: u32, M: u32, O: u32>(x: uN[N], y: uN[M]) -> uN[O] {
   x as uN[O] + y as uN[O]
@@ -1216,7 +1701,7 @@ fn main() -> u32 {
   EXPECT_EQ(int_value, 12);
 }
 
-TEST(BytecodeInterpreterTest, ParametricStruct) {
+TEST_F(BytecodeInterpreterTest, ParametricStruct) {
   constexpr std::string_view kProgram = R"(
 struct MyStruct<N: u32, M: u32 = {N * u32:2}> {
   x: uN[N],
@@ -1237,33 +1722,7 @@ fn main() -> u32 {
   EXPECT_EQ(int_value, 300);
 }
 
-TEST(BytecodeInterpreterTest, BuiltinAddWithCarry) {
-  constexpr std::string_view kProgram = R"(
-fn main() -> (u1, u8) {
-  let x = u8:0xff;
-  let y = u8:0x2;
-  add_with_carry(x, y)
-})";
-
-  XLS_ASSERT_OK_AND_ASSIGN(InterpValue actual, Interpret(kProgram, "main"));
-  auto expected = InterpValue::MakeTuple(
-      {InterpValue::MakeUBits(1, 1), InterpValue::MakeUBits(8, 1)});
-  EXPECT_TRUE(expected.Eq(actual));
-}
-
-TEST(BytecodeInterpreterTest, BuiltinBitSlice) {
-  constexpr std::string_view kProgram = R"(
-fn main() -> u16 {
-  bit_slice(u32:0xdeadbeef, u16:8, u16:16)
-}
-)";
-
-  XLS_ASSERT_OK_AND_ASSIGN(InterpValue value, Interpret(kProgram, "main"));
-  XLS_ASSERT_OK_AND_ASSIGN(int64_t int_value, value.GetBitValueViaSign());
-  EXPECT_EQ(int_value, 0xadbe);
-}
-
-TEST(BytecodeInterpreterTest, BuiltinBitSliceUpdate) {
+TEST_F(BytecodeInterpreterTest, BuiltinBitSliceUpdate) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32 {
   bit_slice_update(u32:0xbeefbeef, u32:16, u32:0xdead)
@@ -1274,7 +1733,18 @@ fn main() -> u32 {
   EXPECT_EQ(int_value, 0xdeadbeef);
 }
 
-TEST(BytecodeInterpreterTest, BuiltinClz) {
+TEST_F(BytecodeInterpreterTest, BuiltinCeilLog2) {
+  constexpr std::string_view kProgram = R"(
+fn main() -> u32 {
+  ceillog2(u32:0xdeadbeef)
+})";
+
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue value, Interpret(kProgram, "main"));
+  XLS_ASSERT_OK_AND_ASSIGN(int64_t int_value, value.GetBitValueViaSign());
+  EXPECT_EQ(int_value, 32);
+}
+
+TEST_F(BytecodeInterpreterTest, BuiltinClz) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32 {
   clz(u32:0xbeef)
@@ -1285,7 +1755,7 @@ fn main() -> u32 {
   EXPECT_EQ(int_value, 16);
 }
 
-TEST(BytecodeInterpreterTest, BuiltinCtz) {
+TEST_F(BytecodeInterpreterTest, BuiltinCtz) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32 {
   ctz(u32:0xbeef0000)
@@ -1296,7 +1766,7 @@ fn main() -> u32 {
   EXPECT_EQ(int_value, 16);
 }
 
-TEST(BytecodeInterpreterTest, BuiltinOneHot) {
+TEST_F(BytecodeInterpreterTest, BuiltinOneHot) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u8 {
   let input = u3:0x5;
@@ -1311,7 +1781,7 @@ fn main() -> u8 {
   EXPECT_EQ(int_value, 0x41);
 }
 
-TEST(BytecodeInterpreterTest, BuiltinOneHotSel) {
+TEST_F(BytecodeInterpreterTest, BuiltinOneHotSel) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32 {
   let cases = u32[8]:[u32:0x1, u32:0x20, u32:0x300, u32:0x4000,
@@ -1326,13 +1796,14 @@ fn main() -> u32 {
   EXPECT_EQ(int_value, 0x80604020);
 }
 
-TEST(BytecodeInterpreterTest, BuiltinPrioritySel) {
+TEST_F(BytecodeInterpreterTest, BuiltinPrioritySel) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32 {
   let cases = u32[8]:[u32:0x1, u32:0x20, u32:0x300, u32:0x4000,
                       u32:0x50000, u32:0x600000, u32:0x7000000, u32:0x80000000];
   let selector = u8:0xaa;
-  priority_sel(selector, cases)
+  let default_value = u32:0xdeadbeef;
+  priority_sel(selector, cases, default_value)
 }
 )";
 
@@ -1341,7 +1812,23 @@ fn main() -> u32 {
   EXPECT_EQ(int_value, 0x00000020);
 }
 
-TEST(BytecodeInterpreterTest, BuiltinRange) {
+TEST_F(BytecodeInterpreterTest, BuiltinPrioritySelUsesDefault) {
+  constexpr std::string_view kProgram = R"(
+fn main() -> u32 {
+  let cases = u32[8]:[u32:0x1, u32:0x20, u32:0x300, u32:0x4000,
+                      u32:0x50000, u32:0x600000, u32:0x7000000, u32:0x80000000];
+  let selector = u8:0x0;
+  let default_value = u32:0xdeadbeef;
+  priority_sel(selector, cases, default_value)
+}
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue value, Interpret(kProgram, "main"));
+  XLS_ASSERT_OK_AND_ASSIGN(int64_t int_value, value.GetBitValueViaSign());
+  EXPECT_EQ(int_value, 0xdeadbeef);
+}
+
+TEST_F(BytecodeInterpreterTest, BuiltinRange) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32[5] {
   range(u32:100, u32:105)
@@ -1359,7 +1846,23 @@ fn main() -> u32[5] {
   }
 }
 
-TEST(BytecodeInterpreterTest, BuiltinGate) {
+TEST_F(BytecodeInterpreterTest,
+       BuiltinArraySizeWithUserDefinedParametricOperand) {
+  constexpr std::string_view kProgram = R"(
+fn make_u32_array<N: u32>() -> u32[N] { zero!<u32[N]>() }
+
+fn u32_array_size<N: u32>() -> u32 { array_size(make_u32_array<N>()) }
+
+fn main() -> u32 {
+    u32_array_size<u32:1>() + u32_array_size<u32:2>()
+}
+)";
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue value, Interpret(kProgram, "main"));
+  XLS_ASSERT_OK_AND_ASSIGN(int64_t int_value, value.GetBitValueViaSign());
+  EXPECT_EQ(int_value, 3);
+}
+
+TEST_F(BytecodeInterpreterTest, BuiltinGate) {
   constexpr std::string_view kProgram = R"(
 fn main(p: bool, x: u32) -> u32 {
   gate!(p, x)
@@ -1378,7 +1881,7 @@ fn main(p: bool, x: u32) -> u32 {
   EXPECT_EQ(int_value, 0x0);
 }
 
-TEST(BytecodeInterpreterTest, BuiltinSMulp) {
+TEST_F(BytecodeInterpreterTest, BuiltinSMulp) {
   constexpr std::string_view kProgram = R"(
 fn main(x: s10, y: s10) -> s10 {
   let mulp = smulp(x, y);
@@ -1399,7 +1902,7 @@ fn main(x: s10, y: s10) -> s10 {
   EXPECT_THAT(bits.ToInt64(), IsOkAndHolds(-507));
 }
 
-TEST(BytecodeInterpreterTest, BuiltinEnumerate) {
+TEST_F(BytecodeInterpreterTest, BuiltinEnumerate) {
   constexpr std::string_view kProgram = R"(
 fn main() -> (u32, u8)[4] {
   let x = u8[4]:[5, 6, 7, 8];
@@ -1422,7 +1925,7 @@ fn main() -> (u32, u8)[4] {
   EXPECT_TRUE(expected.Eq(actual));
 }
 
-TEST(BytecodeInterpreterTest, BuiltinUMulp) {
+TEST_F(BytecodeInterpreterTest, BuiltinUMulp) {
   constexpr std::string_view kProgram = R"(
 fn main(x: u10, y: u10) -> u10 {
   let mulp = umulp(x, y);
@@ -1444,7 +1947,7 @@ fn main(x: u10, y: u10) -> u10 {
   EXPECT_THAT(bits.ToInt64(), IsOkAndHolds(24));
 }
 
-TEST(BytecodeInterpreterTest, RangeExpr) {
+TEST_F(BytecodeInterpreterTest, RangeExpr) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32[8] {
   u32:8..u32:16
@@ -1461,7 +1964,7 @@ fn main() -> u32[8] {
   }
 }
 
-TEST(BytecodeInterpreterTest, TypeMaxExprU7) {
+TEST_F(BytecodeInterpreterTest, TypeMaxExprU7) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u7 {
   u7::MAX
@@ -1471,7 +1974,7 @@ fn main() -> u7 {
   EXPECT_THAT(value.GetBitValueViaSign(), IsOkAndHolds(0x7f));
 }
 
-TEST(BytecodeInterpreterTest, TypeMaxExprS7) {
+TEST_F(BytecodeInterpreterTest, TypeMaxExprS7) {
   constexpr std::string_view kProgram = R"(
 fn main() -> s3 {
   s3::MAX
@@ -1481,7 +1984,7 @@ fn main() -> s3 {
   EXPECT_THAT(value.GetBitValueViaSign(), IsOkAndHolds(3));
 }
 
-TEST(BytecodeInterpreterTest, TypeMaxExprTypeAlias) {
+TEST_F(BytecodeInterpreterTest, TypeMaxExprTypeAlias) {
   constexpr std::string_view kProgram = R"(
 type MyU9 = uN[9];
 fn main() -> MyU9 {
@@ -1492,7 +1995,7 @@ fn main() -> MyU9 {
   EXPECT_THAT(value.GetBitValueViaSign(), IsOkAndHolds(0x1ff));
 }
 
-TEST(BytecodeInterpreterTest, MultipleExpressionStatements) {
+TEST_F(BytecodeInterpreterTest, MultipleExpressionStatements) {
   constexpr std::string_view kProgram = R"(
 fn main() -> u32 {
   u32:42;
@@ -1503,7 +2006,7 @@ fn main() -> u32 {
   EXPECT_THAT(value.GetBitValueViaSign(), IsOkAndHolds(64));
 }
 
-TEST(BytecodeInterpreterTest, ForWithCover) {
+TEST_F(BytecodeInterpreterTest, ForWithCover) {
   constexpr std::string_view kProgram = R"(
 struct SomeStruct {
   some_bool: bool
@@ -1523,110 +2026,7 @@ fn main() {
   EXPECT_TRUE(value.IsUnit());
 }
 
-// https://github.com/google/xls/issues/981
-TEST(BytecodeInterpreterTest, AssertEqFailProcIterations) {
-  constexpr std::string_view kProgram = R"(
-#[test_proc]
-proc BTester {
-    terminator: chan<bool> out;
-
-    init { (u32:0) }
-
-    config(terminator: chan<bool> out) {
-        (terminator,)
-    }
-
-    next(tok: token, state: u32) {
-        assert_eq(state, u32:0);
-        // ensure at least 2 `next()` iterations to create an interpreter frame.
-        let tok = send_if(tok, terminator, state > u32:1, true);
-        (state + u32:1)
-    }
-})";
-
-  XLS_ASSERT_OK_AND_ASSIGN(auto temp_file,
-                           TempFile::CreateWithContent(kProgram, "_test.x"));
-  constexpr std::string_view kModuleName = "test";
-  ParseAndTestOptions options;
-  ::testing::internal::CaptureStderr();
-  absl::StatusOr<TestResult> result = ParseAndTest(
-      kProgram, kModuleName, std::string{temp_file.path()}, options);
-  std::string stdcerr(::testing::internal::GetCapturedStderr());
-  EXPECT_THAT(result, status_testing::IsOkAndHolds(TestResult::kSomeFailed));
-  EXPECT_THAT(stdcerr, HasSubstr("were not equal"));
-}
-
-TEST(BytecodeInterpreterTest, DistinctNestedParametricProcs) {
-  // Tests that B, which has one set of parameters, can instantiate A, which has
-  // a different set of parameters.
-  // TODO(rspringer): Once this goes in, open a bug: if init() is changed to
-  // "{ N }", it fails, because N can't be evaluated to a value: it's computed
-  // without applying the caller bindings.
-  constexpr std::string_view kProgram = R"(
-proc A<N: u32> {
-    data_in: chan<u32> in;
-    data_out: chan<u32> out;
-
-    init {
-        N
-    }
-    config(data_in: chan<u32> in, data_out: chan<u32> out) {
-        (data_in, data_out)
-    }
-    next(tok: token, state: u32) {
-        let (tok, x) = recv(tok, data_in);
-        let tok = send(tok, data_out, x + N + state);
-        state + u32:1
-    }
-}
-
-proc B<M: u32, N: u32> {
-    data_in: chan<u32> in;
-    data_out: chan<u32> out;
-
-    init { () }
-    config(data_in: chan<u32> in, data_out: chan<u32> out) {
-        spawn A<N>(data_in, data_out);
-        (data_in, data_out)
-    }
-    next(tok: token, state: ()) {
-        ()
-    }
-}
-
-#[test_proc]
-proc BTester {
-    data_in: chan<u32> out;
-    data_out: chan<u32> in;
-    terminator: chan<bool> out;
-
-    init { () }
-
-    config(terminator: chan<bool> out) {
-        let (data_in_p, data_in_c) = chan<u32>;
-        let (data_out_p, data_out_c) = chan<u32>;
-        spawn B<u32:5, u32:3>(data_in_c, data_out_p);
-        (data_in_p, data_out_c, terminator)
-    }
-
-    next(tok: token, state: ()) {
-        let tok = send(tok, data_in, u32:3);
-        let (tok, result) = recv(tok, data_out);
-        assert_eq(result, u32:9);
-        let tok = send(tok, terminator, true);
-    }
-})";
-
-  XLS_ASSERT_OK_AND_ASSIGN(auto temp_file,
-                           TempFile::CreateWithContent(kProgram, "_test.x"));
-  constexpr std::string_view kModuleName = "test";
-  ParseAndTestOptions options;
-  absl::StatusOr<TestResult> result = ParseAndTest(
-      kProgram, kModuleName, std::string{temp_file.path()}, options);
-  EXPECT_THAT(result, status_testing::IsOkAndHolds(TestResult::kAllPassed));
-}
-
-TEST(BytecodeInterpreterTest, PrettyPrintsStructs) {
+TEST_F(BytecodeInterpreterTest, AssertEqStructs) {
   constexpr std::string_view kProgram = R"(
 struct InnerStruct {
     x: u32,
@@ -1663,22 +2063,30 @@ fn doomed() {
 
   absl::StatusOr<InterpValue> value = Interpret(kProgram, "doomed");
   EXPECT_THAT(value.status(), StatusIs(absl::StatusCode::kInternal,
-              HasSubstr(R"(lhs and rhs were not equal:
+                                       HasSubstr(R"(lhs and rhs were not equal:
   MyStruct {
-<     a: u32:0
->     a: u32:7
-<     b: uN[16][4]:[u16:1, u16:2, u16:3, u16:4]
->     b: uN[16][4]:[u16:8, u16:8, u16:8, u16:8]
+<     a: u32:0,
+>     a: u32:7,
+      b: [
+<         u16:1,
+>         u16:8,
+<         u16:2,
+>         u16:8,
+<         u16:3,
+>         u16:8,
+<         u16:4
+>         u16:8
+      ],
       c: InnerStruct {
-<         x: u32:5
->         x: u32:12
+<         x: u32:5,
+>         x: u32:12,
 <         y: u32:6
 >         y: u32:13
       }
   })")));
 }
 
-TEST(BytecodeInterpreterTest, PrettyPrintsTheStructFromIssue828) {
+TEST_F(BytecodeInterpreterTest, AssertEqTheStructFromIssue828) {
   constexpr std::string_view kProgram = R"(
 struct S {
   a: u32,
@@ -1723,28 +2131,56 @@ fn doomed() {
 
   absl::StatusOr<InterpValue> value = Interpret(kProgram, "doomed");
   EXPECT_THAT(value.status(), StatusIs(absl::StatusCode::kInternal,
-        AllOf(HasSubstr("were not equal"),
-              HasSubstr(
-R"(lhs and rhs were not equal:
+                                       AllOf(HasSubstr("were not equal"),
+                                             HasSubstr(
+                                                 R"(lhs and rhs were not equal:
   S {
-      a: u32:42
-      b: u32:42
-      c: u32:142
-<     d: u32:142
->     d: u32:42
-      e: u32:42
-      f: u32:42
-<     g: u32:42
->     g: u32:242
-<     h: u32:42
->     h: u32:242
-<     i: u32:242
->     i: u32:42
+      a: u32:42,
+      b: u32:42,
+      c: u32:142,
+<     d: u32:142,
+>     d: u32:42,
+      e: u32:42,
+      f: u32:42,
+<     g: u32:42,
+>     g: u32:242,
+<     h: u32:42,
+>     h: u32:242,
+<     i: u32:242,
+>     i: u32:42,
       j: u32:42
   })"))));
 }
 
-TEST(BytecodeInterpreterTest, PrettyPrintsArrays) {
+TEST_F(BytecodeInterpreterTest, AssertEqArray) {
+  constexpr std::string_view kProgram = R"(
+fn doomed() {
+    let a = u32[4]: [1, 2, 3, 4];
+    assert_eq(a, u32[4]:[1, 20, 3, 4])})";
+
+  absl::StatusOr<InterpValue> value = Interpret(kProgram, "doomed");
+  EXPECT_THAT(
+      value.status(),
+      StatusIs(absl::StatusCode::kInternal,
+               AllOf(HasSubstr("were not equal"), HasSubstr("<     u32:2"),
+                     HasSubstr(">     u32:20"),
+                     HasSubstr("first differing index: 1"))));
+}
+
+TEST_F(BytecodeInterpreterTest, AssertEqTuple) {
+  constexpr std::string_view kProgram = R"(
+fn doomed() {
+    let a = (u32:1, u32:42, u10:4);
+    assert_eq(a, (u32:100, u32:42, u10:4))})";
+
+  absl::StatusOr<InterpValue> value = Interpret(kProgram, "doomed");
+  EXPECT_THAT(value.status(), StatusIs(absl::StatusCode::kInternal,
+                                       AllOf(HasSubstr("were not equal"),
+                                             HasSubstr("<     u32:1"),
+                                             HasSubstr(">     u32:100"))));
+}
+
+TEST_F(BytecodeInterpreterTest, AssertEqArraysOfStructs) {
   constexpr std::string_view kProgram = R"(
 struct InnerStruct {
     x: u32,
@@ -1786,20 +2222,18 @@ fn doomed() {
 
   absl::StatusOr<InterpValue> value = Interpret(kProgram, "doomed");
   EXPECT_THAT(value.status(), StatusIs(absl::StatusCode::kInternal,
-      AllOf(
-          HasSubstr("were not equal"),
-          HasSubstr(R"(lhs and rhs were not equal:
-  MyStruct {
-      c: InnerStruct[2]:[
+                                       AllOf(HasSubstr("were not equal"),
+                                             HasSubstr(R"(MyStruct {
+      c: [
           InnerStruct {
-<             x: u32:1
->             x: u32:5
+<             x: u32:1,
+>             x: u32:5,
 <             y: u32:2
 >             y: u32:6
           },
           InnerStruct {
-<             x: u32:3
->             x: u32:7
+<             x: u32:3,
+>             x: u32:7,
 <             y: u32:4
 >             y: u32:8
           }
@@ -1807,7 +2241,7 @@ fn doomed() {
   })"))));
 }
 
-TEST(BytecodeInterpreterTest, PrettyPrintsEnums) {
+TEST_F(BytecodeInterpreterTest, AssertEqEnums) {
   constexpr std::string_view kProgram = R"(
 enum Flowers {
     ROSES = u24:0xFF007F,
@@ -1820,424 +2254,14 @@ fn doomed() {
     assert_eq(a, b)
 })";
   absl::StatusOr<InterpValue> value = Interpret(kProgram, "doomed");
-  EXPECT_THAT(value.status(), StatusIs(absl::StatusCode::kInternal,
-      AllOf(
-          HasSubstr("Flowers::ROSES (u24:16711807"),
-          HasSubstr("Flowers::VIOLETS (u24:15631086"))));
+  VLOG(1) << "Got status: " << value.status().ToString();
+  EXPECT_THAT(value.status(),
+              StatusIs(absl::StatusCode::kInternal,
+                       AllOf(HasSubstr("Flowers::ROSES  // u24:16711807"),
+                             HasSubstr("Flowers::VIOLETS  // u24:15631086"))));
 }
 
-TEST(BytecodeInterpreterTest, TraceChannels) {
-  constexpr std::string_view kProgram = R"(
-proc incrementer {
-  in_ch: chan<u32> in;
-  out_ch: chan<u32> out;
-
-  init { () }
-
-  config(in_ch: chan<u32> in,
-         out_ch: chan<u32> out) {
-    (in_ch, out_ch)
-  }
-  next(tok: token, _: ()) {
-    let (tok, i) = recv(tok, in_ch);
-    let tok = send(tok, out_ch, i + u32:1);
-  }
-}
-
-#[test_proc]
-proc tester_proc {
-  data_out: chan<u32> out;
-  data_in: chan<u32> in;
-  terminator: chan<bool> out;
-
-  init { () }
-
-  config(terminator: chan<bool> out) {
-    let (input_p, input_c) = chan<u32>;
-    let (output_p, output_c) = chan<u32>;
-    spawn incrementer(input_c, output_p);
-    (input_p, output_c, terminator)
-  }
-
-  next(tok: token, state: ()) {
-    let tok = send(tok, data_out, u32:42);
-    let (tok, result) = recv(tok, data_in);
-
-    let tok = send(tok, data_out, u32:100);
-    let (tok, result) = recv(tok, data_in);
-
-    let tok = send(tok, terminator, true);
- }
-})";
-
-  ImportData import_data(CreateImportDataForTest());
-  XLS_ASSERT_OK_AND_ASSIGN(TypecheckedModule tm, ParseAndTypecheckOrPrintError(
-                                                     kProgram, &import_data));
-  XLS_ASSERT_OK_AND_ASSIGN(TestProc * test_proc,
-                           tm.module->GetTestProc("tester_proc"));
-  XLS_ASSERT_OK_AND_ASSIGN(
-      TypeInfo * ti, tm.type_info->GetTopLevelProcTypeInfo(test_proc->proc()));
-  XLS_ASSERT_OK_AND_ASSIGN(
-      InterpValue terminator,
-      ti->GetConstExpr(test_proc->proc()->config()->params()[0]));
-  std::vector<ProcInstance> proc_instances;
-  std::vector<std::string> trace_output;
-  XLS_ASSERT_OK(ProcConfigBytecodeInterpreter::InitializeProcNetwork(
-      &import_data, ti, test_proc->proc(), terminator, &proc_instances,
-      BytecodeInterpreterOptions().trace_channels(true).trace_hook(
-          [&](std::string_view s) {
-            trace_output.push_back(std::string{s});
-          })));
-  std::shared_ptr<InterpValue::Channel> term_chan =
-      terminator.GetChannelOrDie();
-  while (term_chan->empty()) {
-    for (auto& p : proc_instances) {
-      XLS_ASSERT_OK(p.Run());
-    }
-  }
-  EXPECT_THAT(trace_output,
-              testing::ElementsAre(
-                  "Sent data on channel `tester_proc::data_out`:\n  42",
-                  "Received data on channel `incrementer::in_ch`:\n  42",
-                  "Sent data on channel `incrementer::out_ch`:\n  43",
-                  "Received data on channel `tester_proc::data_in`:\n  43",
-                  "Sent data on channel `tester_proc::data_out`:\n  100",
-                  "Received data on channel `incrementer::in_ch`:\n  100",
-                  "Sent data on channel `incrementer::out_ch`:\n  101",
-                  "Received data on channel `tester_proc::data_in`:\n  101",
-                  "Sent data on channel `tester_proc::terminator`:\n  1"));
-}
-
-TEST(BytecodeInterpreterTest, TraceChannelsHexValues) {
-  constexpr std::string_view kProgram = R"(
-proc incrementer {
-  in_ch: chan<u32> in;
-  out_ch: chan<u32> out;
-
-  init { () }
-
-  config(in_ch: chan<u32> in,
-         out_ch: chan<u32> out) {
-    (in_ch, out_ch)
-  }
-  next(tok: token, _: ()) {
-    let (tok, i) = recv(tok, in_ch);
-    let tok = send(tok, out_ch, i + u32:1);
-  }
-}
-
-#[test_proc]
-proc tester_proc {
-  data_out: chan<u32> out;
-  data_in: chan<u32> in;
-  terminator: chan<bool> out;
-
-  init { () }
-
-  config(terminator: chan<bool> out) {
-    let (input_p, input_c) = chan<u32>;
-    let (output_p, output_c) = chan<u32>;
-    spawn incrementer(input_c, output_p);
-    (input_p, output_c, terminator)
-  }
-
-  next(tok: token, state: ()) {
-    let tok = send(tok, data_out, u32:42);
-    let (tok, result) = recv(tok, data_in);
-
-    let tok = send(tok, data_out, u32:100);
-    let (tok, result) = recv(tok, data_in);
-
-    let tok = send(tok, terminator, true);
- }
-})";
-
-  ImportData import_data(CreateImportDataForTest());
-  XLS_ASSERT_OK_AND_ASSIGN(TypecheckedModule tm, ParseAndTypecheckOrPrintError(
-                                                     kProgram, &import_data));
-  XLS_ASSERT_OK_AND_ASSIGN(TestProc * test_proc,
-                           tm.module->GetTestProc("tester_proc"));
-  XLS_ASSERT_OK_AND_ASSIGN(
-      TypeInfo * ti, tm.type_info->GetTopLevelProcTypeInfo(test_proc->proc()));
-  XLS_ASSERT_OK_AND_ASSIGN(
-      InterpValue terminator,
-      ti->GetConstExpr(test_proc->proc()->config()->params()[0]));
-  std::vector<ProcInstance> proc_instances;
-  std::vector<std::string> trace_output;
-  XLS_ASSERT_OK(ProcConfigBytecodeInterpreter::InitializeProcNetwork(
-      &import_data, ti, test_proc->proc(), terminator, &proc_instances,
-      BytecodeInterpreterOptions()
-          .trace_channels(true)
-          .trace_hook([&](std::string_view s) {
-            trace_output.push_back(std::string{s});
-          })
-          .format_preference(FormatPreference::kHex)));
-  std::shared_ptr<InterpValue::Channel> term_chan =
-      terminator.GetChannelOrDie();
-  while (term_chan->empty()) {
-    for (auto& p : proc_instances) {
-      XLS_ASSERT_OK(p.Run());
-    }
-  }
-  EXPECT_THAT(trace_output,
-              testing::ElementsAre(
-                  "Sent data on channel `tester_proc::data_out`:\n  0x2a",
-                  "Received data on channel `incrementer::in_ch`:\n  0x2a",
-                  "Sent data on channel `incrementer::out_ch`:\n  0x2b",
-                  "Received data on channel `tester_proc::data_in`:\n  0x2b",
-                  "Sent data on channel `tester_proc::data_out`:\n  0x64",
-                  "Received data on channel `incrementer::in_ch`:\n  0x64",
-                  "Sent data on channel `incrementer::out_ch`:\n  0x65",
-                  "Received data on channel `tester_proc::data_in`:\n  0x65",
-                  "Sent data on channel `tester_proc::terminator`:\n  0x1"));
-}
-
-TEST(BytecodeInterpreterTest, TraceChannelsWithNonblockingReceive) {
-  constexpr std::string_view kProgram = R"(
-proc incrementer {
-  in_ch: chan<u32> in;
-  out_ch: chan<u32> out;
-
-  init { () }
-
-  config(in_ch: chan<u32> in,
-         out_ch: chan<u32> out) {
-    (in_ch, out_ch)
-  }
-  next(tok: token, _: ()) {
-    let (tok, i, valid) = recv_non_blocking(tok, in_ch, u32:0);
-    let tok = send(tok, out_ch, i + u32:1);
-  }
-}
-
-#[test_proc]
-proc tester_proc {
-  data_out: chan<u32> out;
-  data_in: chan<u32> in;
-  terminator: chan<bool> out;
-
-  init { () }
-
-  config(terminator: chan<bool> out) {
-    let (input_p, input_c) = chan<u32>;
-    let (output_p, output_c) = chan<u32>;
-    spawn incrementer(input_c, output_p);
-    (input_p, output_c, terminator)
-  }
-
-  next(tok: token, state: ()) {
-    let tok = send_if(tok, data_out, false, u32:42);
-    let (tok, result) = recv(tok, data_in);
-    let tok = send(tok, terminator, true);
- }
-})";
-
-  ImportData import_data(CreateImportDataForTest());
-  XLS_ASSERT_OK_AND_ASSIGN(TypecheckedModule tm, ParseAndTypecheckOrPrintError(
-                                                     kProgram, &import_data));
-  XLS_ASSERT_OK_AND_ASSIGN(TestProc * test_proc,
-                           tm.module->GetTestProc("tester_proc"));
-  XLS_ASSERT_OK_AND_ASSIGN(
-      TypeInfo * ti, tm.type_info->GetTopLevelProcTypeInfo(test_proc->proc()));
-  XLS_ASSERT_OK_AND_ASSIGN(
-      InterpValue terminator,
-      ti->GetConstExpr(test_proc->proc()->config()->params()[0]));
-  std::vector<ProcInstance> proc_instances;
-  std::vector<std::string> trace_output;
-  XLS_ASSERT_OK(ProcConfigBytecodeInterpreter::InitializeProcNetwork(
-      &import_data, ti, test_proc->proc(), terminator, &proc_instances,
-      BytecodeInterpreterOptions().trace_channels(true).trace_hook(
-          [&](std::string_view s) {
-            trace_output.push_back(std::string{s});
-          })));
-  std::shared_ptr<InterpValue::Channel> term_chan =
-      terminator.GetChannelOrDie();
-  while (term_chan->empty()) {
-    for (auto& p : proc_instances) {
-      XLS_ASSERT_OK(p.Run());
-    }
-  }
-  EXPECT_THAT(trace_output,
-              testing::ElementsAre(
-                  "Sent data on channel `incrementer::out_ch`:\n  1",
-                  "Received data on channel `tester_proc::data_in`:\n  1",
-                  "Sent data on channel `tester_proc::terminator`:\n  1"));
-}
-
-TEST(BytecodeInterpreterTest, TraceStructChannels) {
-  constexpr std::string_view kProgram = R"(
-struct Foo {
-  a: u32,
-  b: u16
-}
-
-proc incrementer {
-  in_ch: chan<Foo> in;
-  out_ch: chan<Foo> out;
-
-  init { () }
-
-  config(in_ch: chan<Foo> in,
-         out_ch: chan<Foo> out) {
-    (in_ch, out_ch)
-  }
-  next(tok: token, _: ()) {
-    let (tok, i) = recv(tok, in_ch);
-    let tok = send(tok, out_ch, Foo { a:i.a + u32:1, b:i.b + u16:1 });
-  }
-}
-
-#[test_proc]
-proc tester_proc {
-  data_out: chan<Foo> out;
-  data_in: chan<Foo> in;
-  terminator: chan<bool> out;
-
-  init { () }
-
-  config(terminator: chan<bool> out) {
-    let (input_p, input_c) = chan<Foo>;
-    let (output_p, output_c) = chan<Foo>;
-    spawn incrementer(input_c, output_p);
-    (input_p, output_c, terminator)
-  }
-
-  next(tok: token, state: ()) {
-
-    let tok = send(tok, data_out, Foo { a:u32:42, b:u16:100 });
-    let (tok, result) = recv(tok, data_in);
-
-    let tok = send(tok, data_out, Foo{ a:u32:555, b:u16:123 });
-    let (tok, result) = recv(tok, data_in);
-
-    let tok = send(tok, terminator, true);
- }
-})";
-
-  ImportData import_data(CreateImportDataForTest());
-  XLS_ASSERT_OK_AND_ASSIGN(TypecheckedModule tm, ParseAndTypecheckOrPrintError(
-                                                     kProgram, &import_data));
-  XLS_ASSERT_OK_AND_ASSIGN(TestProc * test_proc,
-                           tm.module->GetTestProc("tester_proc"));
-  XLS_ASSERT_OK_AND_ASSIGN(
-      TypeInfo * ti, tm.type_info->GetTopLevelProcTypeInfo(test_proc->proc()));
-  XLS_ASSERT_OK_AND_ASSIGN(
-      InterpValue terminator,
-      ti->GetConstExpr(test_proc->proc()->config()->params()[0]));
-  std::vector<ProcInstance> proc_instances;
-  std::vector<std::string> trace_output;
-  XLS_ASSERT_OK(ProcConfigBytecodeInterpreter::InitializeProcNetwork(
-      &import_data, ti, test_proc->proc(), terminator, &proc_instances,
-      BytecodeInterpreterOptions().trace_channels(true).trace_hook(
-          [&](std::string_view s) {
-            trace_output.push_back(std::string{s});
-          })));
-  std::shared_ptr<InterpValue::Channel> term_chan =
-      terminator.GetChannelOrDie();
-  while (term_chan->empty()) {
-    for (auto& p : proc_instances) {
-      XLS_ASSERT_OK(p.Run());
-    }
-  }
-  EXPECT_EQ(trace_output[0],
-            R"(Sent data on channel `tester_proc::data_out`:
-  Foo {
-    a: 42,
-    b: 100
-  })");
-  EXPECT_EQ(trace_output[1],
-            R"(Received data on channel `incrementer::in_ch`:
-  Foo {
-    a: 42,
-    b: 100
-  })");
-}
-
-TEST(BytecodeInterpreterTest, TraceArrayOfChannels) {
-  constexpr std::string_view kProgram = R"(
-proc incrementer {
-  in_ch: chan<u32> in;
-  out_ch: chan<u32> out;
-
-  init { () }
-
-  config(in_ch: chan<u32> in,
-         out_ch: chan<u32> out) {
-    (in_ch, out_ch)
-  }
-  next(tok: token, _: ()) {
-    let (tok, i) = recv(tok, in_ch);
-    let tok = send(tok, out_ch, i + u32:1);
-  }
-}
-
-#[test_proc]
-proc tester_proc {
-  data_out: chan<u32>[1] out;
-  data_in: chan<u32>[1] in;
-  terminator: chan<bool> out;
-
-  init { () }
-
-  config(terminator: chan<bool> out) {
-    let (input_p, input_c) = chan<u32>[1];
-    let (output_p, output_c) = chan<u32>[1];
-    spawn incrementer(input_c[0], output_p[0]);
-    (input_p, output_c, terminator)
-  }
-
-  next(tok: token, state: ()) {
-
-    let tok = send(tok, data_out[0], u32:42);
-    let (tok, result) = recv(tok, data_in[0]);
-
-    let tok = send(tok, data_out[0], u32:100);
-    let (tok, result) = recv(tok, data_in[0]);
-
-    let tok = send(tok, terminator, true);
- }
-})";
-
-  ImportData import_data(CreateImportDataForTest());
-  XLS_ASSERT_OK_AND_ASSIGN(TypecheckedModule tm, ParseAndTypecheckOrPrintError(
-                                                     kProgram, &import_data));
-
-  XLS_ASSERT_OK_AND_ASSIGN(TestProc * test_proc,
-                           tm.module->GetTestProc("tester_proc"));
-  XLS_ASSERT_OK_AND_ASSIGN(
-      TypeInfo * ti, tm.type_info->GetTopLevelProcTypeInfo(test_proc->proc()));
-  XLS_ASSERT_OK_AND_ASSIGN(
-      InterpValue terminator,
-      ti->GetConstExpr(test_proc->proc()->config()->params()[0]));
-  std::vector<ProcInstance> proc_instances;
-  std::vector<std::string> trace_output;
-  XLS_ASSERT_OK(ProcConfigBytecodeInterpreter::InitializeProcNetwork(
-      &import_data, ti, test_proc->proc(), terminator, &proc_instances,
-      BytecodeInterpreterOptions().trace_channels(true).trace_hook(
-          [&](std::string_view s) {
-            trace_output.push_back(std::string{s});
-          })));
-  std::shared_ptr<InterpValue::Channel> term_chan =
-      terminator.GetChannelOrDie();
-  while (term_chan->empty()) {
-    for (auto& p : proc_instances) {
-      XLS_ASSERT_OK(p.Run());
-    }
-  }
-  EXPECT_THAT(trace_output,
-              testing::ElementsAre(
-                  "Sent data on channel `tester_proc::data_out[0]`:\n  42",
-                  "Received data on channel `incrementer::in_ch`:\n  42",
-                  "Sent data on channel `incrementer::out_ch`:\n  43",
-                  "Received data on channel `tester_proc::data_in[0]`:\n  43",
-                  "Sent data on channel `tester_proc::data_out[0]`:\n  100",
-                  "Received data on channel `incrementer::in_ch`:\n  100",
-                  "Sent data on channel `incrementer::out_ch`:\n  101",
-                  "Received data on channel `tester_proc::data_in[0]`:\n  101",
-                  "Sent data on channel `tester_proc::terminator`:\n  1"));
-}
-
-TEST(BytecodeInterpreterTest, CheckedCastSnToSn) {
+TEST_F(BytecodeInterpreterTest, CheckedCastSnToSn) {
   constexpr std::string_view kProgram = R"(
 fn main(x: s32) -> s4 {
   checked_cast<s4>(x)
@@ -2245,22 +2269,20 @@ fn main(x: s32) -> s4 {
 )";
 
   for (int64_t x = -32; x <= 32; ++x) {
-    absl::StatusOr<InterpValue> value_or =
+    absl::StatusOr<InterpValue> value =
         Interpret(kProgram, "main", {InterpValue::MakeSBits(32, x)});
 
     if (x >= -8 && x < 8) {
-      XLS_ASSERT_OK_AND_ASSIGN(InterpValue value, value_or);
-      XLS_ASSERT_OK_AND_ASSIGN(int64_t bit_value, value.GetBitValueViaSign());
+      XLS_ASSERT_OK_AND_ASSIGN(int64_t bit_value, value->GetBitValueViaSign());
       EXPECT_EQ(x, bit_value);
     } else {
-      EXPECT_THAT(value_or.status(),
-                  StatusIs(absl::StatusCode::kInvalidArgument,
-                           HasSubstr("unable to cast")));
+      EXPECT_THAT(value.status(), StatusIs(absl::StatusCode::kInvalidArgument,
+                                           HasSubstr("unable to cast")));
     }
   }
 }
 
-TEST(BytecodeInterpreterTest, CheckedCastSnToUn) {
+TEST_F(BytecodeInterpreterTest, CheckedCastSnToUn) {
   constexpr std::string_view kProgram = R"(
 fn main(x: s32) -> u4 {
   checked_cast<u4>(x)
@@ -2268,22 +2290,20 @@ fn main(x: s32) -> u4 {
 )";
 
   for (int64_t x = -32; x <= 32; ++x) {
-    absl::StatusOr<InterpValue> value_or =
+    absl::StatusOr<InterpValue> value =
         Interpret(kProgram, "main", {InterpValue::MakeSBits(32, x)});
 
     if (x >= 0 && x < 16) {
-      XLS_ASSERT_OK_AND_ASSIGN(InterpValue value, value_or);
-      XLS_ASSERT_OK_AND_ASSIGN(int64_t bit_value, value.GetBitValueViaSign());
+      XLS_ASSERT_OK_AND_ASSIGN(int64_t bit_value, value->GetBitValueViaSign());
       EXPECT_EQ(x, bit_value);
     } else {
-      EXPECT_THAT(value_or.status(),
-                  StatusIs(absl::StatusCode::kInvalidArgument,
-                           HasSubstr("unable to cast")));
+      EXPECT_THAT(value.status(), StatusIs(absl::StatusCode::kInvalidArgument,
+                                           HasSubstr("unable to cast")));
     }
   }
 }
 
-TEST(BytecodeInterpreterTest, CheckedCastUnToSn) {
+TEST_F(BytecodeInterpreterTest, CheckedCastUnToSn) {
   constexpr std::string_view kProgram = R"(
 fn main(x: u32) -> s4 {
   checked_cast<s4>(x)
@@ -2291,22 +2311,20 @@ fn main(x: u32) -> s4 {
 )";
 
   for (int64_t x = 0; x <= 32; ++x) {
-    absl::StatusOr<InterpValue> value_or =
+    absl::StatusOr<InterpValue> value =
         Interpret(kProgram, "main", {InterpValue::MakeUBits(32, x)});
 
     if (x < 8) {
-      XLS_ASSERT_OK_AND_ASSIGN(InterpValue value, value_or);
-      XLS_ASSERT_OK_AND_ASSIGN(int64_t bit_value, value.GetBitValueViaSign());
+      XLS_ASSERT_OK_AND_ASSIGN(int64_t bit_value, value->GetBitValueViaSign());
       EXPECT_EQ(x, bit_value);
     } else {
-      EXPECT_THAT(value_or.status(),
-                  StatusIs(absl::StatusCode::kInvalidArgument,
-                           HasSubstr("unable to cast")));
+      EXPECT_THAT(value.status(), StatusIs(absl::StatusCode::kInvalidArgument,
+                                           HasSubstr("unable to cast")));
     }
   }
 }
 
-TEST(BytecodeInterpreterTest, CheckedCastUnToUn) {
+TEST_F(BytecodeInterpreterTest, CheckedCastUnToUn) {
   constexpr std::string_view kProgram = R"(
 fn main(x: u32) -> u4 {
   checked_cast<u4>(x)
@@ -2314,22 +2332,20 @@ fn main(x: u32) -> u4 {
 )";
 
   for (int64_t x = 0; x < 32; ++x) {
-    absl::StatusOr<InterpValue> value_or =
+    absl::StatusOr<InterpValue> value =
         Interpret(kProgram, "main", {InterpValue::MakeUBits(32, x)});
 
     if (x < 16) {
-      XLS_ASSERT_OK_AND_ASSIGN(InterpValue value, value_or);
-      XLS_ASSERT_OK_AND_ASSIGN(int64_t bit_value, value.GetBitValueViaSign());
+      XLS_ASSERT_OK_AND_ASSIGN(int64_t bit_value, value->GetBitValueViaSign());
       EXPECT_EQ(x, bit_value);
     } else {
-      EXPECT_THAT(value_or.status(),
-                  StatusIs(absl::StatusCode::kInvalidArgument,
-                           HasSubstr("unable to cast")));
+      EXPECT_THAT(value.status(), StatusIs(absl::StatusCode::kInvalidArgument,
+                                           HasSubstr("unable to cast")));
     }
   }
 }
 
-TEST(ByteCodeInterpreterTest, CheckHighlightLineByLineDifferences) {
+TEST_F(BytecodeInterpreterTest, CheckHighlightLineByLineDifferences) {
   // The basic functionality: highlight changing text in a sea of sameness.
   EXPECT_EQ(HighlightLineByLineDifferences("+---------+\n"
                                            "|assistant|\n"
@@ -2384,7 +2400,7 @@ TEST(ByteCodeInterpreterTest, CheckHighlightLineByLineDifferences) {
             "< queen\n");
 }
 
-TEST(BytecodeInterpreterTest, RolloverHookTestForAdd) {
+TEST_F(BytecodeInterpreterTest, RolloverHookTestForAdd) {
   constexpr std::string_view kProgram = R"(
 fn main(x: u2, y: u2) -> u2 {
   x + y
@@ -2392,6 +2408,8 @@ fn main(x: u2, y: u2) -> u2 {
 )";
 
   for (uint64_t flat = 0; flat < 16; ++flat) {
+    ImportData import_data = CreateImportDataForTest();
+    const FileTable& file_table = import_data.file_table();
     uint64_t x = (flat >> 0) & 0x3;
     uint64_t y = (flat >> 2) & 0x3;
     std::vector<Span> source_spans;
@@ -2403,24 +2421,25 @@ fn main(x: u2, y: u2) -> u2 {
                       InterpValue::MakeUBits(2, y),
                   },
                   BytecodeInterpreterOptions().rollover_hook(
-                      [&](const Span& s) { source_spans.push_back(s); })));
-    XLS_VLOG(1) << "flat: " << std::hex << flat << " x: " << x << " y: " << y
-                << " result: " << result.ToString();
+                      [&](const Span& s) { source_spans.push_back(s); }),
+                  &import_data));
+    VLOG(1) << "flat: " << std::hex << flat << " x: " << x << " y: " << y
+            << " result: " << result.ToString();
 
     for (const Span& source_span : source_spans) {
-      XLS_VLOG(1) << "Rollover span: " << source_span;
+      VLOG(1) << "Rollover span: " << source_span.ToString(file_table);
     }
 
     if (x + y >= 4) {  // We should have a rollover in these cases.
       ASSERT_EQ(source_spans.size(), 1);
-      EXPECT_EQ(source_spans.at(0).ToString(), "test.x:3:5-3:6");
+      EXPECT_EQ(source_spans.at(0).ToString(file_table), "test.x:3:3-3:8");
     } else {
       ASSERT_TRUE(source_spans.empty());
     }
   }
 }
 
-TEST(BytecodeInterpreterTest, RolloverHookTestForSub) {
+TEST_F(BytecodeInterpreterTest, RolloverHookTestForSub) {
   constexpr std::string_view kProgram = R"(
 fn main(x: u2, y: u2) -> u2 {
   x - y
@@ -2428,6 +2447,8 @@ fn main(x: u2, y: u2) -> u2 {
 )";
 
   for (uint64_t flat = 0; flat < 16; ++flat) {
+    ImportData import_data = CreateImportDataForTest();
+    const FileTable& file_table = import_data.file_table();
     uint64_t x = (flat >> 0) & 0x3;
     uint64_t y = (flat >> 2) & 0x3;
     std::vector<Span> source_spans;
@@ -2439,25 +2460,26 @@ fn main(x: u2, y: u2) -> u2 {
                       InterpValue::MakeUBits(2, y),
                   },
                   BytecodeInterpreterOptions().rollover_hook(
-                      [&](const Span& s) { source_spans.push_back(s); })));
-    XLS_VLOG(1) << "flat: " << std::hex << flat << " x: " << x << " y: " << y
-                << " result: " << result.ToString();
+                      [&](const Span& s) { source_spans.push_back(s); }),
+                  &import_data));
+    VLOG(1) << "flat: " << std::hex << flat << " x: " << x << " y: " << y
+            << " result: " << result.ToString();
 
     for (const Span& source_span : source_spans) {
-      XLS_VLOG(1) << "Rollover span: " << source_span;
+      VLOG(1) << "Rollover span: " << source_span.ToString(file_table);
     }
 
     if (static_cast<int64_t>(x) - static_cast<int64_t>(y) <
         0) {  // We should have a rollover in these cases.
       ASSERT_EQ(source_spans.size(), 1);
-      EXPECT_EQ(source_spans.at(0).ToString(), "test.x:3:5-3:6");
+      EXPECT_EQ(source_spans.at(0).ToString(file_table), "test.x:3:3-3:8");
     } else {
       ASSERT_TRUE(source_spans.empty());
     }
   }
 }
 
-TEST(BytecodeInterpreterTest, RolloverHookTestForUMul) {
+TEST_F(BytecodeInterpreterTest, RolloverHookTestForUMul) {
   constexpr std::string_view kProgram = R"(
 fn main(x: u2, y: u2) -> u2 {
   x * y
@@ -2465,6 +2487,8 @@ fn main(x: u2, y: u2) -> u2 {
 )";
 
   for (uint64_t flat = 0; flat < 16; ++flat) {
+    ImportData import_data = CreateImportDataForTest();
+    const FileTable& file_table = import_data.file_table();
     uint64_t x = (flat >> 0) & 0x3;
     uint64_t y = (flat >> 2) & 0x3;
     std::vector<Span> source_spans;
@@ -2476,24 +2500,25 @@ fn main(x: u2, y: u2) -> u2 {
                       InterpValue::MakeUBits(2, y),
                   },
                   BytecodeInterpreterOptions().rollover_hook(
-                      [&](const Span& s) { source_spans.push_back(s); })));
-    XLS_VLOG(1) << "flat: " << std::hex << flat << " x: " << x << " y: " << y
-                << " result: " << result.ToString();
+                      [&](const Span& s) { source_spans.push_back(s); }),
+                  &import_data));
+    VLOG(1) << "flat: " << std::hex << flat << " x: " << x << " y: " << y
+            << " result: " << result.ToString();
 
     for (const Span& source_span : source_spans) {
-      XLS_VLOG(1) << "Rollover span: " << source_span;
+      VLOG(1) << "Rollover span: " << source_span.ToString(file_table);
     }
 
     if (x * y >= 4) {  // We should have a rollover in these cases.
       ASSERT_EQ(source_spans.size(), 1);
-      EXPECT_EQ(source_spans.at(0).ToString(), "test.x:3:5-3:6");
+      EXPECT_EQ(source_spans.at(0).ToString(file_table), "test.x:3:3-3:8");
     } else {
       ASSERT_TRUE(source_spans.empty());
     }
   }
 }
 
-TEST(BytecodeInterpreterTest, RolloverHookTestForSMul) {
+TEST_F(BytecodeInterpreterTest, RolloverHookTestForSMul) {
   constexpr std::string_view kProgram = R"(
 fn main(x: s2, y: s2) -> s2 {
   x * y
@@ -2502,6 +2527,8 @@ fn main(x: s2, y: s2) -> s2 {
 
   for (int64_t x : {-2, -1, 0, 1}) {
     for (int64_t y : {-2, -1, 0, 1}) {
+      ImportData import_data = CreateImportDataForTest();
+      const FileTable& file_table = import_data.file_table();
       std::vector<Span> source_spans;
       XLS_ASSERT_OK_AND_ASSIGN(
           InterpValue result,
@@ -2511,21 +2538,70 @@ fn main(x: s2, y: s2) -> s2 {
                         InterpValue::MakeSBits(2, y),
                     },
                     BytecodeInterpreterOptions().rollover_hook(
-                        [&](const Span& s) { source_spans.push_back(s); })));
+                        [&](const Span& s) { source_spans.push_back(s); }),
+                    &import_data));
 
       XLS_ASSERT_OK_AND_ASSIGN(int64_t got, result.GetBitValueViaSign());
       bool rollover = x * y != got;
-      XLS_VLOG(1) << " x: " << x << " y: " << y
-                  << " result: " << result.ToString()
-                  << " rollover: " << rollover;
+      VLOG(1) << " x: " << x << " y: " << y << " result: " << result.ToString()
+              << " rollover: " << rollover;
       if (rollover) {
         ASSERT_EQ(source_spans.size(), 1);
-        EXPECT_EQ(source_spans.at(0).ToString(), "test.x:3:5-3:6");
+        EXPECT_EQ(source_spans.at(0).ToString(file_table), "test.x:3:3-3:8");
       } else {
         ASSERT_TRUE(source_spans.empty());
       }
     }
   }
+}
+
+TEST_F(BytecodeInterpreterTest, EnumInStructGithubIssue1541) {
+  constexpr std::string_view kProgram = R"(enum MyEnum: u2 { ZERO_VALUE = 0 }
+struct MyStruct { e: MyEnum }
+
+fn f() -> MyStruct { MyStruct{ e: MyEnum::ZERO_VALUE } }
+fn g() -> MyStruct { zero!<MyStruct>() }
+)";
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue f_result, Interpret(kProgram, "f", {}));
+  VLOG(1) << "f_result: " << f_result;
+
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue g_result, Interpret(kProgram, "g", {}));
+  VLOG(1) << "g_result: " << g_result;
+
+  EXPECT_EQ(f_result, g_result);
+  EXPECT_TRUE(f_result.GetValuesOrDie()[0].IsEnum());
+  EXPECT_TRUE(g_result.GetValuesOrDie()[0].IsEnum());
+}
+
+TEST_F(BytecodeInterpreterTest, MapWithParametricFunction) {
+  constexpr std::string_view kProgram =
+      R"(
+fn f<N:u32>(x: u32) -> u32 { x + N }
+
+fn g() -> u32[3] {
+  // Should result in [3, 4, 8].
+  map([u32:1, u32:2], f<u32:2>) ++ map([u32:3], f<u32:5>)
+}
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue result, Interpret(kProgram, "g", {}));
+  VLOG(1) << "f_result: " << result;
+
+  ASSERT_TRUE(result.IsArray());
+  XLS_ASSERT_OK_AND_ASSIGN(int64_t num_elements, result.GetLength());
+  ASSERT_EQ(num_elements, 3);
+  XLS_ASSERT_OK_AND_ASSIGN(InterpValue element,
+                           result.Index(InterpValue::MakeU32(0)));
+  XLS_ASSERT_OK_AND_ASSIGN(int64_t bit_value, element.GetBitValueViaSign());
+  EXPECT_EQ(bit_value, 3);
+
+  XLS_ASSERT_OK_AND_ASSIGN(element, result.Index(InterpValue::MakeU32(1)));
+  XLS_ASSERT_OK_AND_ASSIGN(bit_value, element.GetBitValueViaSign());
+  EXPECT_EQ(bit_value, 4);
+
+  XLS_ASSERT_OK_AND_ASSIGN(element, result.Index(InterpValue::MakeU32(2)));
+  XLS_ASSERT_OK_AND_ASSIGN(bit_value, element.GetBitValueViaSign());
+  EXPECT_EQ(bit_value, 8);
 }
 
 }  // namespace

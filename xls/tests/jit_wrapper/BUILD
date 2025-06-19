@@ -22,13 +22,19 @@ load(
 )
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
 xls_dslx_test(
     name = "simple_dslx_test",
     srcs = ["simple.x"],
+    dslx_test_args = {"compare": "jit"},
 )
 
 xls_dslx_opt_ir(
@@ -39,7 +45,7 @@ xls_dslx_opt_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "identity",
-    src = ":simple_identity.opt.ir",
+    src = ":simple_identity",
     jit_wrapper_args = {
         "class_name": "F32Identity",
         "function": "identity",
@@ -55,7 +61,7 @@ xls_dslx_opt_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "wide_identity",
-    src = ":simple_wide_identity.opt.ir",
+    src = ":simple_wide_identity",
     jit_wrapper_args = {
         "class_name": "WideIdentity",
         "function": "wide_identity",
@@ -71,7 +77,7 @@ xls_dslx_opt_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "is_inf",
-    src = ":simple_is_inf.opt.ir",
+    src = ":simple_is_inf",
     jit_wrapper_args = {
         "class_name": "F32IsInf",
         "function": "is_inf",
@@ -87,7 +93,7 @@ xls_dslx_opt_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "fail_on_42",
-    src = ":simple_fail_on_42.opt.ir",
+    src = ":simple_fail_on_42",
     jit_wrapper_args = {
         "class_name": "FailOn42",
         "function": "fail_on_42",
@@ -103,7 +109,7 @@ xls_dslx_opt_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "make_tuple",
-    src = ":simple_make_tuple.opt.ir",
+    src = ":simple_make_tuple",
     jit_wrapper_args = {
         "class_name": "MakeTuple",
         "function": "make_tuple",
@@ -120,9 +126,14 @@ cc_test(
         ":is_inf",
         ":make_tuple",
         ":wide_identity",
-        "//xls/common:xls_gunit",
         "//xls/common:xls_gunit_main",
         "//xls/common/status:matchers",
-        "//xls/ir:value_helpers",
+        "//xls/ir:bits",
+        "//xls/ir:value",
+        "//xls/ir:value_utils",
+        "//xls/ir:value_view",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@googletest//:gtest",
     ],
 )

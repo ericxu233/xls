@@ -17,23 +17,24 @@
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
-#include <random>
 #include <tuple>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/functional/function_ref.h"
+#include "absl/log/check.h"
+#include "absl/random/bit_gen_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/ir/function_base.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
+#include "xls/ir/topo_sort.h"
 #include "xls/scheduling/scheduling_options.h"
 
 namespace xls {
@@ -57,7 +58,7 @@ DelayManager::DelayManager(FunctionBase *function,
     index_to_node_[index] = node;
     absl::StatusOr<int64_t> maybe_delay =
         delay_estimator.GetOperationDelayInPs(node);
-    XLS_CHECK_OK(maybe_delay.status());
+    CHECK_OK(maybe_delay.status());
     indices_to_delay_[index][index] = maybe_delay.value();
     index++;
   }
@@ -305,7 +306,7 @@ absl::StatusOr<std::vector<PathInfo>> DelayManager::GetTopNPaths(
 
 absl::StatusOr<std::vector<PathInfo>> DelayManager::GetTopNPathsStochastically(
     int64_t number_paths, float stochastic_ratio,
-    const PathExtractOptions &options,
+    const PathExtractOptions &options, absl::BitGenRef bit_gen,
     absl::FunctionRef<bool(Node *, Node *)> except,
     absl::FunctionRef<float(Node *, Node *)> score) const {
   int64_t number_candidate_paths =
@@ -318,11 +319,9 @@ absl::StatusOr<std::vector<PathInfo>> DelayManager::GetTopNPathsStochastically(
   }
 
   // Randomly sample number_paths.
-  // TODO(hanchenye): 2023-08-14 Enable to pass random generator as argument.
   std::vector<PathInfo> paths;
   std::sample(candidate_paths.begin(), candidate_paths.end(),
-              std::back_inserter(paths), number_paths,
-              std::mt19937{std::random_device{}()});
+              std::back_inserter(paths), number_paths, bit_gen);
   return paths;
 }
 

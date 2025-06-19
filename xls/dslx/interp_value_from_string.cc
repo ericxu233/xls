@@ -15,6 +15,7 @@
 #include "xls/dslx/interp_value_from_string.h"
 
 #include <filesystem>  // NOLINT
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -27,17 +28,18 @@
 #include "xls/dslx/import_data.h"
 #include "xls/dslx/interp_value.h"
 #include "xls/dslx/parse_and_typecheck.h"
+#include "xls/dslx/virtualizable_file_system.h"
 #include "xls/dslx/warning_kind.h"
 
 namespace xls::dslx {
 
 absl::StatusOr<InterpValue> InterpValueFromString(
     std::string_view s, const std::filesystem::path& dslx_stdlib_path) {
-  std::string program = absl::StrFormat("import std const C = (%s);", s);
+  std::string program = absl::StrFormat("import std; const C = (%s);", s);
   ImportData import_data = CreateImportData(
       dslx_stdlib_path,
       /*additional_search_paths=*/absl::Span<const std::filesystem::path>{},
-      kAllWarningsSet);
+      kDefaultWarningsSet, std::make_unique<RealFilesystem>());
   XLS_ASSIGN_OR_RETURN(TypecheckedModule tm,
                        ParseAndTypecheck(program, "cmdline_constant.x",
                                          "cmdline_constant", &import_data));

@@ -17,22 +17,26 @@
 #include <filesystem>  // NOLINT
 #include <optional>
 #include <string>
-#include <string_view>
 #include <vector>
 
+#include "absl/log/log.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/time/time.h"
+#include "google/protobuf/text_format.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/get_runfile_path.h"
 #include "xls/common/logging/log_lines.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/subprocess.h"
+#include "xls/fuzzer/sample.h"
 
 namespace xls {
 namespace {
 
 absl::StatusOr<std::filesystem::path> GetIrMinimizerMainPath() {
-  return GetXlsRunfilePath("xls/tools/ir_minimizer_main");
+  return GetXlsRunfilePath("xls/dev_tools/ir_minimizer_main");
 }
 
 absl::StatusOr<std::filesystem::path> GetSampleRunnerMainPath() {
@@ -43,36 +47,25 @@ absl::StatusOr<std::filesystem::path> GetFindFailingInputMainPath() {
   return GetXlsRunfilePath("xls/fuzzer/find_failing_input_main");
 }
 
-// Writes the content into a file of the given name in the directory.
-absl::Status WriteToFile(const std::filesystem::path& dir_path,
-                         std::string_view filename, std::string_view content,
-                         bool executable = false) {
-  std::filesystem::path path = dir_path / filename;
-  XLS_RETURN_IF_ERROR(SetFileContents(path, content));
-  if (executable) {
-    std::filesystem::permissions(path, std::filesystem::perms::owner_exec,
-                                 std::filesystem::perm_options::add);
-  }
-  return absl::OkStatus();
-}
-
 }  // namespace
 
 absl::StatusOr<std::optional<std::filesystem::path>> MinimizeIr(
     const Sample& smp, std::filesystem::path run_dir,
     std::optional<std::string> inject_jit_result,
     std::optional<absl::Duration> timeout) {
-  XLS_VLOG(3) << "MinimizeIr; run_dir: " << run_dir;
+  VLOG(3) << "MinimizeIr; run_dir: " << run_dir;
   if (!std::filesystem::exists(run_dir / "sample.ir")) {
-    XLS_VLOG(3) << "sample.ir file did not exist within: " << run_dir;
+    VLOG(3) << "sample.ir file did not exist within: " << run_dir;
     return std::nullopt;
   }
 
   SampleOptions ir_minimize_options = smp.options();
   ir_minimize_options.set_input_is_dslx(false);
-  XLS_RETURN_IF_ERROR(
-      SetFileContents(run_dir / "ir_minimizer.options.pbtxt",
-                      ir_minimize_options.proto().DebugString()));
+  std::string ir_minimize_options_str;
+  google::protobuf::TextFormat::PrintToString(ir_minimize_options.proto(),
+                                    &ir_minimize_options_str);
+  XLS_RETURN_IF_ERROR(SetFileContents(run_dir / "ir_minimizer.options.pbtxt",
+                                      ir_minimize_options_str));
 
   XLS_ASSIGN_OR_RETURN(std::filesystem::path sample_runner_main_path,
                        GetSampleRunnerMainPath());
@@ -82,8 +75,8 @@ absl::StatusOr<std::optional<std::filesystem::path>> MinimizeIr(
   {
     std::vector<std::string> args = {
         std::string{sample_runner_main_path}, "--logtostderr",
-        "--options_file=ir_minimizer.options.pbtxt", "--args_file=args.txt",
-        "--input_file=$1"};
+        "--options_file=ir_minimizer.options.pbtxt",
+        "--testvector_textproto=testvector.pbtxt", "--input_file=$1"};
     const std::filesystem::path test_script = run_dir / "ir_minimizer_test.sh";
     XLS_RETURN_IF_ERROR(SetFileContents(
         test_script, absl::StrCat("#!/bin/sh\n! ", absl::StrJoin(args, " "))));
@@ -102,18 +95,19 @@ absl::StatusOr<std::optional<std::filesystem::path>> MinimizeIr(
              absl::StrCat("--test_executable=", test_script.string()),
              "sample.ir"},
             /*cwd=*/run_dir, timeout));
-    XLS_RETURN_IF_ERROR(SetFileContents(stderr_path, result.stderr));
+    XLS_RETURN_IF_ERROR(SetFileContents(stderr_path, result.stderr_content));
 
     if (result.exit_status == 0) {
       std::filesystem::path minimized_ir_path = run_dir / "minimized.ir";
-      XLS_RETURN_IF_ERROR(SetFileContents(minimized_ir_path, result.stdout));
+      XLS_RETURN_IF_ERROR(
+          SetFileContents(minimized_ir_path, result.stdout_content));
       return minimized_ir_path;
     }
   }
 
   // If we're opting to not run the JIT, then we're done.
   if (!smp.options().use_jit()) {
-    XLS_VLOG(3) << "MinimizeIr; not using JIT, so finished";
+    VLOG(3) << "MinimizeIr; not using JIT, so finished";
     return std::nullopt;
   }
 
@@ -137,26 +131,27 @@ absl::StatusOr<std::optional<std::filesystem::path>> MinimizeIr(
         run_dir / absl::StrCat(basename, ".stderr");
 
     std::vector<std::string> args = {find_failing_input_main_path,
-                                     "--input_file=args.txt", "sample.ir"};
+                                     "--testvector_textproto=testvector.pbtxt",
+                                     "sample.ir"};
     args.insert(args.end(), extra_args.begin(), extra_args.end());
     XLS_ASSIGN_OR_RETURN(
         find_failing_input_result,
-        InvokeSubprocess(args, /*cwd=*/run_dir, /*timeout=*/timeout));
-    XLS_RETURN_IF_ERROR(
-        SetFileContents(stderr_path, find_failing_input_result->stderr));
+        InvokeSubprocess(args, /*cwd=*/run_dir, /*optional_timeout=*/timeout));
+    XLS_RETURN_IF_ERROR(SetFileContents(
+        stderr_path, find_failing_input_result->stderr_content));
     if (find_failing_input_result->timeout_expired) {
-      XLS_VLOG(3) << "MinimizeIr; find_failing_input timeout expired";
+      VLOG(3) << "MinimizeIr; find_failing_input timeout expired";
       return std::nullopt;
     }
   }
 
-  XLS_VLOG(3) << "find_failing_input_main; exit status: "
-              << find_failing_input_result->exit_status;
-  XLS_LOG_LINES(INFO, find_failing_input_result->stderr);
+  VLOG(3) << "find_failing_input_main; exit status: "
+          << find_failing_input_result->exit_status;
+  XLS_LOG_LINES(INFO, find_failing_input_result->stderr_content);
   if (find_failing_input_result->exit_status == 0) {
     // A failing input for JIT vs interpreter was found.
-    XLS_VLOG(3) << "Failing input for JIT-vs-interpreter was found.";
-    std::string failed_input = find_failing_input_result->stdout;
+    VLOG(3) << "Failing input for JIT-vs-interpreter was found.";
+    std::string failed_input = find_failing_input_result->stdout_content;
     std::string basename = ir_minimizer_main_path.stem();
     std::filesystem::path stderr_path =
         run_dir / absl::StrCat(basename, "_jit.stderr");
@@ -166,18 +161,19 @@ absl::StatusOr<std::optional<std::filesystem::path>> MinimizeIr(
         "--input=" + failed_input, "sample.ir"};
     minimize_args.insert(minimize_args.end(), extra_args.begin(),
                          extra_args.end());
-    XLS_ASSIGN_OR_RETURN(
-        SubprocessResult minimize_result,
-        InvokeSubprocess(minimize_args, /*cwd=*/run_dir, /*timeout=*/timeout));
-    XLS_RETURN_IF_ERROR(SetFileContents(stderr_path, minimize_result.stderr));
+    XLS_ASSIGN_OR_RETURN(SubprocessResult minimize_result,
+                         InvokeSubprocess(minimize_args, /*cwd=*/run_dir,
+                                          /*optional_timeout=*/timeout));
+    XLS_RETURN_IF_ERROR(
+        SetFileContents(stderr_path, minimize_result.stderr_content));
     if (minimize_result.timeout_expired) {
-      XLS_VLOG(3) << "MinimizeIr; ir_minimizer_main timeout expired";
+      VLOG(3) << "MinimizeIr; ir_minimizer_main timeout expired";
       return std::nullopt;
     }
     if (minimize_result.exit_status == 0) {
       std::filesystem::path minimized_ir_path = run_dir / "minimized.ir";
       XLS_RETURN_IF_ERROR(
-          SetFileContents(minimized_ir_path, minimize_result.stdout));
+          SetFileContents(minimized_ir_path, minimize_result.stdout_content));
       return minimized_ir_path;
     }
   }

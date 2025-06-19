@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """This module contains helper rules."""
 
+load("@bazel_skylib//lib:dicts.bzl", "dicts")
+load("@rules_proto//proto:defs.bzl", "ProtoInfo")
 load(
     "//xls/build_rules:xls_common_rules.bzl",
     "get_output_filename_value",
@@ -44,8 +45,10 @@ def _check_sha256sum_test_impl(ctx):
                 src.short_path,
             ),
             "if [ $? -ne 0 ]; then",
-            "echo \"Error: sha256sum checksum mismatch for file '{}'.\""
+            "echo \"Error: sha256sum checksum mismatch for file '{}':"
                 .format(src.short_path),
+            "  expected: {}".format(ctx.attr.sha256sum),
+            "  actual:   `sha256sum {} | cut -d ' ' -f1`\"".format(src.short_path),
             "exit -1",
             "fi",
             "exit 0",
@@ -126,8 +129,10 @@ def _check_sha256sum_frozen_impl(ctx):
                 src_path,
             ),
             "if [ $? -ne 0 ]; then",
-            "echo \"Error: sha256sum checksum mismatch for file '{}'.\""
+            "echo \"Error: sha256sum checksum mismatch for file '{}':"
                 .format(src_path),
+            "  expected: {}".format(ctx.attr.sha256sum),
+            "  actual:   `sha256sum {} | cut -d ' ' -f1`\"".format(src_path),
             "exit -1",
             "fi",
             "cat {} > {}".format(src_path, frozen_file.path),
@@ -306,3 +311,126 @@ Examples:
     implementation = _proto_data_impl,
     attrs = _proto_data_attrs,
 )
+
+def _proto_to_dslx_impl(ctx):
+    """The implementation of the 'proto_to_dslx' rule.
+
+    Args:
+      ctx: The current rule's context object.
+
+    Returns:
+      DefaultInfo provider
+    """
+    schema_sources = ctx.attr.proto_schema[ProtoInfo].direct_sources
+    schema = schema_sources[0]
+
+    proto2dslx = ctx.executable._proto_to_dslx_tool
+    dslx_filename = get_output_filename_value(
+        ctx,
+        "dslx_file",
+        ctx.attr.name + ".x",
+    )
+    dslx_file = ctx.actions.declare_file(dslx_filename)
+    ctx.actions.run_shell(
+        outputs = [dslx_file],
+        # The files required for generating the protobin file.
+        inputs = [schema, ctx.file.textproto, proto2dslx],
+        # The proto2bin executable is a tool needed by the action.
+        tools = [proto2dslx],
+        command = "{} --proto_def_path {} --proto_name {} --textproto_path {} --var_name {} --output_path {}".format(
+            proto2dslx.path,
+            schema.path,
+            ctx.attr.proto_name,
+            ctx.file.textproto.path,
+            ctx.attr.variable_name,
+            dslx_file.path,
+        ),
+        use_default_shell_env = True,
+        mnemonic = "Proto2DSLX",
+    )
+    return [DefaultInfo(files = depset([dslx_file]))]
+
+_proto_to_dslx_attrs = {
+    "proto_schema": attr.label(
+        doc = "Schema definition proto file",
+        providers = [ProtoInfo],
+        mandatory = True,
+    ),
+    "proto_name": attr.string(
+        doc = "The name of the message type in the .proto files that 'proto_def_path' " +
+              "file represents.",
+        mandatory = True,
+    ),
+    "textproto": attr.label(
+        doc = "The source textproto file to convert to DSLX",
+        allow_single_file = True,
+        mandatory = True,
+    ),
+    "variable_name": attr.string(
+        doc = "The name of the DSLX struct variable with contents of the textproto " +
+              "file. Defaults to 'parameters'",
+        default = "PARAMETERS",
+    ),
+    "dslx_file": attr.output(
+        doc = "The name of the output file to write DSLX output to. " +
+              "Defaults to <rule_name>.x",
+    ),
+    "_proto_to_dslx_tool": attr.label(
+        doc = "Convert a proto text to a dslx",
+        default = Label("//xls/tools:proto_to_dslx_main"),
+        allow_single_file = True,
+        executable = True,
+        cfg = "exec",
+    ),
+}
+
+proto_to_dslx = rule(
+    implementation = _proto_to_dslx_impl,
+    attrs = _proto_to_dslx_attrs,
+)
+
+BoolConfigSettingInfo = provider(
+    doc = "A true/false bit containing whether a config setting is enabled.",
+    fields = ["value"],
+)
+
+def _bool_config_setting_impl(ctx):
+    """The implementation of the 'bool_config_setting' rule.
+
+    Args:
+      ctx: The current rule's context object.
+
+    Returns:
+      BoolConfigSetting provider
+    """
+    return [BoolConfigSettingInfo(value = ctx.attr.value)]
+
+_bool_config_setting_adapter = rule(
+    implementation = _bool_config_setting_impl,
+    attrs = {
+        "value": attr.bool(mandatory = True, doc = "Is the config setting enabled"),
+    },
+)
+
+def bool_config_setting(name, **kwargs):
+    """Creates a config_setting readable by rules.
+
+    Args:
+      name: The name of the bool_config_setting.
+      **kwargs: Arguments to config_setting (except visibility which is used only on the final rule)
+    """
+    config_setting_attrs = ["constraint_values", "define_values", "flag_values", "values"]
+    native_config_name = name + "_real_config_setting"
+    native.config_setting(
+        name = native_config_name,
+        visibility = ["//visibility:private"],
+        **dicts.omit(kwargs, ["visibility"])
+    )
+    _bool_config_setting_adapter(
+        name = name,
+        value = select({
+            native_config_name: True,
+            "//conditions:default": False,
+        }),
+        **dicts.omit(kwargs, config_setting_attrs)
+    )

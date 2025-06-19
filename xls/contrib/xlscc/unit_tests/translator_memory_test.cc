@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <list>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -22,14 +23,15 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "google/protobuf/text_format.h"
 #include "google/protobuf/util/message_differencer.h"
 #include "xls/common/status/matchers.h"
-#include "xls/common/status/status_macros.h"
 #include "xls/contrib/xlscc/hls_block.pb.h"
 #include "xls/contrib/xlscc/unit_tests/unit_test.h"
 #include "xls/ir/bits.h"
-#include "xls/ir/nodes.h"
+#include "xls/ir/node.h"
 #include "xls/ir/package.h"
 #include "xls/ir/value.h"
 
@@ -222,17 +224,17 @@ TEST_F(TranslatorMemoryTest, MemoryReadProc) {
 
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("foo_store");
-    ch_in->set_type(MEMORY);
+    ch_in->set_type(CHANNEL_TYPE_MEMORY);
     ch_in->set_depth(21);
 
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
-  inputs["foo_store__read_response"] = {
+  inputs["foo_store_read_response"] = {
       xls::Value::Tuple({xls::Value(xls::SBits(100, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(50, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(12, 16))})};
@@ -241,7 +243,7 @@ TEST_F(TranslatorMemoryTest, MemoryReadProc) {
   outputs["out"] = {xls::Value(xls::SBits(103, 32)),
                     xls::Value(xls::SBits(53, 32)),
                     xls::Value(xls::SBits(15, 32))};
-  outputs["foo_store__read_request"] = {
+  outputs["foo_store_read_request"] = {
       xls::Value::Tuple({
           xls::Value(xls::UBits(13, 5)),  // addr
           xls::Value::Tuple({})           // mask
@@ -275,23 +277,23 @@ TEST_F(TranslatorMemoryTest, MemoryWriteProc) {
 
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("memory");
-    ch_in->set_type(MEMORY);
+    ch_in->set_type(CHANNEL_TYPE_MEMORY);
     ch_in->set_depth(21);
 
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("in");
     ch_out->set_is_input(true);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
   inputs["in"] = {xls::Value(xls::SBits(122, 32)),
                   xls::Value(xls::SBits(10, 32))};
-  inputs["memory__write_response"] = {xls::Value::Tuple({}),
-                                      xls::Value::Tuple({})};
+  inputs["memory_write_response"] = {xls::Value::Tuple({}),
+                                     xls::Value::Tuple({})};
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> outputs;
-  outputs["memory__write_request"] = {
+  outputs["memory_write_request"] = {
       xls::Value::Tuple({
           xls::Value(xls::UBits(13, 5)),    // addr
           xls::Value(xls::SBits(127, 16)),  // value
@@ -322,20 +324,20 @@ TEST_F(TranslatorMemoryTest, MemoryReadWriteProc) {
 
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("barstore");
-    ch_in->set_type(MEMORY);
+    ch_in->set_type(CHANNEL_TYPE_MEMORY);
     ch_in->set_depth(55);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
-  inputs["barstore__read_response"] = {
+  inputs["barstore_read_response"] = {
       xls::Value::Tuple({xls::Value(xls::SBits(100, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(50, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(12, 16))})};
-  inputs["barstore__write_response"] = {xls::Value::Tuple({}),
-                                        xls::Value::Tuple({})};
+  inputs["barstore_write_response"] = {xls::Value::Tuple({}),
+                                       xls::Value::Tuple({})};
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> outputs;
-  outputs["barstore__read_request"] = {
+  outputs["barstore_read_request"] = {
       xls::Value::Tuple({
           xls::Value(xls::UBits(11, 6)),  // addr
           xls::Value::Tuple({})           // mask
@@ -348,7 +350,7 @@ TEST_F(TranslatorMemoryTest, MemoryReadWriteProc) {
           xls::Value(xls::UBits(17, 6)),  // addr
           xls::Value::Tuple({})           // mask
       })};
-  outputs["barstore__write_request"] = {
+  outputs["barstore_write_request"] = {
       xls::Value::Tuple({
           xls::Value(xls::UBits(10, 6)),    // addr
           xls::Value(xls::SBits(105, 16)),  // value
@@ -389,17 +391,17 @@ TEST_F(TranslatorMemoryTest, MemoryReadInPipelinedLoop) {
 
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("foo_store");
-    ch_in->set_type(MEMORY);
+    ch_in->set_type(CHANNEL_TYPE_MEMORY);
     ch_in->set_depth(21);
 
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
-  inputs["foo_store__read_response"] = {
+  inputs["foo_store_read_response"] = {
       xls::Value::Tuple({xls::Value(xls::SBits(100, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(10, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(1, 16))}),
@@ -410,7 +412,7 @@ TEST_F(TranslatorMemoryTest, MemoryReadInPipelinedLoop) {
   absl::flat_hash_map<std::string, std::list<xls::Value>> outputs;
   outputs["out"] = {xls::Value(xls::SBits(211, 32)),
                     xls::Value(xls::SBits(115, 32))};
-  outputs["foo_store__read_request"] = {
+  outputs["foo_store_read_request"] = {
       xls::Value::Tuple({
           xls::Value(xls::UBits(13, 5)),  // addr
           xls::Value::Tuple({})           // mask
@@ -453,7 +455,7 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemory) {
       };)";
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
-  inputs["foo_store__read_response"] = {
+  inputs["foo_store_read_response"] = {
       xls::Value::Tuple({xls::Value(xls::SBits(100, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(50, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(12, 16))})};
@@ -462,7 +464,7 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemory) {
   outputs["out"] = {xls::Value(xls::SBits(300, 64)),
                     xls::Value(xls::SBits(150, 64)),
                     xls::Value(xls::SBits(36, 64))};
-  outputs["foo_store__read_request"] = {
+  outputs["foo_store_read_request"] = {
       xls::Value::Tuple({
           xls::Value(xls::UBits(13, 5)),  // addr
           xls::Value::Tuple({})           // mask
@@ -483,14 +485,74 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemory) {
   const std::string ref_meta_str = R"(
     channels {
       name: "foo_store"
-      type: MEMORY
+      type: CHANNEL_TYPE_MEMORY
       width_in_bits: 16
       depth: 21
     }
     channels {
       name: "out"
       is_input: false
-      type: FIFO
+      type: CHANNEL_TYPE_FIFO
+      width_in_bits: 64
+    }
+    name: "Block"
+  )";
+
+  xlscc::HLSBlock ref_meta;
+  ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(ref_meta_str, &ref_meta));
+
+  std::string diff;
+  google::protobuf::util::MessageDifferencer differencer;
+  differencer.ReportDifferencesToString(&diff);
+  ASSERT_TRUE(differencer.Compare(meta, ref_meta)) << diff;
+}
+
+TEST_F(TranslatorMemoryTest, IOProcClassArrayUsing) {
+  const std::string content = R"(
+       template<bool regs, typename T, int N>
+       struct MyMemoryBase {
+       };
+
+       template<typename T, int N>
+       struct MyMemoryBase<true, T, N> {
+         using type = T[N];
+       };
+
+       template<typename T, int N>
+       struct MyMemoryBase<false, T, N> {
+         using type = __xls_memory<T, N>;
+       };
+
+       template<typename T, int N, bool regs>
+       using MyMemory = typename MyMemoryBase<regs, T, N>::type;
+
+       class Block {
+        public:
+         MyMemory<short, 21, true> foo_store;
+         __xls_channel<long, __xls_channel_dir_Out>& out;
+
+         #pragma hls_top
+         void Run() {
+          out.write(3*foo_store[13]);
+         }
+      };)";
+
+  absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
+
+  absl::flat_hash_map<std::string, std::list<xls::Value>> outputs;
+  outputs["out"] = {xls::Value(xls::SBits(0, 64)),
+                    xls::Value(xls::SBits(0, 64)),
+                    xls::Value(xls::SBits(0, 64))};
+  ProcTest(content, /*block_spec=*/std::nullopt, inputs, outputs,
+           /* min_ticks = */ 3);
+
+  XLS_ASSERT_OK_AND_ASSIGN(xlscc::HLSBlock meta, GetBlockSpec());
+
+  const std::string ref_meta_str = R"(
+    channels {
+      name: "out"
+      is_input: false
+      type: CHANNEL_TYPE_FIFO
       width_in_bits: 64
     }
     name: "Block"
@@ -523,7 +585,7 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemorySubroutine) {
       };)";
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
-  inputs["foo_store__read_response"] = {
+  inputs["foo_store_read_response"] = {
       xls::Value::Tuple({xls::Value(xls::SBits(100, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(50, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(12, 16))})};
@@ -532,7 +594,7 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemorySubroutine) {
   outputs["out"] = {xls::Value(xls::SBits(300, 64)),
                     xls::Value(xls::SBits(150, 64)),
                     xls::Value(xls::SBits(36, 64))};
-  outputs["foo_store__read_request"] = {
+  outputs["foo_store_read_request"] = {
       xls::Value::Tuple({
           xls::Value(xls::UBits(13, 5)),  // addr
           xls::Value::Tuple({})           // mask
@@ -553,14 +615,14 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemorySubroutine) {
   const std::string ref_meta_str = R"(
     channels {
       name: "foo_store"
-      type: MEMORY
+      type: CHANNEL_TYPE_MEMORY
       width_in_bits: 16
       depth: 21
     }
     channels {
       name: "out"
       is_input: false
-      type: FIFO
+      type: CHANNEL_TYPE_FIFO
       width_in_bits: 64
     }
     name: "Block"
@@ -593,7 +655,7 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemorySubroutine2) {
       };)";
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
-  inputs["foo_store__read_response"] = {
+  inputs["foo_store_read_response"] = {
       xls::Value::Tuple({xls::Value(xls::SBits(100, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(50, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(12, 16))})};
@@ -602,7 +664,7 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemorySubroutine2) {
   outputs["out"] = {xls::Value(xls::SBits(300, 64)),
                     xls::Value(xls::SBits(150, 64)),
                     xls::Value(xls::SBits(36, 64))};
-  outputs["foo_store__read_request"] = {
+  outputs["foo_store_read_request"] = {
       xls::Value::Tuple({
           xls::Value(xls::UBits(13, 5)),  // addr
           xls::Value::Tuple({})           // mask
@@ -623,14 +685,14 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemorySubroutine2) {
   const std::string ref_meta_str = R"(
     channels {
       name: "foo_store"
-      type: MEMORY
+      type: CHANNEL_TYPE_MEMORY
       width_in_bits: 16
       depth: 21
     }
     channels {
       name: "out"
       is_input: false
-      type: FIFO
+      type: CHANNEL_TYPE_FIFO
       width_in_bits: 64
     }
     name: "Block"
@@ -664,7 +726,7 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemorySubroutine3) {
       };)";
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
-  inputs["foo_store__read_response"] = {
+  inputs["foo_store_read_response"] = {
       xls::Value::Tuple({xls::Value(xls::SBits(100, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(50, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(12, 16))})};
@@ -673,7 +735,7 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemorySubroutine3) {
   outputs["out"] = {xls::Value(xls::SBits(300, 64)),
                     xls::Value(xls::SBits(150, 64)),
                     xls::Value(xls::SBits(36, 64))};
-  outputs["foo_store__read_request"] = {
+  outputs["foo_store_read_request"] = {
       xls::Value::Tuple({
           xls::Value(xls::UBits(13, 5)),  // addr
           xls::Value::Tuple({})           // mask
@@ -694,14 +756,14 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemorySubroutine3) {
   const std::string ref_meta_str = R"(
     channels {
       name: "foo_store"
-      type: MEMORY
+      type: CHANNEL_TYPE_MEMORY
       width_in_bits: 16
       depth: 21
     }
     channels {
       name: "out"
       is_input: false
-      type: FIFO
+      type: CHANNEL_TYPE_FIFO
       width_in_bits: 64
     }
     name: "Block"
@@ -736,13 +798,13 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemorySubroutine4) {
       };)";
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
-  inputs["foo_store__write_response"] = {xls::Value::Tuple({}),
-                                         xls::Value::Tuple({})};
+  inputs["foo_store_write_response"] = {xls::Value::Tuple({}),
+                                        xls::Value::Tuple({})};
   inputs["in"] = {xls::Value(xls::SBits(3, 64)), xls::Value(xls::SBits(8, 64)),
                   xls::Value(xls::SBits(15, 64))};
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> outputs;
-  outputs["foo_store__write_request"] = {
+  outputs["foo_store_write_request"] = {
       xls::Value::Tuple({
           xls::Value(xls::UBits(3, 5)),     // addr
           xls::Value(xls::SBits(100, 16)),  // value
@@ -766,14 +828,14 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemorySubroutine4) {
   const std::string ref_meta_str = R"(
     channels {
       name: "foo_store"
-      type: MEMORY
+      type: CHANNEL_TYPE_MEMORY
       width_in_bits: 16
       depth: 21
     }
     channels {
       name: "in"
       is_input: true
-      type: FIFO
+      type: CHANNEL_TYPE_FIFO
       width_in_bits: 64
     }
     name: "Block"
@@ -811,7 +873,7 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemoryPipelinedLoop) {
       };)";
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
-  inputs["foo_store__read_response"] = {
+  inputs["foo_store_read_response"] = {
       xls::Value::Tuple({xls::Value(xls::SBits(100, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(50, 16))}),
       xls::Value::Tuple({xls::Value(xls::SBits(12, 16))})};
@@ -820,7 +882,7 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemoryPipelinedLoop) {
   outputs["out"] = {xls::Value(xls::SBits(300, 64)),
                     xls::Value(xls::SBits(150, 64)),
                     xls::Value(xls::SBits(36, 64))};
-  outputs["foo_store__read_request"] = {
+  outputs["foo_store_read_request"] = {
       xls::Value::Tuple({
           xls::Value(xls::UBits(13, 5)),  // addr
           xls::Value::Tuple({})           // mask
@@ -841,14 +903,14 @@ TEST_F(TranslatorMemoryTest, IOProcClassMemoryPipelinedLoop) {
   const std::string ref_meta_str = R"(
     channels {
       name: "foo_store"
-      type: MEMORY
+      type: CHANNEL_TYPE_MEMORY
       width_in_bits: 16
       depth: 21
     }
     channels {
       name: "out"
       is_input: false
-      type: FIFO
+      type: CHANNEL_TYPE_FIFO
       width_in_bits: 64
     }
     name: "Block"
@@ -903,7 +965,7 @@ TEST_F(TranslatorMemoryTest, ReferenceToMemoryOp) {
 
   ASSERT_THAT(
       SourceToIr(content).status(),
-      xls::status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kUnimplemented,
           testing::HasSubstr("eferences to side effecting operations")));
 }
@@ -1002,50 +1064,49 @@ TEST_F(TranslatorMemoryTest, MemoryUnused) {
 
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("foo_unused");
-    ch_in->set_type(MEMORY);
+    ch_in->set_type(CHANNEL_TYPE_MEMORY);
     ch_in->set_depth(21);
 
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   // Check that dummy ops are present
   XLS_ASSERT_OK(ScanFile(content, /*clang_argv=*/{},
                          /*io_test_mode=*/false,
                          /*error_on_init_interval=*/false));
-  package_.reset(new xls::Package("my_package"));
+  package_ = std::make_unique<xls::Package>("my_package");
   XLS_ASSERT_OK(
       translator_->GenerateIR_Block(package_.get(), block_spec).status());
 
   {
     XLS_ASSERT_OK_AND_ASSIGN(xls::Channel * channel,
-                             package_->GetChannel("foo_unused__read_request"));
+                             package_->GetChannel("foo_unused_read_request"));
     XLS_ASSERT_OK_AND_ASSIGN(std::vector<xls::Node*> ops,
-                             GetOpsForChannel(channel->id()));
+                             GetOpsForChannelNameContains(channel->name()));
     EXPECT_FALSE(ops.empty());
   }
   {
     XLS_ASSERT_OK_AND_ASSIGN(xls::Channel * channel,
-                             package_->GetChannel("foo_unused__read_response"));
+                             package_->GetChannel("foo_unused_read_response"));
     XLS_ASSERT_OK_AND_ASSIGN(std::vector<xls::Node*> ops,
-                             GetOpsForChannel(channel->id()));
+                             GetOpsForChannelNameContains(channel->name()));
     EXPECT_FALSE(ops.empty());
   }
   {
     XLS_ASSERT_OK_AND_ASSIGN(xls::Channel * channel,
-                             package_->GetChannel("foo_unused__write_request"));
+                             package_->GetChannel("foo_unused_write_request"));
     XLS_ASSERT_OK_AND_ASSIGN(std::vector<xls::Node*> ops,
-                             GetOpsForChannel(channel->id()));
+                             GetOpsForChannelNameContains(channel->name()));
     EXPECT_FALSE(ops.empty());
   }
   {
-    XLS_ASSERT_OK_AND_ASSIGN(
-        xls::Channel * channel,
-        package_->GetChannel("foo_unused__write_response"));
+    XLS_ASSERT_OK_AND_ASSIGN(xls::Channel * channel,
+                             package_->GetChannel("foo_unused_write_response"));
     XLS_ASSERT_OK_AND_ASSIGN(std::vector<xls::Node*> ops,
-                             GetOpsForChannel(channel->id()));
+                             GetOpsForChannelNameContains(channel->name()));
     EXPECT_FALSE(ops.empty());
   }
 
@@ -1180,39 +1241,39 @@ TEST_F(TranslatorMemoryTest, MemoryTokenNetwork) {
   XLS_ASSERT_OK(ScanFile(content, /*clang_argv=*/{},
                          /*io_test_mode=*/false,
                          /*error_on_init_interval=*/false));
-  package_.reset(new xls::Package("my_package"));
+  package_ = std::make_unique<xls::Package>("my_package");
   HLSBlock block_spec;
   XLS_ASSERT_OK_AND_ASSIGN(
       xls::Proc * ret,
       translator_->GenerateIR_BlockFromClass(package_.get(), &block_spec));
 
-  int64_t memory_read_request_id = -1, memory_read_response_id = -1;
+  std::string_view memory_read_request, memory_read_response;
 
   for (xls::Channel* channel : package_->channels()) {
-    const std::string ch_name = channel->name();
-    if (ch_name == "memory__read_request") {
-      memory_read_request_id = channel->id();
-    } else if (ch_name == "memory__read_response") {
-      memory_read_response_id = channel->id();
+    const std::string ch_name{channel->name()};
+    if (ch_name == "memory_read_request") {
+      memory_read_request = channel->name();
+    } else if (ch_name == "memory_read_response") {
+      memory_read_response = channel->name();
     }
   }
 
-  ASSERT_GE(memory_read_request_id, 0);
-  ASSERT_GE(memory_read_response_id, 0);
+  ASSERT_FALSE(memory_read_request.empty());
+  ASSERT_FALSE(memory_read_response.empty());
 
   XLS_ASSERT_OK_AND_ASSIGN(
-      std::vector<xls::Node*> nodes_for_memory_read_response_id,
-      GetIOOpsForChannel(ret, memory_read_response_id));
-  ASSERT_EQ(nodes_for_memory_read_response_id.size(), 1);
+      std::vector<xls::Node*> nodes_for_memory_read_response,
+      GetIOOpsForChannel(ret, memory_read_response));
+  ASSERT_EQ(nodes_for_memory_read_response.size(), 1);
   XLS_ASSERT_OK_AND_ASSIGN(
-      std::vector<xls::Node*> nodes_for_memory_read_request_id,
-      GetIOOpsForChannel(ret, memory_read_request_id));
-  ASSERT_EQ(nodes_for_memory_read_request_id.size(), 1);
+      std::vector<xls::Node*> nodes_for_memory_read_request,
+      GetIOOpsForChannel(ret, memory_read_request));
+  ASSERT_EQ(nodes_for_memory_read_request.size(), 1);
 
   XLS_ASSERT_OK_AND_ASSIGN(
       bool request_before_response,
-      NodeIsAfterTokenWise(ret, /*before=*/nodes_for_memory_read_request_id[0],
-                           /*after=*/nodes_for_memory_read_response_id[0]));
+      NodeIsAfterTokenWise(ret, /*before=*/nodes_for_memory_read_request[0],
+                           /*after=*/nodes_for_memory_read_response[0]));
   EXPECT_TRUE(request_before_response);
 }
 
@@ -1234,43 +1295,44 @@ TEST_F(TranslatorMemoryTest, MemoryTokenNetworkReadAfterWrite) {
   XLS_ASSERT_OK(ScanFile(content, /*clang_argv=*/{},
                          /*io_test_mode=*/false,
                          /*error_on_init_interval=*/false));
-  package_.reset(new xls::Package("my_package"));
+  package_ = std::make_unique<xls::Package>("my_package");
   HLSBlock block_spec;
   XLS_ASSERT_OK_AND_ASSIGN(
       xls::Proc * ret,
       translator_->GenerateIR_BlockFromClass(package_.get(), &block_spec));
 
-  int64_t memory_read_request_id = -1, memory_write_request_id = -1;
+  std::string_view memory_read_request, memory_write_request;
 
   for (xls::Channel* channel : package_->channels()) {
-    const std::string ch_name = channel->name();
-    if (ch_name == "memory__read_request") {
-      memory_read_request_id = channel->id();
-    } else if (ch_name == "memory__write_request") {
-      memory_write_request_id = channel->id();
+    const std::string ch_name{channel->name()};
+    if (ch_name == "memory_read_request") {
+      memory_read_request = channel->name();
+    } else if (ch_name == "memory_write_request") {
+      memory_write_request = channel->name();
     }
   }
 
-  ASSERT_GE(memory_read_request_id, 0);
-  ASSERT_GE(memory_write_request_id, 0);
+  ASSERT_FALSE(memory_read_request.empty());
+  ASSERT_FALSE(memory_write_request.empty());
 
   XLS_ASSERT_OK_AND_ASSIGN(
-      std::vector<xls::Node*> nodes_for_memory_read_request_id,
-      GetIOOpsForChannel(ret, memory_read_request_id));
-  ASSERT_EQ(nodes_for_memory_read_request_id.size(), 1);
+      std::vector<xls::Node*> nodes_for_memory_read_request,
+      GetIOOpsForChannel(ret, memory_read_request));
+  ASSERT_EQ(nodes_for_memory_read_request.size(), 1);
   XLS_ASSERT_OK_AND_ASSIGN(
-      std::vector<xls::Node*> nodes_for_memory_write_request_id,
-      GetIOOpsForChannel(ret, memory_write_request_id));
-  ASSERT_EQ(nodes_for_memory_write_request_id.size(), 1);
+      std::vector<xls::Node*> nodes_for_memory_write_request,
+      GetIOOpsForChannel(ret, memory_write_request));
+  ASSERT_EQ(nodes_for_memory_write_request.size(), 1);
 
   XLS_ASSERT_OK_AND_ASSIGN(
       bool write_before_read,
-      NodeIsAfterTokenWise(ret, /*before=*/nodes_for_memory_write_request_id[0],
-                           /*after=*/nodes_for_memory_read_request_id[0]));
+      NodeIsAfterTokenWise(ret, /*before=*/nodes_for_memory_write_request[0],
+                           /*after=*/nodes_for_memory_read_request[0]));
   EXPECT_TRUE(write_before_read);
 }
 
-TEST_F(TranslatorMemoryTest, PingPong) {
+// TODO(seanhaskell): Turn on once b/321114633 is resolved
+TEST_F(TranslatorMemoryTest, DISABLED_PingPong) {
   const std::string content = R"(
     class Block {
     public:
@@ -1322,7 +1384,6 @@ TEST_F(TranslatorMemoryTest, PingPong) {
       {4, 5, 6, 7, 8, 9, 10, 11},
       {3, 22, 10, 3, 8, 1, 2, 55},
   };
-
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
   absl::flat_hash_map<std::string, std::list<xls::Value>> outputs;
 
@@ -1375,6 +1436,87 @@ TEST_F(TranslatorMemoryTest, Size) {
 
   Run({{"this", xls::Value::Tuple({xls::Value::Tuple({})})}}, out_tuple,
       content);
+}
+
+TEST_F(TranslatorMemoryTest, PassMemoryAliased) {
+  const std::string content = R"(
+      using StoreType =  __xls_memory<int, 32>;
+
+      void sub(StoreType& memory,
+               __xls_channel<int>& out,
+               int addr) {
+         const int val = memory[addr];
+         out.write(3*val);
+      }
+
+      #pragma hls_top
+      void my_package(__xls_channel<int>& in,
+                      StoreType& memory,
+                      __xls_channel<int>& out) {
+         const int addr = in.read();
+         sub(memory, out, addr);
+      })";
+
+  IOTest(
+      content,
+      /*inputs=*/{IOOpTest("in", 7, true), IOOpTest("memory__read", 10, true)},
+      /*outputs=*/
+      {IOOpTest("memory__read", xls::Value(xls::UBits(7, 5)), true),
+       IOOpTest("out", 30, true)});
+}
+
+TEST_F(TranslatorMemoryTest, PassMemoryTypedef) {
+  const std::string content = R"(
+      typedef __xls_memory<int, 32> StoreType;
+
+      void sub(StoreType& memory,
+                       __xls_channel<int>& out,
+                       int addr) {
+         const int val = memory[addr];
+         out.write(3*val);
+      }
+
+      #pragma hls_top
+      void my_package(__xls_channel<int>& in,
+                       StoreType& memory,
+                       __xls_channel<int>& out) {
+         const int addr = in.read();
+         sub(memory, out, addr);
+      })";
+
+  IOTest(
+      content,
+      /*inputs=*/{IOOpTest("in", 7, true), IOOpTest("memory__read", 10, true)},
+      /*outputs=*/
+      {IOOpTest("memory__read", xls::Value(xls::UBits(7, 5)), true),
+       IOOpTest("out", 30, true)});
+}
+
+TEST_F(TranslatorMemoryTest, PassChannelAliased) {
+  const std::string content = R"(
+      using ChannelType =  __xls_channel<int>;
+
+      void sub(__xls_memory<int, 32>& memory,
+                       ChannelType& out,
+                       int addr) {
+         const int val = memory[addr];
+         out.write(3*val);
+      }
+
+      #pragma hls_top
+      void my_package(__xls_channel<int>& in,
+                       __xls_memory<int, 32>& memory,
+                       ChannelType& out) {
+         const int addr = in.read();
+         sub(memory, out, addr);
+      })";
+
+  IOTest(
+      content,
+      /*inputs=*/{IOOpTest("in", 7, true), IOOpTest("memory__read", 10, true)},
+      /*outputs=*/
+      {IOOpTest("memory__read", xls::Value(xls::UBits(7, 5)), true),
+       IOOpTest("out", 30, true)});
 }
 
 }  // namespace

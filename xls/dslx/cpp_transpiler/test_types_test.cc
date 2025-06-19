@@ -15,6 +15,7 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "xls/common/status/matchers.h"
 #include "xls/dslx/cpp_transpiler/test_types_lib.h"
 #include "xls/ir/bits.h"
@@ -23,20 +24,24 @@
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
-using testing::HasSubstr;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
+using ::testing::HasSubstr;
 
 TEST(TestTypesTest, EnumToString) {
-  EXPECT_EQ(MyEnumToString(test::MyEnum::kA), "MyEnum::kA");
-  EXPECT_EQ(MyEnumToString(test::MyEnum::kB), "MyEnum::kB");
-  EXPECT_EQ(MyEnumToString(test::MyEnum::kC), "MyEnum::kC");
-  EXPECT_EQ(MyEnumToString(test::MyEnum(1234)), "<unknown>");
+  EXPECT_EQ(MyEnumToString(test::MyEnum::kA), "MyEnum::kA (0)");
+  EXPECT_EQ(MyEnumToString(test::MyEnum::kB), "MyEnum::kB (1)");
+  EXPECT_EQ(MyEnumToString(test::MyEnum::kC), "MyEnum::kC (42)");
+  EXPECT_EQ(MyEnumToString(test::MyEnum(123)), "<unknown> (123)");
+  // 1234 overflows the uint8_t making it 210.
+  EXPECT_EQ(MyEnumToString(test::MyEnum(1234)), "<unknown> (210)");
 
-  EXPECT_EQ(MyEnumToDslxString(test::MyEnum::kA), "MyEnum::kA");
-  EXPECT_EQ(MyEnumToDslxString(test::MyEnum::kB), "MyEnum::kB");
-  EXPECT_EQ(MyEnumToDslxString(test::MyEnum::kC), "MyEnum::kC");
-  EXPECT_EQ(MyEnumToDslxString(test::MyEnum(1234)), "<unknown>");
+  EXPECT_EQ(MyEnumToDslxString(test::MyEnum::kA), "MyEnum::kA (0)");
+  EXPECT_EQ(MyEnumToDslxString(test::MyEnum::kB), "MyEnum::kB (1)");
+  EXPECT_EQ(MyEnumToDslxString(test::MyEnum::kC), "MyEnum::kC (42)");
+  EXPECT_EQ(MyEnumToDslxString(test::MyEnum(123)), "<unknown> (123)");
+  // 1234 overflows the uint8_t making it 210.
+  EXPECT_EQ(MyEnumToDslxString(test::MyEnum(1234)), "<unknown> (210)");
 }
 
 TEST(TestTypesTest, VerifyEnum) {
@@ -134,9 +139,11 @@ TEST(TestTypesTest, VerifyMySignedType) {
 TEST(TestTypesTest, MyTypeToValue) {
   EXPECT_THAT(test::MyTypeToValue(test::MyType{42}),
               IsOkAndHolds(Value(UBits(42, 37))));
-  EXPECT_THAT(test::MyTypeToValue(test::MyType{0xffffaaaabbb}),
-              StatusIs(absl::StatusCode::kInvalidArgument,
-                       HasSubstr("Value does not fit in 37 bits")));
+  EXPECT_THAT(
+      test::MyTypeToValue(test::MyType{0xffffaaaabbb}),
+      StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          HasSubstr("Unsigned value 0xffffaaaabbb does not fit in 37 bits")));
 }
 
 TEST(TestTypesTest, MyTypeFromValue) {
@@ -154,11 +161,11 @@ TEST(TestTypesTest, SimpleStructToString) {
   test::InnerStruct s{.x = 42, .y = test::MyEnum::kB};
   EXPECT_EQ(s.ToString(), R"(InnerStruct {
   x: bits[17]:0x2a,
-  y: MyEnum::kB,
+  y: MyEnum::kB (1),
 })");
   EXPECT_EQ(s.ToDslxString(), R"(InnerStruct {
   x: u17:0x2a,
-  y: MyEnum::kB,
+  y: MyEnum::kB (1),
 })");
 }
 
@@ -187,9 +194,10 @@ TEST(TestTypesTest, SimpleStructToValue) {
       s.ToValue(),
       IsOkAndHolds(Value::Tuple({Value(UBits(42, 17)), Value(UBits(1, 7))})));
   test::InnerStruct t{.x = 0xffffffff, .y = test::MyEnum::kB};
-  EXPECT_THAT(t.ToValue(),
-              StatusIs(absl::StatusCode::kInvalidArgument,
-                       HasSubstr("Value does not fit in 17 bits")));
+  EXPECT_THAT(
+      t.ToValue(),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("Unsigned value 0xffffffff does not fit in 17 bits")));
   test::InnerStruct u{.x = 0x123, .y = static_cast<test::MyEnum>(250)};
   EXPECT_THAT(u.ToValue(),
               StatusIs(absl::StatusCode::kInvalidArgument,
@@ -471,11 +479,11 @@ TEST(TestTypesTest, TupleOfStructsToString) {
   EXPECT_EQ(TupleOfStructsToString(s), R"((
   InnerStruct {
     x: bits[17]:0xc,
-    y: MyEnum::kA,
+    y: MyEnum::kA (0),
   },
   InnerStruct {
     x: bits[17]:0x16,
-    y: MyEnum::kB,
+    y: MyEnum::kB (1),
   },
 ))");
 }
@@ -511,14 +519,14 @@ TEST(TestTypesTest, NestedStructToString) {
   EXPECT_EQ(s.ToString(), R"(OuterStruct {
   a: InnerStruct {
       x: bits[17]:0x2a,
-      y: MyEnum::kB,
+      y: MyEnum::kB (1),
     },
   b: InnerStruct {
       x: bits[17]:0x7b,
-      y: MyEnum::kC,
+      y: MyEnum::kC (42),
     },
   c: bits[37]:0xdead,
-  v: MyEnum::kA,
+  v: MyEnum::kA (0),
 })");
 
   EXPECT_EQ(test::OuterStruct::kCWidth, 37);
@@ -555,14 +563,14 @@ TEST(TestTypesTest, DoublyNestedStructToString) {
   s: OuterStruct {
       a: InnerStruct {
           x: bits[17]:0x2a,
-          y: MyEnum::kB,
+          y: MyEnum::kB (1),
         },
       b: InnerStruct {
           x: bits[17]:0x7b,
-          y: MyEnum::kC,
+          y: MyEnum::kC (42),
         },
       c: bits[37]:0xdead,
-      v: MyEnum::kA,
+      v: MyEnum::kA (0),
     },
 })");
   EXPECT_EQ(s.ToDslxString(), R"(OuterOuterStruct {
@@ -576,14 +584,14 @@ TEST(TestTypesTest, DoublyNestedStructToString) {
   s: OuterStruct {
       a: InnerStruct {
           x: u17:0x2a,
-          y: MyEnum::kB,
+          y: MyEnum::kB (1),
         },
       b: InnerStruct {
           x: u17:0x7b,
-          y: MyEnum::kC,
+          y: MyEnum::kC (42),
         },
       c: MyType:0xdead,
-      v: MyEnum::kA,
+      v: MyEnum::kA (0),
     },
 })");
 }
@@ -606,11 +614,20 @@ TEST(TestTypesTest, SnakeCaseToString) {
                            .some_other_field = test::SnakeCaseEnumT::kA};
   EXPECT_EQ(s.ToString(), R"(SnakeCaseStructT {
   some_field: bits[13]:0x42,
-  some_other_field: SnakeCaseEnumT::kA,
+  some_other_field: SnakeCaseEnumT::kA (0),
 })");
   EXPECT_EQ(s.ToDslxString(), R"(snake_case_struct_t {
   some_field: snake_case_type_t:0x42,
-  some_other_field: snake_case_enum_t::kA,
+  some_other_field: snake_case_enum_t::kA (0),
+})");
+}
+
+TEST(TestTypesTest, StructWithKeywordFields) {
+  test::StructWithKeywordFields a{._float = 42, ._int = 1};
+
+  EXPECT_EQ(a.ToString(), R"(StructWithKeywordFields {
+  _float: bits[32]:0x2a,
+  _int: bits[42]:0x1,
 })");
 }
 

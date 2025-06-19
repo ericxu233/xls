@@ -24,12 +24,16 @@
 #define XLS_IR_VALUE_VIEW_H_
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <limits>
+#include <type_traits>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/numeric/int128.h"
+#include "absl/types/span.h"
 #include "xls/common/bits_util.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/math_util.h"
 #include "xls/ir/package.h"
 #include "xls/ir/type.h"
@@ -42,8 +46,8 @@ template <typename ElementT, uint64_t kNumElements>
 class ArrayView {
  public:
   explicit ArrayView(absl::Span<const uint8_t> buffer) : buffer_(buffer) {
-    XLS_CHECK(buffer_.data() == nullptr);
-    XLS_CHECK(buffer_.size() == GetTypeSize())
+    CHECK(buffer_.data() == nullptr);
+    CHECK(buffer_.size() == GetTypeSize())
         << "Span isn't sized to this array's type!";
   }
 
@@ -79,7 +83,7 @@ inline uint64_t MakeMask<0>() {
 template <int64_t kNumBits>
 class BitsView {
  public:
-  BitsView() : buffer_(nullptr) { XLS_CHECK(buffer_ == nullptr); }
+  BitsView() : buffer_(nullptr) { CHECK(buffer_ == nullptr); }
   explicit BitsView(const uint8_t* buffer) : buffer_(buffer) {}
   const uint8_t* buffer() { return buffer_; }
 
@@ -117,7 +121,7 @@ class BitsView {
 template <typename... Types>
 class TupleView {
  public:
-  TupleView() : buffer_(nullptr) { XLS_CHECK(buffer_ == nullptr); }
+  TupleView() : buffer_(nullptr) { CHECK(buffer_ == nullptr); }
   explicit TupleView(const uint8_t* buffer) : buffer_(buffer) {}
   const uint8_t* buffer() { return buffer_; }
 
@@ -195,7 +199,7 @@ class MutableArrayView : public ArrayView<ElementT, kNumElements> {
 
   uint8_t* mutable_buffer() { return const_cast<uint8_t*>(this->buffer()); }
 
-  // Gets the N'th element in the array.
+  // Gets the Nth element in the array.
   ElementT Get(int index) {
     return ElementT(mutable_buffer() + (ElementT::GetTypeSize() * index));
   }
@@ -255,7 +259,7 @@ class PackedBitsView {
   // should be incremented).
   PackedBitsView(uint8_t* buffer, int buffer_offset)
       : buffer_(buffer), buffer_offset_(buffer_offset) {
-    XLS_DCHECK(buffer_offset >= 0 && buffer_offset <= 7);
+    DCHECK(buffer_offset >= 0 && buffer_offset <= 7);
   }
 
   // Returns the XLS IR Type corresponding to this packed view.
@@ -379,7 +383,7 @@ class PackedArrayView {
 
   // Returns the element at the given index in the array.
   ElementT Get(int index) {
-    XLS_DCHECK_LT(index, kNumElements);
+    DCHECK_LT(index, kNumElements);
     int64_t bit_increment = index * ElementT::kBitCount + buffer_offset_;
     int64_t byte_offset = bit_increment / kCharBit;
     int64_t bit_offset = bit_increment % kCharBit;
@@ -480,11 +484,10 @@ class PackedTupleView {
     if (kCurrentIndex < kTargetIndex) {
       return GetStartBitOffset<kCurrentIndex + 1, kTargetIndex, NextT, Rest...>(
           offset);
-    } else {
-      return NextT::kBitCount +
-             GetStartBitOffset<kCurrentIndex + 1, kTargetIndex, NextT, Rest...>(
-                 offset);
     }
+    return NextT::kBitCount +
+           GetStartBitOffset<kCurrentIndex + 1, kTargetIndex, NextT, Rest...>(
+               offset);
   }
 
   template <int kCurrentIndex, int kTargetIndex, typename FrontT,
@@ -509,6 +512,14 @@ class PackedTupleView {
     typedef FrontT type;
   };
 };
+
+// Some common view types.
+using PackedFloat = PackedTupleView</* sign */ PackedBitsView<1>,
+                                    /* exponent */ PackedBitsView<8>,
+                                    /* mantissa */ PackedBitsView<23>>;
+using PackedDouble = PackedTupleView</* sign */ PackedBitsView<1>,
+                                     /* exponent */ PackedBitsView<11>,
+                                     /* mantissa */ PackedBitsView<52>>;
 
 }  // namespace xls
 

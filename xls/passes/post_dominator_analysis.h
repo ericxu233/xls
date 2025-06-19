@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_PASSES_POSTDOMINATOR_FUNCTION_H_
-#define XLS_PASSES_POSTDOMINATOR_FUNCTION_H_
+#ifndef XLS_PASSES_POST_DOMINATOR_ANALYSIS_H_
+#define XLS_PASSES_POST_DOMINATOR_ANALYSIS_H_
 
 #include <memory>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "xls/ir/function.h"
 #include "xls/ir/node.h"
 
 namespace xls {
@@ -67,4 +67,4 @@ class PostDominatorAnalysis {
 
 }  // namespace xls
 
-#endif  // XLS_PASSES_POSTDOMINATOR_FUNCTION_H_
+#endif  // XLS_PASSES_POST_DOMINATOR_ANALYSIS_H_

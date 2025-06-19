@@ -15,9 +15,12 @@
 #ifndef XLS_PASSES_SPARSIFY_SELECT_PASS_H_
 #define XLS_PASSES_SPARSIFY_SELECT_PASS_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
@@ -27,15 +30,16 @@ namespace xls {
 // each of which covers a single interval from the selector interval set.
 class SparsifySelectPass : public OptimizationFunctionBasePass {
  public:
+  static constexpr std::string_view kName = "sparsify_select";
   SparsifySelectPass()
-      : OptimizationFunctionBasePass("sparsify_select", "Sparsify Select") {}
+      : OptimizationFunctionBasePass(kName, "Sparsify Select") {}
   ~SparsifySelectPass() override = default;
 
  protected:
   // Sparsify selects using range analysis.
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
 };
 
 }  // namespace xls

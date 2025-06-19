@@ -1,3 +1,5 @@
+#![feature(type_inference_v2)]
+
 // Copyright 2022 The XLS Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,9 +27,9 @@ proc main {
     (req, resp)
   }
 
-  next(tok: token, state: u32) {
+  next(state: u32) {
     let request = state * state;
-    let tok = send(tok, req, request);
+    let tok = send(join(), req, request);
     let (tok, _response) = recv(tok, resp);
     state + u32:1
   }

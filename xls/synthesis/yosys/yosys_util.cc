@@ -15,11 +15,14 @@
 
 #include "xls/synthesis/yosys/yosys_util.h"
 
-#include <optional>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_split.h"
@@ -32,28 +35,24 @@ namespace synthesis {
 
 absl::StatusOr<int64_t> ParseNextpnrOutput(std::string_view nextpnr_output) {
   bool found = false;
-  double max_mhz;
+  double max_mhz = 0.0;
+
   // We're looking for lines of the form:
   //
   //   Info: Max frequency for clock 'foo': 125.28 MHz (PASS at 100.00 MHz)
   //
   // And we want to extract 125.28.
-  // TODO(meheff): Use regular expressions for this. Unfortunately using RE2
-  // causes multiple definition link errors when building yosys_server_test.
-  for (auto line : absl::StrSplit(nextpnr_output, '\n')) {
-    if (absl::StartsWith(line, "Info: Max frequency for clock") &&
-        absl::StrContains(line, " MHz ")) {
-      std::vector<std::string_view> tokens = absl::StrSplit(line, ' ');
-      for (int64_t i = 1; i < tokens.size(); ++i) {
-        if (tokens[i] == "MHz") {
-          if (absl::SimpleAtod(tokens[i - 1], &max_mhz)) {
-            found = true;
-            break;
-          }
-        }
-      }
-    }
+
+  // Finds the last line following the above pattern.
+  static constexpr LazyRE2 max_frequency_regex = {
+      .pattern_ = R"(Info: Max frequency for clock '.*': ([\d\.]+) MHz)"};
+  double parsed_max_mhz = 0.0;
+  while (RE2::FindAndConsume(&nextpnr_output, *max_frequency_regex,
+                             &parsed_max_mhz)) {
+    found = true;
+    max_mhz = parsed_max_mhz;
   }
+
   if (!found) {
     return absl::NotFoundError(
         "Could not find maximum frequency in nextpnr output.");
@@ -65,12 +64,25 @@ absl::StatusOr<int64_t> ParseNextpnrOutput(std::string_view nextpnr_output) {
 absl::StatusOr<YosysSynthesisStatistics> ParseYosysOutput(
     std::string_view yosys_output) {
   YosysSynthesisStatistics stats;
-  std::vector<std::string> lines = absl::StrSplit(yosys_output, '\n');
-  std::vector<std::string>::iterator parse_line_itr = lines.begin();
+  stats.area = -1.0f;
+  stats.sequential_area = -1.0f;
+  std::vector<std::string_view> lines = absl::StrSplit(yosys_output, '\n');
+  std::vector<std::string_view>::iterator parse_line_itr = lines.begin();
+
+  // Advance parse_line_index until a line starting with 'key' is found.
+  // Return false if 'key' is not found, otherwise true.
+  auto parse_until_found_string_starts_with = [&](std::string_view key) {
+    for (; parse_line_itr != lines.end(); ++parse_line_itr) {
+      if (absl::StartsWith(*parse_line_itr, key)) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   // Advance parse_line_index until a line containing 'key' is found.
   // Return false if 'key' is not found, otherwise true.
-  auto parse_until_found = [&](std::string_view key) {
+  auto parse_until_found_string_contains = [&](std::string_view key) {
     for (; parse_line_itr != lines.end(); ++parse_line_itr) {
       if (absl::StrContains(*parse_line_itr, key)) {
         return true;
@@ -79,40 +91,73 @@ absl::StatusOr<YosysSynthesisStatistics> ParseYosysOutput(
     return false;
   };
 
-  // This function requies the top level module to have been identified
-  // in order to work correctly (however, we do not need to parse
-  // the name of the top level module).
-  if (!parse_until_found("Top module:")) {
-    return absl::FailedPreconditionError(
-        "ParseYosysOutput could not find the term \"Top module\" in the yosys "
-        "output");
+  // Find the XLS marker for the statistics section - the set of statistics
+  // we are interested in is printed after this marker.
+  if (!parse_until_found_string_starts_with(
+          "XLS marker: statistics section starts here")) {
+    return absl::InternalError(
+        "ParseYosysOutput could not find the term \"XLS marker: statistics "
+        "section starts here\" in the yosys output");
   }
-
-  // Find the last printed statistics - these describe the whole design rather
-  // than a single module.
-  std::optional<std::vector<std::string>::iterator> last_num_cell_itr;
-  while (parse_until_found("Number of cells:")) {
-    last_num_cell_itr = parse_line_itr;
-    ++parse_line_itr;
-  }
-  if (!last_num_cell_itr.has_value()) {
+  // Find the "Number of cells:" line. The cell histogram is printed immediately
+  // after this line.
+  if (!parse_until_found_string_contains("Number of cells:")) {
     return absl::InternalError(
         "ParseYosysOutput could not find the term \"Number of cells:\" in the "
         "yosys output");
   }
+  parse_line_itr++;
 
+  static constexpr LazyRE2 cell_histogram_regex = {
+      .pattern_ = R"(\s+(\w+)\s+(\d+)\s*)"};
   // Process cell histogram.
-  for (parse_line_itr = last_num_cell_itr.value() + 1;
-       parse_line_itr != lines.end(); ++parse_line_itr) {
+  for (; parse_line_itr != lines.end(); ++parse_line_itr) {
     int64_t cell_count;
     std::string cell_name;
-    if (RE2::FullMatch(*parse_line_itr, "\\s+(\\w+)\\s+(\\d+)\\s*", &cell_name,
+    if (RE2::FullMatch(*parse_line_itr, *cell_histogram_regex, &cell_name,
                        &cell_count)) {
       XLS_RET_CHECK(!stats.cell_histogram.contains(cell_name));
       stats.cell_histogram[cell_name] = cell_count;
     } else {
       break;
     }
+  }
+
+  static constexpr LazyRE2 unknown_cell_area_regex = {
+      .pattern_ = R"(\s+Area for cell type (\w+) is unknown!)"};
+  static constexpr LazyRE2 area_regex = {
+      .pattern_ = R"(\s+Chip area for .+: ([0-9\+\-e\.]+))"};
+  static constexpr LazyRE2 sequential_area_regex = {
+      .pattern_ = R"(\s+of which used for sequential elements: )"
+                  R"(([0-9\+\-e\.]+))"};
+
+  // The stats related to area, if exists, should come immediately after the
+  // cell histogram. We need to be careful of not jumping to another set of
+  // statistics. Ideally, we should have an end marker as the area part might or
+  // might not exist. However, we find that printing another marker after
+  // calling `yosys stats` might result in the marker getting mixed in the
+  // statistics output. Therefore, we use the following heuristic: if we see the
+  // "Number of cells:" line again, we are probably in another set of
+  // statistics, and we should stop parsing.
+  while (parse_line_itr != lines.end() &&
+         !absl::StrContains(*parse_line_itr, "Number of cells:")) {
+    double parsed_area = -1.0f;
+    double parsed_sequential_area = -1.0f;
+    std::string parsed_cell_type_area_unknown;
+    if (RE2::FullMatch(*parse_line_itr, *unknown_cell_area_regex,
+                       &parsed_cell_type_area_unknown)) {
+      stats.cell_type_with_unknown_area.push_back(
+          parsed_cell_type_area_unknown);
+    }
+    if (RE2::FullMatch(*parse_line_itr, *area_regex, &parsed_area)) {
+      stats.area = parsed_area;
+    }
+    if (RE2::PartialMatch(*parse_line_itr, *sequential_area_regex,
+                          &parsed_sequential_area)) {
+      stats.sequential_area = parsed_sequential_area;
+      break;
+    }
+    ++parse_line_itr;
   }
 
   return stats;
@@ -127,6 +172,11 @@ absl::StatusOr<STAStatistics> ParseOpenSTAOutput(std::string_view sta_output) {
   std::string slack_ps;
   bool period_ok = false, slack_ok = false;
 
+  static constexpr LazyRE2 clk_period_regex = {
+      .pattern_ = R"(op_clk period_min = (\d+\.\d+) fmax = (\d+\.\d+))"};
+  static constexpr LazyRE2 slack_regex = {
+      .pattern_ = R"(^(?:worst slack(?: max)?) (-?\d+.\d+))"};
+
   for (std::string_view line : absl::StrSplit(sta_output, '\n')) {
     line = absl::StripAsciiWhitespace(line);
     // We're looking for lines with this outline, all in ps, freq in mhz
@@ -135,16 +185,14 @@ absl::StatusOr<STAStatistics> ParseOpenSTAOutput(std::string_view sta_output) {
     //   worst slack -96.67
     // And we want to extract 116.71 and 8568.43 and -96.67
 
-    if (RE2::PartialMatch(line,
-                          R"(op_clk period_min = (\d+\.\d+) fmax = (\d+\.\d+))",
-                          &clk_period_ps, &freq_mhz)) {
+    if (RE2::PartialMatch(line, *clk_period_regex, &clk_period_ps, &freq_mhz)) {
       XLS_RET_CHECK(absl::SimpleAtof(clk_period_ps, &stats.period_ps));
       stats.max_frequency_hz = static_cast<int64_t>(
           1e12 / stats.period_ps);  // use clk in ps for accuracy
       period_ok = true;
     }
 
-    if (RE2::PartialMatch(line, R"(^worst slack (-?\d+.\d+))", &slack_ps)) {
+    if (RE2::PartialMatch(line, *slack_regex, &slack_ps)) {
       XLS_RET_CHECK(absl::SimpleAtof(slack_ps, &tmp_float));
       stats.slack_ps = static_cast<int64_t>(tmp_float);
       // ensure that negative slack (even small) is reported as negative!
@@ -156,7 +204,7 @@ absl::StatusOr<STAStatistics> ParseOpenSTAOutput(std::string_view sta_output) {
   }
   bool opensta_ok = period_ok && slack_ok;
   XLS_RET_CHECK(opensta_ok) << "\"Problem parsing results from OpenSTA. "
-                            "OpenSTA may have exited unexpectedly.\"";
+                               "OpenSTA may have exited unexpectedly.\"";
 
   return stats;
 }  // ParseOpenSTAOutput

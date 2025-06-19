@@ -21,7 +21,8 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
-#include "xls/common/logging/logging.h"
+#include "absl/log/check.h"
+#include "absl/types/span.h"
 
 namespace xls {
 
@@ -49,6 +50,8 @@ class NameUniquer {
   // Returns true if the given str is a valid Verilog, and thus XLS, identifier.
   static bool IsValidIdentifier(std::string_view str);
 
+  void Reset() { generated_names_.clear(); }
+
  private:
   // Used to track and generate new identifiers for the same instruction name
   // root.
@@ -66,7 +69,7 @@ class NameUniquer {
         result = id;
       } else {
         // ID has been used before, find the next one
-        XLS_CHECK(used_.insert(next_).second);
+        CHECK(used_.insert(next_).second);
         result = next_;
       }
 
@@ -99,7 +102,13 @@ class NameUniquer {
 
   // Map from name prefix to the generator data structure which tracks used
   // identifiers and generates new ones.
-  absl::flat_hash_map<std::string, SequentialIdGenerator> generated_names_;
+  struct PrefixTracker {
+    // Whether the bare prefix (no numeric suffix) is taken as a name.
+    bool bare_prefix_taken = false;
+    // Numeric suffix generator for guaranteeing uniqueness.
+    SequentialIdGenerator generator;
+  };
+  absl::flat_hash_map<std::string, PrefixTracker> generated_names_;
 };
 
 }  // namespace xls

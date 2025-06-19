@@ -16,6 +16,7 @@
 #define XLS_INTERPRETER_BLOCK_INTERPRETER_H_
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -26,26 +27,20 @@
 #include "xls/codegen/module_signature.pb.h"
 #include "xls/interpreter/block_evaluator.h"
 #include "xls/ir/block.h"
+#include "xls/ir/block_elaboration.h"
 #include "xls/ir/value.h"
 
 namespace xls {
 
-// Runs a single cycle of a block with the given register values and input
-// values. Returns the value sent to the output port and the next register
-// state.
-absl::StatusOr<BlockRunResult> BlockRun(
-    const absl::flat_hash_map<std::string, Value>& inputs,
-    const absl::flat_hash_map<std::string, Value>& reg_state, Block* block);
-
 class InterpreterBlockEvaluator final : public BlockEvaluator {
  public:
   constexpr InterpreterBlockEvaluator() : BlockEvaluator("Interpreter") {}
-  absl::StatusOr<BlockRunResult> EvaluateBlock(
-      const absl::flat_hash_map<std::string, Value>& inputs,
-      const absl::flat_hash_map<std::string, Value>& registers,
-      Block* block) const final {
-    return BlockRun(inputs, registers, block);
-  }
+
+ protected:
+  absl::StatusOr<std::unique_ptr<BlockContinuation>> MakeNewContinuation(
+      BlockElaboration&& elaboration,
+      const absl::flat_hash_map<std::string, Value>& initial_registers,
+      OutputPortSampleTime sample_time) const override;
 };
 
 // Runs the interpreter on a combinational block. `inputs` must contain a
@@ -53,15 +48,21 @@ class InterpreterBlockEvaluator final : public BlockEvaluator {
 // for each output port of the block.
 inline absl::StatusOr<absl::flat_hash_map<std::string, Value>>
 InterpretCombinationalBlock(
-    Block* block, const absl::flat_hash_map<std::string, Value>& inputs) {
-  return InterpreterBlockEvaluator().EvaluateCombinationalBlock(block, inputs);
+    Block* block, const absl::flat_hash_map<std::string, Value>& inputs,
+    BlockEvaluator::OutputPortSampleTime sample_time =
+        BlockEvaluator::OutputPortSampleTime::kAtLastPosEdgeClock) {
+  return InterpreterBlockEvaluator().EvaluateCombinationalBlock(block, inputs,
+                                                                sample_time);
 }
 
 // Overload which accepts and returns uint64_t values instead of xls::Values.
 inline absl::StatusOr<absl::flat_hash_map<std::string, uint64_t>>
 InterpretCombinationalBlock(
-    Block* block, const absl::flat_hash_map<std::string, uint64_t>& inputs) {
-  return InterpreterBlockEvaluator().EvaluateCombinationalBlock(block, inputs);
+    Block* block, const absl::flat_hash_map<std::string, uint64_t>& inputs,
+    BlockEvaluator::OutputPortSampleTime sample_time =
+        BlockEvaluator::OutputPortSampleTime::kAtLastPosEdgeClock) {
+  return InterpreterBlockEvaluator().EvaluateCombinationalBlock(block, inputs,
+                                                                sample_time);
 }
 
 // Runs the interpreter on a block feeding a sequence of values to input ports
@@ -71,16 +72,22 @@ InterpretCombinationalBlock(
 inline absl::StatusOr<std::vector<absl::flat_hash_map<std::string, Value>>>
 InterpretSequentialBlock(
     Block* block,
-    absl::Span<const absl::flat_hash_map<std::string, Value>> inputs) {
-  return InterpreterBlockEvaluator().EvaluateSequentialBlock(block, inputs);
+    absl::Span<const absl::flat_hash_map<std::string, Value>> inputs,
+    BlockEvaluator::OutputPortSampleTime sample_time =
+        BlockEvaluator::OutputPortSampleTime::kAtLastPosEdgeClock) {
+  return InterpreterBlockEvaluator().EvaluateSequentialBlock(block, inputs,
+                                                             sample_time);
 }
 
 // Overload which accepts and returns uint64_t values instead of xls::Values.
 inline absl::StatusOr<std::vector<absl::flat_hash_map<std::string, uint64_t>>>
 InterpretSequentialBlock(
     Block* block,
-    absl::Span<const absl::flat_hash_map<std::string, uint64_t>> inputs) {
-  return InterpreterBlockEvaluator().EvaluateSequentialBlock(block, inputs);
+    absl::Span<const absl::flat_hash_map<std::string, uint64_t>> inputs,
+    BlockEvaluator::OutputPortSampleTime sample_time =
+        BlockEvaluator::OutputPortSampleTime::kAtLastPosEdgeClock) {
+  return InterpreterBlockEvaluator().EvaluateSequentialBlock(block, inputs,
+                                                             sample_time);
 }
 
 // Runs the interpreter on a block.  Each input port in the block
@@ -119,7 +126,7 @@ InterpretChannelizedSequentialBlockWithUint64(
 }
 
 // A single evaluator which uses the interpreter.
-static const InterpreterBlockEvaluator kInterpreterBlockEvaluator;
+inline constexpr InterpreterBlockEvaluator kInterpreterBlockEvaluator;
 
 }  // namespace xls
 

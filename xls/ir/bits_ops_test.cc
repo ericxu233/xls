@@ -17,19 +17,20 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "benchmark/benchmark.h"
 #include "gtest/gtest.h"
-#include "fuzztest/fuzztest.h"
+#include "xls/common/fuzzing/fuzztest.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 #include "xls/common/status/matchers.h"
 #include "xls/data_structures/inline_bitmap.h"
 #include "xls/ir/bits.h"
-#include "xls/ir/bits_test_helpers.h"
+#include "xls/ir/bits_test_utils.h"
 #include "xls/ir/format_preference.h"
 #include "xls/ir/number_parser.h"
 
@@ -852,6 +853,9 @@ TEST(BitsOpsTest, BitSliceUpdate) {
   }
 }
 
+// Will initialize a bunch of boolean arrays with numbers in the following tests
+// NOLINTBEGIN(readability-implicit-bool-conversion)
+// NOLINTBEGIN(modernize-use-bool-literals)
 TEST(BitsOpsTest, LongestCommonPrefixLSBTypical) {
   // Simple typical example
   Bits x(absl::InlinedVector<bool, 1>{1, 1, 0, 1, 1});
@@ -884,6 +888,44 @@ TEST(BitsOpsTest, LongestCommonPrefixLSBMoreThan2) {
   Bits expected(absl::InlinedVector<bool, 1>{0, 1, 1});
   EXPECT_EQ(bits_ops::LongestCommonPrefixLSB({x, y, z}), expected);
 }
+
+TEST(BitsOpsTest, LongestCommonPrefixMSBTypical) {
+  // Simple typical example
+  Bits x(absl::InlinedVector<bool, 1>{1, 1, 0, 1, 1});
+  Bits y(absl::InlinedVector<bool, 1>{1, 0, 0, 1, 1});
+  Bits expected(absl::InlinedVector<bool, 1>{0, 1, 1});
+  EXPECT_EQ(bits_ops::LongestCommonPrefixMSB({x, y}), expected)
+      << "lcp: " << bits_ops::LongestCommonPrefixMSB({x, y}).ToDebugString()
+      << " , expected: " << expected.ToDebugString();
+}
+
+TEST(BitsOpsTest, LongestCommonPrefixMSBEmptyResult) {
+  // Differ in the first bit => common prefix is the empty bitstring
+  Bits x(absl::InlinedVector<bool, 1>{1, 1, 0, 1, 0});
+  Bits y(absl::InlinedVector<bool, 1>{1, 0, 0, 1, 1});
+  Bits expected(0);
+  EXPECT_EQ(bits_ops::LongestCommonPrefixMSB({x, y}), expected);
+}
+
+TEST(BitsOpsTest, LongestCommonPrefixMSBSame) {
+  // Everything the same => common prefix is the entire bitstring
+  Bits x(absl::InlinedVector<bool, 1>{1, 0, 0, 1, 1});
+  Bits y(absl::InlinedVector<bool, 1>{1, 0, 0, 1, 1});
+  Bits expected(absl::InlinedVector<bool, 1>{1, 0, 0, 1, 1});
+  EXPECT_EQ(bits_ops::LongestCommonPrefixMSB({x, y}), expected);
+}
+
+TEST(BitsOpsTest, LongestCommonPrefixMSBMoreThan2) {
+  // Example with more than 2 bitstrings
+  Bits x(absl::InlinedVector<bool, 1>{1, 1, 1, 1, 0});
+  Bits y(absl::InlinedVector<bool, 1>{1, 0, 1, 1, 0});
+  Bits z(absl::InlinedVector<bool, 1>{0, 1, 1, 1, 0});
+  Bits expected(absl::InlinedVector<bool, 1>{1, 1, 0});
+  EXPECT_EQ(bits_ops::LongestCommonPrefixMSB({x, y, z}), expected);
+}
+
+// NOLINTEND(modernize-use-bool-literals)
+// NOLINTEND(readability-implicit-bool-conversion)
 
 void TestBinary(const Bits& b, const std::string& expected) {
   EXPECT_EQ(BitsToString(b, FormatPreference::kBinary), expected);
@@ -1128,6 +1170,63 @@ void BM_SubCachedOne(benchmark::State& state) {
   }
 }
 BENCHMARK(BM_SubCachedOne)->Range(64, 1 << 20);
+
+void BM_Truncate(benchmark::State& state) {
+  for (auto _ : state) {
+    Bits f(256);
+    auto v = bits_ops::Truncate(f, state.range(0));
+    benchmark::DoNotOptimize(v);
+    benchmark::DoNotOptimize(f);
+  }
+}
+BENCHMARK(BM_Truncate)->Range(0, 255);
+
+void BM_SignExtend(benchmark::State& state) {
+  for (auto _ : state) {
+    Bits f = state.range(0) ? Bits(32) : Bits::AllOnes(32);
+    auto v = bits_ops::SignExtend(f, state.range(1));
+    benchmark::DoNotOptimize(v);
+    benchmark::DoNotOptimize(f);
+  }
+}
+BENCHMARK(BM_SignExtend)->RangePair(0, 1, 33, 1 << 20);
+
+void BM_ZeroExtend(benchmark::State& state) {
+  for (auto _ : state) {
+    Bits f(32);
+    auto v = bits_ops::ZeroExtend(f, state.range(0));
+    benchmark::DoNotOptimize(v);
+    benchmark::DoNotOptimize(f);
+  }
+}
+BENCHMARK(BM_ZeroExtend)->Range(33, 1 << 20);
+
+void BM_TruncateMove(benchmark::State& state) {
+  for (auto _ : state) {
+    Bits f(256);
+    auto v = bits_ops::Truncate(std::move(f), state.range(0));
+    benchmark::DoNotOptimize(v);
+  }
+}
+BENCHMARK(BM_TruncateMove)->Range(0, 255);
+
+void BM_SignExtendMove(benchmark::State& state) {
+  for (auto _ : state) {
+    Bits f = state.range(0) ? Bits(32) : Bits::AllOnes(32);
+    auto v = bits_ops::SignExtend(std::move(f), state.range(1));
+    benchmark::DoNotOptimize(v);
+  }
+}
+BENCHMARK(BM_SignExtendMove)->RangePair(0, 1, 33, 1 << 20);
+
+void BM_ZeroExtendMove(benchmark::State& state) {
+  for (auto _ : state) {
+    Bits f(32);
+    auto v = bits_ops::ZeroExtend(std::move(f), state.range(0));
+    benchmark::DoNotOptimize(v);
+  }
+}
+BENCHMARK(BM_ZeroExtendMove)->Range(33, 1 << 20);
 
 }  // namespace
 }  // namespace xls

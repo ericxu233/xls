@@ -18,10 +18,10 @@
 #include <string>
 #include <string_view>
 
+#include "absl/log/check.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
 #include "xls/ir/code_template.h"
@@ -65,7 +65,7 @@ FfiPartialValueSubstituteHelper::GetUpdatedFfiData() const {
   }
   absl::StatusOr<CodeTemplate> code_template =
       CodeTemplate::Create(ffi_->code_template());
-  XLS_CHECK(code_template.ok()) << "unexpected: invalid template";
+  CHECK(code_template.ok()) << "unexpected: invalid template";
   std::string modified_template = code_template->Substitute(
       [&](std::string_view name) {
         auto found = substitutions_.find(name);
@@ -77,6 +77,9 @@ FfiPartialValueSubstituteHelper::GetUpdatedFfiData() const {
       CodeTemplate::Escaped::kKeep);
   ForeignFunctionData result;
   result.set_code_template(modified_template);
+  if (ffi_->has_delay_ps()) {
+    result.set_delay_ps(ffi_->delay_ps());
+  }
   return result;
 }
 

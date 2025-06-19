@@ -14,26 +14,28 @@
 
 #include "xls/examples/sample_packages.h"
 
-#include <filesystem>
+#include <cstdint>
+#include <filesystem>  // NOLINT
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include "absl/memory/memory.h"
+#include "absl/log/check.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "absl/strings/str_split.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/strip.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/get_runfile_path.h"
 #include "xls/common/file/path.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/examples/sample_packages.inc.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_parser.h"
+#include "xls/ir/type.h"
 #include "xls/ir/verifier.h"
 
 namespace xls {
@@ -51,8 +53,8 @@ std::pair<std::unique_ptr<Package>, Function*> BuildRrot32() {
   auto rhs = (x << rhs_shamt);
   auto result = lhs | rhs;
   absl::StatusOr<Function*> f = b.BuildWithReturnValue(result);
-  XLS_CHECK_OK(f.status());
-  XLS_CHECK_OK(VerifyPackage(p.get()));
+  CHECK_OK(f.status());
+  CHECK_OK(VerifyPackage(p.get()));
   return {std::move(p), *f};
 }
 
@@ -69,7 +71,7 @@ std::pair<std::unique_ptr<Package>, Function*> BuildRrot8Fixed() {
      }
 })";
   Function* function = Parser::ParseFunction(input, p.get()).value();
-  XLS_QCHECK_OK(p->SetTop(function));
+  QCHECK_OK(p->SetTop(function));
   return {std::move(p), function};
 }
 
@@ -82,8 +84,8 @@ std::pair<std::unique_ptr<Package>, Function*> BuildAbs32() {
   auto is_neg = b.Eq(x >> imm_31, b.Literal(UBits(1, /*bit_count=*/32)));
   auto result = b.Select(is_neg, -x, x);
   absl::StatusOr<Function*> f = b.BuildWithReturnValue(result);
-  XLS_CHECK_OK(f.status());
-  XLS_CHECK_OK(VerifyPackage(p.get()));
+  CHECK_OK(f.status());
+  CHECK_OK(VerifyPackage(p.get()));
   return {std::move(p), *f};
 }
 
@@ -95,8 +97,8 @@ std::pair<std::unique_ptr<Package>, Function*> BuildConcatWith1() {
   auto imm_1 = b.Literal(UBits(1, /*bit_count=*/1));
   b.Concat({x, imm_1});
   absl::StatusOr<Function*> f = b.Build();
-  XLS_CHECK_OK(f.status());
-  XLS_CHECK_OK(VerifyPackage(p.get()));
+  CHECK_OK(f.status());
+  CHECK_OK(VerifyPackage(p.get()));
   return {std::move(p), *f};
 }
 
@@ -107,8 +109,8 @@ std::pair<std::unique_ptr<Package>, Function*> BuildSignExtendTo32() {
   auto x = b.Param("x", bits_2);
   b.SignExtend(x, 32);
   absl::StatusOr<Function*> f = b.Build();
-  XLS_CHECK_OK(f.status());
-  XLS_CHECK_OK(VerifyPackage(p.get()));
+  CHECK_OK(f.status());
+  CHECK_OK(VerifyPackage(p.get()));
   return {std::move(p), *f};
 }
 
@@ -119,8 +121,8 @@ std::pair<std::unique_ptr<Package>, Function*> BuildZeroExtendTo32() {
   auto x = b.Param("x", bits_2);
   b.ZeroExtend(x, 32);
   absl::StatusOr<Function*> f = b.Build();
-  XLS_CHECK_OK(f.status());
-  XLS_CHECK_OK(VerifyPackage(p.get()));
+  CHECK_OK(f.status());
+  CHECK_OK(VerifyPackage(p.get()));
   return {std::move(p), *f};
 }
 
@@ -133,7 +135,7 @@ std::pair<std::unique_ptr<Package>, Function*> BuildAccumulateIvar(
     auto x = fb.Param("x", p->GetBitsType(bit_count));
     auto y = fb.Param("y", p->GetBitsType(bit_count));
     absl::StatusOr<Function*> f = fb.BuildWithReturnValue(x + y);
-    XLS_CHECK_OK(f.status());
+    CHECK_OK(f.status());
     body = *f;
   }
 
@@ -142,8 +144,8 @@ std::pair<std::unique_ptr<Package>, Function*> BuildAccumulateIvar(
   BValue result = fb.CountedFor(/*init_value=*/zero, /*trip_count=*/trip_count,
                                 /*stride=*/1, body);
   absl::StatusOr<Function*> f = fb.BuildWithReturnValue(result);
-  XLS_CHECK_OK(f.status());
-  XLS_CHECK_OK(VerifyPackage(p.get()));
+  CHECK_OK(f.status());
+  CHECK_OK(VerifyPackage(p.get()));
   return {std::move(p), *f};
 }
 
@@ -163,7 +165,7 @@ std::pair<std::unique_ptr<Package>, Function*> BuildTwoLoops(
     auto x = fb.Param("x", p->GetBitsType(bit_count));
     auto y = fb.Param("y", p->GetBitsType(bit_count));
     absl::StatusOr<Function*> f = fb.BuildWithReturnValue(x + y);
-    XLS_CHECK_OK(f.status());
+    CHECK_OK(f.status());
     inner_body1 = *f;
   }
   Function* inner_body2;
@@ -172,7 +174,7 @@ std::pair<std::unique_ptr<Package>, Function*> BuildTwoLoops(
     auto x = fb.Param("x", p->GetBitsType(bit_count));
     auto y = fb.Param("y", p->GetBitsType(bit_count));
     absl::StatusOr<Function*> f = fb.BuildWithReturnValue(x - y);
-    XLS_CHECK_OK(f.status());
+    CHECK_OK(f.status());
     inner_body2 = *f;
   }
   BValue zero1 = fb.Literal(UBits(0, bit_count));
@@ -184,8 +186,8 @@ std::pair<std::unique_ptr<Package>, Function*> BuildTwoLoops(
 
   BValue result2 = dependent_loops ? param + loop1 + loop2 : loop2;
   absl::StatusOr<Function*> f = fb.BuildWithReturnValue(result2);
-  XLS_CHECK_OK(f.status());
-  XLS_CHECK_OK(VerifyPackage(p.get()));
+  CHECK_OK(f.status());
+  CHECK_OK(VerifyPackage(p.get()));
   return {std::move(p), *f};
 }
 
@@ -200,7 +202,7 @@ std::pair<std::unique_ptr<Package>, Function*> BuildSimpleMap(
     b.ULt(b.Param("element", element_type),
           b.Literal(UBits(10, element_type->bit_count())));
     absl::StatusOr<Function*> f = b.Build();
-    XLS_CHECK_OK(f.status());
+    CHECK_OK(f.status());
     to_apply = *f;
   }
   Function* top;
@@ -208,10 +210,10 @@ std::pair<std::unique_ptr<Package>, Function*> BuildSimpleMap(
     FunctionBuilder b("top", p.get());
     b.Map(b.Param("input", array_type), to_apply);
     absl::StatusOr<Function*> f = b.Build();
-    XLS_CHECK_OK(f.status());
+    CHECK_OK(f.status());
     top = *f;
   }
-  XLS_CHECK_OK(VerifyPackage(p.get()));
+  CHECK_OK(VerifyPackage(p.get()));
   return {std::move(p), top};
 }
 

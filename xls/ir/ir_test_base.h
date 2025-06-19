@@ -22,15 +22,12 @@
 #include <utility>
 #include <vector>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/str_replace.h"
-#include "xls/common/source_location.h"
-#include "xls/delay_model/delay_estimator.h"
-#include "xls/delay_model/delay_estimators.h"
-#include "xls/ir/bits.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_base.h"
 #include "xls/ir/node.h"
@@ -49,11 +46,16 @@ class VerifiedPackage : public Package {
  public:
   explicit VerifiedPackage(std::string_view name) : Package(name) {}
   ~VerifiedPackage() override;
+
+  void AcceptInvalid() { verify_ = false; }
+
+ private:
+  bool verify_ = true;
 };
 
 // A test base class with convenience functions for IR tests.
 class IrTestBase : public ::testing::Test {
- protected:
+ public:
   IrTestBase() = default;
 
   static std::string TestName() {
@@ -102,40 +104,7 @@ class IrTestBase : public ::testing::Test {
   static Proc* FindProc(std::string_view name, Package* package);
   static Block* FindBlock(std::string_view name, Package* package);
 
-  // Runs the given package (passed as IR text) and EXPECTs the result to equal
-  // 'expected'. Runs the package in several ways:
-  // (1) unoptimized IR through the interpreter.
-  // (2) optimized IR through the interpreter. (enabled with run_optimized)
-  // (3) pipeline generator emitted Verilog through a Verilog simulator.
-  //          (enabled with simulate)
-  static void RunAndExpectEq(
-      const absl::flat_hash_map<std::string, uint64_t>& args, uint64_t expected,
-      std::string_view package_text, bool run_optimized = true,
-      bool simulate = true,
-      xabsl::SourceLocation loc = xabsl::SourceLocation::current());
-
-  // Overload which takes Bits as arguments and the expected result.
-  static void RunAndExpectEq(
-      const absl::flat_hash_map<std::string, Bits>& args, Bits expected,
-      std::string_view package_text, bool run_optimized = true,
-      bool simulate = true,
-      xabsl::SourceLocation loc = xabsl::SourceLocation::current());
-
-  // Overload which takes Values as arguments and the expected result.
-  static void RunAndExpectEq(
-      const absl::flat_hash_map<std::string, Value>& args, Value expected,
-      std::string_view package_text, bool run_optimized = true,
-      bool simulate = true,
-      xabsl::SourceLocation loc = xabsl::SourceLocation::current());
-
- private:
-  // Helper for RunAndExpectEq which accepts arguments and expectation as Values
-  // and takes a std::unique_ptr<Package>.
-  static void RunAndExpectEq(
-      const absl::flat_hash_map<std::string, Value>& args,
-      const Value& expected, std::unique_ptr<Package>&& package,
-      bool run_optimized = true, bool simulate = true);
-
+ protected:
   // Converts the given map of uint64_t arguments into a map of Value argument
   // with the appropriate bit widths as determined by the package.
   static absl::StatusOr<absl::flat_hash_map<std::string, Value>>
@@ -161,6 +130,8 @@ class TestDelayEstimator : public DelayEstimator {
       case Op::kConcat:
       case Op::kLiteral:
       case Op::kParam:
+      case Op::kStateRead:
+      case Op::kNext:
       case Op::kReceive:
       case Op::kSend:
       case Op::kTupleIndex:
@@ -176,6 +147,52 @@ class TestDelayEstimator : public DelayEstimator {
  private:
   int64_t base_delay_;
 };
+
+// Helper to record IR before and after some test event which changes it.
+struct ScopedRecordIr {
+ public:
+  explicit ScopedRecordIr(Package* p, std::string_view name = "",
+                          bool with_initial = true)
+      : p_(p), name_(name) {
+    if (with_initial) {
+      testing::Test::RecordProperty(
+          absl::StrFormat("initial%s%s", name_.empty() ? "" : "_", name_),
+          p_->DumpIr());
+    }
+  }
+  ~ScopedRecordIr() {
+    testing::Test::RecordProperty(
+        absl::StrFormat("final%s%s", name_.empty() ? "" : "_", name_),
+        p_->DumpIr());
+  }
+
+ private:
+  Package* p_;
+  std::string_view name_;
+};
+
+// Helper to record something on failure.
+template <typename T>
+struct ScopedMaybeRecord {
+ public:
+  ScopedMaybeRecord(std::string_view title, T t) : title_(title), t_(t) {}
+  ~ScopedMaybeRecord() {
+    if (testing::Test::HasFailure()) {
+      if constexpr (std::is_convertible_v<T, std::string_view>) {
+        testing::Test::RecordProperty(title_, t_);
+      } else {
+        testing::Test::RecordProperty(title_, testing::PrintToString(t_));
+      }
+    }
+  }
+
+ private:
+  std::string title_;
+  T t_;
+};
+
+template <typename T>
+ScopedMaybeRecord(std::string_view, T) -> ScopedMaybeRecord<T>;
 
 }  // namespace xls
 

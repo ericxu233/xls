@@ -21,6 +21,7 @@
 #define XLS_NETLIST_LIB_PARSER_H_
 
 #include <cctype>
+#include <cstdint>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -31,10 +32,11 @@
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 
 namespace xls {
@@ -75,10 +77,10 @@ class CharStream {
   }
   char PeekCharOrDie() {
     if (if_.has_value()) {
-      XLS_DCHECK(!if_->eof());
+      DCHECK(!if_->eof());
       return if_->peek();
     }
-    XLS_DCHECK_LT(cursor_, text_.size());
+    DCHECK_LT(cursor_, text_.size());
     return text_[cursor_];
   }
   char PopCharOrDie() {

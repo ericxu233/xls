@@ -18,7 +18,7 @@
 //
 // See casts_test.cc for the normal "positive" tests on casts.h.
 
-#include "xls/common/casts.h"
+#include "xls/common/casts.h"  // IWYU pragma: keep
 
 // A base class.
 class Base {
@@ -30,12 +30,10 @@ class Base {
 };
 
 // A class derived from Base.
-class Derived : public Base {
-};
+class Derived : public Base {};
 
 // Another class derived from Base.
-class Derived2 : public Base {
-};
+class Derived2 : public Base {};
 
 // Yet another class derived from Base, this time with a constructor from
 // base. This is used to verify that the existence of such a constructor
@@ -43,7 +41,7 @@ class Derived2 : public Base {
 class Derived3 : public Base {
  public:
   Derived3() = default;
-  Derived3(const Base&) { }
+  Derived3(const Base&) {}  // NOLINT(google-explicit-constructor)
 };
 
 // A class unrelated to the Base class hierarchy.
@@ -51,7 +49,6 @@ class Unrelated {
  public:
   virtual ~Unrelated() = default;
 };
-
 
 // We want to test one compiler error at a time, so we partition the code into
 // branches using conditional compilation.  casts_nc_test.py will compile this
@@ -61,71 +58,54 @@ class Unrelated {
 #if defined(TEST_down_cast_UP)
 
 // Tests using down_cast to do an up cast.
-Base* WontCompile(Derived* p) {
-  return down_cast<Base*>(p);
-}
+Base* WontCompile(Derived* p) { return down_cast<Base*>(p); }
 
 #elif defined(TEST_down_cast_CROSS)
 
 // Tests using down_cast to do a cross cast.
-Derived2* WontCompile(Derived* p) {
-  return down_cast<Derived2*>(p);
-}
+Derived2* WontCompile(Derived* p) { return down_cast<Derived2*>(p); }
 
 #elif defined(TEST_down_cast_UNRELATED)
 
 // Tests using down_cast to cast between unrelated types.
-Unrelated* WontCompile(Base* p) {
-  return down_cast<Unrelated*>(p);
-}
+Unrelated* WontCompile(Base* p) { return down_cast<Unrelated*>(p); }
 
 #elif defined(TEST_down_cast_REMOVE_CONST)
 
 // Tests using down_cast to remove const qualification
-Derived* WontCompile(const Base* p) {
-  return down_cast<Derived*>(p);
-}
+Derived* WontCompile(const Base* p) { return down_cast<Derived*>(p); }
 
 #elif defined(TEST_down_cast_UP_REF)
 
 // Tests using down_cast to do an up cast on references.
-Base& WontCompile(Derived& r) {
-  return down_cast<Base&>(r);
-}
+Base& WontCompile(Derived& r) { return down_cast<Base&>(r); }
 
 #elif defined(TEST_down_cast_CROSS_REF)
 
 // Tests using down_cast to do a cross cast on references.
-Derived2& WontCompile(Derived& r) {
-  return down_cast<Derived2&>(r);
-}
+Derived2& WontCompile(Derived& r) { return down_cast<Derived2&>(r); }
 
 #elif defined(TEST_down_cast_UNRELATED_REF)
 
 // Tests using down_cast to cast between unrelated types on references.
-Unrelated& WontCompile(Base& r) {
-  return down_cast<Unrelated&>(r);
-}
+Unrelated& WontCompile(Base& r) { return down_cast<Unrelated&>(r); }
 
 #elif defined(TEST_down_cast_REMOVE_CONST_REF)
 
 // Tests using down_cast to remove const qualification
-Derived& WontCompile(const Base& r) {
-  return down_cast<Derived&>(r);
-}
+Derived& WontCompile(const Base& r) { return down_cast<Derived&>(r); }
 
 #elif defined(TEST_down_cast_NOT_A_REF)
 
 // Tests using down_cast when the target type isn't a reference.
-Derived3 WontCompile(Base& r) {
-  return down_cast<Derived3>(r);
-}
+Derived3 WontCompile(Base& r) { return down_cast<Derived3>(r); }
 
 #else  // Smoke test
 
 // Finally, tests that good code does compile (i.e. the compiler is
 // not blindly failing everything).
 
+// NOLINTNEXTLINE(clang-diagnostic-unused-function)
 static int Identity(int x) { return x; }
 
 #endif

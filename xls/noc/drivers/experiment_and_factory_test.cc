@@ -12,25 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdint>
 #include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/container/flat_hash_map.h"
-#include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "xls/common/status/matchers.h"
 #include "xls/noc/config/network_config.pb.h"
 #include "xls/noc/config/network_config_proto_builder.h"
 #include "xls/noc/drivers/experiment.h"
 #include "xls/noc/drivers/experiment_factory.h"
 #include "xls/noc/simulation/common.h"
+#include "xls/noc/simulation/flit.h"
+#include "xls/noc/simulation/traffic_description.h"
 
 namespace xls::noc {
 namespace {
 
-using ::xls::status_testing::StatusIs;
+using ::absl_testing::StatusIs;
 
 // Dummy ExperimentBuilder used in this unit test.
 class TestExperimentBuilder : public ExperimentBuilderBase {

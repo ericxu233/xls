@@ -14,21 +14,21 @@
 
 #include "xls/data_structures/binary_decision_diagram.h"
 
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "absl/container/inlined_vector.h"
-#include "xls/common/logging/logging.h"
-#include "xls/common/status/matchers.h"
-#include "xls/ir/bits.h"
-#include "xls/ir/format_preference.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
+#include "absl/status/status_matchers.h"
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 
 TEST(BinaryDecisionDiagramTest, BasicInvariants) {
   BinaryDecisionDiagram bdd;
@@ -90,10 +90,11 @@ TEST(BinaryDecisionDiagramTest, BddSize) {
 
 TEST(BinaryDecisionDiagramTest, ToString) {
   BinaryDecisionDiagram bdd;
-  BddNodeIndex x0 = bdd.NewVariable();
-  BddNodeIndex x1 = bdd.NewVariable();
-  BddNodeIndex x2 = bdd.NewVariable();
-  BddNodeIndex x3 = bdd.NewVariable();
+  std::vector<BddNodeIndex> vars = bdd.NewVariables(4);
+  BddNodeIndex x0 = vars[0];
+  BddNodeIndex x1 = vars[1];
+  BddNodeIndex x2 = vars[2];
+  BddNodeIndex x3 = vars[3];
 
   EXPECT_EQ(bdd.ToStringDnf(bdd.zero()), "0");
   EXPECT_EQ(bdd.ToStringDnf(bdd.one()), "1");
@@ -221,6 +222,7 @@ TEST(BinaryDecisionDiagramTest, Parity) {
   // Construct and test a 64-bit even parity expression.
   BinaryDecisionDiagram bdd;
   std::vector<BddNodeIndex> variables;
+  variables.reserve(64);
   for (int64_t i = 0; i < 64; ++i) {
     variables.push_back(bdd.NewVariable());
   }
@@ -231,7 +233,7 @@ TEST(BinaryDecisionDiagramTest, Parity) {
                     bdd.And(bdd.Not(parity), variables[i]));
 
     if (i < 30) {
-      EXPECT_EQ(bdd.path_count(parity), 1LL << (i + 1));
+      EXPECT_EQ(bdd.path_count(parity), int64_t{1} << (i + 1));
     } else {
       EXPECT_EQ(bdd.path_count(parity), std::numeric_limits<int32_t>::max());
     }
@@ -259,6 +261,7 @@ TEST(BinaryDecisionDiagramTest, ThreeVariableExhaustive) {
   // possible inputs.
   BinaryDecisionDiagram bdd;
   std::vector<BddNodeIndex> vars;
+  vars.reserve(3);
   for (int64_t i = 0; i < 3; ++i) {
     vars.push_back(bdd.NewVariable());
   }
@@ -290,8 +293,8 @@ TEST(BinaryDecisionDiagramTest, ThreeVariableExhaustive) {
       }
       return result;
     };
-    XLS_VLOG(1) << "truth_table = " << to_binary(truth_table);
-    XLS_VLOG(1) << "func = " << bdd.ToStringDnf(func);
+    VLOG(1) << "truth_table = " << to_binary(truth_table);
+    VLOG(1) << "func = " << bdd.ToStringDnf(func);
 
     // Now evaluate the function for all inputs
     for (bool x2 : {false, true}) {

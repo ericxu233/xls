@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_FUZZER_CPP_AST_GENERATOR_H_
-#define XLS_FUZZER_CPP_AST_GENERATOR_H_
+#ifndef XLS_FUZZER_AST_GENERATOR_H_
+#define XLS_FUZZER_AST_GENERATOR_H_
 
 #include <cstdint>
 #include <functional>
@@ -26,8 +26,8 @@
 #include <vector>
 
 #include "absl/container/btree_map.h"
-#include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/random/bit_gen_ref.h"
 #include "absl/random/distributions.h"
 #include "absl/status/status.h"
@@ -35,9 +35,9 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/test_macros.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/module.h"
 #include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/frontend/token.h"
 #include "xls/fuzzer/ast_generator_options.pb.h"
@@ -105,8 +105,9 @@ struct BitsAndSignedness {
 };
 
 // Options that are used to configure the AST generator.
+//
+// See ast_generator_options.proto for field descriptions.
 struct AstGeneratorOptions {
-  // See ast_generator_options.proto for fields descriptions.
   bool emit_signed_types = true;
   int64_t max_width_bits_types = 64;
   int64_t max_width_aggregate_types = 1024;
@@ -141,41 +142,41 @@ std::string AbslUnparseFlag(const AstGeneratorOptions& ast_generator_options);
 class AstGenerator {
  public:
   // The random generator must be alive for the lifetime of the object.
-  AstGenerator(AstGeneratorOptions options, absl::BitGenRef bit_gen);
+  AstGenerator(AstGeneratorOptions options, absl::BitGenRef bit_gen,
+               FileTable& file_table);
 
   // Generates the entity with name "name" in a module named "module_name".
   absl::StatusOr<AnnotatedModule> Generate(const std::string& top_entity_name,
                                            const std::string& module_name);
 
-  bool RandomBool() { return absl::Bernoulli(bit_gen_, 0.5); }
+ private:
+  // We include RNG helper functions to help simplify circumstances where the
+  // Abseil Random library does not provide native interfaces (e.g., choosing a
+  // random item from a list of choices, or picking a random integer from a
+  // shifted Poisson distribution), or where it uses terminology that is not
+  // widely known (e.g., Bernoulli distribution for a weighted-coin-flip).
 
-  // Returns a random float uniformly distributed over [0, 1).
-  float RandomFloat() { return absl::Uniform<float>(bit_gen_, 0.0f, 1.0f); }
-
-  // Returns a random integer over the range [0, limit).
-  int64_t RandRange(int64_t limit) {
-    return absl::Uniform<int64_t>(bit_gen_, 0, limit);
-  }
-
-  // Returns a random integer over the range [start, limit).
-  int64_t RandRange(int64_t start, int64_t limit) {
-    return absl::Uniform<int64_t>(bit_gen_, start, limit);
+  // Returns a random boolean, true with the given probability.
+  //
+  // NOTE: This is significantly more efficient (in entropy, and possibly
+  //       in runtime) than generating a random float and comparing it to a
+  //       cutoff probability.
+  bool RandomBool(double true_probability = 0.5) {
+    return absl::Bernoulli(bit_gen_, true_probability);
   }
 
   // Returns a random integer with the given expected value from a distribution
   // which tails off exponentially in both directions over the range
   // [lower_limit, inf). Useful for picking a number around some value with
   // decreasing likelihood of picking something far away from the expected
-  // value.  The underlying distribution is a Poisson distribution. See:
+  // value.  The underlying distribution is a shifted Poisson distribution. See:
   // https://en.wikipedia.org/wiki/Poisson_distribution.
-  int64_t RandomIntWithExpectedValue(float expected_value,
+  int64_t RandomIntWithExpectedValue(double expected_value,
                                      int64_t lower_limit = 0) {
-    const double mean =
-        static_cast<double>(expected_value) - static_cast<double>(lower_limit);
+    const double mean = expected_value - static_cast<double>(lower_limit);
     return lower_limit + absl::Poisson<int64_t>(bit_gen_, mean);
   }
 
- private:
   XLS_FRIEND_TEST(AstGeneratorTest, GeneratesParametricBindings);
   XLS_FRIEND_TEST(AstGeneratorTest, BitsTypeGetMetadata);
 
@@ -203,7 +204,8 @@ class AstGenerator {
   static bool IsNil(const TypeAnnotation* t);
   static bool IsBuiltinBool(const TypeAnnotation* type) {
     if (auto* builtin_type = dynamic_cast<const BuiltinTypeAnnotation*>(type)) {
-      return !builtin_type->GetSignedness() && builtin_type->GetBitCount() == 1;
+      return !builtin_type->GetSignedness().value() &&
+             builtin_type->GetBitCount() == 1;
     }
     return false;
   }
@@ -213,7 +215,7 @@ class AstGenerator {
 
   // Helper that returns the bit count of type when converted to a builtin bits
   // type. Returns an error status if the type is not a builtin bits type.
-  absl::StatusOr<int64_t> BitsTypeGetBitCount(TypeAnnotation* type);
+  absl::StatusOr<int64_t> BitsTypeGetBitCount(const TypeAnnotation* type);
 
   static std::tuple<std::vector<Expr*>, std::vector<TypeAnnotation*>,
                     std::vector<LastDelayingOp>>
@@ -223,8 +225,16 @@ class AstGenerator {
   static bool EnvContainsTuple(const Env& e);
   static bool EnvContainsToken(const Env& e);
   static bool EnvContainsChannel(const Env& e);
+
+  // Helper that tests whether a given type annotation contains a token type
+  // (transitively anywhere in the structure of the type).
   static absl::StatusOr<bool> ContainsToken(const TypeAnnotation* type);
-  static bool ContainsTypeRef(const TypeAnnotation* type);
+
+  // As above but for types containing arrays.
+  static absl::StatusOr<bool> ContainsArray(const TypeAnnotation* type);
+
+  // As above but for types containing TypeRef type annotations.
+  static absl::StatusOr<bool> ContainsTypeRef(const TypeAnnotation* type);
 
   // Generates a function with name "name", returning the minimum number of
   // stages the function can be scheduled in.
@@ -321,14 +331,25 @@ class AstGenerator {
   absl::StatusOr<std::pair<TypedExpr, TypedExpr>> ChooseEnvValueBitsPair(
       Env* env, std::optional<int64_t> bit_count = std::nullopt);
 
-  absl::StatusOr<TypedExpr> ChooseEnvValueUBits(Env* env) {
-    auto is_ubits = [&](const TypedExpr& e) -> bool { return IsUBits(e.type); };
-    return ChooseEnvValue(env, is_ubits);
+  absl::StatusOr<TypedExpr> ChooseEnvValueUBits(
+      Env* env, std::optional<int64_t> bit_count = std::nullopt) {
+    auto want_expr = [&](const TypedExpr& e) -> bool {
+      if (!IsUBits(e.type)) {
+        return false;
+      }
+      if (bit_count.has_value() &&
+          GetTypeBitCount(e.type) != bit_count.value()) {
+        return false;
+      }
+      return true;
+    };
+    return ChooseEnvValue(env, want_expr);
   }
 
   absl::StatusOr<TypedExpr> ChooseEnvValueArray(
-      Env* env, std::function<bool(ArrayTypeAnnotation*)> take =
-                    [](auto _) { return true; }) {
+      Env* env, std::function<bool(ArrayTypeAnnotation*)> take = [](auto _) {
+        return true;
+      }) {
     auto predicate = [&](const TypedExpr& e) -> bool {
       return IsArray(e.type) &&
              take(dynamic_cast<ArrayTypeAnnotation*>(e.type));
@@ -361,6 +382,20 @@ class AstGenerator {
   // being generated, and `ctx.env` contains the parameters as NameRefs.
   absl::StatusOr<TypedExpr> GenerateBody(int64_t call_depth, Context* ctx);
 
+  // When the first element of the rhs type is a `token`, generates
+  //   let x1: token = x1.0;
+  //   let x2: type1 = x1.1;
+  // Otherwise, it will sometimes generate
+  //    let (x1, x2, x3): (type1, type2, type3) = tuple_value;
+  // and sometimes
+  //    let (x1, x2, x3) = tuple_value;
+  // and sometimes do nothing (because the tuple was already assigned
+  // to a variable int he previous Statement).
+  // TODO: https://github.com/google/xls/issues/1459 - Randomly destructure
+  // or use tuple indexing.
+  void GenerateTupleAssignment(NameRef* name_ref, TypedExpr& rhs, Context* ctx,
+                               std::vector<Statement*>& statements);
+
   absl::StatusOr<TypedExpr> GenerateUnop(Context* ctx);
 
   absl::StatusOr<Expr*> GenerateUmin(TypedExpr arg, int64_t other);
@@ -385,12 +420,10 @@ class AstGenerator {
   absl::StatusOr<int64_t> GenerateNaryOperandCount(Context* ctx,
                                                    int64_t lower_limit = 0);
 
-  // Generates an expression AST node and returns it. expr_size is a limit on
-  // the size of the generated expression. call_depth is the depth of the call
-  // stack (via map or other function-calling operation) for the function being
-  // generated.
-  absl::StatusOr<TypedExpr> GenerateExpr(int64_t expr_size, int64_t call_depth,
-                                         Context* ctx);
+  // Generates an expression AST node and returns it. call_depth is the depth of
+  // the call stack (via map or other function-calling operation) for the
+  // function being generated.
+  absl::StatusOr<TypedExpr> GenerateExpr(int64_t call_depth, Context* ctx);
 
   // Generates an invocation of the one_hot_sel builtin.
   absl::StatusOr<TypedExpr> GenerateOneHotSelectBuiltin(Context* ctx);
@@ -493,7 +526,19 @@ class AstGenerator {
   // Return a token builtin type.
   BuiltinTypeAnnotation* MakeTokenType();
 
-  TypeAnnotation* MakeTypeAnnotation(bool is_signed, int64_t width);
+  // Deterministically creates a type annotation with the given signedness and
+  // width.
+  //
+  // If `use_xn` is true, the type annotation will be `xN[is_signed][width]`.
+  TypeAnnotation* MakeTypeAnnotation(bool is_signed, int64_t width,
+                                     bool use_xn);
+
+  // Shorthand helper for making a `bool` type annotation, which is fairly
+  // common.
+  TypeAnnotation* MakeBoolTypeAnnotation() {
+    return MakeTypeAnnotation(/*is_signed=*/false, /*width=*/1,
+                              /*use_xn=*/false);
+  }
 
   // Generates a binary operation AST node in which operands and results type
   // are all the same (excluding shifts), such as: add, and, mul, etc.
@@ -533,7 +578,9 @@ class AstGenerator {
   // Generates a shift operation AST node.
   absl::StatusOr<TypedExpr> GenerateShift(Context* ctx);
 
-  absl::StatusOr<TypedExpr> GenerateSynthesizableDiv(Context* ctx);
+  // Generates a div or mod AST node, depending on the `kind`.
+  absl::StatusOr<TypedExpr> GenerateSynthesizableDivOrMod(Context* ctx,
+                                                          BinopKind kind);
 
   // Generates a group of operations containing PartialProduct ops. The output
   // of the group will be deterministic (e.g. a smulp followed by an add).
@@ -545,9 +592,10 @@ class AstGenerator {
   // As part of this process, a TypeAlias is created and added to the
   // currently-active set.
   TypeRefTypeAnnotation* MakeTypeRefTypeAnnotation(TypeAnnotation* type) {
+    CHECK(type != nullptr);
     std::string type_name = GenSym();
     NameDef* name_def = MakeNameDef(type_name);
-    auto* type_alias = module_->Make<TypeAlias>(fake_span_, name_def, type,
+    auto* type_alias = module_->Make<TypeAlias>(fake_span_, *name_def, *type,
                                                 /*is_public=*/false);
     auto* type_ref = module_->Make<TypeRef>(fake_span_, type_alias);
     type_aliases_.push_back(type_alias);
@@ -560,16 +608,17 @@ class AstGenerator {
   absl::StatusOr<TypedExpr> GenerateLogicalOp(Context* ctx);
 
   Expr* MakeSel(Expr* test, Expr* lhs, Expr* rhs) {
-    Block* consequent = module_->Make<Block>(
+    StatementBlock* consequent = module_->Make<StatementBlock>(
         fake_span_, std::vector<Statement*>{module_->Make<Statement>(lhs)},
         /*trailing_semi=*/false);
-    Block* alternate = module_->Make<Block>(
+    StatementBlock* alternate = module_->Make<StatementBlock>(
         fake_span_, std::vector<Statement*>{module_->Make<Statement>(rhs)},
         /*trailing_semi=*/false);
     return module_->Make<Conditional>(fake_span_, test, consequent, alternate);
   }
   Expr* MakeGe(Expr* lhs, Expr* rhs) {
-    return module_->Make<Binop>(fake_span_, BinopKind::kGe, lhs, rhs);
+    return module_->Make<Binop>(fake_span_, BinopKind::kGe, lhs, rhs,
+                                fake_span_);
   }
 
   // Creates a number AST node with value 'value' represented in a decimal
@@ -585,8 +634,10 @@ class AstGenerator {
   // the format specified.
   Number* MakeBool(
       bool value, FormatPreference format_preference = FormatPreference::kHex) {
-    return MakeNumberFromBits(UBits(value ? 1 : 0, 1),
-                              MakeTypeAnnotation(false, 1), format_preference);
+    return MakeNumberFromBits(
+        UBits(value ? 1 : 0, 1),
+        MakeTypeAnnotation(/*is_signed=*/false, /*width=*/1, /*use_xn=*/false),
+        format_preference);
   }
 
   // Creates a number AST node with value 'value' of type 'type' represented in
@@ -644,22 +695,8 @@ class AstGenerator {
 
   // Gets-or-creates a top level constant with the given value, using the
   // minimum number of bits required to make that constant.
-  ConstRef* GetOrCreateConstRef(
+  NameRef* GetOrCreateConstNameRef(
       int64_t value, std::optional<int64_t> want_width = std::nullopt);
-
-  template <typename T>
-  T RandomSetChoice(const absl::btree_set<T>& choices) {
-    int64_t index = RandRange(choices.size());
-    auto it = choices.begin();
-    std::advance(it, index);
-    return *it;
-  }
-  template <typename T>
-  T RandomChoice(absl::Span<const T> choices) {
-    XLS_CHECK(!choices.empty());
-    int64_t index = RandRange(choices.size());
-    return choices[index];
-  }
 
   // Returns a recoverable status error with the given message. A recoverable
   // error may be raised to indicate that the generation of an individual
@@ -704,10 +741,10 @@ class AstGenerator {
 
   const AstGeneratorOptions options_;
 
+  FileTable& file_table_;
+
   const Pos fake_pos_;
   const Span fake_span_;
-
-  absl::btree_set<BinopKind> binops_;
 
   std::unique_ptr<Module> module_;
 
@@ -731,4 +768,4 @@ class AstGenerator {
 
 }  // namespace xls::dslx
 
-#endif  // XLS_FUZZER_CPP_AST_GENERATOR_H_
+#endif  // XLS_FUZZER_AST_GENERATOR_H_

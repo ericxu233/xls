@@ -29,8 +29,8 @@
 namespace xls {
 
 struct SubprocessResult {
-  std::string stdout;
-  std::string stderr;
+  std::string stdout_content;
+  std::string stderr_content;
   int exit_status;
 
   // The results of WIFEXITED for the subprocess.
@@ -48,12 +48,12 @@ struct SubprocessResult {
   bool timeout_expired;
 };
 std::ostream &operator<<(std::ostream &os, const SubprocessResult &other);
-inline void PrintTo(const SubprocessResult& result, std::ostream* os) {
+inline void PrintTo(const SubprocessResult &result, std::ostream *os) {
   *os << absl::StreamFormat(
       "SubprocessResult "
       "{\n\tstdout=%s\n\tstderr=%s\n\texit_status=%d\n\tnormal_termination=%"
       "d\n\ttimeout_expired=%d\n}}",
-      result.stdout, result.stderr, result.exit_status,
+      result.stdout_content, result.stderr_content, result.exit_status,
       result.normal_termination, result.timeout_expired);
 }
 
@@ -79,11 +79,16 @@ absl::StatusOr<SubprocessResult> SubprocessErrorAsStatus(
 // Ex:
 //   auto streams_or_status = SubprocessResultToStrings(InvokeSubprocess(...));
 //   if (streams_or_status.ok()) {
-//     XLS_VLOG() << "stdout:" << streams_or_status->first;
-//     XLS_VLOG() << "stderr:" << streams_or_status->second;
+//     VLOG() << "stdout:" << streams_or_status->first;
+//     VLOG() << "stderr:" << streams_or_status->second;
 //   }
 absl::StatusOr<std::pair<std::string, std::string>> SubprocessResultToStrings(
     absl::StatusOr<SubprocessResult> result);
+
+struct EnvironmentVariable {
+  std::string name;
+  std::string value;
+};
 
 // Invokes a subprocess with the given argv. If 'cwd' is supplied, the
 // subprocess will be invoked in the given directory. Problems in invocation
@@ -95,7 +100,8 @@ absl::StatusOr<std::pair<std::string, std::string>> SubprocessResultToStrings(
 absl::StatusOr<SubprocessResult> InvokeSubprocess(
     absl::Span<const std::string> argv,
     std::optional<std::filesystem::path> cwd = std::nullopt,
-    std::optional<absl::Duration> optional_timeout = std::nullopt);
+    std::optional<absl::Duration> optional_timeout = std::nullopt,
+    absl::Span<const EnvironmentVariable> = {});
 
 }  // namespace xls
 #endif  // XLS_COMMON_SUBPROCESS_H_

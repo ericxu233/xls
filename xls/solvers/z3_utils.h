@@ -19,10 +19,13 @@
 #include <string>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "xls/common/source_location.h"
 #include "xls/ir/type.h"
-#include "../z3/src/api/z3.h"  // IWYU pragma: keep
-#include "../z3/src/api/z3_api.h"
+#include "xls/ir/value.h"
+#include "z3/src/api/z3.h"  // IWYU pragma: keep
+#include "z3/src/api/z3_api.h"
 
 namespace xls {
 namespace solvers {
@@ -39,6 +42,14 @@ class ScopedErrorHandler {
   ~ScopedErrorHandler();
 
   absl::Status status() const { return status_; }
+
+  template <typename Res>
+  absl::StatusOr<Res> StatusOr(Res res) const {
+    if (status_.ok()) {
+      return res;
+    }
+    return status_;
+  }
 
  private:
   static void Handler(Z3_context c, Z3_error_code e);
@@ -68,6 +79,11 @@ std::string SolverResultToString(Z3_context ctx, Z3_solver solver,
 // decimal to hex.
 std::string QueryNode(Z3_context ctx, Z3_model model, Z3_ast node,
                       bool hexify = true);
+
+// Returns the Value corresponding to the given node interpreted under the given
+// model as the given type (assuming the type is compatible).
+absl::StatusOr<Value> NodeValue(Z3_context ctx, Z3_model model, Z3_ast node,
+                                Type* type);
 
 // Converts Z3 boolean (#b[01]+) output values to hex. Any range matching the
 // pattern "#b[01]+" will be converted to "#x[0-9a-f]+", where the values are

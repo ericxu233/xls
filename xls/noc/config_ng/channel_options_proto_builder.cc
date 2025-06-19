@@ -16,14 +16,15 @@
 
 #include <string_view>
 
-#include "xls/common/logging/logging.h"
+#include "absl/log/die_if_null.h"
 #include "xls/common/proto_adaptor_utils.h"
+#include "xls/noc/config_ng/topology_options_network_config_builder.pb.h"
 
 namespace xls::noc {
 
 ChannelOptionsProtoBuilder::ChannelOptionsProtoBuilder(
     ChannelOptionsProto* proto_ptr)
-    : proto_ptr_(XLS_DIE_IF_NULL(proto_ptr)) {}
+    : proto_ptr_(ABSL_DIE_IF_NULL(proto_ptr)) {}
 
 ChannelOptionsProtoBuilder::ChannelOptionsProtoBuilder(
     ChannelOptionsProto* proto_ptr, const ChannelOptionsProto& default_proto)

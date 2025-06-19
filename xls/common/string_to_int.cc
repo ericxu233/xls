@@ -14,13 +14,16 @@
 
 #include "xls/common/string_to_int.h"
 
+#include <cstdint>
 #include <limits>
 #include <string_view>
 
+#include "absl/log/log.h"
 #include "absl/numeric/int128.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/strip.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 
@@ -92,7 +95,7 @@ absl::StatusOr<int64_t> StrTo64Base(std::string_view s, int base) {
         break;
       }
       default:
-        XLS_LOG(FATAL) << "Invalid base: " << base;
+        LOG(FATAL) << "Invalid base: " << base;
     }
     if (digit >= base) {
       return error();

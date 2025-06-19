@@ -14,13 +14,13 @@
 
 #include "xls/noc/simulation/sample_network_graphs.h"
 
-#include <vector>
-
-#include "absl/status/statusor.h"
-#include "absl/strings/str_format.h"
-#include "xls/common/status/ret_check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/noc/config/network_config.pb.h"
+#include "xls/noc/config/network_config_proto_builder.h"
 #include "xls/noc/simulation/network_graph.h"
+#include "xls/noc/simulation/network_graph_builder.h"
 #include "xls/noc/simulation/parameters.h"
 
 namespace xls::noc {
@@ -51,13 +51,13 @@ absl::Status BuildNetworkGraphLinear000(NetworkConfigProto* nc_proto,
       .WithSourceSinkPipelineStage(2);
 
   XLS_ASSIGN_OR_RETURN(*nc_proto, builder.Build());
-  XLS_LOG(INFO) << nc_proto->DebugString();
-  XLS_LOG(INFO) << "Done ...";
+  LOG(INFO) << *nc_proto;
+  LOG(INFO) << "Done ...";
 
   // Build network.
   XLS_RETURN_IF_ERROR(BuildNetworkGraphFromProto(*nc_proto, graph, params));
   graph->Dump();
-  XLS_LOG(INFO) << "Network Graph Complete ...";
+  LOG(INFO) << "Network Graph Complete ...";
 
   return absl::OkStatus();
 }
@@ -65,7 +65,7 @@ absl::Status BuildNetworkGraphLinear000(NetworkConfigProto* nc_proto,
 absl::Status BuildNetworkGraphLinear001(NetworkConfigProto* nc_proto,
                                         NetworkManager* graph,
                                         NocParameters* params) {
-  XLS_LOG(INFO) << "Setting up network ...";
+  LOG(INFO) << "Setting up network ...";
   NetworkConfigProtoBuilder builder("Test");
 
   builder.WithPort("SendPort0").AsInputDirection().WithVirtualChannel("VC0");
@@ -125,13 +125,13 @@ absl::Status BuildNetworkGraphLinear001(NetworkConfigProto* nc_proto,
       .WithSinkSourcePipelineStage(2);
 
   XLS_ASSIGN_OR_RETURN(*nc_proto, builder.Build());
-  XLS_LOG(INFO) << nc_proto->DebugString();
-  XLS_LOG(INFO) << "Done ...";
+  LOG(INFO) << *nc_proto;
+  LOG(INFO) << "Done ...";
 
   // Build and assign simulation objects
   XLS_RETURN_IF_ERROR(BuildNetworkGraphFromProto(*nc_proto, graph, params));
   graph->Dump();
-  XLS_LOG(INFO) << "Network Graph Complete ...";
+  LOG(INFO) << "Network Graph Complete ...";
 
   return absl::OkStatus();
 }
@@ -139,7 +139,7 @@ absl::Status BuildNetworkGraphLinear001(NetworkConfigProto* nc_proto,
 absl::Status BuildNetworkGraphTree000(NetworkConfigProto* nc_proto,
                                       NetworkManager* graph,
                                       NocParameters* params) {
-  XLS_LOG(INFO) << "Setting up network ...";
+  LOG(INFO) << "Setting up network ...";
   NetworkConfigProtoBuilder builder("Test");
 
   builder.WithVirtualChannel("VC0").WithFlitBitWidth(100).WithDepth(3);
@@ -210,13 +210,13 @@ absl::Status BuildNetworkGraphTree000(NetworkConfigProto* nc_proto,
   builder.WithLink("LinkB3").WithSourcePort("Bout2").WithSinkPort("RecvPort3");
 
   XLS_ASSIGN_OR_RETURN(*nc_proto, builder.Build());
-  XLS_LOG(INFO) << nc_proto->DebugString();
-  XLS_LOG(INFO) << "Done ...";
+  LOG(INFO) << *nc_proto;
+  LOG(INFO) << "Done ...";
 
   // Build and assign simulation objects
   XLS_RETURN_IF_ERROR(BuildNetworkGraphFromProto(*nc_proto, graph, params));
   graph->Dump();
-  XLS_LOG(INFO) << "Network Graph Complete ...";
+  LOG(INFO) << "Network Graph Complete ...";
 
   return absl::OkStatus();
 }
@@ -224,7 +224,7 @@ absl::Status BuildNetworkGraphTree000(NetworkConfigProto* nc_proto,
 absl::Status BuildNetworkGraphTree001(NetworkConfigProto* nc_proto,
                                       NetworkManager* graph,
                                       NocParameters* params) {
-  XLS_LOG(INFO) << "Setting up network ...";
+  LOG(INFO) << "Setting up network ...";
   NetworkConfigProtoBuilder builder("Test");
 
   builder.WithVirtualChannel("VC0").WithDepth(3);
@@ -277,13 +277,13 @@ absl::Status BuildNetworkGraphTree001(NetworkConfigProto* nc_proto,
       .WithPhitBitWidth(128);
 
   XLS_ASSIGN_OR_RETURN(*nc_proto, builder.Build());
-  XLS_LOG(INFO) << nc_proto->DebugString();
-  XLS_LOG(INFO) << "Done ...";
+  LOG(INFO) << *nc_proto;
+  LOG(INFO) << "Done ...";
 
   // Build and assign simulation objects
   XLS_RETURN_IF_ERROR(BuildNetworkGraphFromProto(*nc_proto, graph, params));
   graph->Dump();
-  XLS_LOG(INFO) << "Network Graph Complete ...";
+  LOG(INFO) << "Network Graph Complete ...";
 
   return absl::OkStatus();
 }
@@ -291,7 +291,7 @@ absl::Status BuildNetworkGraphTree001(NetworkConfigProto* nc_proto,
 absl::Status BuildNetworkGraphLoop000(NetworkConfigProto* nc_proto,
                                       NetworkManager* graph,
                                       NocParameters* params) {
-  XLS_LOG(INFO) << "Setting up network ...";
+  LOG(INFO) << "Setting up network ...";
   NetworkConfigProtoBuilder builder("Test");
 
   builder.WithPort("SendPort0").AsInputDirection().WithVirtualChannel("VC0");
@@ -351,13 +351,13 @@ absl::Status BuildNetworkGraphLoop000(NetworkConfigProto* nc_proto,
       .WithSinkSourcePipelineStage(2);
 
   XLS_ASSIGN_OR_RETURN(*nc_proto, builder.Build());
-  XLS_LOG(INFO) << nc_proto->DebugString();
-  XLS_LOG(INFO) << "Done ...";
+  LOG(INFO) << *nc_proto;
+  LOG(INFO) << "Done ...";
 
   // Build and assign simulation objects
   XLS_RETURN_IF_ERROR(BuildNetworkGraphFromProto(*nc_proto, graph, params));
   graph->Dump();
-  XLS_LOG(INFO) << "Network Graph Complete ...";
+  LOG(INFO) << "Network Graph Complete ...";
 
   return absl::OkStatus();
 }
@@ -365,7 +365,7 @@ absl::Status BuildNetworkGraphLoop000(NetworkConfigProto* nc_proto,
 absl::Status BuildNetworkGraphLoop001(NetworkConfigProto* nc_proto,
                                       NetworkManager* graph,
                                       NocParameters* params) {
-  XLS_LOG(INFO) << "Setting up network ...";
+  LOG(INFO) << "Setting up network ...";
   NetworkConfigProtoBuilder builder("Test");
 
   builder.WithPort("SendPort0").AsInputDirection().WithVirtualChannel("VC0");
@@ -473,13 +473,13 @@ absl::Status BuildNetworkGraphLoop001(NetworkConfigProto* nc_proto,
       .WithSinkSourcePipelineStage(2);
 
   XLS_ASSIGN_OR_RETURN(*nc_proto, builder.Build());
-  XLS_LOG(INFO) << nc_proto->DebugString();
-  XLS_LOG(INFO) << "Done ...";
+  LOG(INFO) << *nc_proto;
+  LOG(INFO) << "Done ...";
 
   // Build and assign simulation objects
   XLS_RETURN_IF_ERROR(BuildNetworkGraphFromProto(*nc_proto, graph, params));
   graph->Dump();
-  XLS_LOG(INFO) << "Network Graph Complete ...";
+  LOG(INFO) << "Network Graph Complete ...";
 
   return absl::OkStatus();
 }

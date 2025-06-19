@@ -44,7 +44,8 @@ the following:
 
 ```dslx
 fn hello_xls(hello_string: u8[11]) {
-  trace!(hello_string);
+    // Trace the value to stderr as output.
+    trace!(hello_string);
 }
 ```
 
@@ -55,21 +56,23 @@ Let's go over this, line-by-line:
     returns no value (the return type would be specified after the argument
     list's closing parenthesis and before the function-opening curly brace, if
     the function returned a value).
-2.  This second line invokes the built-in `trace!` directive, passing it the
+2.  A comment line.
+3.  This second line invokes the built-in `trace!` attribute, passing it the
     function's input string, and throws away the result.
 
 ## 3. Say hello, XLS!
 
 Let's run (and test) our code!
 
-First thing, though, we should make sure our module parses and passes
-type checking. The fastest way to do that is via the DSLX
+First thing, though, we should make sure our module parses and passes type
+checking. The fastest way to do that is via the DSLX
 "[repl](https://en.wikipedia.org/wiki/Read%E2%80%93eval%E2%80%93print_loop)",
-conveniently called [`repl`](https://github.com/google/xls/tree/main/xls/tools/repl.cc).
-You can run it against the above example with the command:
+conveniently called
+[`repl`](https://github.com/google/xls/tree/main/xls/dev_tools/repl.cc). You can run it
+against the above example with the command:
 
 ```
-$ ./bazel-bin/xls/tools/repl hello_xls.x
+$ ./bazel-bin/xls/dev_tools/repl hello_xls.x
 ```
 
 This tool first examines the specified module for language correctness, and will
@@ -93,7 +96,7 @@ fn hello_test() {
 
 Again, going line-by-line:
 
-1.  This directive tells the interpreter that the next function is a test
+1.  This attribute tells the interpreter that the next function is a test
     function, meaning that it shouldn't be passed down the synthesis chain and
     that it should be executed by the interpreter.
 2.  This line declares the [test] function `hello_test`, which takes no args and
@@ -106,7 +109,7 @@ up! Open a terminal and execute the following in the XLS checkout root
 directory:
 
 ```
-$ ./bazel-bin/xls/dslx/interpreter_main hello_xls.x
+$ ./bazel-bin/xls/dslx/interpreter_main hello_xls.x --alsologtostderr
 ```
 
 You should see the following output:
@@ -117,6 +120,9 @@ trace of hello_string @ hello.x:4:17-4:31: [72, 101, 108, 108, 111, 44, 32, 88, 
 [            OK ]
 [===============] 1 test(s) ran; 0 failed; 0 skipped.
 ```
+
+Note that the `trace!` output is treated as `INFO` level logging, which is made
+visible in stderr by adding the '--alsologtostderr' flag.
 
 Perfect! While this may not be what you initially expected, examine the output
 elements carefully: they correspond to the ASCII codes of the characters in

@@ -154,11 +154,13 @@ message TemplateArgument {
 message ArrayType {
   optional Type element_type = 1;
   optional int32 size = 2;
+  optional bool use_tuple = 3;
 }
 
 // Channel type
 message ChannelType {
   optional Type item_type = 1;
+  optional int32 memory_size = 2;
 }
 
 // Generic type

@@ -15,9 +15,12 @@
 #ifndef XLS_PASSES_STRENGTH_REDUCTION_PASS_H_
 #define XLS_PASSES_STRENGTH_REDUCTION_PASS_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
@@ -25,18 +28,16 @@ namespace xls {
 // by a power-of-two constant may be replaced with a shift left.
 class StrengthReductionPass : public OptimizationFunctionBasePass {
  public:
-  explicit StrengthReductionPass(int64_t opt_level = kMaxOptLevel)
-      : OptimizationFunctionBasePass("strength_red", "Strength Reduction"),
-        opt_level_(opt_level) {}
+  static constexpr std::string_view kName = "strength_red";
+  explicit StrengthReductionPass()
+      : OptimizationFunctionBasePass(kName, "Strength Reduction") {}
   ~StrengthReductionPass() override = default;
 
  protected:
-  int64_t opt_level_;
-
   // Run all registered passes in order of registration.
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
 };
 
 }  // namespace xls

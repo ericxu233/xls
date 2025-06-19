@@ -14,15 +14,50 @@
 
 #include "xls/interpreter/proc_evaluator.h"
 
+#include <cstdint>
 #include <ostream>
 #include <string>
+#include <vector>
 
-#include "xls/common/logging/logging.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_format.h"
+#include "xls/ir/node.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/proc.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
+#include "xls/ir/value_utils.h"
 
 namespace xls {
 
+absl::Status ProcContinuation::CheckConformsToStateType(
+    const std::vector<Value>& v) const {
+  // Check that v is the same size;
+  if (v.size() != proc()->GetStateElementCount()) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "ProcContinuation::CheckConformsToStateType %s value is size %d, "
+        "expected %d",
+        proc_instance()->ToString(), v.size(), proc()->GetStateElementCount()));
+  }
+
+  // Check that v's elements are compatible with the type as what's in state_.
+  for (int64_t i = 0; i < v.size(); ++i) {
+    Type* type = proc()->GetStateElementType(i);
+    if (!ValueConformsToType(v[i], type)) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "ProcContinuation::CheckConformsToStateType %s value[%d] is %s, "
+          "expected type %s",
+          proc_instance()->ToString(), i, v[i].ToString(), type->ToString()));
+    }
+  }
+
+  return absl::OkStatus();
+}
+
 bool TickResult::operator==(const TickResult& other) const {
-  return execution_state == other.execution_state && channel == other.channel &&
+  return execution_state == other.execution_state &&
+         channel_instance == other.channel_instance &&
          progress_made == other.progress_made;
 }
 
@@ -31,11 +66,12 @@ bool TickResult::operator!=(const TickResult& other) const {
 }
 
 std::string TickResult::ToString() const {
-  return absl::StrFormat(
-      "{ state=%s, channel=%s, progress_made=%s }",
-      ::xls::ToString(execution_state),
-      channel.has_value() ? channel.value()->ToString() : "(none)",
-      progress_made ? "true" : "false");
+  return absl::StrFormat("{ state=%s, channel_instance=%s, progress_made=%s }",
+                         ::xls::ToString(execution_state),
+                         channel_instance.has_value()
+                             ? channel_instance.value()->ToString()
+                             : "(none)",
+                         progress_made ? "true" : "false");
 }
 
 std::string ToString(TickExecutionState state) {
@@ -47,7 +83,7 @@ std::string ToString(TickExecutionState state) {
     case TickExecutionState::kSentOnChannel:
       return "kSentOnChannel";
   }
-  XLS_CHECK(false) << "Internal Error";
+  CHECK(false) << "Internal Error";
 }
 
 std::ostream& operator<<(std::ostream& os, TickExecutionState state) {

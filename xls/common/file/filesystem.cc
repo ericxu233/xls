@@ -23,21 +23,24 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>  // NOLINT
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>  // NOLINT
 #include <utility>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/cord.h"
 #include "absl/strings/str_cat.h"
 #include "google/protobuf/descriptor.h"
 #include "google/protobuf/io/tokenizer.h"
-#include "google/protobuf/io/zero_copy_stream_impl_lite.h"
+#include "google/protobuf/io/zero_copy_stream.h"
+#include "google/protobuf/io/zero_copy_stream_impl.h"
 #include "google/protobuf/text_format.h"
-#include "xls/common/logging/logging.h"
+#include "xls/common/file/temp_file.h"
 #include "xls/common/status/error_code_to_status.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
@@ -62,7 +65,8 @@ class ParseTextProtoFileErrorCollector : public google::protobuf::io::ErrorColle
       const std::filesystem::path& file_name, const google::protobuf::Message& proto)
       : file_name_(file_name), proto_(proto) {}
 
-  void AddError(int line, int column, const std::string& message) override {
+  void RecordError(int line, google::protobuf::io::ColumnNumber column,
+                   std::string_view message) final {
     status_.Update(absl::Status(
         absl::StatusCode::kFailedPrecondition,
         absl::StrCat("Failed to parse ", proto_.GetDescriptor()->name(),
@@ -71,7 +75,7 @@ class ParseTextProtoFileErrorCollector : public google::protobuf::io::ErrorColle
                      "'.  Proto parser error:\n", message)));
   }
 
-  absl::Status status() { return status_; }
+  absl::Status status() const { return status_; }
 
  private:
   absl::Status status_;
@@ -90,13 +94,16 @@ absl::Status SetFileContentsOrAppend(const std::filesystem::path& file_name,
                     (set_or_append == SetOrAppend::kAppend ? O_APPEND : 0),
                 0664);
   if (fd == -1) {
-    return ErrNoToStatusWithFilename(errno, file_name);
+    XLS_RETURN_IF_ERROR(ErrNoToStatusWithFilename(errno, file_name));
+    return absl::InternalError("errno returned but no status");
   }
 
   // Clear existing contents if not appending.
   if (set_or_append == SetOrAppend::kSet) {
     if (ftruncate(fd, 0) == -1) {
-      return ErrNoToStatusWithFilename(errno, file_name);
+      // Continue anyway since some files like /dev/null can't be truncated.
+      LOG(WARNING) << "Unable to truncate opened file " << file_name
+                   << " due to " << strerror(errno);
     }
   }
 
@@ -108,13 +115,15 @@ absl::Status SetFileContentsOrAppend(const std::filesystem::path& file_name,
         continue;
       }
       close(fd);
-      return ErrNoToStatusWithFilename(errno, file_name);
+      XLS_RETURN_IF_ERROR(ErrNoToStatusWithFilename(errno, file_name));
+      return absl::InternalError("errno returned but no status");
     }
     written += n;
   }
 
   if (close(fd) != 0) {
-    return ErrNoToStatusWithFilename(errno, file_name);
+    XLS_RETURN_IF_ERROR(ErrNoToStatusWithFilename(errno, file_name));
+    return absl::InternalError("errno returned but no status");
   }
   return absl::OkStatus();
 }
@@ -168,9 +177,16 @@ absl::StatusOr<std::string> GetFileContents(
   // Use POSIX C APIs instead of C++ iostreams to avoid exceptions.
   std::string result;
 
-  int fd = open(file_name.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd == -1) {
-    return ErrNoToStatusWithFilename(errno, file_name);
+  int fd;
+  if (file_name == "/dev/stdin" || file_name == "-") {
+    fd = dup(STDIN_FILENO);  // dup standard input fd for portability:
+                             // - /dev/stdin is not posix
+                             // - avoid closing stdin's file descriptor
+  } else {
+    fd = open(file_name.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) {
+      return ErrNoToStatusWithFilename(errno, file_name);
+    }
   }
 
   char buf[4096];
@@ -196,6 +212,18 @@ absl::Status SetFileContents(const std::filesystem::path& file_name,
   return SetFileContentsOrAppend(file_name, content, SetOrAppend::kSet);
 }
 
+absl::Status SetFileContentsAtomically(const std::filesystem::path& file_name,
+                                       std::string_view content) {
+  if (file_name == "/dev/null") {
+    return absl::OkStatus();
+  }
+  XLS_ASSIGN_OR_RETURN(TempFile temp_file,
+                       TempFile::CreateWithContent(content));
+  std::error_code ec;
+  std::filesystem::rename(std::move(temp_file).Release(), file_name, ec);
+  return ErrorCodeToStatus(ec);
+}
+
 absl::Status AppendStringToFile(const std::filesystem::path& file_name,
                                 std::string_view content) {
   return SetFileContentsOrAppend(file_name, content, SetOrAppend::kAppend);
@@ -211,10 +239,8 @@ absl::Status ParseTextProto(std::string_view contents,
   google::protobuf::TextFormat::Parser parser;
   parser.RecordErrorsTo(&collector);
 
-  // Needed for this to compile in OSS, for some reason
-  std::string contents_owned(contents.begin(), contents.end());
-  const bool success = parser.ParseFromString(contents_owned, proto);
-  XLS_DCHECK_EQ(success, collector.status().ok());
+  const bool success = parser.ParseFromString(contents, proto);
+  DCHECK_EQ(success, collector.status().ok());
   return collector.status();
 }
 
@@ -230,9 +256,7 @@ absl::Status ParseProtobin(std::string_view contents,
   if (proto == nullptr) {
     return absl::FailedPreconditionError("Invalid pointer value.");
   }
-  std::string contents_owned(contents.begin(), contents.end());
-  std::stringstream contents_ss(contents_owned);
-  if (!proto->ParseFromIstream(&contents_ss)) {
+  if (!proto->ParseFromString(contents)) {
     return absl::FailedPreconditionError("Error with parsing file: " +
                                          file_name.string());
   }
@@ -264,8 +288,9 @@ absl::Status SetProtobinFile(const std::filesystem::path& file_name,
   return SetFileContents(file_name, bin_proto);
 }
 
-absl::Status SetTextProtoFile(const std::filesystem::path& file_name,
-                              const google::protobuf::Message& proto) {
+absl::Status PrintTextProtoToStream(
+    const google::protobuf::Message& proto,
+    google::protobuf::io::ZeroCopyOutputStream* output_stream) {
   if (!proto.IsInitialized()) {
     return absl::FailedPreconditionError(
         absl::StrCat("Cannot serialize proto, missing required field ",
@@ -273,23 +298,43 @@ absl::Status SetTextProtoFile(const std::filesystem::path& file_name,
   }
 
   const google::protobuf::Descriptor* const descriptor = proto.GetDescriptor();
-  std::string text_proto =
+  output_stream->WriteCord(absl::Cord(
       absl::StrCat("# proto-file: ", descriptor->file()->name(),
                    "\n"
                    "# proto-message: ",
                    descriptor->containing_type() ? descriptor->full_name()
                                                  : descriptor->name(),
-                   "\n\n");
+                   "\n\n")));
 
   google::protobuf::TextFormat::Printer printer = google::protobuf::TextFormat::Printer();
-  google::protobuf::io::StringOutputStream output_stream(&text_proto);
-  if (!printer.Print(proto, &output_stream)) {
-    return absl::FailedPreconditionError(absl::StrCat(
-        "Failed to convert proto to text for saving to ", file_name.string(),
-        " (this generally stems from massive protobufs that either exhaust "
-        "memory or overflow a 32-bit buffer somewhere)."));
+  if (!printer.Print(proto, output_stream)) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("Failed to convert proto to text & save to stream (this "
+                     "generally stems from massive protobufs that either "
+                     "exhaust memory or overflow a 32-bit buffer somewhere)."));
   }
-  return SetFileContents(file_name, text_proto);
+  return absl::OkStatus();
+}
+
+absl::Status SetTextProtoFile(const std::filesystem::path& file_name,
+                              const google::protobuf::Message& proto) {
+  // Use POSIX C APIs instead of C++ iostreams to avoid exceptions.
+  int fd = open(file_name.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0664);
+  if (fd == -1) {
+    return ErrNoToStatusWithFilename(errno, file_name);
+  }
+
+  // Clear existing contents.
+  if (ftruncate(fd, 0) == -1) {
+    return ErrNoToStatusWithFilename(errno, file_name);
+  }
+
+  google::protobuf::io::FileOutputStream output_stream(fd);
+  XLS_RETURN_IF_ERROR(PrintTextProtoToStream(proto, &output_stream));
+  if (!output_stream.Close()) {
+    return ErrNoToStatusWithFilename(errno, file_name);
+  }
+  return absl::OkStatus();
 }
 
 absl::StatusOr<std::filesystem::path> GetCurrentDirectory() {
@@ -362,12 +407,13 @@ absl::StatusOr<std::vector<std::filesystem::path>> FindFilesMatchingRegex(
 }
 
 absl::StatusOr<std::filesystem::path> GetRealPath(const std::string& path) {
+  constexpr int kPathMax = 8192;  // more portable than using PATH_MAX
   struct stat statbuf;
   XLS_RET_CHECK(lstat(path.c_str(), &statbuf) != -1) << strerror(errno);
   // If the file is a link, then dereference it.
   if ((statbuf.st_mode & S_IFMT) == S_IFLNK) {
-    char buf[PATH_MAX];
-    ssize_t len = readlink(path.c_str(), buf, PATH_MAX - 1);
+    char buf[kPathMax];
+    ssize_t len = readlink(path.c_str(), buf, sizeof(buf) - 1);
     XLS_RET_CHECK(len != -1) << strerror(errno);
     buf[len] = '\0';
     return buf;

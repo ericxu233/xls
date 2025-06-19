@@ -14,7 +14,6 @@
 
 #include "xls/dslx/bytecode/bytecode.h"
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -25,6 +24,7 @@
 #include <variant>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -36,9 +36,17 @@
 #include "absl/types/span.h"
 #include "absl/types/variant.h"
 #include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/interp_value.h"
+#include "xls/dslx/type_system/type.h"
+#include "xls/dslx/type_system/type_info.h"
+#include "xls/dslx/value_format_descriptor.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
+#include "xls/ir/format_preference.h"
+#include "xls/ir/format_strings.h"
 #include "xls/ir/number_parser.h"
 #include "re2/re2.h"
 
@@ -72,6 +80,9 @@ absl::StatusOr<Bytecode::Op> OpFromString(std::string_view s) {
   }
   if (s == "create_tuple") {
     return Bytecode::Op::kCreateTuple;
+  }
+  if (s == "decode") {
+    return Bytecode::Op::kDecode;
   }
   if (s == "div") {
     return Bytecode::Op::kDiv;
@@ -187,8 +198,11 @@ absl::StatusOr<Bytecode::Op> OpFromString(std::string_view s) {
   if (s == "swap") {
     return Bytecode::Op::kSwap;
   }
-  if (s == "trace") {
-    return Bytecode::Op::kTrace;
+  if (s == "trace_arg") {
+    return Bytecode::Op::kTraceArg;
+  }
+  if (s == "trace_fmt") {
+    return Bytecode::Op::kTraceFmt;
   }
   if (s == "width_slice") {
     return Bytecode::Op::kWidthSlice;
@@ -222,6 +236,8 @@ std::string OpToString(Bytecode::Op op) {
       return "create_array";
     case Bytecode::Op::kCreateTuple:
       return "create_tuple";
+    case Bytecode::Op::kDecode:
+      return "decode";
     case Bytecode::Op::kDiv:
       return "div";
     case Bytecode::Op::kDup:
@@ -300,8 +316,10 @@ std::string OpToString(Bytecode::Op op) {
       return "usub";
     case Bytecode::Op::kSwap:
       return "swap";
-    case Bytecode::Op::kTrace:
-      return "trace";
+    case Bytecode::Op::kTraceArg:
+      return "trace_arg";
+    case Bytecode::Op::kTraceFmt:
+      return "trace_fmt";
     case Bytecode::Op::kWidthSlice:
       return "width_slice";
     case Bytecode::Op::kXor:
@@ -311,14 +329,14 @@ std::string OpToString(Bytecode::Op op) {
 }
 
 std::string BytecodesToString(absl::Span<const Bytecode> bytecodes,
-                              bool source_locs) {
+                              bool source_locs, const FileTable& file_table) {
   std::string program;
   for (size_t i = 0; i < bytecodes.size(); ++i) {
     if (i != 0) {
       absl::StrAppend(&program, "\n");
     }
     absl::StrAppendFormat(&program, "%03d %s", i,
-                          bytecodes.at(i).ToString(source_locs));
+                          bytecodes.at(i).ToString(file_table, source_locs));
   }
   return program;
 }
@@ -347,6 +365,9 @@ std::string BytecodesToString(absl::Span<const Bytecode> bytecodes,
   return MatchArmItem(Kind::kWildcard);
 }
 
+/* static */ Bytecode::MatchArmItem Bytecode::MatchArmItem::MakeRestOfTuple() {
+  return MatchArmItem(Kind::kRestOfTuple);
+}
 /* static */ Bytecode::MatchArmItem Bytecode::MatchArmItem::MakeRange(
     InterpValue start, InterpValue limit) {
   return MatchArmItem(Kind::kRange,
@@ -434,6 +455,8 @@ std::string Bytecode::MatchArmItem::ToString() const {
     }
     case Kind::kWildcard:
       return "wildcard";
+    case Kind::kRestOfTuple:
+      return "restOfTuple";
   }
 
   return "<invalid MatchArmItem>";
@@ -457,45 +480,47 @@ DEF_UNARY_BUILDER(Swap);
 #undef DEF_UNARY_BUILDER
 
 /* static */ Bytecode Bytecode::MakeJumpRelIf(Span span, JumpTarget target) {
-  return Bytecode(std::move(span), Op::kJumpRelIf, target);
+  return Bytecode(span, Op::kJumpRelIf, target);
 }
 
 /* static */ Bytecode Bytecode::MakeJumpRel(Span span, JumpTarget target) {
-  return Bytecode(std::move(span), Op::kJumpRel, target);
+  return Bytecode(span, Op::kJumpRel, target);
 }
 
-/* static */ Bytecode Bytecode::MakeLiteral(Span span, InterpValue literal) {
-  return Bytecode(std::move(span), Op::kLiteral, std::move(literal));
+/* static */ Bytecode Bytecode::MakeLiteral(
+    Span span, InterpValue literal,
+    std::optional<ValueFormatDescriptor> format_descriptor) {
+  return Bytecode(span, Op::kLiteral, std::move(literal),
+                  std::move(format_descriptor));
 }
 
 /* static */ Bytecode Bytecode::MakeLoad(Span span, SlotIndex slot_index) {
-  return Bytecode(std::move(span), Op::kLoad, slot_index);
+  return Bytecode(span, Op::kLoad, slot_index);
 }
 
 /* static */ Bytecode Bytecode::MakeMatchArm(Span span, MatchArmItem item) {
-  return Bytecode(std::move(span), Op::kMatchArm, std::move(item));
+  return Bytecode(span, Op::kMatchArm, std::move(item));
 }
 
 /* static */ Bytecode Bytecode::MakeRecv(Span span, ChannelData channel_data) {
-  return Bytecode(std::move(span), Op::kRecv, std::move(channel_data));
+  return Bytecode(span, Op::kRecv, std::move(channel_data));
 }
 
 /* static */ Bytecode Bytecode::MakeRecvNonBlocking(Span span,
                                                     ChannelData channel_data) {
-  return Bytecode(std::move(span), Op::kRecvNonBlocking,
-                  std::move(channel_data));
+  return Bytecode(span, Op::kRecvNonBlocking, std::move(channel_data));
 }
 
 /* static */ Bytecode Bytecode::MakeSend(Span span, ChannelData channel_data) {
-  return Bytecode(std::move(span), Op::kSend, std::move(channel_data));
+  return Bytecode(span, Op::kSend, std::move(channel_data));
 }
 
 /* static */ Bytecode Bytecode::MakeSpawn(Span span, SpawnData spawn_data) {
-  return Bytecode(std::move(span), Op::kSpawn, spawn_data);
+  return Bytecode(span, Op::kSpawn, spawn_data);
 }
 
 /* static */ Bytecode Bytecode::MakeStore(Span span, SlotIndex slot_index) {
-  return Bytecode(std::move(span), Op::kStore, slot_index);
+  return Bytecode(span, Op::kStore, slot_index);
 }
 
 absl::StatusOr<Bytecode::JumpTarget> Bytecode::jump_target() const {
@@ -552,31 +577,31 @@ absl::StatusOr<InterpValue> Bytecode::value_data() const {
   return std::get<InterpValue>(data_.value());
 }
 
-absl::StatusOr<const ConcreteType*> Bytecode::type_data() const {
+absl::StatusOr<const Type*> Bytecode::type_data() const {
   XLS_RET_CHECK(data_.has_value());
-  XLS_RET_CHECK(
-      std::holds_alternative<std::unique_ptr<ConcreteType>>(data_.value()));
-  return std::get<std::unique_ptr<ConcreteType>>(data_.value()).get();
+  XLS_RET_CHECK(std::holds_alternative<std::unique_ptr<Type>>(data_.value()));
+  return std::get<std::unique_ptr<Type>>(data_.value()).get();
 }
 
 void Bytecode::PatchJumpTarget(int64_t value) {
-  XLS_CHECK(op_ == Op::kJumpRelIf || op_ == Op::kJumpRel)
+  CHECK(op_ == Op::kJumpRelIf || op_ == Op::kJumpRel)
       << "Cannot patch non-jump op: " << OpToString(op_);
-  XLS_CHECK(data_.has_value());
+  CHECK(data_.has_value());
   JumpTarget jump_target = std::get<JumpTarget>(data_.value());
-  XLS_CHECK_EQ(jump_target, kPlaceholderJumpAmount);
+  CHECK_EQ(jump_target, kPlaceholderJumpAmount);
   data_ = JumpTarget(value);
 }
 
-std::string Bytecode::ToString(bool source_locs) const {
+std::string Bytecode::ToString(const FileTable& file_table,
+                               bool source_locs) const {
   std::string op_string = OpToString(op_);
   std::string loc_string;
   if (source_locs) {
-    loc_string = " @ " + source_span_.ToString();
+    loc_string = " @ " + source_span_.ToString(file_table);
   }
 
   if (op_ == Op::kJumpRel || op_ == Op::kJumpRelIf) {
-    XLS_CHECK(std::holds_alternative<JumpTarget>(data_.value()));
+    CHECK(std::holds_alternative<JumpTarget>(data_.value()));
     JumpTarget target = std::get<JumpTarget>(data_.value());
     return absl::StrFormat("%s %+d%s", OpToString(op_), target.value(),
                            loc_string);
@@ -584,17 +609,21 @@ std::string Bytecode::ToString(bool source_locs) const {
 
   if (data_.has_value()) {
     struct DataVisitor {
-      std::string operator()(const std::unique_ptr<ConcreteType>& v) {
+      std::string operator()(const std::unique_ptr<Type>& v) {
         return v->ToString();
       }
 
       std::string operator()(const InvocationData& iv) {
-        if (iv.bindings.has_value()) {
-          return absl::StrCat(iv.invocation->ToString(), " : ",
-                              iv.bindings.value().ToString());
+        std::string result = iv.invocation()->ToString();
+        if (iv.caller_bindings().has_value()) {
+          absl::StrAppend(
+              &result, " caller_bindings: ", iv.caller_bindings()->ToString());
         }
-
-        return iv.invocation->ToString();
+        if (iv.callee_bindings().has_value()) {
+          absl::StrAppend(
+              &result, " callee_bindings: ", iv.callee_bindings()->ToString());
+        }
+        return result;
       }
 
       std::string operator()(const InterpValue& v) { return v.ToString(); }
@@ -636,7 +665,16 @@ std::string Bytecode::ToString(bool source_locs) const {
       std::string operator()(const MatchArmItem& v) { return v.ToString(); }
 
       std::string operator()(const SpawnData& spawn_data) {
-        return spawn_data.spawn->ToString();
+        // TODO: https://github.com/google/xls/issues/608 - source the rest
+        // of the data needed to print SpawnData, including the callee
+        // and parametrics.
+        std::string config_args =
+            absl::StrJoin(spawn_data.spawn_functions().config->args(), ", ",
+                          [](std::string* out, const Expr* e) {
+                            absl::StrAppend(out, e->ToString());
+                          });
+
+        return absl::StrFormat("spawn (%s)", config_args);
       }
     };
 
@@ -744,8 +782,8 @@ std::vector<Bytecode> BytecodeFunction::CloneBytecodes() const {
             Bytecode(bc.source_span(), bc.op(),
                      std::get<InterpValue>(bc.data().value())));
       } else {
-        const std::unique_ptr<ConcreteType>& type =
-            std::get<std::unique_ptr<ConcreteType>>(bc.data().value());
+        const std::unique_ptr<Type>& type =
+            std::get<std::unique_ptr<Type>>(bc.data().value());
         bytecodes.emplace_back(
             Bytecode(bc.source_span(), bc.op(), type->CloneToUnique()));
       }

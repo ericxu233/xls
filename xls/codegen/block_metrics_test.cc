@@ -20,12 +20,18 @@
 #include "xls/codegen/codegen_pass.h"
 #include "xls/codegen/xls_metrics.pb.h"
 #include "xls/common/status/matchers.h"
-#include "xls/delay_model/delay_estimators.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimators.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/block.h"
+#include "xls/ir/fileno.h"
 #include "xls/ir/function_builder.h"
-#include "xls/ir/ir_parser.h"
+#include "xls/ir/op.h"
 #include "xls/ir/package.h"
+#include "xls/ir/register.h"
+#include "xls/ir/source_location.h"
 #include "xls/ir/type.h"
+#include "xls/ir/value.h"
 #include "xls/scheduling/pipeline_schedule.h"
 #include "xls/scheduling/run_pipeline_schedule.h"
 #include "xls/scheduling/scheduling_options.h"
@@ -58,21 +64,16 @@ TEST(BlockMetricsGeneratorTest, PipelineRegisters) {
   BlockBuilder bb("test_block", &package);
 
   XLS_ASSERT_OK(bb.block()->AddClockPort("clk"));
-  BValue rst = bb.InputPort("rst", package.GetBitsType(1));
+  BValue rst = bb.ResetPort(
+      "rst", ResetBehavior{.asynchronous = false, .active_low = false});
 
   BValue a = bb.InputPort("a", u32);
   BValue b = bb.InputPort("b", u32);
   BValue c = bb.Subtract(a, b);
 
-  BValue p0_c = bb.InsertRegister("p0_c", c, rst,
-                                  xls::Reset{.reset_value = Value(UBits(0, 32)),
-                                             .asynchronous = false,
-                                             .active_low = false});
+  BValue p0_c = bb.InsertRegister("p0_c", c, rst, Value(UBits(0, 32)));
 
-  BValue p1_c = bb.InsertRegister("p1_c", p0_c, rst,
-                                  xls::Reset{.reset_value = Value(UBits(0, 32)),
-                                             .asynchronous = false,
-                                             .active_low = false});
+  BValue p1_c = bb.InsertRegister("p1_c", p0_c, rst, Value(UBits(0, 32)));
 
   bb.OutputPort("z", p1_c);
 
@@ -102,15 +103,15 @@ TEST(BlockMetricsGeneratorTest, PipelineRegistersCount) {
                           SchedulingOptions().pipeline_stages(3)));
 
   XLS_ASSERT_OK_AND_ASSIGN(
-      CodegenPassUnit unit,
-      FunctionToPipelinedBlock(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(
           schedule,
           CodegenOptions().flop_inputs(false).flop_outputs(false).clock_name(
               "clk"),
           f));
 
   XLS_ASSERT_OK_AND_ASSIGN(BlockMetricsProto proto,
-                           GenerateBlockMetrics(unit.block));
+                           GenerateBlockMetrics(context.top_block()));
 
   EXPECT_EQ(proto.flop_count(), schedule.CountFinalInteriorPipelineRegisters());
 }
@@ -235,15 +236,15 @@ TEST(BlockMetricsGeneratorTest, BillOfMaterials) {
                           SchedulingOptions().pipeline_stages(1)));
 
   XLS_ASSERT_OK_AND_ASSIGN(
-      CodegenPassUnit unit,
-      FunctionToPipelinedBlock(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(
           schedule,
           CodegenOptions().flop_inputs(false).flop_outputs(false).clock_name(
               "clk"),
           f));
 
   XLS_ASSERT_OK_AND_ASSIGN(BlockMetricsProto proto,
-                           GenerateBlockMetrics(unit.block));
+                           GenerateBlockMetrics(context.top_block()));
 
   EXPECT_EQ(proto.bill_of_materials_size(), 6);
   EXPECT_EQ(proto.bill_of_materials(0).op(), ToOpProto(Op::kInputPort));

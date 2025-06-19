@@ -14,7 +14,7 @@
 
 #include "xls/noc/config_ng/network_connection.h"
 
-#include "xls/common/logging/logging.h"
+#include "absl/log/die_if_null.h"
 #include "xls/noc/config_ng/network_component_port.h"
 
 namespace xls::noc {
@@ -22,7 +22,7 @@ namespace xls::noc {
 NetworkConnection::NetworkConnection(NetworkView* network_view)
     : source_port_(nullptr),
       sink_port_(nullptr),
-      network_view_(*XLS_DIE_IF_NULL(network_view)) {}
+      network_view_(*ABSL_DIE_IF_NULL(network_view)) {}
 
 NetworkConnection& NetworkConnection::ConnectToSourcePort(
     NetworkComponentPort* source_port) {

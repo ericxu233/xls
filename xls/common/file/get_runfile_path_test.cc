@@ -14,10 +14,12 @@
 
 #include "xls/common/file/get_runfile_path.h"
 
+#include <filesystem>  // NOLINT
 #include <string>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/status/matchers.h"
@@ -25,7 +27,7 @@
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 using ::testing::HasSubstr;
 
 TEST(GetRunfilePathTest, GetXlsRunfilePathReturnsTheRightPath) {

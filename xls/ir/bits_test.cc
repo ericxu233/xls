@@ -15,31 +15,39 @@
 #include "xls/ir/bits.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "benchmark/benchmark.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "fuzztest/fuzztest.h"
+#include "xls/common/fuzzing/fuzztest.h"
 #include "absl/container/inlined_vector.h"
-#include "absl/strings/str_format.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/types/span.h"
 #include "xls/common/bits_util.h"
 #include "xls/common/math_util.h"
 #include "xls/common/status/matchers.h"
 #include "xls/data_structures/inline_bitmap.h"
+#include "xls/ir/bit_push_buffer.h"
 #include "xls/ir/bits_ops.h"
-#include "xls/ir/bits_test_helpers.h"
+#include "xls/ir/bits_test_utils.h"
+#include "xls/ir/format_preference.h"
 #include "xls/ir/number_parser.h"
 #include "xls/ir/value.h"
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::ElementsAre;
 using ::testing::ElementsAreArray;
 using ::testing::HasSubstr;
@@ -532,10 +540,80 @@ TEST(BitsTest, ToBitVectorAndBack) {
   EXPECT_EQ(Bits(UBits(0b11001, 1234).ToBitVector()), UBits(0b11001, 1234));
 }
 
-static std::string BytesToHexString(absl::Span<const uint8_t> bytes) {
-  return "0x" + absl::StrJoin(bytes, "", [](std::string* out, uint8_t b) {
-           absl::StrAppendFormat(out, "%02x", b);
-         });
+static void BinFormatter(std::string* out, uint8_t value) {
+  absl::StrAppend(out, "0b");
+  for (int64_t i = 0; i < 8; ++i) {
+    bool bit = (value >> (7 - i)) & 1;
+    absl::StrAppend(out, bit ? "1" : "0");
+  }
+}
+
+TEST(BitsTest, FlattenToWithinOneByte) {
+  Bits b4 = UBits(0b100, 3);
+  BitPushBuffer buffer;
+  b4.FlattenTo(&buffer);
+  EXPECT_EQ(buffer.ToString(), "0b100");
+  EXPECT_EQ(buffer.size_in_bits(), 3);
+  {
+    const std::vector<uint8_t> expected_lsb_padded = {0b100'00000};
+    std::vector<uint8_t> actual = buffer.GetUint8DataWithLsbPadding();
+    EXPECT_EQ(actual, expected_lsb_padded)
+        << "Expected: "
+        << absl::StrJoin(expected_lsb_padded, ", ", BinFormatter)
+        << "\nActual: " << absl::StrJoin(actual, ", ", BinFormatter);
+  }
+  {
+    const std::vector<uint8_t> expected_msb_padded = {0b00000'100};
+    std::vector<uint8_t> actual = buffer.GetUint8DataWithMsbPadding();
+    EXPECT_EQ(actual, expected_msb_padded)
+        << "Expected: "
+        << absl::StrJoin(expected_msb_padded, ", ", BinFormatter)
+        << "\nActual: " << absl::StrJoin(actual, ", ", BinFormatter);
+  }
+}
+
+TEST(BitsType, FlattenTwoAcrossTwoBytes) {
+  Bits b9 = UBits(0b101'0000'0011, /*bit_count=*/11);
+  BitPushBuffer buffer;
+  b9.FlattenTo(&buffer);
+  EXPECT_EQ(buffer.ToString(), "0b10100000011");
+  // Note that the LSB padded version is always just a left shifted version
+  // of the MSB padded version.
+  {
+    const std::vector<uint8_t> expected = {0b1010'0000, 0b0110'0000};
+    std::vector<uint8_t> actual = buffer.GetUint8DataWithLsbPadding();
+    EXPECT_EQ(actual, expected)
+        << "Expected: " << absl::StrJoin(expected, ", ", BinFormatter)
+        << "\nActual: " << absl::StrJoin(actual, ", ", BinFormatter);
+  }
+  {
+    const std::vector<uint8_t> expected = {0b0000'0101, 0b0000'0011};
+    std::vector<uint8_t> actual = buffer.GetUint8DataWithMsbPadding();
+    EXPECT_EQ(actual, expected)
+        << "Expected: " << absl::StrJoin(expected, ", ", BinFormatter)
+        << "\nActual: " << absl::StrJoin(actual, ", ", BinFormatter);
+  }
+}
+
+TEST(BitsType, FlattenMultiByteExactByteAlignment) {
+  Bits b16 = UBits(0b0000'1111'1000'0000, /*bit_count=*/16);
+  BitPushBuffer buffer;
+  b16.FlattenTo(&buffer);
+  EXPECT_EQ(buffer.ToString(), "0b0000111110000000");
+  {
+    const std::vector<uint8_t> expected = {0b0000'1111, 0b1000'0000};
+    std::vector<uint8_t> actual = buffer.GetUint8DataWithLsbPadding();
+    EXPECT_EQ(actual, expected)
+        << "Expected: " << absl::StrJoin(expected, ", ", BinFormatter)
+        << "\nActual: " << absl::StrJoin(actual, ", ", BinFormatter);
+  }
+  {
+    const std::vector<uint8_t> expected = {0b0000'1111, 0b1000'0000};
+    std::vector<uint8_t> actual = buffer.GetUint8DataWithMsbPadding();
+    EXPECT_EQ(actual, expected)
+        << "Expected: " << absl::StrJoin(expected, ", ", BinFormatter)
+        << "\nActual: " << absl::StrJoin(actual, ", ", BinFormatter);
+  }
 }
 
 void RoundtripOneByte(uint8_t byte, int64_t bit_count) {
@@ -585,10 +663,69 @@ FUZZ_TEST(BitsFuzzTest, RoundtripNBytes)
 void RoundtripBitVectorThroughBitmap(
     const absl::InlinedVector<bool, 64>& bit_vector) {
   EXPECT_THAT(
-      Bits::FromBitmap(InlineBitmap::FromBits(bit_vector)).ToBitVector(),
+      Bits::FromBitmap(InlineBitmap::FromBitsLsbIs0(bit_vector)).ToBitVector(),
       ElementsAreArray(bit_vector));
 }
 FUZZ_TEST(BitsFuzzTest, RoundtripBitVectorThroughBitmap);
+
+void CompareBitsAndPushBufferData(
+    const absl::InlinedVector<bool, 64>& bit_vector) {
+  // Create a `Bits` object from the source `bit_vector`.
+  Bits bits = Bits::FromBitmap(InlineBitmap::FromBitsLsbIs0(bit_vector));
+
+  // Build the push buffer from those bits -- we push from the most significant
+  // bit to the least significant bit.
+  BitPushBuffer buffer;
+  for (int64_t i = 0; i < bits.bit_count(); ++i) {
+    buffer.PushBit(bits.GetFromMsb(i));
+  }
+
+  EXPECT_EQ(bits.ToDebugString(), buffer.ToString());
+
+  // Count the number of set bits in the exported bytes.
+  auto count_ones = [](const std::vector<uint8_t>& bytes) {
+    int64_t count = 0;
+    for (uint8_t byte : bytes) {
+      count += std::popcount(byte);
+    }
+    return count;
+  };
+  int64_t ones_count_lsb_padding =
+      count_ones(buffer.GetUint8DataWithLsbPadding());
+  int64_t ones_count_msb_padding =
+      count_ones(buffer.GetUint8DataWithMsbPadding());
+  int64_t ones_count_from_bits = count_ones(bits.ToBytes());
+  EXPECT_EQ(ones_count_lsb_padding, ones_count_from_bits);
+  EXPECT_EQ(ones_count_msb_padding, ones_count_from_bits);
+
+  // Check this is also the same as the direct count of the original source bit
+  // vector.
+  int64_t set_in_bit_vector = std::count_if(
+      bit_vector.begin(), bit_vector.end(), [](bool bit) { return bit; });
+  EXPECT_EQ(ones_count_from_bits, set_in_bit_vector);
+}
+FUZZ_TEST(BitsFuzzTest, CompareBitsAndPushBufferData);
+
+void BM_BitsRopePushBack(benchmark::State& state) {
+  int64_t add_cnt = state.range(0);
+  Bits to_add = Bits::FromBytes(
+      std::vector<uint8_t>(CeilOfRatio<int64_t>(state.range(1), 8), 0b10101010),
+      state.range(1));
+  for (auto s : state) {
+    BitsRope rope(state.range(0) * state.range(1));
+    for (int64_t i = 0; i < add_cnt; ++i) {
+      rope.push_back(to_add);
+    }
+    Bits res = std::move(rope).Build();
+    state.PauseTiming();
+    benchmark::DoNotOptimize(res);
+    state.ResumeTiming();
+  }
+}
+
+// First pair is the number of elements to push second is the number of bits in
+// each element.
+BENCHMARK(BM_BitsRopePushBack)->RangePair(5, 500, 10, 2000);
 
 }  // namespace
 }  // namespace xls

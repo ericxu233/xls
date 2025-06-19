@@ -27,6 +27,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/types/span.h"
 #include "xls/common/strong_int.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/frontend/token.h"
 
 namespace xls::dslx {
@@ -53,6 +54,10 @@ using Requirement = std::variant<int64_t, std::monostate>;
 // width requirement, i.e. a hard line break) as described above.
 inline Requirement InfinityRequirement() { return std::monostate{}; }
 
+inline bool IsInfinite(const Requirement& r) {
+  return std::holds_alternative<std::monostate>(r);
+}
+
 // Command for the pretty printer that says we should insert a newline.
 struct HardLine {};
 
@@ -63,6 +68,9 @@ struct FlatChoice {
   DocRef on_break;
 };
 
+// See `DocArena::MakeNestIfFlatFits()` for details -- in a nutshell, emits a
+// nested line if that fits in flat mode (with the doc contents
+// `on_nested_flat`).
 struct NestIfFlatFits {
   DocRef on_nested_flat;
 
@@ -101,6 +109,33 @@ struct Align {
   DocRef arg;
 };
 
+// Command that differs slightly from `FlatChoice`:
+// * if `flat_requirement` doesn't fit in the current available characters we
+//   enter break mode and emit `on_break`
+// * if `flat_requirement` does fit in the current available characters we
+//   enter flat mode and emit `on_flat`
+//
+// This is slightly more powerful than `FlatChoice` for less common scenarios
+// where we know we want to trigger a document being emitted in flat mode /
+// break mode based on some a priori knowledge; e.g. if we know some leading
+// text will fit if we emit `on_flat` in flat mode.
+struct ModeSelect {
+  int64_t flat_requirement;
+  DocRef on_flat;
+  DocRef on_break;
+};
+
+// Command that reduces the text width of the document by "cols" count for the
+// duration of emitting "arg". This is useful if you know you need to tack
+// something on afterwards that should be inline. It generally has to be
+// important though, because it'll reduce all the lines by cols if something is
+// emitted multi-line. (Something like a semicolon is a canonical example of
+// something you might want to ensure there's space for.)
+struct ReduceTextWidth {
+  DocRef arg;
+  int64_t cols;
+};
+
 // Command for the pretty printer that says we should emit the (potentially
 // multi-line) "text", reflowing it at line length using "prefix" as the leader
 // on each new line.
@@ -112,6 +147,12 @@ struct Align {
 struct PrefixedReflow {
   std::string prefix;
   std::string text;
+};
+
+// Similar to Align, but always emits the document left-aligned (indentation
+// level zero.)
+struct ZeroIndent {
+  DocRef arg;
 };
 
 // The basic entity used for pretty printing -- a "doc" has a requirement for
@@ -126,7 +167,8 @@ struct Doc {
   // The value can carry more information on what to do in flat/break
   // situations, or nested documents within commands.
   std::variant<std::string, HardLine, FlatChoice, Group, Concat, Nest, Align,
-               PrefixedReflow, NestIfFlatFits>
+               PrefixedReflow, NestIfFlatFits, ReduceTextWidth, ModeSelect,
+               ZeroIndent>
       value;
 
   std::string ToDebugString(const DocArena& arena) const;
@@ -139,7 +181,9 @@ struct Doc {
 // on this object.
 class DocArena {
  public:
-  DocArena();
+  explicit DocArena(const FileTable& file_table);
+
+  const FileTable& file_table() { return file_table_; }
 
   std::string ToDebugString(DocRef ref) const {
     return Deref(ref).ToDebugString(*this);
@@ -163,6 +207,13 @@ class DocArena {
   // when we're not in flat mode.
   DocRef MakeGroup(DocRef arg_ref);
 
+  // Creates a "mode select" doc -- we emit `on_flat` starting in flat mode in
+  // flat_req fits, otherwise we switch to break mode and emit `on_break`.
+  //
+  // This still gives the flat requirement of `on_flat` to the surrounding
+  // context, there is just a mode switch forced when this doc is encountered.
+  DocRef MakeModeSelect(DocRef flat_req, DocRef on_flat, DocRef on_break);
+
   // Creates a "nest" doc that nests "arg_ref" by "delta" spaces.
   DocRef MakeNest(DocRef arg_ref, int64_t delta = 4);
 
@@ -177,6 +228,14 @@ class DocArena {
   // Creates an "align" doc that aligns at the current indentation level for
   // "arg_ref" doc emission.
   DocRef MakeAlign(DocRef arg_ref);
+
+  // Creates a "zero indent" doc that sets the indentation to zero for the
+  // "arg_ref" doc emission.
+  DocRef MakeZeroIndent(DocRef arg_ref);
+
+  // Creates a "reduce text width" doc that reduces the available text width by
+  // "cols" in "arg_ref" doc emission.
+  DocRef MakeReduceTextWidth(DocRef arg_ref, int64_t cols = 1);
 
   // Creates a "choice" doc where:
   //
@@ -196,8 +255,8 @@ class DocArena {
   // vs preferring
   //
   //    let my_really_long_identifier =
-  //      invoke_a_thing_that(smushes, against, rhs);
-  //    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^-- nest-if-flat-and-fits
+  //        invoke_a_thing_that(smushes, against, rhs);
+  //    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^-- nest-if-flat-and-fits
   DocRef MakeNestIfFlatFits(DocRef on_nested_flat_ref, DocRef on_other_ref);
 
   // Creates a "prefixed reflow" doc, see `PrefixedReflow` for details.
@@ -220,6 +279,10 @@ class DocArena {
   // flat mode.
   DocRef break1() const { return break1_; }
 
+  // A doc that emits no text but claims to take infinite columns, which
+  // effectively forces the surrounding doc it's used in into break mode.
+  DocRef force_break_mode() const { return force_break_mode_; }
+
   // Some helpful text to have pre-defined and common.
   DocRef oparen() const { return oparen_; }
   DocRef cparen() const { return cparen_; }
@@ -228,7 +291,6 @@ class DocArena {
   DocRef equals() const { return equals_; }
   DocRef dot_dot() const { return dot_dot_; }
   DocRef underscore() const { return underscore_; }
-  DocRef slash_slash() const { return slash_slash_; }
   DocRef ocurl() const { return ocurl_; }
   DocRef ccurl() const { return ccurl_; }
   DocRef semi() const { return semi_; }
@@ -248,10 +310,12 @@ class DocArena {
 
   // Note: the returned reference should not be held across an allocation.
   const pprint_internal::Doc& Deref(DocRef ref) const {
-    return items_[uint16_t{ref}];
+    return items_[ref.value()];
   }
 
  private:
+  const FileTable& file_table_;
+
   // Note: we use reference indices so we can realloc inline data (instead of
   // boxing everything) and to avoid the variant type being recursive.
   std::vector<pprint_internal::Doc> items_;
@@ -262,6 +326,10 @@ class DocArena {
   DocRef break0_;
   DocRef break1_;
 
+  // Empty string but that we claim has infinite inline requirement, effectively
+  // forcing us into break mode.
+  DocRef force_break_mode_;
+
   // Some convenient often-used text fragments.
   DocRef oparen_;
   DocRef cparen_;
@@ -270,7 +338,6 @@ class DocArena {
   DocRef equals_;
   DocRef dot_dot_;
   DocRef underscore_;
-  DocRef slash_slash_;
   DocRef ocurl_;
   DocRef ccurl_;
   DocRef semi_;

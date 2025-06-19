@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import xls.dslx.tests.mod_simple_enum
+import xls.dslx.tests.mod_simple_enum;
 
 fn main(et: mod_simple_enum::EnumType) -> u32 {
     match et {
         mod_simple_enum::EnumType::FIRST => u32:0,
         mod_simple_enum::EnumType::SECOND => u32:1,
-        _ => u32:2,
     }
 }
 

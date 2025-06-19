@@ -16,7 +16,6 @@ import subprocess
 
 from absl.testing import absltest
 from xls.common import runfiles
-
 from xls.contrib.xlscc import hls_block_pb2
 
 XLSCC_MAIN_PATH = runfiles.get_path("xls/contrib/xlscc/xlscc")
@@ -83,25 +82,25 @@ class XlsccMainTest(absltest.TestCase):
     channel = hls_block_pb2.HLSChannel()
     channel.name = "dir"
     channel.is_input = True
-    channel.type = hls_block_pb2.ChannelType.DIRECT_IN
+    channel.type = hls_block_pb2.ChannelType.CHANNEL_TYPE_DIRECT_IN
     block_out.channels.add().CopyFrom(channel)
 
     channel = hls_block_pb2.HLSChannel()
     channel.name = "in"
     channel.is_input = True
-    channel.type = hls_block_pb2.ChannelType.FIFO
+    channel.type = hls_block_pb2.ChannelType.CHANNEL_TYPE_FIFO
     block_out.channels.add().CopyFrom(channel)
 
     channel = hls_block_pb2.HLSChannel()
     channel.name = "out1"
     channel.is_input = False
-    channel.type = hls_block_pb2.ChannelType.FIFO
+    channel.type = hls_block_pb2.ChannelType.CHANNEL_TYPE_FIFO
     block_out.channels.add().CopyFrom(channel)
 
     channel = hls_block_pb2.HLSChannel()
     channel.name = "out2"
     channel.is_input = False
-    channel.type = hls_block_pb2.ChannelType.FIFO
+    channel.type = hls_block_pb2.ChannelType.CHANNEL_TYPE_FIFO
     block_out.channels.add().CopyFrom(channel)
 
     block_pb_file = self.create_tempfile(file_path="block.pb")
@@ -110,8 +109,10 @@ class XlsccMainTest(absltest.TestCase):
       f.write(block_out.SerializeToString())
 
     subprocess.check_call([
-        XLSCC_MAIN_PATH, cpp_file.full_path, "--block_pb",
-        block_pb_file.full_path
+        XLSCC_MAIN_PATH,
+        cpp_file.full_path,
+        "--block_pb",
+        block_pb_file.full_path,
     ])
 
 

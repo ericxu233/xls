@@ -17,9 +17,12 @@
 #ifndef XLS_PASSES_CANONICALIZATION_PASS_H_
 #define XLS_PASSES_CANONICALIZATION_PASS_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
@@ -30,14 +33,15 @@ namespace xls {
 // later passes.
 class CanonicalizationPass : public OptimizationFunctionBasePass {
  public:
+  static constexpr std::string_view kName = "canon";
   explicit CanonicalizationPass()
-      : OptimizationFunctionBasePass("canon", "Canonicalization") {}
+      : OptimizationFunctionBasePass(kName, "Canonicalization") {}
   ~CanonicalizationPass() override = default;
 
  protected:
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
 };
 
 }  // namespace xls

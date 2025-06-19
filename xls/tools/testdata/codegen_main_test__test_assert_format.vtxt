@@ -2,6 +2,8 @@ module invert_with_assert(
   input wire x,
   output wire out
 );
-  `MY_ASSERT(x, "assert message")
   assign out = ~x;
+  `ifdef ASSERT_ON
+  `MY_ASSERT(x, "assert message")
+  `endif  // ASSERT_ON
 endmodule

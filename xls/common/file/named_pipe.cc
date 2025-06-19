@@ -15,22 +15,27 @@
 #include "xls/common/file/named_pipe.h"
 
 #include <sys/stat.h>
-#include <sys/types.h>
+#include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
+#include <filesystem>  // NOLINT
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
+#include "xls/common/file/file_descriptor.h"
 #include "xls/common/status/error_code_to_status.h"
 #include "xls/common/status/status_macros.h"
 
 namespace xls {
 
-/*static*/ absl::StatusOr<FileLineReader> FileLineReader::Create(
+/* static */ absl::StatusOr<FileLineReader> FileLineReader::Create(
     const std::filesystem::path& path) {
   XLS_ASSIGN_OR_RETURN(FileStream fs, FileStream::Open(path, "r"));
   return FileLineReader(std::move(fs));
@@ -41,25 +46,29 @@ absl::StatusOr<std::optional<std::string>> FileLineReader::ReadLine() {
   int c;
   while ((c = fgetc(file_.get())) != EOF) {
     if (static_cast<char>(c) == '\n') {
+      VLOG(1) << "ReadLine: " << result;
       return result;
     }
     result += static_cast<char>(c);
   }
   if (ferror(file_.get())) {
+    VLOG(1) << "Error reading from file";
     return absl::InternalError(absl::StrFormat(
         "Error reading line from file %s", file_.path().string()));
   }
   // At end-of-file.
+  VLOG(1) << "ReadLine at EOF";
   return std::nullopt;
 }
 
-/*static*/ absl::StatusOr<FileLineWriter> FileLineWriter::Create(
+/* static */ absl::StatusOr<FileLineWriter> FileLineWriter::Create(
     const std::filesystem::path& path) {
   XLS_ASSIGN_OR_RETURN(FileStream fs, FileStream::Open(path, "w"));
   return FileLineWriter(std::move(fs));
 }
 
 absl::Status FileLineWriter::WriteLine(std::string_view line) {
+  VLOG(1) << "WriteLine: " << line;
   if (!line.empty()) {
     size_t written = fwrite(line.data(), line.size(), 1, file_.get());
     if (written == 0) {
@@ -73,7 +82,7 @@ absl::Status FileLineWriter::WriteLine(std::string_view line) {
   return absl::OkStatus();
 }
 
-/*static*/ absl::StatusOr<NamedPipe> NamedPipe::Create(
+/* static */ absl::StatusOr<NamedPipe> NamedPipe::Create(
     const std::filesystem::path& path) {
   // Create with RW permissions for the user only.
   int ec = mkfifo(path.c_str(), S_IRUSR | S_IWUSR);
@@ -104,7 +113,7 @@ NamedPipe::NamedPipe(NamedPipe&& other) : path_(std::move(other.path_)) {
 void NamedPipe::Cleanup() {
   if (!path_.empty()) {
     if (unlink(path_.c_str()) != 0) {
-      XLS_LOG(ERROR) << "Failed remove named pipe " << path_;
+      LOG(ERROR) << "Failed remove named pipe " << path_;
     }
   }
 }

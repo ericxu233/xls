@@ -14,33 +14,36 @@
 
 #include "xls/codegen/ram_rewrite_pass.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
+#include "absl/types/variant.h"
 #include "xls/codegen/block_conversion.h"
 #include "xls/codegen/codegen_pass.h"
 #include "xls/codegen/module_signature.h"
+#include "xls/codegen/module_signature.pb.h"
 #include "xls/codegen/ram_configuration.h"
-#include "xls/common/casts.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/common/visitor.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/block.h"
 #include "xls/ir/channel.h"
 #include "xls/ir/node.h"
 #include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
-#include "xls/ir/register.h"
+#include "xls/ir/package.h"
 #include "xls/ir/source_location.h"
 #include "xls/ir/type.h"
 #include "xls/ir/value.h"
@@ -49,25 +52,6 @@
 namespace xls::verilog {
 
 namespace {
-absl::StatusOr<Channel*> GetStreamingChannel(Block* block,
-                                             std::string_view channel_name) {
-  XLS_ASSIGN_OR_RETURN(Channel * channel,
-                       block->package()->GetChannel(channel_name));
-  XLS_RET_CHECK_EQ(channel->kind(), ChannelKind::kStreaming)
-      << absl::StreamFormat("Channel %s must be a streaming channel.",
-                            channel_name);
-  XLS_RET_CHECK(channel->GetDataPortName().has_value())
-      << "data port not found- channel " << channel->name()
-      << " should be streaming with ready/valid flow control.";
-  XLS_RET_CHECK(channel->GetValidPortName().has_value())
-      << "valid port not found- channel " << channel->name()
-      << " should be streaming with ready/valid flow control.";
-  XLS_RET_CHECK(channel->GetReadyPortName().has_value())
-      << "ready port not found- channel " << channel->name()
-      << " should be streaming with ready/valid flow control.";
-
-  return channel;
-}
 
 struct ReqBlockPorts {
   OutputPort* req_data;
@@ -146,17 +130,25 @@ absl::Status CheckDataPortType(
 
 absl::StatusOr<ReqBlockPorts> GetReqBlockPorts(Block* block,
                                                std::string_view channel_name) {
-  XLS_ASSIGN_OR_RETURN(Channel * req_channel,
-                       GetStreamingChannel(block, channel_name));
   XLS_ASSIGN_OR_RETURN(
-      auto* req_data_port,
-      block->GetOutputPort(req_channel->GetDataPortName().value()));
-  XLS_ASSIGN_OR_RETURN(
-      auto* req_valid_port,
-      block->GetOutputPort(req_channel->GetValidPortName().value()));
-  XLS_ASSIGN_OR_RETURN(
-      auto* req_ready_port,
-      block->GetInputPort(req_channel->GetReadyPortName().value()));
+      ChannelPortMetadata metadata,
+      block->GetChannelPortMetadata(channel_name, ChannelDirection::kSend));
+  XLS_RET_CHECK(metadata.data_port.has_value())
+      << absl::StreamFormat("No data port for channel `%s` in block `%s`",
+                            channel_name, block->name());
+  XLS_RET_CHECK(metadata.ready_port.has_value())
+      << absl::StreamFormat("No ready port for channel `%s` in block `%s`",
+                            channel_name, block->name());
+  XLS_RET_CHECK(metadata.valid_port.has_value())
+      << absl::StreamFormat("No valid port for channel `%s` in block `%s`",
+                            channel_name, block->name());
+  XLS_ASSIGN_OR_RETURN(auto* req_data_port,
+                       block->GetOutputPort(*metadata.data_port));
+  XLS_ASSIGN_OR_RETURN(auto* req_valid_port,
+                       block->GetOutputPort(*metadata.valid_port));
+  XLS_ASSIGN_OR_RETURN(auto* req_ready_port,
+                       block->GetInputPort(*metadata.ready_port));
+
   return ReqBlockPorts{.req_data = req_data_port,
                        .req_valid = req_valid_port,
                        .req_ready = req_ready_port};
@@ -164,17 +156,24 @@ absl::StatusOr<ReqBlockPorts> GetReqBlockPorts(Block* block,
 
 absl::StatusOr<RespBlockPorts> GetRespBlockPorts(
     Block* block, std::string_view channel_name) {
-  XLS_ASSIGN_OR_RETURN(Channel * resp_channel,
-                       GetStreamingChannel(block, channel_name));
   XLS_ASSIGN_OR_RETURN(
-      auto* resp_data_port,
-      block->GetInputPort(resp_channel->GetDataPortName().value()));
-  XLS_ASSIGN_OR_RETURN(
-      auto* resp_valid_port,
-      block->GetInputPort(resp_channel->GetValidPortName().value()));
-  XLS_ASSIGN_OR_RETURN(
-      auto* resp_ready_port,
-      block->GetOutputPort(resp_channel->GetReadyPortName().value()));
+      ChannelPortMetadata metadata,
+      block->GetChannelPortMetadata(channel_name, ChannelDirection::kReceive));
+  XLS_RET_CHECK(metadata.data_port.has_value())
+      << absl::StreamFormat("No data port for channel `%s` in block `%s`",
+                            channel_name, block->name());
+  XLS_RET_CHECK(metadata.ready_port.has_value())
+      << absl::StreamFormat("No ready port for channel `%s` in block `%s`",
+                            channel_name, block->name());
+  XLS_RET_CHECK(metadata.valid_port.has_value())
+      << absl::StreamFormat("No valid port for channel `%s` in block `%s`",
+                            channel_name, block->name());
+  XLS_ASSIGN_OR_RETURN(auto* resp_data_port,
+                       block->GetInputPort(*metadata.data_port));
+  XLS_ASSIGN_OR_RETURN(auto* resp_valid_port,
+                       block->GetInputPort(*metadata.valid_port));
+  XLS_ASSIGN_OR_RETURN(auto* resp_ready_port,
+                       block->GetOutputPort(*metadata.ready_port));
   return RespBlockPorts{.resp_data = resp_data_port,
                         .resp_valid = resp_valid_port,
                         .resp_ready = resp_ready_port};
@@ -219,6 +218,31 @@ absl::StatusOr<RamWPortBlockPorts> GetWBlockPorts(
   return ports;
 }
 
+// When we rewrite Ram ports, we invalidate the metadata in StreamingIOPipeline.
+// To avoid having dangling pointers, we remove the StreamingInputs and
+// StreamingOutputs associated with Ram channels.
+// TODO: github/xls#1300 - remove when metadata is refactored.
+void ClearRewrittenMetadata(
+    StreamingIOPipeline& streaming_io,
+    absl::flat_hash_set<std::string_view> channel_names) {
+  for (std::vector<StreamingInput>& inputs : streaming_io.inputs) {
+    inputs.erase(
+        std::remove_if(inputs.begin(), inputs.end(),
+                       [&channel_names](const StreamingInput& input) {
+                         return channel_names.contains(input.GetChannelName());
+                       }),
+        inputs.end());
+  }
+  for (std::vector<StreamingOutput>& outputs : streaming_io.outputs) {
+    outputs.erase(
+        std::remove_if(outputs.begin(), outputs.end(),
+                       [&channel_names](const StreamingOutput& output) {
+                         return channel_names.contains(output.GetChannelName());
+                       }),
+        outputs.end());
+  }
+}
+
 // The write completion channel exists to model the behavior of a write
 // completion and does not actually drive any bits. It is useful as a touchpoint
 // for scheduling constraints.
@@ -255,12 +279,81 @@ absl::Status WriteCompletionRewrite(
   return absl::OkStatus();
 }
 
-absl::StatusOr<bool> Ram1RWRewrite(
-    CodegenPassUnit* unit, const CodegenPassOptions& pass_options,
-    const RamConfiguration& base_ram_configuration) {
-  auto& ram_config =
-      down_cast<const Ram1RWConfiguration&>(base_ram_configuration);
-  Block* block = unit->block;
+absl::Status Ram1RWUpdateSignature(
+    ModuleSignature& signature, const Ram1RWConfiguration& ram_config,
+    std::string_view ram_name, Package* package, OutputPort* req_addr_port,
+    OutputPort* req_re_port, OutputPort* req_we_port,
+    OutputPort* req_wr_data_port, OutputPort* req_wr_mask_port,
+    OutputPort* req_rd_mask_port, InputPort* resp_rd_data_port) {
+  auto builder = ModuleSignatureBuilder::FromProto(signature.proto());
+
+  for (std::string_view channel_name : {
+           ram_config.rw_port_configuration().request_channel_name,
+           ram_config.rw_port_configuration().response_channel_name,
+           ram_config.rw_port_configuration().write_completion_channel_name,
+       }) {
+    XLS_ASSIGN_OR_RETURN(ChannelInterfaceProto channel_interface,
+                         signature.GetChannelInterfaceByName(channel_name));
+    if (channel_interface.has_data_port_name()) {
+      XLS_RETURN_IF_ERROR(
+          builder.RemoveData(channel_interface.data_port_name()));
+    }
+    if (channel_interface.has_valid_port_name()) {
+      XLS_RETURN_IF_ERROR(
+          builder.RemoveData(channel_interface.valid_port_name()));
+    }
+    if (channel_interface.has_ready_port_name()) {
+      XLS_RETURN_IF_ERROR(
+          builder.RemoveData(channel_interface.ready_port_name()));
+    }
+    XLS_RETURN_IF_ERROR(builder.RemoveChannelInterface(channel_name));
+  }
+
+  for (const OutputPort* port : {
+           req_addr_port,
+           req_re_port,
+           req_we_port,
+           req_wr_data_port,
+           req_wr_mask_port,
+           req_rd_mask_port,
+       }) {
+    if (port->port_type()->GetFlatBitCount() > 0) {
+      builder.AddDataOutput(port->name(), port->port_type());
+    }
+  }
+  for (const xls::InputPort* port : {resp_rd_data_port}) {
+    if (resp_rd_data_port->GetType()->GetFlatBitCount() > 0) {
+      builder.AddDataInput(port->name(), port->GetType());
+    }
+  }
+
+  builder.AddRam1RW({
+      .package = package,
+      .data_type = req_wr_data_port->port_type(),
+      .ram_name = ram_name,
+      .req_name = ram_config.rw_port_configuration().request_channel_name,
+      .resp_name = ram_config.rw_port_configuration().response_channel_name,
+      .address_width = req_addr_port->port_type()->GetFlatBitCount(),
+      .read_mask_width = req_rd_mask_port->GetType()->GetFlatBitCount(),
+      .write_mask_width = req_wr_mask_port->GetType()->GetFlatBitCount(),
+      .address_name = req_addr_port->GetName(),
+      .read_enable_name = req_re_port->GetName(),
+      .write_enable_name = req_we_port->GetName(),
+      .read_data_name = resp_rd_data_port->GetName(),
+      .write_data_name = req_wr_data_port->GetName(),
+      .write_mask_name = req_wr_mask_port->GetName(),
+      .read_mask_name = req_rd_mask_port->GetName(),
+  });
+
+  XLS_ASSIGN_OR_RETURN(signature, builder.Build());
+  return absl::OkStatus();
+}
+
+absl::StatusOr<bool> Ram1RWRewrite(Package* package,
+                                   const CodegenPassOptions& pass_options,
+                                   const Ram1RWConfiguration& ram_config,
+                                   CodegenContext& context) {
+  Block* block = context.top_block();
 
   XLS_ASSIGN_OR_RETURN(
       RamRWPortBlockPorts rw_block_ports,
@@ -268,7 +361,7 @@ absl::StatusOr<bool> Ram1RWRewrite(
 
   // req is (addr, wr_data, we, re)
   XLS_RETURN_IF_ERROR(CheckDataPortType(
-      rw_block_ports.req_ports.req_data->operand(0)->GetType(), "Request",
+      rw_block_ports.req_ports.req_data->port_type(), "Request",
       {TypeKind::kBits, std::nullopt, std::nullopt, std::nullopt,
        TypeKind::kBits, TypeKind::kBits},
       {"addr", "wr_data", "wr_mask", "rd_mask", "we", "re"}));
@@ -283,9 +376,9 @@ absl::StatusOr<bool> Ram1RWRewrite(
   };
 
   // Peel off each field from the data port's operand.
-  XLS_VLOG(3) << "req_data_port op = "
-              << rw_block_ports.req_ports.req_data->operand(0)
-                     ->ToStringWithOperandTypes();
+  VLOG(3) << "req_data_port op = "
+          << rw_block_ports.req_ports.req_data->operand(0)
+                 ->ToStringWithOperandTypes();
   XLS_ASSIGN_OR_RETURN(
       Node * req_addr,
       tuple_index(rw_block_ports.req_ports.req_data->operand(0), 0));
@@ -356,24 +449,31 @@ absl::StatusOr<bool> Ram1RWRewrite(
                            /*loc=*/SourceInfo(), req_re_valid, Op::kIdentity,
                            req_re_valid_buf_name));
 
-  std::optional<xls::Reset> reset_behavior =
-      pass_options.codegen_options.ResetBehavior();
-
   XLS_ASSIGN_OR_RETURN(
       Node * ram_resp_valid,
-      AddRegisterAfterNode(absl::StrCat(req_valid->GetName(), "_delay"),
-                           reset_behavior, std::nullopt, req_re_valid_buf,
-                           block));
+      AddRegisterAfterNode(
+          /*name_prefix=*/absl::StrCat(req_valid->GetName(), "_delay"),
+          /*load_enable=*/std::nullopt, req_re_valid_buf));
 
   // Make a new response port with a new name.
   std::string resp_rd_data_name =
       block->UniquifyNodeName(absl::StrCat(ram_name, "_rd_data"));
+  // Make the actual input port. Destructure the response type. (NB The bits are
+  // identical but other parts expect the wr_data and rd_data ports to have the
+  // same type).
+  XLS_ASSIGN_OR_RETURN(
+      TupleType * orig_port_type,
+      rw_block_ports.resp_ports.resp_data->GetType()->AsTuple());
+  XLS_RET_CHECK_EQ(orig_port_type->size(), 1)
+      << "Unexpected extra elements in ram rd_data port type "
+      << orig_port_type;
   XLS_ASSIGN_OR_RETURN(
       InputPort * resp_rd_data_port,
-      block->AddInputPort(resp_rd_data_name,
-                          rw_block_ports.resp_ports.resp_data->GetType()));
-  XLS_RETURN_IF_ERROR(
-      rw_block_ports.resp_ports.resp_data->ReplaceUsesWith(resp_rd_data_port));
+      block->AddInputPort(resp_rd_data_name, orig_port_type->element_type(0)));
+  XLS_RETURN_IF_ERROR(rw_block_ports.resp_ports.resp_data
+                          ->ReplaceUsesWithNew<Tuple>(
+                              absl::Span<Node* const>{resp_rd_data_port})
+                          .status());
 
   // Add buffer before resp_ready
   std::string resp_ready_port_buf_name = absl::StrFormat(
@@ -384,7 +484,6 @@ absl::StatusOr<bool> Ram1RWRewrite(
                            rw_block_ports.resp_ports.resp_ready->operand(0),
                            Op::kIdentity, resp_ready_port_buf_name));
 
-  // Update channel ready/valid ports usages with new internal signals.
   XLS_RETURN_IF_ERROR(
       rw_block_ports.resp_ports.resp_ready->ReplaceOperandNumber(
           0, resp_ready_port_buf));
@@ -394,13 +493,13 @@ absl::StatusOr<bool> Ram1RWRewrite(
       rw_block_ports.req_ports.req_ready->ReplaceUsesWith(resp_ready_port_buf));
 
   // Add zero-latency buffer at output of ram
-  std::vector<Node*> valid_nodes;
+  std::vector<std::optional<Node*>> valid_nodes;
   std::string zero_latency_buffer_name =
       absl::StrCat(ram_name, "_ram_zero_latency0");
   XLS_RETURN_IF_ERROR(AddZeroLatencyBufferToRDVNodes(
                           resp_rd_data_port, ram_resp_valid,
-                          resp_ready_port_buf, zero_latency_buffer_name,
-                          reset_behavior, block, valid_nodes)
+                          resp_ready_port_buf, zero_latency_buffer_name, block,
+                          valid_nodes)
                           .status());
 
   // Add output ports for expanded req.data.
@@ -428,85 +527,40 @@ absl::StatusOr<bool> Ram1RWRewrite(
   XLS_RETURN_IF_ERROR(WriteCompletionRewrite(
       block, rw_block_ports.write_completion_ports, ram_name));
 
-  if (unit->signature.has_value()) {
-    ModuleSignature* signature = &unit->signature.value();
-    auto builder = ModuleSignatureBuilder::FromProto(signature->proto());
-    XLS_RETURN_IF_ERROR(builder.RemoveStreamingChannel(
-        ram_config.rw_port_configuration().request_channel_name));
-    XLS_RETURN_IF_ERROR(builder.RemoveStreamingChannel(
-        ram_config.rw_port_configuration().response_channel_name));
-    XLS_RETURN_IF_ERROR(builder.RemoveStreamingChannel(
-        ram_config.rw_port_configuration().write_completion_channel_name));
+  if (context.HasMetadataForBlock(context.top_block())) {
+    CodegenMetadata& metadata =
+        context.GetMetadataForBlock(context.top_block());
 
-    for (std::string_view channel_name : {
-             ram_config.rw_port_configuration().request_channel_name,
-             ram_config.rw_port_configuration().response_channel_name,
-             ram_config.rw_port_configuration().write_completion_channel_name,
-         }) {
-      XLS_ASSIGN_OR_RETURN(Channel * channel,
-                           block->package()->GetChannel(channel_name));
-      if (channel->GetReadyPortName().has_value()) {
-        XLS_RETURN_IF_ERROR(
-            builder.RemoveData(channel->GetReadyPortName().value()));
-      }
-      if (channel->GetDataPortName().has_value()) {
-        XLS_RETURN_IF_ERROR(
-            builder.RemoveData(channel->GetDataPortName().value()));
-      }
-      if (channel->GetValidPortName().has_value()) {
-        XLS_RETURN_IF_ERROR(
-            builder.RemoveData(channel->GetValidPortName().value()));
-      }
+    ClearRewrittenMetadata(
+        metadata.streaming_io_and_pipeline,
+        {ram_config.rw_port_configuration().request_channel_name,
+         ram_config.rw_port_configuration().response_channel_name,
+         ram_config.rw_port_configuration().write_completion_channel_name});
+
+    if (block->GetSignature().has_value()) {
+      XLS_ASSIGN_OR_RETURN(ModuleSignature signature,
+                           ModuleSignature::FromProto(*block->GetSignature()));
+      XLS_RETURN_IF_ERROR(
+          Ram1RWUpdateSignature(signature, ram_config, ram_name, package,
+                                /*req_addr_port=*/req_addr_port,
+                                /*req_re_port=*/req_re_port,
+                                /*req_we_port=*/req_we_port,
+                                /*req_wr_data_port=*/req_wr_data_port,
+                                /*req_wr_mask_port=*/req_wr_mask_port,
+                                /*req_rd_mask_port=*/req_rd_mask_port,
+                                /*resp_rd_data_port=*/resp_rd_data_port));
+      block->SetSignature(signature.proto());
     }
-
-    for (const xls::OutputPort* port : {
-             req_addr_port,
-             req_re_port,
-             req_we_port,
-             req_wr_data_port,
-             req_wr_mask_port,
-             req_rd_mask_port,
-         }) {
-      if (port->operand(0)->GetType()->GetFlatBitCount() > 0) {
-        builder.AddDataOutput(port->name(), port->operand(0)->GetType());
-      }
-    }
-    for (const xls::InputPort* port : {resp_rd_data_port}) {
-      if (port->GetType()->GetFlatBitCount() > 0) {
-        builder.AddDataInput(port->name(), port->GetType());
-      }
-    }
-
-    builder.AddRam1RW({
-        .package = unit->package,
-        .data_type = req_wr_data_port->GetType(),
-        .ram_name = ram_name,
-        .req_name = ram_config.rw_port_configuration().request_channel_name,
-        .resp_name = ram_config.rw_port_configuration().response_channel_name,
-        .address_width = req_addr_port->GetType()->GetFlatBitCount(),
-        .read_mask_width = req_rd_mask_port->GetType()->GetFlatBitCount(),
-        .write_mask_width = req_wr_mask_port->GetType()->GetFlatBitCount(),
-        .address_name = req_addr_port->GetName(),
-        .read_enable_name = req_re_port->GetName(),
-        .write_enable_name = req_we_port->GetName(),
-        .read_data_name = resp_rd_data_port->GetName(),
-        .write_data_name = req_wr_data_port->GetName(),
-        .write_mask_name = req_wr_mask_port->GetName(),
-        .read_mask_name = req_rd_mask_port->GetName(),
-    });
-
-    XLS_ASSIGN_OR_RETURN(*signature, builder.Build());
   }
 
   return true;
 }
 
-absl::StatusOr<bool> Ram1R1WRewrite(
-    CodegenPassUnit* unit, const CodegenPassOptions& pass_options,
-    const RamConfiguration& base_ram_configuration) {
-  auto& ram_config =
-      down_cast<const Ram1R1WConfiguration&>(base_ram_configuration);
-  Block* block = unit->block;
+absl::StatusOr<bool> Ram1R1WRewrite(Package* package,
+                                    const CodegenPassOptions& pass_options,
+                                    const Ram1R1WConfiguration& ram_config,
+                                    CodegenContext& context) {
+  Block* block = context.top_block();
 
   XLS_ASSIGN_OR_RETURN(
       RamRPortBlockPorts r_block_ports,
@@ -517,7 +571,7 @@ absl::StatusOr<bool> Ram1R1WRewrite(
 
   // rd_req is (rd_addr, rd_mask)
   XLS_RETURN_IF_ERROR(CheckDataPortType(
-      r_block_ports.req_ports.req_data->operand(0)->GetType(), "rd_req",
+      r_block_ports.req_ports.req_data->port_type(), "rd_req",
       {TypeKind::kBits, std::nullopt}, {"rd_addr", "rd_mask"}));
   // rd_resp is (rd_data)
   XLS_RETURN_IF_ERROR(
@@ -525,8 +579,8 @@ absl::StatusOr<bool> Ram1R1WRewrite(
                         "rd_resp", {std::nullopt}, {"rd_data"}));
   // wr_req is (wr_addr, wr_data, wr_mask)
   XLS_RETURN_IF_ERROR(
-      CheckDataPortType(w_block_ports.req_ports.req_data->operand(0)->GetType(),
-                        "wr_req", {TypeKind::kBits, std::nullopt, std::nullopt},
+      CheckDataPortType(w_block_ports.req_ports.req_data->port_type(), "wr_req",
+                        {TypeKind::kBits, std::nullopt, std::nullopt},
                         {"wr_addr", "wr_data", "wr_mask"}));
 
   auto tuple_index = [block](Node* node, int idx) {
@@ -584,14 +638,11 @@ absl::StatusOr<bool> Ram1R1WRewrite(
       block->MakeNodeWithName<UnOp>(
           /*loc=*/SourceInfo(), rd_en, Op::kIdentity, req_re_valid_buf_name));
 
-  std::optional<xls::Reset> reset_behavior =
-      pass_options.codegen_options.ResetBehavior();
-
   XLS_ASSIGN_OR_RETURN(
       Node * rd_resp_valid,
-      AddRegisterAfterNode(absl::StrCat(rd_en->GetName(), "_delay"),
-                           reset_behavior, std::nullopt, req_re_valid_buf,
-                           block));
+      AddRegisterAfterNode(
+          /*name_prefix=*/absl::StrCat(rd_en->GetName(), "_delay"),
+          /*load_enable=*/std::nullopt, req_re_valid_buf));
 
   // Make a new response port with a new name.
   std::string rd_data_name =
@@ -623,13 +674,12 @@ absl::StatusOr<bool> Ram1R1WRewrite(
       r_block_ports.req_ports.req_ready->ReplaceUsesWith(resp_ready_port_buf));
 
   // Add zero-latency buffer at output of ram
-  std::vector<Node*> valid_nodes;
+  std::vector<std::optional<Node*>> valid_nodes;
   std::string zero_latency_buffer_name =
       absl::StrCat(ram_name, "_ram_zero_latency0");
   XLS_RETURN_IF_ERROR(AddZeroLatencyBufferToRDVNodes(
                           rd_data_port, rd_resp_valid, resp_ready_port_buf,
-                          zero_latency_buffer_name, reset_behavior, block,
-                          valid_nodes)
+                          zero_latency_buffer_name, block, valid_nodes)
                           .status());
   // Replace write ready with literal 1 (RAM is always ready for write).
   // TODO(rigge): should this signal check for hazards?
@@ -669,106 +719,107 @@ absl::StatusOr<bool> Ram1R1WRewrite(
   XLS_RETURN_IF_ERROR(WriteCompletionRewrite(
       block, w_block_ports.write_completion_ports, ram_name));
 
-  if (unit->signature.has_value()) {
-    ModuleSignature* signature = &unit->signature.value();
-    auto builder = ModuleSignatureBuilder::FromProto(signature->proto());
-    XLS_RETURN_IF_ERROR(builder.RemoveStreamingChannel(
-        ram_config.r_port_configuration().request_channel_name));
-    XLS_RETURN_IF_ERROR(builder.RemoveStreamingChannel(
-        ram_config.r_port_configuration().response_channel_name));
-    XLS_RETURN_IF_ERROR(builder.RemoveStreamingChannel(
-        ram_config.w_port_configuration().request_channel_name));
-    XLS_RETURN_IF_ERROR(builder.RemoveStreamingChannel(
-        ram_config.w_port_configuration().write_completion_channel_name));
+  if (context.HasMetadataForBlock(context.top_block())) {
+    CodegenMetadata& metadata =
+        context.GetMetadataForBlock(context.top_block());
 
-    for (std::string_view channel_name : {
-             ram_config.r_port_configuration().request_channel_name,
-             ram_config.r_port_configuration().response_channel_name,
-             ram_config.w_port_configuration().request_channel_name,
-             ram_config.w_port_configuration().write_completion_channel_name,
-         }) {
-      XLS_ASSIGN_OR_RETURN(Channel * channel,
-                           block->package()->GetChannel(channel_name));
-      if (channel->GetReadyPortName().has_value()) {
-        XLS_RETURN_IF_ERROR(
-            builder.RemoveData(channel->GetReadyPortName().value()));
-      }
-      if (channel->GetDataPortName().has_value()) {
-        XLS_RETURN_IF_ERROR(
-            builder.RemoveData(channel->GetDataPortName().value()));
-      }
-      if (channel->GetValidPortName().has_value()) {
-        XLS_RETURN_IF_ERROR(
-            builder.RemoveData(channel->GetValidPortName().value()));
-      }
-    }
-    for (const xls::OutputPort* port : {
-             rd_addr_port,
-             rd_mask_port,
-             rd_en_port,
-             wr_addr_port,
-             wr_data_port,
-             wr_mask_port,
-             wr_en_port,
-         }) {
-      if (port->operand(0)->GetType()->GetFlatBitCount() > 0) {
-        builder.AddDataOutput(port->name(), port->operand(0)->GetType());
-      }
-    }
-    for (const xls::InputPort* port : {rd_data_port}) {
-      if (port->GetType()->GetFlatBitCount() > 0) {
-        builder.AddDataInput(port->name(), port->GetType());
-      }
-    }
+    if (context.top_block()->GetSignature().has_value()) {
+      ClearRewrittenMetadata(
+          metadata.streaming_io_and_pipeline,
+          {
+              ram_config.r_port_configuration().request_channel_name,
+              ram_config.r_port_configuration().response_channel_name,
+              ram_config.w_port_configuration().request_channel_name,
+              ram_config.w_port_configuration().write_completion_channel_name,
+          });
+      XLS_ASSIGN_OR_RETURN(
+          ModuleSignature signature,
+          ModuleSignature::FromProto(*context.top_block()->GetSignature()));
+      auto builder = ModuleSignatureBuilder::FromProto(
+          *context.top_block()->GetSignature());
 
-    builder.AddRam1R1W({
-        .package = unit->package,
-        .data_type = rd_data->GetType(),
-        .ram_name = ram_name,
-        .rd_req_name = ram_config.r_port_configuration().request_channel_name,
-        .rd_resp_name = ram_config.r_port_configuration().response_channel_name,
-        .wr_req_name = ram_config.w_port_configuration().request_channel_name,
-        .address_width = rd_addr_port->GetType()->GetFlatBitCount(),
-        .read_mask_width = rd_mask_port->GetType()->GetFlatBitCount(),
-        .write_mask_width = wr_mask_port->GetType()->GetFlatBitCount(),
-        .read_address_name = rd_addr_port->GetName(),
-        .read_data_name = rd_data_port->GetName(),
-        .read_mask_name = rd_mask_port->GetName(),
-        .read_enable_name = rd_en_port->GetName(),
-        .write_address_name = wr_addr_port->GetName(),
-        .write_data_name = wr_data_port->GetName(),
-        .write_mask_name = wr_mask_port->GetName(),
-        .write_enable_name = wr_en_port->GetName(),
-    });
+      for (std::string_view channel_name : {
+               ram_config.r_port_configuration().request_channel_name,
+               ram_config.r_port_configuration().response_channel_name,
+               ram_config.w_port_configuration().request_channel_name,
+               ram_config.w_port_configuration().write_completion_channel_name,
+           }) {
+        XLS_ASSIGN_OR_RETURN(ChannelInterfaceProto channel_interface,
+                             signature.GetChannelInterfaceByName(channel_name));
+        if (channel_interface.has_data_port_name()) {
+          XLS_RETURN_IF_ERROR(
+              builder.RemoveData(channel_interface.data_port_name()));
+        }
+        if (channel_interface.has_valid_port_name()) {
+          XLS_RETURN_IF_ERROR(
+              builder.RemoveData(channel_interface.valid_port_name()));
+        }
+        if (channel_interface.has_ready_port_name()) {
+          XLS_RETURN_IF_ERROR(
+              builder.RemoveData(channel_interface.ready_port_name()));
+        }
+        XLS_RETURN_IF_ERROR(builder.RemoveChannelInterface(channel_name));
+      }
+      for (const xls::OutputPort* port : {
+               rd_addr_port,
+               rd_mask_port,
+               rd_en_port,
+               wr_addr_port,
+               wr_data_port,
+               wr_mask_port,
+               wr_en_port,
+           }) {
+        if (port->operand(0)->GetType()->GetFlatBitCount() > 0) {
+          builder.AddDataOutput(port->name(), port->operand(0)->GetType());
+        }
+      }
+      for (const xls::InputPort* port : {rd_data_port}) {
+        if (port->GetType()->GetFlatBitCount() > 0) {
+          builder.AddDataInput(port->name(), port->GetType());
+        }
+      }
 
-    XLS_ASSIGN_OR_RETURN(*signature, builder.Build());
+      builder.AddRam1R1W({
+          .package = package,
+          .data_type = rd_data_port->GetType(),
+          .ram_name = ram_name,
+          .rd_req_name = ram_config.r_port_configuration().request_channel_name,
+          .rd_resp_name =
+              ram_config.r_port_configuration().response_channel_name,
+          .wr_req_name = ram_config.w_port_configuration().request_channel_name,
+          .address_width = rd_addr_port->port_type()->GetFlatBitCount(),
+          .read_mask_width = rd_mask_port->port_type()->GetFlatBitCount(),
+          .write_mask_width = wr_mask_port->port_type()->GetFlatBitCount(),
+          .read_address_name = rd_addr_port->GetName(),
+          .read_data_name = rd_data_port->GetName(),
+          .read_mask_name = rd_mask_port->GetName(),
+          .read_enable_name = rd_en_port->GetName(),
+          .write_address_name = wr_addr_port->GetName(),
+          .write_data_name = wr_data_port->GetName(),
+          .write_mask_name = wr_mask_port->GetName(),
+          .write_enable_name = wr_en_port->GetName(),
+      });
+
+      XLS_ASSIGN_OR_RETURN(signature, builder.Build());
+      context.top_block()->SetSignature(signature.proto());
+    }
   }
 
   return true;
 }
 
-absl::flat_hash_map<std::string, ram_rewrite_function_t>*
-GetRamRewriteFunctionMap() {
-  static auto* singleton =
-      new absl::flat_hash_map<std::string, ram_rewrite_function_t>{
-          {"1RW", Ram1RWRewrite},
-          {"1R1W", Ram1R1WRewrite},
-      };
-  return singleton;
-}
-
-absl::StatusOr<bool> RamRewrite(CodegenPassUnit* unit,
+absl::StatusOr<bool> RamRewrite(Package* package,
                                 const CodegenPassOptions& pass_options,
-                                const RamConfiguration& ram_configuration) {
-  absl::flat_hash_map<std::string, ram_rewrite_function_t>*
-      rewrite_function_map = GetRamRewriteFunctionMap();
-  auto itr = rewrite_function_map->find(ram_configuration.ram_kind());
-  if (itr == rewrite_function_map->end()) {
-    return absl::InvalidArgumentError(
-        absl::StrFormat("No RAM rewriter found for RAM kind %s.",
-                        ram_configuration.ram_kind()));
-  }
-  return itr->second(unit, pass_options, ram_configuration);
+                                const RamConfiguration& ram_configuration,
+                                CodegenContext& context) {
+  return absl::visit(
+      Visitor{[&](const Ram1RWConfiguration& config) {
+                return Ram1RWRewrite(package, pass_options, config, context);
+              },
+              [&](const Ram1R1WConfiguration& config) {
+                return Ram1R1WRewrite(package, pass_options, config, context);
+              }},
+      ram_configuration);
 }
 
 }  // namespace
@@ -776,16 +827,25 @@ absl::StatusOr<bool> RamRewrite(CodegenPassUnit* unit,
 // This function finds all the ports related to each channel specified in
 // `codegen_options.ram_channels()` and invokes `RewriteRamChannel()` on them.
 absl::StatusOr<bool> RamRewritePass::RunInternal(
-    CodegenPassUnit* unit, const CodegenPassOptions& options,
-    PassResults* results) const {
+    Package* package, const CodegenPassOptions& options, PassResults* results,
+    CodegenContext& context) const {
   bool changed = false;
 
-  for (auto& ram_configuration : options.codegen_options.ram_configurations()) {
-    XLS_VLOG(2) << "Rewriting channels for ram "
-                << ram_configuration->ram_name() << ".";
-    XLS_ASSIGN_OR_RETURN(bool this_one_changed,
-                         RamRewrite(unit, options, *ram_configuration));
+  XLS_RET_CHECK(context.HasTopBlock())
+      << "RamRewritePass requires top_block to be set.";
+
+  for (const RamConfiguration& ram_configuration :
+       options.codegen_options.ram_configurations()) {
+    VLOG(2) << "Rewriting channels for ram "
+            << RamConfigurationRamName(ram_configuration) << ".";
+    XLS_ASSIGN_OR_RETURN(
+        bool this_one_changed,
+        RamRewrite(package, options, ram_configuration, context));
     changed = changed || this_one_changed;
+  }
+
+  if (changed) {
+    context.GcMetadata();
   }
 
   return changed;

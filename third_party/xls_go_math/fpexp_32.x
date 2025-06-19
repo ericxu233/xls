@@ -93,9 +93,9 @@
 //      NaN (qnan) but accept all NaN respresentations
 //      as input
 
-import std
-import float32
-import third_party.xls_berkeley_softfloat.fpdiv_2x32
+import std;
+import float32;
+import third_party.xls_berkeley_softfloat.fpdiv_2x32;
 
 type F32 = float32::F32;
 
@@ -209,4 +209,3 @@ fn fpexp_32_test() {
   let input = float32::unflatten(u32:0xf12d483f);
   assert_eq(float32::zero(u1:0), fpexp_32(input));
 }
-

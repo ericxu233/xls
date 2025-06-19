@@ -11,12 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 #ifndef XLS_PASSES_USELESS_ASSERT_REMOVAL_PASS_H_
 #define XLS_PASSES_USELESS_ASSERT_REMOVAL_PASS_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
@@ -24,17 +28,18 @@ namespace xls {
 // they are never triggered. Rewires tokens to ensure nothing breaks.
 class UselessAssertRemovalPass : public OptimizationFunctionBasePass {
  public:
+  static constexpr std::string_view kName = "useless_assert_remove";
   UselessAssertRemovalPass()
-      : OptimizationFunctionBasePass("useless_assert_remove",
+      : OptimizationFunctionBasePass(kName,
                                      "Remove useless (always true) asserts") {}
   ~UselessAssertRemovalPass() override = default;
 
  protected:
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
 };
 
 }  // namespace xls
 
-#endif
+#endif  // XLS_PASSES_USELESS_ASSERT_REMOVAL_PASS_H_

@@ -17,18 +17,20 @@
 #include <utility>
 #include <vector>
 
+#include "absl/log/log.h"
 #include "absl/types/variant.h"
-#include "external/verible/common/lsp/lsp-protocol-enums.h"
-#include "external/verible/common/lsp/lsp-protocol.h"
+#include "verible/common/lsp/lsp-protocol-enums.h"
+#include "verible/common/lsp/lsp-protocol.h"
 #include "xls/common/visitor.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/module.h"
 #include "xls/dslx/lsp/lsp_type_utils.h"
 
 namespace xls::dslx {
 namespace {
 
 std::vector<verible::lsp::DocumentSymbol> ToDocumentSymbols(const Function& f) {
-  XLS_VLOG(3) << "ToDocumentSymbols; f: " << f.identifier();
+  VLOG(3) << "ToDocumentSymbols; f: " << f.identifier();
   verible::lsp::DocumentSymbol ds = {
       .name = f.identifier(),
       .kind = verible::lsp::SymbolKind::kMethod,
@@ -39,7 +41,7 @@ std::vector<verible::lsp::DocumentSymbol> ToDocumentSymbols(const Function& f) {
 }
 
 std::vector<verible::lsp::DocumentSymbol> ToDocumentSymbols(
-    const StructDef& s) {
+    const StructDefBase& s) {
   verible::lsp::DocumentSymbol ds = {
       .name = s.identifier(),
       .kind = verible::lsp::SymbolKind::kStruct,
@@ -70,16 +72,29 @@ std::vector<verible::lsp::DocumentSymbol> ToDocumentSymbols(
   return {std::move(ds)};
 }
 
+std::vector<verible::lsp::DocumentSymbol> ToDocumentSymbols(Use& u) {
+  std::vector<verible::lsp::DocumentSymbol> result;
+  for (const UseSubject& subject : u.LinearizeToSubjects()) {
+    result.push_back(verible::lsp::DocumentSymbol{
+        .name = subject.name_def().identifier(),
+        .kind = verible::lsp::SymbolKind::kModule,
+        .range = ConvertSpanToLspRange(subject.name_def().span()),
+        .selectionRange = ConvertSpanToLspRange(subject.name_def().span()),
+    });
+  }
+  return result;
+}
+
 }  // namespace
 
 std::vector<verible::lsp::DocumentSymbol> ToDocumentSymbols(const Module& m) {
-  XLS_VLOG(1) << "ToDocumentSymbols; module: " << m.name() << " has "
-              << m.top().size() << " top-level elements";
+  VLOG(1) << "ToDocumentSymbols; module: " << m.name() << " has "
+          << m.top().size() << " top-level elements";
   std::vector<verible::lsp::DocumentSymbol> result;
   for (const ModuleMember& member : m.top()) {
     std::vector<verible::lsp::DocumentSymbol> symbols =
         absl::visit(Visitor{
-                        [](Function* f) { return ToDocumentSymbols(*f); },
+                        [](auto* n) { return ToDocumentSymbols(*n); },
                         [](Proc*) {
                           // TODO(google/xls#1080): Complete the set of symbols.
                           return std::vector<verible::lsp::DocumentSymbol>{};
@@ -100,15 +115,20 @@ std::vector<verible::lsp::DocumentSymbol> ToDocumentSymbols(const Module& m) {
                           // TODO(google/xls#1080): Complete the set of symbols.
                           return std::vector<verible::lsp::DocumentSymbol>{};
                         },
-                        [](StructDef* s) { return ToDocumentSymbols(*s); },
-                        [](ConstantDef* c) { return ToDocumentSymbols(*c); },
-                        [](EnumDef* e) { return ToDocumentSymbols(*e); },
+                        [](Impl*) {
+                          // TODO(google/xls#1080): Complete the set of symbols.
+                          return std::vector<verible::lsp::DocumentSymbol>{};
+                        },
                         [](Import*) {
                           // TODO(google/xls#1080): Complete the set of symbols.
                           return std::vector<verible::lsp::DocumentSymbol>{};
                         },
                         [](ConstAssert*) {
                           // Note: no symbols are bound by a const assert.
+                          return std::vector<verible::lsp::DocumentSymbol>{};
+                        },
+                        [](VerbatimNode*) {
+                          // Note: no symbols are bound by a VerbatimNode.
                           return std::vector<verible::lsp::DocumentSymbol>{};
                         },
                     },

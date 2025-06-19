@@ -12,33 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_JIT_CHANNEL_QUEUE_TEST_BASE_H_
-#define XLS_JIT_CHANNEL_QUEUE_TEST_BASE_H_
+#ifndef XLS_INTERPRETER_CHANNEL_QUEUE_TEST_BASE_H_
+#define XLS_INTERPRETER_CHANNEL_QUEUE_TEST_BASE_H_
 
 #include <functional>
 #include <memory>
+#include <utility>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "xls/interpreter/channel_queue.h"
-#include "xls/ir/channel.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/proc_elaboration.h"
 
 namespace xls {
 
 class ChannelQueueTestParam {
  public:
   // `new_queue` is a factory which creates a channel queue to test.
-  ChannelQueueTestParam(
-      std::function<std::unique_ptr<ChannelQueue>(Channel*)> new_queue)
-      : new_queue_(new_queue) {}
+  explicit ChannelQueueTestParam(
+      std::function<std::unique_ptr<ChannelQueue>(ChannelInstance*)> new_queue)
+      : new_queue_(std::move(new_queue)) {}
 
-  std::unique_ptr<ChannelQueue> CreateQueue(Channel* channel) const {
-    return new_queue_(channel);
+  std::unique_ptr<ChannelQueue> CreateQueue(
+      ChannelInstance* channel_instance) const {
+    return new_queue_(channel_instance);
   }
 
  private:
-  std::function<std::unique_ptr<ChannelQueue>(Channel*)> new_queue_;
+  std::function<std::unique_ptr<ChannelQueue>(ChannelInstance*)> new_queue_;
 };
 
 // A suite of test which can be run against arbitrary ChannelQueue
@@ -50,4 +51,4 @@ class ChannelQueueTestBase
 
 }  // namespace xls
 
-#endif  // XLS_JIT_CHANNEL_QUEUE_TEST_BASE_H_
+#endif  // XLS_INTERPRETER_CHANNEL_QUEUE_TEST_BASE_H_

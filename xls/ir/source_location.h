@@ -15,11 +15,14 @@
 #ifndef XLS_IR_SOURCE_LOCATION_H_
 #define XLS_IR_SOURCE_LOCATION_H_
 
+#include <compare>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "absl/types/span.h"
 #include "xls/ir/fileno.h"
 
 namespace xls {
@@ -30,7 +33,7 @@ class SourceLocation {
  public:
   SourceLocation() : SourceLocation(Fileno(0), Lineno(0), Colno(0)) {}
   SourceLocation(Fileno fileno, Lineno lineno, Colno colno)
-    : fileno_(fileno), lineno_(lineno), colno_(colno) {}
+      : fileno_(fileno), lineno_(lineno), colno_(colno) {}
   SourceLocation(const SourceLocation& other) = default;
   SourceLocation& operator=(const SourceLocation& other) = default;
 
@@ -41,6 +44,16 @@ class SourceLocation {
   std::string ToString() const {
     return absl::StrFormat("%d,%d,%d", fileno_.value(), lineno_.value(),
                            colno_.value());
+  }
+
+  std::strong_ordering operator<=>(const SourceLocation& other) const {
+    if (fileno_ != other.fileno_) {
+      return fileno_.value() <=> other.fileno_.value();
+    }
+    if (lineno_ != other.lineno_) {
+      return lineno_.value() <=> other.lineno_.value();
+    }
+    return colno_.value() <=> other.colno_.value();
   }
 
  private:
@@ -54,6 +67,8 @@ struct SourceInfo {
 
   SourceInfo() = default;
   explicit SourceInfo(const SourceLocation& loc) : locations({loc}) {}
+  explicit SourceInfo(std::vector<SourceLocation>&& locs)
+      : locations(std::move(locs)) {}
   explicit SourceInfo(absl::Span<const SourceLocation> locs)
       : locations(locs.begin(), locs.end()) {}
 

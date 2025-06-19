@@ -16,6 +16,10 @@ load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
 
 package(
     default_applicable_licenses = ["//:license"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -36,24 +40,24 @@ exports_files(
 bzl_library(
     name = "xlscc_rules_bzl",
     srcs = ["xlscc_rules.bzl"],
-    visibility = ["//xls/contrib/xlscc/build_rules/__subpackages__"],
+    visibility = ["//visibility:private"],
     deps = [
-        "@bazel_skylib//lib:dicts",
+        ":xlscc_providers_bzl",
         "//xls/build_rules:xls_codegen_rules_bzl",
         "//xls/build_rules:xls_common_rules_bzl",
         "//xls/build_rules:xls_config_rules_bzl",
         "//xls/build_rules:xls_ir_rules_bzl",
         "//xls/build_rules:xls_providers_bzl",
         "//xls/build_rules:xls_toolchains_bzl",
-        "//xls/build_rules:xls_type_check_helpers_bzl",
-        "//xls/contrib/xlscc/build_rules:xlscc_providers_bzl",
+        "//xls/build_rules:xls_type_check_utils_bzl",
+        "@bazel_skylib//lib:dicts",
     ],
 )
 
 bzl_library(
     name = "xlscc_rules_build_defs_bzl",
     srcs = ["xlscc_rules_build_defs.bzl"],
-    visibility = ["//xls/contrib/xlscc/build_rules/__subpackages__"],
+    visibility = ["//visibility:private"],
     deps = [
         ":xlscc_rules_bzl",
     ],
@@ -71,7 +75,7 @@ bzl_library(
 bzl_library(
     name = "xlscc_providers_bzl",
     srcs = ["xlscc_providers.bzl"],
-    visibility = ["//xls/contrib/xlscc/build_rules/__subpackages__"],
+    visibility = ["//visibility:private"],
 )
 
 bzl_library(

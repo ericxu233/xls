@@ -14,12 +14,12 @@
 
 #include "xls/common/indent.h"
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "absl/strings/str_cat.h"
-#include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 
 namespace xls {

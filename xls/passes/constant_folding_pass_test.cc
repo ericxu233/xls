@@ -23,17 +23,19 @@
 #include "xls/ir/function.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/package.h"
 #include "xls/ir/value.h"
 #include "xls/passes/dce_pass.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace m = ::xls::op_matchers;
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 
 class ConstantFoldingPassTest : public IrTestBase {
  protected:
@@ -41,13 +43,14 @@ class ConstantFoldingPassTest : public IrTestBase {
 
   absl::StatusOr<bool> Run(Function* f) {
     PassResults results;
+    OptimizationContext context;
     XLS_ASSIGN_OR_RETURN(bool changed,
                          ConstantFoldingPass().RunOnFunctionBase(
-                             f, OptimizationPassOptions(), &results));
+                             f, OptimizationPassOptions(), &results, context));
     // Run dce to clean things up.
     XLS_RETURN_IF_ERROR(
         DeadCodeEliminationPass()
-            .RunOnFunctionBase(f, OptimizationPassOptions(), &results)
+            .RunOnFunctionBase(f, OptimizationPassOptions(), &results, context)
             .status());
     // Return whether constant folding changed anything.
     return changed;

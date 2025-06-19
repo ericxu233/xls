@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_DSLX_TYPE_SYSTEM_UNWRAP_METATYPE_H_
-#define XLS_DSLX_TYPE_SYSTEM_UNWRAP_METATYPE_H_
+#ifndef XLS_DSLX_TYPE_SYSTEM_UNWRAP_META_TYPE_H_
+#define XLS_DSLX_TYPE_SYSTEM_UNWRAP_META_TYPE_H_
 
 #include <memory>
 #include <string_view>
 
 #include "absl/status/statusor.h"
-#include "xls/dslx/type_system/concrete_type.h"
+#include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/type_system/type.h"
 
 namespace xls::dslx {
 
@@ -31,12 +32,12 @@ namespace xls::dslx {
 //
 // Returns a TypeInferenceError if t is not a metatype, and the error message
 // will say: "Expected a type in ${context}".
-absl::StatusOr<std::unique_ptr<ConcreteType>> UnwrapMetaType(
-    std::unique_ptr<ConcreteType> t, const Span& span,
-    std::string_view context);
+absl::StatusOr<std::unique_ptr<Type>> UnwrapMetaType(
+    std::unique_ptr<Type> t, const Span& span, std::string_view context,
+    const FileTable& file_table);
 
-absl::StatusOr<const ConcreteType*> UnwrapMetaType(const ConcreteType& t);
+absl::StatusOr<const Type*> UnwrapMetaType(const Type& t);
 
 }  // namespace xls::dslx
 
-#endif  // XLS_DSLX_TYPE_SYSTEM_UNWRAP_METATYPE_H_
+#endif  // XLS_DSLX_TYPE_SYSTEM_UNWRAP_META_TYPE_H_

@@ -20,6 +20,7 @@ load("@bazel_skylib//lib:dicts.bzl", "dicts")
 load(
     "//xls/build_rules:xls_common_rules.bzl",
     "get_runfiles_for_xls",
+    "get_src_ir_for_xls",
     "split_filename",
 )
 load(
@@ -27,14 +28,26 @@ load(
     "CONFIG",
     "enable_generated_file_wrapper",
 )
-load("//xls/build_rules:xls_ir_rules.bzl", "xls_ir_common_attrs")
-load("//xls/build_rules:xls_providers.bzl", "JitWrapperInfo")
+load(
+    "//xls/build_rules:xls_internal_aot_rules.bzl",
+    "xls_aot_generate",
+)
+load(
+    "//xls/build_rules:xls_internal_build_defs.bzl",
+    "XLS_IS_MSAN_BUILD",
+)
+load(
+    "//xls/build_rules:xls_ir_rules.bzl",
+    "xls_ir_common_attrs",
+    "xls_ir_top_attrs",
+)
+load("//xls/build_rules:xls_providers.bzl", "AotCompileInfo", "JitWrapperInfo")
 load(
     "//xls/build_rules:xls_toolchains.bzl",
     "xls_toolchain_attrs",
 )
 load(
-    "//xls/build_rules:xls_type_check_helpers.bzl",
+    "//xls/build_rules:xls_type_check_utils.bzl",
     "bool_type_check",
     "dictionary_type_check",
     "string_type_check",
@@ -56,6 +69,14 @@ _xls_ir_jit_wrapper_attrs = {
     "header_file": attr.output(
         doc = "The filename of the generated header file. The filename must " +
               "have a '" + _H_FILE_EXTENSION + "' extension.",
+        mandatory = True,
+    ),
+    "wrapper_type": attr.string(
+        doc = "type of function_base we are wrapping.",
+        mandatory = True,
+    ),
+    "aot_info": attr.label(
+        doc = "The target which contains information about available AOT code.",
         mandatory = True,
     ),
 }
@@ -106,8 +127,8 @@ def _xls_ir_jit_wrapper_impl(ctx):
             fail("Unrecognized argument: %s." % flag_name)
 
     # source file
-    src = ctx.file.src
-    jit_wrapper_flags.add("--ir_path", src.path)
+    src = get_src_ir_for_xls(ctx)
+    jit_wrapper_flags.add("--ir_path", src.ir_file.path)
 
     # Retrieve basename and extension from filename
     source_filename = ctx.outputs.source_file.basename
@@ -123,6 +144,9 @@ def _xls_ir_jit_wrapper_impl(ctx):
         fail("Header filename must contain the '%s' extension." %
              _H_FILE_EXTENSION)
 
+    if ctx.attr.top != "":
+        jit_wrapper_flags.add("--function", ctx.attr.top)
+
     # validate basename
     if source_basename != header_basename:
         fail("The basename of the source and header files do not match.")
@@ -137,12 +161,20 @@ def _xls_ir_jit_wrapper_impl(ctx):
     jit_wrapper_flags.add("--output_dir", cc_file.dirname)
 
     # genfiles directory
-    jit_wrapper_flags.add("--genfiles_dir", ctx.genfiles_dir.path)
+    jit_wrapper_flags.add("--genfiles_dir", ctx.bin_dir.path + "/")
+
+    # function_type
+    jit_wrapper_flags.add("--function_type", ctx.attr.wrapper_type)
+
+    # Aot information
+    aot_info_file = ctx.attr.aot_info[AotCompileInfo].proto_file
+    jit_wrapper_flags.add("--aot_info", aot_info_file.path)
+
     my_generated_files = [cc_file, h_file]
 
     # Get runfiles
     jit_wrapper_tool_runfiles = ctx.attr._xls_jit_wrapper_tool[DefaultInfo].default_runfiles
-    runfiles = get_runfiles_for_xls(ctx, [jit_wrapper_tool_runfiles], [src])
+    runfiles = get_runfiles_for_xls(ctx, [jit_wrapper_tool_runfiles], [src.ir_file, aot_info_file])
 
     ctx.actions.run(
         outputs = my_generated_files,
@@ -151,8 +183,9 @@ def _xls_ir_jit_wrapper_impl(ctx):
         arguments = [jit_wrapper_flags],
         executable = jit_wrapper_tool.path,
         mnemonic = "IRJITWrapper",
-        progress_message = "Building JIT wrapper for source file: %s" % (src.path),
+        progress_message = "Building JIT wrapper for source file: %s" % (src.ir_file.path),
         toolchain = None,
+        use_default_shell_env = True,
     )
     return [
         JitWrapperInfo(
@@ -196,17 +229,39 @@ Examples:
     implementation = _xls_ir_jit_wrapper_impl,
     attrs = dicts.add(
         xls_ir_common_attrs,
+        xls_ir_top_attrs,
         _xls_ir_jit_wrapper_attrs,
         CONFIG["xls_outs_attrs"],
         xls_toolchain_attrs,
     ),
 )
 
+def _no_aot_info_impl(ctx):
+    """Helper rule to create an empty AotInfo proto."""
+    file = ctx.actions.declare_file(ctx.attr.name + ".pb")
+    ctx.actions.write(file, "", is_executable = False)
+    return [
+        DefaultInfo(files = depset([file])),
+        AotCompileInfo(object_file = None, proto_file = file),
+    ]
+
+_no_aot_info = rule(
+    doc = """Internal only utility rule to generate an empty AotCompileInfo proto file.
+
+    This can be used with function types that don't yet support AOT.
+    """,
+    implementation = _no_aot_info_impl,
+    attrs = {},
+)
+
 def xls_ir_jit_wrapper_macro(
         name,
         src,
+        top,
         source_file,
         header_file,
+        wrapper_type,
+        aot_info,
         jit_wrapper_args = {},
         enable_generated_file = True,
         enable_presubmit_generated_file = False,
@@ -220,10 +275,14 @@ def xls_ir_jit_wrapper_macro(
     Args:
       name: The name of the rule.
       src: The IR file. See 'src' attribute from the 'xls_ir_jit_wrapper' rule.
+      top: Name of the function/block/proc to wrap.
       source_file: The generated source file. See 'source_file' attribute from
         the 'xls_ir_jit_wrapper' rule.
       header_file: The generated header file. See 'header_file' attribute from
         the 'xls_ir_jit_wrapper' rule.
+      wrapper_type: What sort of function base are we wrapping.
+      aot_info: AotCompileInfo generating label with information about the AOT
+        code that is available.
       jit_wrapper_args: Arguments of the JIT tool. See 'jit_wrapper_args'
          attribute from the 'xls_ir_jit_wrapper' rule.
       enable_generated_file: See 'enable_generated_file' from
@@ -236,9 +295,11 @@ def xls_ir_jit_wrapper_macro(
     # Type check input
     string_type_check("name", name)
     string_type_check("src", src)
+    string_type_check("top", top)
     string_type_check("source_file", source_file)
     string_type_check("header_file", header_file)
-    string_type_check("namespace", header_file)
+    string_type_check("wrapper_type", wrapper_type)
+    string_type_check("aot_info", aot_info)
     dictionary_type_check("jit_wrapper_args", jit_wrapper_args)
     bool_type_check("enable_generated_file", enable_generated_file)
     bool_type_check("enable_presubmit_generated_file", enable_presubmit_generated_file)
@@ -246,9 +307,12 @@ def xls_ir_jit_wrapper_macro(
     xls_ir_jit_wrapper(
         name = name,
         src = src,
+        top = top,
         source_file = source_file,
         header_file = header_file,
+        aot_info = aot_info,
         jit_wrapper_args = jit_wrapper_args,
+        wrapper_type = wrapper_type,
         outs = [source_file, header_file],
         **kwargs
     )
@@ -260,10 +324,30 @@ def xls_ir_jit_wrapper_macro(
         **kwargs
     )
 
+FUNCTION_WRAPPER_TYPE = "FUNCTION"
+PROC_WRAPPER_TYPE = "PROC"
+BLOCK_WRAPPER_TYPE = "BLOCK"
+
+_BASE_JIT_WRAPPER_DEPS = {
+    FUNCTION_WRAPPER_TYPE: ["//xls/jit:function_base_jit_wrapper"],
+    PROC_WRAPPER_TYPE: [
+        "//xls/jit:proc_base_jit_wrapper",
+        "@com_google_absl//absl/container:flat_hash_map",
+    ],
+    BLOCK_WRAPPER_TYPE: [
+        "//xls/jit:block_base_jit_wrapper",
+        "//xls/ir:bits",
+        "@com_google_absl//absl/container:flat_hash_map",
+    ],
+}
+
 def cc_xls_ir_jit_wrapper(
         name,
         src,
         jit_wrapper_args = {},
+        wrapper_type = FUNCTION_WRAPPER_TYPE,
+        top = "",
+        llvm_opt_level = 3,
         **kwargs):
     """Invokes the JIT wrapper generator and compiles the result as a cc_library.
 
@@ -276,10 +360,19 @@ def cc_xls_ir_jit_wrapper(
       src: The path to the IR file.
       jit_wrapper_args: Arguments of the JIT wrapper tool. Note: argument
                         'output_name' cannot be defined.
+      wrapper_type: The type of XLS construct to wrap. Must be one of 'BLOCK',
+                    'FUNCTION', or 'PROC'. You should use the exported
+                    FUNCTION_WRAPPER_TYPE, BLOCK_WRAPPER_TYPE, or
+                    PROC_WRAPPER_TYPE symbols. Defaults to FUNCTION_WRAPPER_TYPE
+                    for compatibility.
+      llvm_opt_level: what opt level to configure aot compiled code to use.
+      top: Name of the top function/proc/block.
       **kwargs: Keyword arguments. Named arguments.
     """
+
     dictionary_type_check("jit_wrapper_args", jit_wrapper_args)
     string_type_check("src", src)
+    string_type_check("top", src)
 
     # Validate arguments of macro
     if kwargs.get("source_file"):
@@ -289,12 +382,32 @@ def cc_xls_ir_jit_wrapper(
         fail("Cannot set 'header_file' attribute in macro '%s' of type " +
              "'cc_xls_ir_jit_wrapper'." % name)
 
+    if wrapper_type not in (FUNCTION_WRAPPER_TYPE, BLOCK_WRAPPER_TYPE, PROC_WRAPPER_TYPE):
+        fail(("Cannot set 'wrapper_type' to %s. It must be one of BLOCK_WRAPPER_TYPE, " +
+              "FUNCTION_WRAPPER_TYPE, or PROC_WRAPPER_TYPE") % wrapper_type)
+
     source_filename = name + _CC_FILE_EXTENSION
     header_filename = name + _H_FILE_EXTENSION
+
+    extra_lib_deps = []
+    xls_aot_generate(
+        name = name + "_aot_code_for_wrapper",
+        src = src,
+        top = top,
+        with_msan = XLS_IS_MSAN_BUILD,
+        llvm_opt_level = llvm_opt_level,
+        # The XLS AOT compiler does not currently support cross-compilation.
+    )
+    aot_info_target = ":" + name + "_aot_code_for_wrapper"
+    extra_lib_deps.append(aot_info_target)
+
     xls_ir_jit_wrapper_macro(
         name = "__" + name + "_xls_ir_jit_wrapper",
         src = src,
+        top = top,
         jit_wrapper_args = jit_wrapper_args,
+        aot_info = aot_info_target,
+        wrapper_type = wrapper_type,
         source_file = source_filename,
         header_file = header_filename,
         **kwargs
@@ -304,15 +417,13 @@ def cc_xls_ir_jit_wrapper(
         name = name,
         srcs = [":" + source_filename],
         hdrs = [":" + header_filename],
-        deps = [
+        deps = extra_lib_deps +
+               _BASE_JIT_WRAPPER_DEPS[wrapper_type] + [
             "@com_google_absl//absl/status",
-            "//xls/common/status:status_macros",
             "@com_google_absl//absl/status:statusor",
-            "//xls/public:ir_parser",
-            "//xls/public:ir",
-            "//xls/public:function_builder",
+            "//xls/common/status:status_macros",
+            "//xls/interpreter:evaluator_options",
             "//xls/public:value",
-            "//xls/jit:function_jit",
         ],
         **kwargs
     )

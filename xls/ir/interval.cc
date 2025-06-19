@@ -14,18 +14,14 @@
 
 #include "xls/ir/interval.h"
 
-#include <algorithm>
 #include <cstdint>
-#include <functional>
-#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "absl/status/statusor.h"
+#include "absl/log/check.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
 #include "xls/ir/format_preference.h"
@@ -44,15 +40,15 @@ Interval Interval::Maximal(int64_t bit_width) {
 Interval Interval::Precise(const Bits& bits) { return Interval(bits, bits); }
 
 Interval Interval::ZeroExtend(int64_t bit_width) const {
-  XLS_CHECK_GE(bit_width, BitCount());
+  CHECK_GE(bit_width, BitCount());
   return Interval(bits_ops::ZeroExtend(LowerBound(), bit_width),
                   bits_ops::ZeroExtend(UpperBound(), bit_width));
 }
 
 bool Interval::Overlaps(const Interval& lhs, const Interval& rhs) {
-  XLS_CHECK_EQ(lhs.BitCount(), rhs.BitCount());
-  XLS_CHECK(!lhs.IsImproper());
-  XLS_CHECK(!rhs.IsImproper());
+  CHECK_EQ(lhs.BitCount(), rhs.BitCount());
+  CHECK(!lhs.IsImproper());
+  CHECK(!rhs.IsImproper());
   if (lhs.BitCount() == 0) {
     // The unique zero-width interval overlaps itself.
     return true;
@@ -85,9 +81,9 @@ bool Interval::Disjoint(const Interval& lhs, const Interval& rhs) {
 }
 
 bool Interval::Abuts(const Interval& lhs, const Interval& rhs) {
-  XLS_CHECK_EQ(lhs.BitCount(), rhs.BitCount());
-  XLS_CHECK(!lhs.IsImproper());
-  XLS_CHECK(!rhs.IsImproper());
+  CHECK_EQ(lhs.BitCount(), rhs.BitCount());
+  CHECK(!lhs.IsImproper());
+  CHECK(!rhs.IsImproper());
   if (lhs.BitCount() == 0) {
     // The unique zero-width interval does not abut itself.
     return false;
@@ -122,9 +118,9 @@ bool Interval::Abuts(const Interval& lhs, const Interval& rhs) {
 }
 
 Interval Interval::ConvexHull(const Interval& lhs, const Interval& rhs) {
-  XLS_CHECK_EQ(lhs.BitCount(), rhs.BitCount());
-  XLS_CHECK(!lhs.IsImproper());
-  XLS_CHECK(!rhs.IsImproper());
+  CHECK_EQ(lhs.BitCount(), rhs.BitCount());
+  CHECK(!lhs.IsImproper());
+  CHECK(!rhs.IsImproper());
   if (lhs.BitCount() == 0) {
     // The convex hull of any set of zero-width intervals is of course the
     // unique zero-width interval.
@@ -135,10 +131,10 @@ Interval Interval::ConvexHull(const Interval& lhs, const Interval& rhs) {
 }
 
 std::optional<Interval> Interval::Intersect(const Interval& lhs,
-                                             const Interval& rhs) {
-  XLS_CHECK_EQ(lhs.BitCount(), rhs.BitCount());
-  XLS_CHECK(!lhs.IsImproper());
-  XLS_CHECK(!rhs.IsImproper());
+                                            const Interval& rhs) {
+  CHECK_EQ(lhs.BitCount(), rhs.BitCount());
+  CHECK(!lhs.IsImproper());
+  CHECK(!rhs.IsImproper());
 
   Interval intersection(bits_ops::UMax(lhs.LowerBound(), rhs.LowerBound()),
                         bits_ops::UMin(lhs.UpperBound(), rhs.UpperBound()));
@@ -150,9 +146,9 @@ std::optional<Interval> Interval::Intersect(const Interval& lhs,
 
 std::vector<Interval> Interval::Difference(const Interval& lhs,
                                            const Interval& rhs) {
-  XLS_CHECK_EQ(lhs.BitCount(), rhs.BitCount());
-  XLS_CHECK(!lhs.IsImproper());
-  XLS_CHECK(!rhs.IsImproper());
+  CHECK_EQ(lhs.BitCount(), rhs.BitCount());
+  CHECK(!lhs.IsImproper());
+  CHECK(!rhs.IsImproper());
 
   // X - Y = X - (X ∩ Y)
   std::optional<Interval> intersection = Intersect(lhs, rhs);
@@ -185,49 +181,11 @@ std::vector<Interval> Interval::Complement(const Interval& interval) {
 }
 
 bool Interval::IsSubsetOf(const Interval& lhs, const Interval& rhs) {
-  XLS_CHECK_EQ(lhs.BitCount(), rhs.BitCount());
-  XLS_CHECK(!lhs.IsImproper());
-  XLS_CHECK(!rhs.IsImproper());
+  CHECK_EQ(lhs.BitCount(), rhs.BitCount());
+  CHECK(!lhs.IsImproper());
+  CHECK(!rhs.IsImproper());
   return bits_ops::ULessThanOrEqual(rhs.LowerBound(), lhs.LowerBound()) &&
          bits_ops::UGreaterThanOrEqual(rhs.UpperBound(), lhs.UpperBound());
-}
-
-bool Interval::ForEachElement(
-    const std::function<bool(const Bits&)>& callback) const {
-  EnsureValid();
-  if (bits_ops::UEqual(lower_bound_, upper_bound_)) {
-    return callback(lower_bound_);
-  }
-  Bits value = lower_bound_;
-  if (IsImproper()) {
-    Bits max = Bits::AllOnes(BitCount());
-    while (bits_ops::ULessThan(value, max)) {
-      if (callback(value)) {
-        return true;
-      }
-      value = bits_ops::Increment(value);
-    }
-    if (callback(value)) {
-      return true;
-    }
-    value = UBits(0, BitCount());
-  }
-  while (bits_ops::ULessThan(value, upper_bound_)) {
-    if (callback(value)) {
-      return true;
-    }
-    value = bits_ops::Increment(value);
-  }
-  return callback(value);
-}
-
-std::vector<Bits> Interval::Elements() const {
-  std::vector<Bits> result;
-  ForEachElement([&result](const Bits& value) {
-    result.push_back(value);
-    return false;
-  });
-  return result;
 }
 
 Bits Interval::SizeBits() const {
@@ -247,15 +205,7 @@ Bits Interval::SizeBits() const {
 }
 
 std::optional<int64_t> Interval::Size() const {
-  absl::StatusOr<uint64_t> size_status = SizeBits().ToUint64();
-  if (size_status.ok()) {
-    uint64_t size = *size_status;
-    if (size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-      return std::nullopt;
-    }
-    return static_cast<int64_t>(size);
-  }
-  return std::nullopt;
+  return bits_ops::TryUnsignedBitsToInt64(SizeBits());
 }
 
 bool Interval::IsImproper() const {
@@ -286,23 +236,27 @@ bool Interval::IsMaximal() const {
   if (BitCount() == 0) {
     return true;
   }
-  return bits_ops::UEqual(lower_bound_, UBits(0, BitCount())) &&
-         bits_ops::UEqual(upper_bound_, Bits::AllOnes(BitCount()));
+  if (IsImproper()) {
+    // Means upper is less than lower.
+    return bits_ops::UEqual(bits_ops::Increment(upper_bound_), lower_bound_);
+  }
+  return lower_bound_.IsZero() && upper_bound_.IsAllOnes();
 }
 
 bool Interval::IsTrueWhenAndWith(const Bits& value) const {
-  XLS_CHECK_EQ(value.bit_count(), BitCount());
-  int64_t right_index = std::min(LowerBound().CountTrailingZeros(),
-                                 UpperBound().CountTrailingZeros());
-  int64_t left_index = BitCount() - UpperBound().CountLeadingZeros();
-  Bits interval_mask_value(BitCount());
-  interval_mask_value.SetRange(right_index, left_index);
-  return !bits_ops::And(interval_mask_value, value).IsZero();
+  CHECK_EQ(value.bit_count(), BitCount());
+  BitsRope interval_mask_value(BitCount());
+  Bits common_prefix =
+      bits_ops::LongestCommonPrefixMSB({LowerBound(), UpperBound()});
+  interval_mask_value.push_back(
+      Bits::AllOnes(BitCount() - common_prefix.bit_count()));
+  interval_mask_value.push_back(common_prefix);
+  return !bits_ops::And(interval_mask_value.Build(), value).IsZero();
 }
 
 bool Interval::Covers(const Bits& point) const {
   EnsureValid();
-  XLS_CHECK_EQ(BitCount(), point.bit_count());
+  CHECK_EQ(BitCount(), point.bit_count());
   if (BitCount() == 0) {
     return true;
   }

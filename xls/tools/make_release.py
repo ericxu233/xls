@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# pylint: disable=broad-exception-raised
 """Script for project-specific release of the XLS toolchain.
 
 Usage:
@@ -35,9 +36,10 @@ BINARIES = (
     'dslx/ir_convert/ir_converter_main',
     'tools/opt_main',
     'tools/codegen_main',
-    'visualization/ir_viz/app',
+    # TODO: https://github.com/google/xls/issues/2021 - Re-enable when fixed.
+    # 'visualization/ir_viz/app',
 )
-PACKAGE_UTIL = 'tools/package_bazel_build'
+PACKAGE_UTIL = 'dev_tools/package_bazel_build'
 
 # BUILD file to write into the release directory.
 BUILD_FILE = """package(
@@ -62,7 +64,8 @@ def build_and_copy_binaries(wc_dir, target_dir):
   bazel_args = ['bazel', 'build', '-c', 'opt'] + targets + [package_target]
   print('Running:\n  ' + ' '.join(bazel_args))
   subprocess.check_call(
-      ['bazel', 'build', '-c', 'opt'] + targets + [package_target], cwd=wc_dir)
+      ['bazel', 'build', '-c', 'opt'] + targets + [package_target], cwd=wc_dir
+  )
 
   print(f'Copying binaries to {target_dir}')
 

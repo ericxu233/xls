@@ -15,19 +15,28 @@
 #include "xls/noc/drivers/experiment.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 #include "absl/types/variant.h"
-#include "xls/common/logging/logging.h"
+#include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/noc/simulation/common.h"
+#include "xls/noc/simulation/flit.h"
 #include "xls/noc/simulation/global_routing_table.h"
 #include "xls/noc/simulation/network_graph.h"
 #include "xls/noc/simulation/network_graph_builder.h"
 #include "xls/noc/simulation/noc_traffic_injector.h"
 #include "xls/noc/simulation/parameters.h"
+#include "xls/noc/simulation/random_number_interface.h"
 #include "xls/noc/simulation/sim_objects.h"
 #include "xls/noc/simulation/simulator_to_link_monitor_service_shim.h"
 #include "xls/noc/simulation/simulator_to_traffic_injector_shim.h"
@@ -112,20 +121,20 @@ Stats GetStats(absl::Span<const PacketInfo> packets) {
 }  // namespace internal
 
 absl::Status ExperimentMetrics::DebugDump() const {
-  XLS_LOG(INFO) << "Dumping Metrics ...";
+  LOG(INFO) << "Dumping Metrics ...";
 
   for (auto& [name, val] : float_metrics_) {
-    XLS_LOG(INFO) << absl::StreamFormat("%s : %g", name, val);
+    LOG(INFO) << absl::StreamFormat("%s : %g", name, val);
   }
 
   for (auto& [name, val] : integer_metrics_) {
-    XLS_LOG(INFO) << absl::StreamFormat("%s : %g", name, val);
+    LOG(INFO) << absl::StreamFormat("%s : %g", name, val);
   }
 
   for (auto& [name, val] : integer_integer_map_metrics_) {
-    XLS_LOG(INFO) << absl::StreamFormat("%s :", name);
+    LOG(INFO) << absl::StreamFormat("%s :", name);
     for (auto& [key, value] : val) {
-      XLS_LOG(INFO) << absl::StreamFormat("%g , %g", key, value);
+      LOG(INFO) << absl::StreamFormat("%g , %g", key, value);
     }
   }
 
@@ -214,7 +223,7 @@ absl::StatusOr<ExperimentData> ExperimentRunner::RunExperiment(
        routing_table.GetSinkIndices().GetNetworkComponents()) {
     XLS_ASSIGN_OR_RETURN(NetworkComponentParam nc_param,
                          params.GetNetworkComponentParam(sink_id));
-    XLS_CHECK(std::holds_alternative<NetworkInterfaceSinkParam>(nc_param));
+    CHECK(std::holds_alternative<NetworkInterfaceSinkParam>(nc_param));
     std::string nc_name =
         std::string(std::get<NetworkInterfaceSinkParam>(nc_param).GetName());
 
@@ -309,8 +318,8 @@ absl::StatusOr<ExperimentData> ExperimentRunner::RunExperiment(
       // Get vc name
       XLS_ASSIGN_OR_RETURN(NetworkParam network_param,
                            params.GetNetworkParam(graph.GetNetworkIds()[0]));
-      XLS_CHECK(flit_destination.vc >= 0 &&
-                flit_destination.vc < network_param.VirtualChannelCount())
+      CHECK(flit_destination.vc >= 0 &&
+            flit_destination.vc < network_param.VirtualChannelCount())
           << "VC index is out of range.";
       VirtualChannelParam vc_param =
           network_param.GetVirtualChannels().at(flit_destination.vc);

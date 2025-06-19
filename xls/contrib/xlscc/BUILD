@@ -17,14 +17,20 @@
 #  depending on the translation library.
 # Email xls-team@ or seanhaskell@ if a dependency is desired.
 
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+# Load proto_library
+# cc_proto_library is used in this file
+
 # pytype binary only
 load("@rules_python//python:proto.bzl", "py_proto_library")
-load("@bazel_skylib//rules:build_test.bzl", "build_test")
-# cc_proto_library is used in this file
 
 package(
     default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -37,15 +43,18 @@ proto_library(
     name = "hls_block_proto",
     srcs = ["hls_block.proto"],
     features = ["-proto_dynamic_mode_static_link"],
+    deps = ["//xls/ir:channel_proto"],
 )
 
 cc_proto_library(
     name = "hls_block_cc_proto",
+    visibility = ["//xls:xls_users"],
     deps = [":hls_block_proto"],
 )
 
 py_proto_library(
     name = "hls_block_py_pb2",
+    visibility = ["//xls:xls_users"],
     deps = [":hls_block_proto"],
 )
 
@@ -80,8 +89,8 @@ py_binary(
     visibility = ["//xls:xls_users"],
     deps = [
         ":metadata_output_py_pb2",
-        "@com_google_absl_py//absl:app",
-        "@com_google_absl_py//absl/flags",
+        "@abseil-py//absl:app",
+        "@abseil-py//absl/flags",
     ],
 )
 
@@ -90,59 +99,159 @@ cc_library(
     hdrs = [
         "xlscc_logging.h",
     ],
+    deps = ["@com_google_absl//absl/log:check"],
+)
+
+cc_library(
+    name = "tracked_bvalue",
+    srcs = ["tracked_bvalue.cc"],
+    hdrs = ["tracked_bvalue.h"],
+    deps = [
+        "//xls/ir",
+        "//xls/ir:function_builder",
+        "//xls/ir:source_location",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+cc_library(
+    name = "node_manipulation",
+    srcs = ["node_manipulation.cc"],
+    hdrs = ["node_manipulation.h"],
+    deps = [
+        "//xls/ir",
+        "//xls/ir:op",
+    ],
+)
+
+cc_library(
+    name = "translator_types",
+    srcs = [
+        "translator_types.cc",
+    ],
+    hdrs = [
+        "translator_types.h",
+    ],
+    deps = [
+        ":metadata_output_cc_proto",
+        ":node_manipulation",
+        ":tracked_bvalue",
+        "//xls/common/status:status_macros",
+        "//xls/ir",
+        "//xls/ir:bits",
+        "//xls/ir:function_builder",
+        "//xls/ir:source_location",
+        "//xls/ir:type",
+        "//xls/ir:value",
+        "@com_google_absl//absl/container:btree",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:str_format",
+        "@llvm-project//clang:ast",
+        "@llvm-project//clang:basic",
+    ],
+)
+
+cc_library(
+    name = "generate_fsm",
+    srcs = [
+        "generate_fsm.cc",
+    ],
+    hdrs = [
+        "generate_fsm.h",
+    ],
+    deps = [
+        ":tracked_bvalue",
+        ":translator_types",
+        ":xlscc_logging",
+        "//xls/common/status:status_macros",
+        "//xls/ir",
+        "//xls/ir:source_location",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+    ],
 )
 
 cc_library(
     name = "translator",
     srcs = [
+        "continuations.cc",
         "translate_block.cc",
         "translate_io.cc",
         "translate_loops.cc",
         "translate_metadata.cc",
         "translator.cc",
-        "translator_types.cc",
     ],
     hdrs = [
         "translator.h",
     ],
     deps = [
         ":cc_parser",
+        ":generate_fsm",
         ":hls_block_cc_proto",
         ":metadata_output_cc_proto",
+        ":node_manipulation",
+        ":tracked_bvalue",
+        ":translator_types",
         ":xlscc_logging",
-        "@com_google_absl//absl/base",
-        "@com_google_absl//absl/container:btree",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/container:flat_hash_set",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:str_format",
-        "@com_google_absl//absl/types:span",
-        "//xls/common/logging",
+        "//xls/common:math_util",
+        "//xls/common:stopwatch",
+        "//xls/common/status:ret_check",
         "//xls/common/status:status_macros",
         "//xls/interpreter:ir_interpreter",
         "//xls/ir",
         "//xls/ir:bits",
         "//xls/ir:caret",
         "//xls/ir:channel",
+        "//xls/ir:channel_cc_proto",
         "//xls/ir:channel_ops",
         "//xls/ir:function_builder",
         "//xls/ir:ir_parser",
         "//xls/ir:op",
         "//xls/ir:source_location",
+        "//xls/ir:state_element",
         "//xls/ir:type",
         "//xls/ir:value",
-        "//xls/ir:value_helpers",
+        "//xls/ir:value_utils",
+        "//xls/passes:dce_pass",
         "//xls/passes:optimization_pass",
         "//xls/passes:optimization_pass_pipeline",
+        "//xls/passes:pass_base",
         "//xls/solvers:z3_ir_translator",
         "//xls/solvers:z3_utils",
-        "@z3//:api",
-        "@com_googlesource_code_re2//:re2",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/container:btree",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
         "@llvm-project//clang:ast",
         "@llvm-project//clang:basic",
         "@llvm-project//llvm:Support",
+        "@re2",
+        "@z3//:api",
     ],
 )
 
@@ -152,22 +261,28 @@ cc_library(
     hdrs = ["cc_parser.h"],
     deps = [
         ":metadata_output_cc_proto",
+        "//xls/common:thread",
+        "//xls/common/file:filesystem",
+        "//xls/ir",
+        "//xls/ir:channel",
+        "//xls/ir:source_location",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
-        "//xls/common:thread",
-        "//xls/common/logging",
-        "//xls/common/status:status_macros",
-        "//xls/ir",
-        "//xls/ir:source_location",
-        "@com_googlesource_code_re2//:re2",
+        "@com_google_absl//absl/types:span",
         "@llvm-project//clang:ast",
         "@llvm-project//clang:basic",
         "@llvm-project//clang:frontend",
+        "@llvm-project//clang:lex",
+        "@llvm-project//clang:sema",
         "@llvm-project//clang:tooling",
+        "@llvm-project//llvm:Support",
     ],
 )
 
@@ -181,12 +296,19 @@ filegroup(
         "synth_only/ac_compat/ac_wait.h",
         "synth_only/algorithm",
         "synth_only/assert.h",
+        "synth_only/atomic",
         "synth_only/cassert",
         "synth_only/cmath",
+        "synth_only/cstddef",
         "synth_only/cstdint",
+        "synth_only/cstdio",
         "synth_only/cstdlib",
+        "synth_only/fstream",
         "synth_only/inttypes.h",
+        "synth_only/iomanip",
+        "synth_only/ios",
         "synth_only/iostream",
+        "synth_only/istream",
         "synth_only/limits",
         "synth_only/math.h",
         "synth_only/ostream",
@@ -194,33 +316,44 @@ filegroup(
         "synth_only/stdarg.h",
         "synth_only/stddef.h",
         "synth_only/stdint.h",
+        "synth_only/stdio.h",
         "synth_only/string",
         "synth_only/type_traits",
+        "synth_only/utility",
+        "synth_only/vector",
         "synth_only/xls_fixed.h",
         "synth_only/xls_int.h",
+        "synth_only/xls_intrinsics.h",
     ],
     visibility = ["//xls:xls_users"],
 )
 
 cc_binary(
     name = "xlscc",
-    srcs = ["main.cc"],
+    srcs = [
+        "flags.h",
+        "main.cc",
+    ],
     visibility = ["//xls:xls_users"],
     deps = [
         ":hls_block_cc_proto",
         ":metadata_output_cc_proto",
         ":translator",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:str_format",
         "//xls/common:exit_status",
         "//xls/common:init_xls",
         "//xls/common/file:filesystem",
-        "//xls/common/logging",
         "//xls/common/logging:log_flags",
         "//xls/common/status:status_macros",
+        "//xls/ir",
+        "//xls/ir:channel",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:span",
         "@llvm-project//clang:ast",
     ],
 )
@@ -232,12 +365,11 @@ py_binary(
         "//xls/tools:eval_ir_main",
         "//xls/tools:eval_proc_main",
     ],
-    python_version = "PY3",
     deps = [
         ":hls_block_py_pb2",
         ":metadata_output_py_pb2",
-        "@com_google_absl_py//absl:app",
-        "@com_google_absl_py//absl/flags",
         "//xls/common:runfiles",
+        "@abseil-py//absl:app",
+        "@abseil-py//absl/flags",
     ],
 )

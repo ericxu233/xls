@@ -14,23 +14,33 @@
 
 #include "xls/passes/dce_pass.h"
 
+#include <cstdint>
 #include <deque>
 
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/function_base.h"
+#include "xls/ir/node_util.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
 #include "xls/passes/pass_base.h"
 
 namespace xls {
 
 absl::StatusOr<bool> DeadCodeEliminationPass::RunOnFunctionBaseInternal(
     FunctionBase* f, const OptimizationPassOptions& options,
-    PassResults* results) const {
+    PassResults* results, OptimizationContext& context) const {
   auto is_deletable = [](Node* n) {
-    return !n->function_base()->HasImplicitUse(n) &&
+    // Don't remove invokes, they will be removed by inlining. The invoked
+    // functions could have side effects, so DCE shouldn't remove them.
+    //
+    // TODO: google/xls#1806 -  consider making invokes side-effecting if we can
+    // deal with FFI well.
+    return !n->function_base()->HasImplicitUse(n) && !n->Is<Invoke>() &&
            (!OpIsSideEffecting(n->op()) || n->Is<Gate>());
   };
 
@@ -51,18 +61,20 @@ absl::StatusOr<bool> DeadCodeEliminationPass::RunOnFunctionBaseInternal(
     unique_operands.clear();
     for (Node* operand : node->operands()) {
       if (unique_operands.insert(operand).second) {
-        if (operand->users().size() == 1 && is_deletable(operand)) {
+        if (HasSingleUse(operand) && is_deletable(operand)) {
           worklist.push_back(operand);
         }
       }
     }
-    XLS_VLOG(3) << "DCE removing " << node->ToString();
+    VLOG(3) << "DCE removing " << node->ToString();
     XLS_RETURN_IF_ERROR(f->RemoveNode(node));
     removed_count++;
   }
 
-  XLS_VLOG(2) << "Removed " << removed_count << " dead nodes";
+  VLOG(2) << "Removed " << removed_count << " dead nodes";
   return removed_count > 0;
 }
+
+REGISTER_OPT_PASS(DeadCodeEliminationPass);
 
 }  // namespace xls

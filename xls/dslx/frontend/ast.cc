@@ -16,9 +16,10 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <memory>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -26,26 +27,35 @@
 #include <variant>
 #include <vector>
 
+#include "absl/algorithm/container.h"
+#include "absl/base/no_destructor.h"
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
-#include "absl/meta/type_traits.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/substitute.h"
 #include "absl/types/span.h"
 #include "absl/types/variant.h"
 #include "xls/common/casts.h"
 #include "xls/common/indent.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/visitor.h"
+#include "xls/dslx/channel_direction.h"
+#include "xls/dslx/frontend/ast_builtin_types.inc"
+#include "xls/dslx/frontend/ast_node.h"
 #include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/frontend/token_utils.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
+#include "xls/ir/format_preference.h"
+#include "xls/ir/format_strings.h"
 #include "xls/ir/number_parser.h"
 
 namespace xls::dslx {
@@ -76,16 +86,38 @@ class DfsIteratorNoTypes {
 
 static AnyNameDef GetSubjectNameDef(const ColonRef::Subject& subject) {
   return absl::visit(
-      Visitor{
-          [](NameRef* n) { return n->name_def(); },
-          [](ColonRef* n) { return GetSubjectNameDef(n->subject()); },
-      },
+      Visitor{[](NameRef* n) { return n->name_def(); },
+              [](ColonRef* n) { return GetSubjectNameDef(n->subject()); },
+              [](TypeRefTypeAnnotation* n) {
+                return TypeDefinitionGetNameDef(
+                    n->type_ref()->type_definition());
+              }},
       subject);
 }
 
 void Parenthesize(std::string* s) { *s = absl::StrCat("(", *s, ")"); }
 
+std::string MakeExternTypeAttr(const std::optional<std::string>& name) {
+  if (name) {
+    return absl::StrFormat("#[sv_type(\"%s\")]\n", *name);
+  }
+  return "";
+}
 }  // namespace
+
+std::string_view FunctionTagToString(FunctionTag tag) {
+  switch (tag) {
+    case FunctionTag::kNormal:
+      return "normal";
+    case FunctionTag::kProcConfig:
+      return "proc config";
+    case FunctionTag::kProcNext:
+      return "proc next";
+    case FunctionTag::kProcInit:
+      return "proc init";
+  }
+  LOG(FATAL) << "Out-of-range function tag: " << static_cast<int>(tag);
+}
 
 std::string_view PrecedenceToString(Precedence p) {
   switch (p) {
@@ -139,17 +171,17 @@ std::string_view PrecedenceToString(Precedence p) {
       return "weakest";
   }
 
-  XLS_LOG(FATAL) << "Invalid precedence value: " << static_cast<int>(p);
+  LOG(FATAL) << "Invalid precedence value: " << static_cast<int>(p);
 }
 
 constexpr int64_t kTargetLineChars = 80;
 
 ExprOrType ToExprOrType(AstNode* n) {
-  if (Expr* e = down_cast<Expr*>(n)) {
+  if (Expr* e = dynamic_cast<Expr*>(n)) {
     return e;
   }
   auto* type = down_cast<TypeAnnotation*>(n);
-  XLS_CHECK_NE(type, nullptr);
+  CHECK_NE(type, nullptr);
   return type;
 }
 
@@ -177,6 +209,8 @@ std::string_view AstNodeKindToString(AstNodeKind kind) {
       return "type reference";
     case AstNodeKind::kImport:
       return "import";
+    case AstNodeKind::kImpl:
+      return "impl";
     case AstNodeKind::kUnop:
       return "unary op";
     case AstNodeKind::kBinop:
@@ -193,8 +227,6 @@ std::string_view AstNodeKindToString(AstNodeKind kind) {
       return "proc member";
     case AstNodeKind::kNameRef:
       return "name reference";
-    case AstNodeKind::kConstRef:
-      return "const reference";
     case AstNodeKind::kArray:
       return "array";
     case AstNodeKind::kString:
@@ -247,24 +279,36 @@ std::string_view AstNodeKindToString(AstNodeKind kind) {
       return "format macro";
     case AstNodeKind::kZeroMacro:
       return "zero macro";
+    case AstNodeKind::kAllOnesMacro:
+      return "all-ones macro";
     case AstNodeKind::kSlice:
       return "slice";
     case AstNodeKind::kEnumDef:
       return "enum definition";
     case AstNodeKind::kStructDef:
       return "struct definition";
+    case AstNodeKind::kStructMember:
+      return "struct member";
+    case AstNodeKind::kProcDef:
+      return "proc definition";
     case AstNodeKind::kQuickCheck:
       return "quick-check";
     case AstNodeKind::kXlsTuple:
       return "tuple";
+    case AstNodeKind::kRestOfTuple:
+      return "rest of tuple";
     case AstNodeKind::kFor:
       return "for";
-    case AstNodeKind::kBlock:
-      return "block";
+    case AstNodeKind::kFunctionRef:
+      return "function-ref";
+    case AstNodeKind::kStatementBlock:
+      return "statement-block";
     case AstNodeKind::kCast:
       return "cast";
     case AstNodeKind::kConstantDef:
       return "constant definition";
+    case AstNodeKind::kLambda:
+      return "lambda";
     case AstNodeKind::kLet:
       return "let";
     case AstNodeKind::kChannelDecl:
@@ -275,39 +319,70 @@ std::string_view AstNodeKindToString(AstNodeKind kind) {
       return "tuple index";
     case AstNodeKind::kUnrollFor:
       return "unroll-for";
+    case AstNodeKind::kUse:
+      return "use";
+    case AstNodeKind::kUseTreeEntry:
+      return "use-tree-entry";
+    case AstNodeKind::kVerbatimNode:
+      return "verbatim-node";
   }
-  XLS_LOG(FATAL) << "Out-of-range AstNodeKind: " << static_cast<int>(kind);
+  LOG(FATAL) << "Out-of-range AstNodeKind: " << static_cast<int>(kind);
 }
 
 AnyNameDef TypeDefinitionGetNameDef(const TypeDefinition& td) {
   return absl::visit(
       Visitor{
-          [](TypeAlias* n) -> AnyNameDef { return n->name_def(); },
+          [](TypeAlias* n) -> AnyNameDef { return &n->name_def(); },
           [](StructDef* n) -> AnyNameDef { return n->name_def(); },
+          [](ProcDef* n) -> AnyNameDef { return n->name_def(); },
           [](EnumDef* n) -> AnyNameDef { return n->name_def(); },
           [](ColonRef* n) -> AnyNameDef {
             return GetSubjectNameDef(n->subject());
+          },
+          [](UseTreeEntry* n) -> AnyNameDef {
+            return n->GetLeafNameDef().value();
           },
       },
       td);
 }
 
+AstNode* TypeDefinitionToAstNode(const TypeDefinition& td) {
+  return absl::visit(Visitor{
+                         [](TypeAlias* n) -> AstNode* { return n; },
+                         [](StructDef* n) -> AstNode* { return n; },
+                         [](ProcDef* n) -> AstNode* { return n; },
+                         [](EnumDef* n) -> AstNode* { return n; },
+                         [](ColonRef* n) -> AstNode* { return n; },
+                         [](UseTreeEntry* n) -> AstNode* { return n; },
+                     },
+                     td);
+}
+
 absl::StatusOr<TypeDefinition> ToTypeDefinition(AstNode* node) {
-  if (auto* n = dynamic_cast<TypeAlias*>(node)) {
-    return TypeDefinition(n);
+  if (node->kind() == AstNodeKind::kTypeAlias) {
+    return down_cast<TypeAlias*>(node);
   }
-  if (auto* n = dynamic_cast<StructDef*>(node)) {
-    return TypeDefinition(n);
+  if (node->kind() == AstNodeKind::kProcDef) {
+    return down_cast<ProcDef*>(node);
   }
-  if (auto* n = dynamic_cast<EnumDef*>(node)) {
-    return TypeDefinition(n);
+  if (node->kind() == AstNodeKind::kStructDef) {
+    return down_cast<StructDef*>(node);
   }
-  if (auto* n = dynamic_cast<ColonRef*>(node)) {
-    return TypeDefinition(n);
+  if (node->kind() == AstNodeKind::kEnumDef) {
+    return down_cast<EnumDef*>(node);
+  }
+  if (node->kind() == AstNodeKind::kColonRef) {
+    return down_cast<ColonRef*>(node);
   }
   return absl::InvalidArgumentError(
-      absl::StrFormat("AST node is not a type definition: (%s) %s",
-                      node->GetNodeTypeName(), node->ToString()));
+      absl::StrCat("AST node is not a type definition: ", node->kind()));
+}
+
+const Span& FreeVariables::GetFirstNameRefSpan(
+    std::string_view identifier) const {
+  std::vector<const NameRef*> name_refs = values_.at(identifier);
+  CHECK(!name_refs.empty());
+  return name_refs.at(0)->span();
 }
 
 FreeVariables FreeVariables::DropBuiltinDefs() const {
@@ -337,18 +412,6 @@ FreeVariables::GetNameDefTuples() const {
   return result;
 }
 
-std::vector<const ConstRef*> FreeVariables::GetConstRefs() {
-  std::vector<const ConstRef*> const_refs;
-  for (const auto& [name, refs] : values_) {
-    for (const NameRef* name_ref : refs) {
-      if (auto* const_ref = dynamic_cast<const ConstRef*>(name_ref)) {
-        const_refs.push_back(const_ref);
-      }
-    }
-  }
-  return const_refs;
-}
-
 std::vector<AnyNameDef> FreeVariables::GetNameDefs() const {
   std::vector<AnyNameDef> result;
   for (auto& pair : GetNameDefTuples()) {
@@ -358,6 +421,7 @@ std::vector<AnyNameDef> FreeVariables::GetNameDefs() const {
 }
 
 void FreeVariables::Add(std::string identifier, const NameRef* name_ref) {
+  name_refs_.insert(name_ref);
   auto it = values_.insert({identifier, {name_ref}});
   if (!it.second) {
     it.first->second.push_back(name_ref);
@@ -372,26 +436,46 @@ absl::flat_hash_set<std::string> FreeVariables::Keys() const {
   return result;
 }
 
-FreeVariables GetFreeVariables(const AstNode* node, const Pos* start_pos) {
+std::string FreeVariables::ToString() const {
+  auto name_ref_appender = [](std::string* out, const NameRef* ref) {
+    absl::StrAppendFormat(out, "NameRef(%p)", ref);
+  };
+  auto item_appender =
+      [&](std::string* out,
+          const std::pair<std::string, std::vector<const NameRef*>>& item) {
+        absl::StrAppend(out, item.first, ": [",
+                        absl::StrJoin(item.second, ", ", name_ref_appender),
+                        "]");
+      };
+  return absl::StrFormat("{%s}", absl::StrJoin(values_, ", ", item_appender));
+}
+
+FreeVariables GetFreeVariablesByLambda(
+    const AstNode* node,
+    const std::function<bool(const NameRef&)>& consider_free) {
   DfsIteratorNoTypes it(node);
   FreeVariables freevars;
   while (it.HasNext()) {
     const AstNode* n = it.Next();
-    if (const auto* name_ref = dynamic_cast<const NameRef*>(n)) {
-      // If a start position was given we test whether the name definition
-      // occurs before that start position. (If none was given we accept all
-      // name refs.)
-      if (start_pos == nullptr) {
+    if (n->kind() == AstNodeKind::kNameRef) {
+      const auto* name_ref = down_cast<const NameRef*>(n);
+      if (consider_free == nullptr || consider_free(*name_ref)) {
         freevars.Add(name_ref->identifier(), name_ref);
-      } else {
-        std::optional<Pos> name_def_start = name_ref->GetNameDefStart();
-        if (!name_def_start.has_value() || *name_def_start < *start_pos) {
-          freevars.Add(name_ref->identifier(), name_ref);
-        }
       }
     }
   }
   return freevars;
+}
+
+FreeVariables GetFreeVariablesByPos(const AstNode* node, const Pos* start_pos) {
+  std::function<bool(const NameRef&)> consider_free = nullptr;
+  if (start_pos != nullptr) {
+    consider_free = [start_pos](const NameRef& name_ref) {
+      std::optional<Pos> name_def_start = name_ref.GetNameDefStart();
+      return !name_def_start.has_value() || name_def_start.value() < *start_pos;
+    };
+  }
+  return GetFreeVariablesByLambda(node, consider_free);
 }
 
 std::string BuiltinTypeToString(BuiltinType t) {
@@ -406,9 +490,13 @@ std::string BuiltinTypeToString(BuiltinType t) {
 }
 
 absl::StatusOr<BuiltinType> GetBuiltinType(bool is_signed, int64_t width) {
-#define TEST(__enum, __name, __str, __signedness, __width) \
-  if (__signedness == is_signed && __width == width) {     \
-    return BuiltinType::__enum;                            \
+#define TEST(__enum, __name, __str, __signedness, __width)           \
+  {                                                                  \
+    std::optional<bool> signedness = __signedness;                   \
+    if (signedness.has_value() && signedness.value() == is_signed && \
+        __width == width) {                                          \
+      return BuiltinType::__enum;                                    \
+    }                                                                \
   }
   XLS_DSLX_BUILTIN_TYPE_EACH(TEST)
 #undef TEST
@@ -419,9 +507,15 @@ absl::StatusOr<BuiltinType> GetBuiltinType(bool is_signed, int64_t width) {
 
 absl::StatusOr<bool> GetBuiltinTypeSignedness(BuiltinType type) {
   switch (type) {
-#define CASE(__enum, _unused1, _unused2, __signedness, _unused3) \
-  case BuiltinType::__enum:                                      \
-    return __signedness;
+#define CASE(__enum, _unused1, __str, __signedness, _unused3)           \
+  case BuiltinType::__enum: {                                           \
+    std::optional<bool> signedness = __signedness;                      \
+    if (!signedness.has_value()) {                                      \
+      return absl::InvalidArgumentError("Type " #__str                  \
+                                        " has no defined signedness."); \
+    }                                                                   \
+    return signedness.value();                                          \
+  }
     XLS_DSLX_BUILTIN_TYPE_EACH(CASE)
 #undef CASE
   }
@@ -429,7 +523,7 @@ absl::StatusOr<bool> GetBuiltinTypeSignedness(BuiltinType type) {
       absl::StrCat("Unknown builtin type: ", static_cast<int64_t>(type)));
 }
 
-absl::StatusOr<int64_t> GetBuiltinTypeBitCount(BuiltinType type) {
+int64_t GetBuiltinTypeBitCount(BuiltinType type) {
   switch (type) {
 #define CASE(__enum, _unused1, _unused2, _unused3, __width) \
   case BuiltinType::__enum:                                 \
@@ -437,8 +531,7 @@ absl::StatusOr<int64_t> GetBuiltinTypeBitCount(BuiltinType type) {
     XLS_DSLX_BUILTIN_TYPE_EACH(CASE)
 #undef CASE
   }
-  return absl::InvalidArgumentError(
-      absl::StrCat("Unknown builtin type: ", static_cast<int64_t>(type)));
+  LOG(FATAL) << "Impossible builtin type: " << static_cast<int64_t>(type);
 }
 
 absl::StatusOr<BuiltinType> BuiltinTypeFromString(std::string_view s) {
@@ -453,32 +546,50 @@ absl::StatusOr<BuiltinType> BuiltinTypeFromString(std::string_view s) {
 }
 
 const absl::btree_set<BinopKind>& GetBinopSameTypeKinds() {
-  static auto* singleton = new absl::btree_set<BinopKind>{
-      BinopKind::kAdd, BinopKind::kSub, BinopKind::kMul, BinopKind::kAnd,
-      BinopKind::kOr,  BinopKind::kXor, BinopKind::kDiv,
-  };
+  static const absl::NoDestructor<absl::btree_set<BinopKind>> singleton({
+      BinopKind::kAdd,
+      BinopKind::kSub,
+      BinopKind::kMul,
+      BinopKind::kAnd,
+      BinopKind::kOr,
+      BinopKind::kXor,
+      BinopKind::kDiv,
+      BinopKind::kMod,
+  });
   return *singleton;
 }
 
 const absl::btree_set<BinopKind>& GetBinopComparisonKinds() {
-  static auto* singleton = new absl::btree_set<BinopKind>{
-      BinopKind::kGe, BinopKind::kGt, BinopKind::kLe,
-      BinopKind::kLt, BinopKind::kEq, BinopKind::kNe,
-  };
+  static const absl::NoDestructor<absl::btree_set<BinopKind>> singleton({
+      BinopKind::kGe,
+      BinopKind::kGt,
+      BinopKind::kLe,
+      BinopKind::kLt,
+      BinopKind::kEq,
+      BinopKind::kNe,
+  });
+  return *singleton;
+}
+
+const absl::btree_set<BinopKind>& GetBinopLogicalKinds() {
+  static const absl::NoDestructor<absl::btree_set<BinopKind>> singleton({
+      BinopKind::kLogicalOr,
+      BinopKind::kLogicalAnd,
+  });
   return *singleton;
 }
 
 const absl::btree_set<BinopKind>& GetBinopShifts() {
-  static auto* singleton = new absl::btree_set<BinopKind>{
+  static const absl::NoDestructor<absl::btree_set<BinopKind>> singleton({
       BinopKind::kShl,
       BinopKind::kShr,
-  };
+  });
   return *singleton;
 }
 
 std::string BinopKindFormat(BinopKind kind) {
   switch (kind) {
-    // clang-format off
+      // clang-format off
     // Shifts.
     case BinopKind::kShl:       return "<<";
     case BinopKind::kShr:       return ">>";
@@ -531,38 +642,63 @@ NameDef::~NameDef() = default;
 // -- class Conditional
 
 Conditional::Conditional(Module* owner, Span span, Expr* test,
-                         Block* consequent,
-                         std::variant<Block*, Conditional*> alternate)
-    : Expr(owner, std::move(span)),
+                         StatementBlock* consequent,
+                         std::variant<StatementBlock*, Conditional*> alternate,
+                         bool in_parens, bool has_else)
+    : Expr(owner, std::move(span), in_parens),
       test_(test),
       consequent_(consequent),
-      alternate_(alternate) {}
+      alternate_(alternate),
+      has_else_(has_else) {}
 
 Conditional::~Conditional() = default;
 
+std::vector<StatementBlock*> Conditional::GatherBlocks() {
+  std::vector<StatementBlock*> blocks;
+  blocks.push_back(consequent_);
+  absl::visit(Visitor{
+                  [&](StatementBlock* block) { blocks.push_back(block); },
+                  [&](Conditional* elseif) {
+                    for (StatementBlock* block : elseif->GatherBlocks()) {
+                      blocks.push_back(block);
+                    }
+                  },
+              },
+              alternate_);
+  return blocks;
+}
+
 std::string Conditional::ToStringInternal() const {
   std::string inline_str = absl::StrFormat(
-      R"(if %s %s else %s)", test_->ToInlineString(),
-      consequent_->ToInlineString(), ToAstNode(alternate_)->ToInlineString());
+      R"(if %s %s%s)", test_->ToInlineString(), consequent_->ToInlineString(),
+      has_else_
+          ? absl::StrFormat(" else %s", ToAstNode(alternate_)->ToInlineString())
+          : std::string());
+
   if (inline_str.size() <= kTargetLineChars) {
     return inline_str;
   }
-  return absl::StrFormat(R"(if %s %s else %s)", test_->ToString(),
-                         consequent_->ToString(),
-                         ToAstNode(alternate_)->ToString());
+
+  return absl::StrFormat(
+      R"(if %s %s%s)", test_->ToString(), consequent_->ToString(),
+      has_else_ ? absl::StrFormat(" else %s", ToAstNode(alternate_)->ToString())
+                : std::string()
+
+  );
 }
 
 bool Conditional::HasMultiStatementBlocks() const {
   if (consequent_->size() > 1) {
     return true;
   }
-  return absl::visit(Visitor{
-                         [](const Block* block) { return block->size() > 1; },
-                         [](const Conditional* elseif) {
-                           return elseif->HasMultiStatementBlocks();
-                         },
-                     },
-                     alternate_);
+  return absl::visit(
+      Visitor{
+          [](const StatementBlock* block) { return block->size() > 1; },
+          [](const Conditional* elseif) {
+            return elseif->HasMultiStatementBlocks();
+          },
+      },
+      alternate_);
 }
 
 // -- class Attr
@@ -578,8 +714,8 @@ ParametricBinding::ParametricBinding(Module* owner, NameDef* name_def,
       name_def_(name_def),
       type_annotation_(type_annotation),
       expr_(expr) {
-  XLS_CHECK_EQ(name_def_->owner(), owner);
-  XLS_CHECK_EQ(type_annotation_->owner(), owner);
+  CHECK_EQ(name_def_->owner(), owner);
+  CHECK_EQ(type_annotation_->owner(), owner);
 }
 
 ParametricBinding::~ParametricBinding() = default;
@@ -612,66 +748,9 @@ std::string MatchArm::ToString() const {
   return absl::StrFormat("%s => %s", patterns_or, expr_->ToString());
 }
 
-std::vector<AstNode*> StructInstance::GetChildren(bool want_types) const {
-  std::vector<AstNode*> results;
-  results.reserve(members_.size());
-  for (auto& item : members_) {
-    results.push_back(item.second);
-  }
-  return results;
-}
-
-std::string StructInstance::ToStringInternal() const {
-  std::string type_name = ToAstNode(struct_ref_)->ToString();
-
-  std::string members_str = absl::StrJoin(
-      members_, ", ",
-      [](std::string* out, const std::pair<std::string, Expr*>& member) {
-        absl::StrAppendFormat(out, "%s: %s", member.first,
-                              member.second->ToString());
-      });
-  return absl::StrFormat("%s { %s }", type_name, members_str);
-}
-
-std::string For::ToStringInternal() const {
-  std::string type_str;
-  if (type_annotation_ != nullptr) {
-    type_str = absl::StrCat(": ", type_annotation_->ToString());
-  }
-  return absl::StrFormat(R"(for %s%s in %s %s(%s))", names_->ToString(),
-                         type_str, iterable_->ToString(), body_->ToString(),
-                         init_->ToString());
-}
-
-UnrollFor::UnrollFor(Module* owner, Span span, NameDefTree* names,
-                     TypeAnnotation* types, Expr* iterable, Block* body,
-                     Expr* init)
-    : Expr(owner, std::move(span)),
-      names_(names),
-      types_(types),
-      iterable_(iterable),
-      body_(body),
-      init_(init) {}
+For::~For() = default;
 
 UnrollFor::~UnrollFor() = default;
-
-std::string UnrollFor::ToStringInternal() const {
-  std::string type_str;
-  if (types_ != nullptr) {
-    type_str = absl::StrCat(": ", types_->ToString());
-  }
-  return absl::StrFormat("unroll_for! %s%s in %s %s(%s)", names_->ToString(),
-                         type_str, iterable_->ToString(), body_->ToString(),
-                         init_->ToString());
-}
-
-std::vector<AstNode*> UnrollFor::GetChildren(bool want_types) const {
-  std::vector<AstNode*> children{names_, iterable_, body_, init_};
-  if (want_types && types_ != nullptr) {
-    children.push_back(types_);
-  }
-  return children;
-}
 
 ConstantDef::ConstantDef(Module* owner, Span span, NameDef* name_def,
                          TypeAnnotation* type_annotation, Expr* value,
@@ -699,21 +778,10 @@ std::string ConstantDef::ToString() const {
 }
 
 Array::Array(Module* owner, Span span, std::vector<Expr*> members,
-             bool has_ellipsis)
-    : Expr(owner, std::move(span)),
+             bool has_ellipsis, bool in_parens)
+    : Expr(owner, std::move(span), in_parens),
       members_(std::move(members)),
       has_ellipsis_(has_ellipsis) {}
-
-ConstantArray::ConstantArray(Module* owner, Span span,
-                             std::vector<Expr*> members, bool has_ellipsis)
-    : Array(owner, std::move(span), std::move(members), has_ellipsis) {
-  for (Expr* expr : this->members()) {
-    XLS_CHECK(IsConstant(expr))
-        << "non-constant in constant array: " << expr->ToString();
-  }
-}
-
-ConstantArray::~ConstantArray() = default;
 
 // -- class TypeRef
 
@@ -723,10 +791,13 @@ TypeRef::TypeRef(Module* owner, Span span, TypeDefinition type_definition)
       type_definition_(type_definition) {}
 
 std::string TypeRef::ToString() const {
-  return absl::visit(Visitor{[&](TypeAlias* n) { return n->identifier(); },
-                             [&](StructDef* n) { return n->identifier(); },
-                             [&](EnumDef* n) { return n->identifier(); },
-                             [&](ColonRef* n) { return n->ToString(); }},
+  return absl::visit(Visitor{
+                         [&](ColonRef* n) { return n->ToString(); },
+                         [&](UseTreeEntry* n) {
+                           return n->GetLeafNameDef().value()->identifier();
+                         },
+                         [&](auto* n) { return n->identifier(); },
+                     },
                      type_definition_);
 }
 
@@ -735,34 +806,162 @@ TypeRef::~TypeRef() = default;
 // -- class Import
 
 Import::Import(Module* owner, Span span, std::vector<std::string> subject,
-               NameDef* name_def, std::optional<std::string> alias)
+               NameDef& name_def, std::optional<std::string> alias)
     : AstNode(owner),
       span_(std::move(span)),
       subject_(std::move(subject)),
       name_def_(name_def),
       alias_(std::move(alias)) {
-  XLS_CHECK(!subject_.empty());
-  XLS_CHECK(name_def != nullptr);
+  CHECK(!subject_.empty());
 }
 
 Import::~Import() = default;
 
 std::string Import::ToString() const {
   if (alias_.has_value()) {
-    return absl::StrFormat("import %s as %s", absl::StrJoin(subject_, "."),
+    return absl::StrFormat("import %s as %s;", absl::StrJoin(subject_, "."),
                            *alias_);
   }
-  return absl::StrFormat("import %s", absl::StrJoin(subject_, "."));
+  return absl::StrFormat("import %s;", absl::StrJoin(subject_, "."));
+}
+
+// -- class Use
+
+UseInteriorEntry::UseInteriorEntry(std::string identifier,
+                                   std::vector<UseTreeEntry*> subtrees)
+    : identifier_(std::move(identifier)), subtrees_(std::move(subtrees)) {
+  CHECK(!subtrees_.empty());
+  for (const auto& subtree : subtrees_) {
+    DCHECK(subtree != nullptr);
+  }
+}
+
+std::vector<NameDef*> UseInteriorEntry::GetLeafNameDefs() const {
+  std::vector<NameDef*> result;
+  for (const auto& subtree : subtrees_) {
+    std::vector<NameDef*> subtree_leaf_name_defs = subtree->GetLeafNameDefs();
+    result.insert(result.end(), subtree_leaf_name_defs.begin(),
+                  subtree_leaf_name_defs.end());
+  }
+  return result;
+}
+
+std::string UseInteriorEntry::ToString() const {
+  std::string subtrees_str;
+  if (subtrees_.size() == 1) {
+    subtrees_str = subtrees_.front()->ToString();
+  } else {
+    subtrees_str =
+        absl::StrCat("{",
+                     absl::StrJoin(subtrees_, ", ",
+                                   [](std::string* out, const auto& subtree) {
+                                     absl::StrAppend(out, subtree->ToString());
+                                   }),
+                     "}");
+  }
+  return absl::StrCat(identifier_, "::", subtrees_str);
+}
+
+void UseTreeEntry::LinearizeToSubjects(std::vector<std::string>& prefix,
+                                       std::vector<UseSubject>& results) {
+  return absl::visit(
+      Visitor{
+          [&](const UseInteriorEntry& interior) {
+            prefix.push_back(std::string{interior.identifier()});
+            for (UseTreeEntry* subtree : interior.subtrees()) {
+              subtree->LinearizeToSubjects(prefix, results);
+            }
+            prefix.pop_back();
+          },
+          [&](NameDef* name_def) {
+            CHECK(name_def != nullptr);
+            UseSubject result(prefix, *name_def, *this);
+            result.mutable_identifiers().push_back(name_def->identifier());
+            results.push_back(std::move(result));
+          },
+      },
+      payload_);
+}
+
+std::string UseTreeEntry::ToString() const {
+  return absl::visit(
+      Visitor{
+          [](const NameDef* leaf) { return leaf->identifier(); },
+          [](const UseInteriorEntry& interior) { return interior.ToString(); }},
+      payload_);
+}
+
+std::vector<AstNode*> UseTreeEntry::GetChildren(bool want_types) const {
+  return absl::visit(
+      Visitor{[](NameDef* leaf) { return std::vector<AstNode*>{leaf}; },
+              [](const UseInteriorEntry& interior) {
+                std::vector<AstNode*> results;
+                results.reserve(interior.subtrees().size());
+                for (UseTreeEntry* subtree : interior.subtrees()) {
+                  results.push_back(subtree);
+                }
+                return results;
+              }},
+      payload_);
+}
+
+std::vector<NameDef*> UseTreeEntry::GetLeafNameDefs() const {
+  return absl::visit(
+      Visitor{[](NameDef* leaf) { return std::vector<NameDef*>{leaf}; },
+              [](const UseInteriorEntry& interior) {
+                return interior.GetLeafNameDefs();
+              }},
+      payload_);
+}
+
+std::vector<std::string> UseTreeEntry::GetLeafIdentifiers() const {
+  std::vector<NameDef*> leaf_name_defs = GetLeafNameDefs();
+  std::vector<std::string> result;
+  result.reserve(leaf_name_defs.size());
+  for (const NameDef* name_def : leaf_name_defs) {
+    result.push_back(name_def->identifier());
+  }
+  return result;
+}
+
+UseSubject::UseSubject(std::vector<std::string> identifiers, NameDef& name_def,
+                       UseTreeEntry& use_tree_entry)
+    : identifiers_(std::move(identifiers)),
+      name_def_(&name_def),
+      use_tree_entry_(&use_tree_entry) {}
+
+std::string UseSubject::ToErrorString() const {
+  return absl::StrCat("`", absl::StrJoin(identifiers_, "::"), "`");
+}
+
+absl::Status UseTreeEntry::Accept(AstNodeVisitor* v) const {
+  return v->HandleUseTreeEntry(this);
+}
+
+Use::Use(Module* owner, Span span, UseTreeEntry& root)
+    : AstNode(owner), span_(std::move(span)), root_(&root) {}
+
+Use::~Use() = default;
+
+std::string Use::ToString() const {
+  return absl::StrCat("use ", root_->ToString(), ";");
+}
+
+std::vector<AstNode*> Use::GetChildren(bool want_types) const {
+  return {root_};
 }
 
 // -- class ColonRef
 
-ColonRef::ColonRef(Module* owner, Span span, Subject subject, std::string attr)
-    : Expr(owner, std::move(span)), subject_(subject), attr_(std::move(attr)) {}
+ColonRef::ColonRef(Module* owner, Span span, Subject subject, std::string attr,
+                   bool in_parens)
+    : Expr(owner, std::move(span), in_parens),
+      subject_(subject),
+      attr_(std::move(attr)) {}
 
 ColonRef::~ColonRef() = default;
 
-std::optional<Import*> ColonRef::ResolveImportSubject() const {
+std::optional<ImportSubject> ColonRef::ResolveImportSubject() const {
   if (!std::holds_alternative<NameRef*>(subject_)) {
     return std::nullopt;
   }
@@ -773,23 +972,17 @@ std::optional<Import*> ColonRef::ResolveImportSubject() const {
   }
   const auto* name_def = std::get<const NameDef*>(any_name_def);
   AstNode* definer = name_def->definer();
+
+  if (auto* use_tree_entry = dynamic_cast<UseTreeEntry*>(definer)) {
+    return use_tree_entry;
+  }
+
   Import* import = dynamic_cast<Import*>(definer);
   if (import == nullptr) {
     return std::nullopt;
   }
   return import;
 }
-
-// -- class ProcMember
-
-ProcMember::ProcMember(Module* owner, NameDef* name_def,
-                       TypeAnnotation* type_annotation)
-    : AstNode(owner),
-      name_def_(name_def),
-      type_annotation_(type_annotation),
-      span_(name_def_->span().start(), type_annotation_->span().limit()) {}
-
-ProcMember::~ProcMember() = default;
 
 // -- class Param
 
@@ -814,342 +1007,20 @@ std::string ChannelDecl::ToStringInternal() const {
   }
 
   std::string fifo_depth_str;
-  if (fifo_depth_.has_value()) {
-    fifo_depth_str = absl::StrCat(", ", fifo_depth_.value()->ToString());
+  if (fifo_depth().has_value()) {
+    fifo_depth_str = absl::StrCat(", ", (*fifo_depth())->ToString());
   }
-  return absl::StrFormat("chan<%s%s>%s", type_->ToString(), fifo_depth_str,
-                         absl::StrJoin(dims, ""));
-}
-
-// -- class Module
-
-Module::~Module() {
-  XLS_VLOG(3) << "Destroying module \"" << name_ << "\" @ " << this;
-}
-
-std::string Module::ToString() const {
-  // Don't print Proc functions, as they'll be printed as part of the procs
-  // themselves.
-  std::vector<ModuleMember> print_top;
-  for (const auto& member : top_) {
-    if (std::holds_alternative<Function*>(member) &&
-        std::get<Function*>(member)->proc().has_value()) {
-      continue;
-    }
-    print_top.push_back(member);
+  std::string channel_attribute_str;
+  if (channel_config().has_value()) {
+    channel_attribute_str =
+        absl::StrCat("\n#[channel(",
+                     absl::StrJoin(channel_config()->GetDslxKwargs(), ", ",
+                                   absl::PairFormatter("=")),
+                     ")]\n");
   }
-  return absl::StrJoin(print_top, "\n",
-                       [](std::string* out, const ModuleMember& member) {
-                         absl::StrAppend(out, ToAstNode(member)->ToString());
-                       });
-}
-
-const AstNode* Module::FindNode(AstNodeKind kind, const Span& target) const {
-  for (const auto& node : nodes_) {
-    if (node->kind() == kind && node->GetSpan().has_value() &&
-        node->GetSpan().value() == target) {
-      return node.get();
-    }
-  }
-  return nullptr;
-}
-
-std::vector<const AstNode*> Module::FindIntercepting(const Pos& target) const {
-  std::vector<const AstNode*> found;
-  for (const auto& node : nodes_) {
-    if (node->GetSpan().has_value() && node->GetSpan()->Contains(target)) {
-      found.push_back(node.get());
-    }
-  }
-  return found;
-}
-
-std::optional<Function*> Module::GetFunction(std::string_view target_name) {
-  for (ModuleMember& member : top_) {
-    if (std::holds_alternative<Function*>(member)) {
-      Function* f = std::get<Function*>(member);
-      if (f->identifier() == target_name) {
-        return f;
-      }
-    }
-  }
-  return std::nullopt;
-}
-
-std::optional<Proc*> Module::GetProc(std::string_view target_name) {
-  for (ModuleMember& member : top_) {
-    if (std::holds_alternative<Proc*>(member)) {
-      Proc* p = std::get<Proc*>(member);
-      if (p->identifier() == target_name) {
-        return p;
-      }
-    }
-  }
-  return std::nullopt;
-}
-
-absl::StatusOr<TestFunction*> Module::GetTest(std::string_view target_name) {
-  for (ModuleMember& member : top_) {
-    if (std::holds_alternative<TestFunction*>(member)) {
-      TestFunction* t = std::get<TestFunction*>(member);
-      if (t->identifier() == target_name) {
-        return t;
-      }
-    }
-  }
-  return absl::NotFoundError(absl::StrFormat(
-      "No test in module %s with name \"%s\"", name_, target_name));
-}
-
-absl::StatusOr<TestProc*> Module::GetTestProc(std::string_view target_name) {
-  for (ModuleMember& member : top_) {
-    if (std::holds_alternative<TestProc*>(member)) {
-      auto* t = std::get<TestProc*>(member);
-      if (t->proc()->identifier() == target_name) {
-        return t;
-      }
-    }
-  }
-  return absl::NotFoundError(absl::StrFormat(
-      "No test proc in module %s with name \"%s\"", name_, target_name));
-}
-
-std::vector<std::string> Module::GetTestNames() const {
-  std::vector<std::string> result;
-  for (auto& member : top_) {
-    if (std::holds_alternative<TestFunction*>(member)) {
-      TestFunction* t = std::get<TestFunction*>(member);
-      result.push_back(t->identifier());
-    } else if (std::holds_alternative<TestProc*>(member)) {
-      TestProc* tp = std::get<TestProc*>(member);
-      result.push_back(tp->proc()->identifier());
-    }
-  }
-  return result;
-}
-
-std::vector<std::string> Module::GetFunctionNames() const {
-  std::vector<std::string> result;
-  for (auto& member : top_) {
-    if (std::holds_alternative<Function*>(member)) {
-      result.push_back(std::get<Function*>(member)->identifier());
-    }
-  }
-  return result;
-}
-
-const StructDef* Module::FindStructDef(const Span& span) const {
-  return down_cast<const StructDef*>(FindNode(AstNodeKind::kStructDef, span));
-}
-
-const EnumDef* Module::FindEnumDef(const Span& span) const {
-  return down_cast<const EnumDef*>(FindNode(AstNodeKind::kEnumDef, span));
-}
-
-std::optional<ModuleMember*> Module::FindMemberWithName(
-    std::string_view target) {
-  for (ModuleMember& member : top_) {
-    if (std::holds_alternative<Function*>(member)) {
-      if (std::get<Function*>(member)->identifier() == target) {
-        return &member;
-      }
-    } else if (std::holds_alternative<Proc*>(member)) {
-      if (std::get<Proc*>(member)->identifier() == target) {
-        return &member;
-      }
-    } else if (std::holds_alternative<TestFunction*>(member)) {
-      if (std::get<TestFunction*>(member)->identifier() == target) {
-        return &member;
-      }
-    } else if (std::holds_alternative<TestProc*>(member)) {
-      if (std::get<TestProc*>(member)->proc()->identifier() == target) {
-        return &member;
-      }
-    } else if (std::holds_alternative<QuickCheck*>(member)) {
-      if (std::get<QuickCheck*>(member)->identifier() == target) {
-        return &member;
-      }
-    } else if (std::holds_alternative<TypeAlias*>(member)) {
-      if (std::get<TypeAlias*>(member)->identifier() == target) {
-        return &member;
-      }
-    } else if (std::holds_alternative<StructDef*>(member)) {
-      if (std::get<StructDef*>(member)->identifier() == target) {
-        return &member;
-      }
-    } else if (std::holds_alternative<ConstantDef*>(member)) {
-      if (std::get<ConstantDef*>(member)->identifier() == target) {
-        return &member;
-      }
-    } else if (std::holds_alternative<EnumDef*>(member)) {
-      if (std::get<EnumDef*>(member)->identifier() == target) {
-        return &member;
-      }
-    } else if (std::holds_alternative<Import*>(member)) {
-      if (std::get<Import*>(member)->identifier() == target) {
-        return &member;
-      }
-    } else {
-      XLS_LOG(FATAL) << "Unhandled module member variant: "
-                     << ToAstNode(member)->GetNodeTypeName();
-    }
-  }
-  return std::nullopt;
-}
-
-absl::StatusOr<ConstantDef*> Module::GetConstantDef(std::string_view target) {
-  std::optional<ModuleMember*> member = FindMemberWithName(target);
-  if (!member.has_value()) {
-    return absl::NotFoundError(
-        absl::StrFormat("Could not find member named '%s' in module.", target));
-  }
-  if (!std::holds_alternative<ConstantDef*>(*member.value())) {
-    return absl::NotFoundError(absl::StrFormat(
-        "Member named '%s' in module was not a constant.", target));
-  }
-  return std::get<ConstantDef*>(*member.value());
-}
-
-absl::flat_hash_map<std::string, TypeDefinition>
-Module::GetTypeDefinitionByName() const {
-  absl::flat_hash_map<std::string, TypeDefinition> result;
-  for (auto& member : top_) {
-    if (std::holds_alternative<TypeAlias*>(member)) {
-      TypeAlias* td = std::get<TypeAlias*>(member);
-      result[td->identifier()] = td;
-    } else if (std::holds_alternative<EnumDef*>(member)) {
-      EnumDef* enum_ = std::get<EnumDef*>(member);
-      result[enum_->identifier()] = enum_;
-    } else if (std::holds_alternative<StructDef*>(member)) {
-      StructDef* struct_ = std::get<StructDef*>(member);
-      result[struct_->identifier()] = struct_;
-    }
-  }
-  return result;
-}
-
-std::vector<TypeDefinition> Module::GetTypeDefinitions() const {
-  std::vector<TypeDefinition> results;
-  for (auto& member : top_) {
-    if (std::holds_alternative<TypeAlias*>(member)) {
-      TypeAlias* td = std::get<TypeAlias*>(member);
-      results.push_back(td);
-    } else if (std::holds_alternative<EnumDef*>(member)) {
-      EnumDef* enum_def = std::get<EnumDef*>(member);
-      results.push_back(enum_def);
-    } else if (std::holds_alternative<StructDef*>(member)) {
-      StructDef* struct_def = std::get<StructDef*>(member);
-      results.push_back(struct_def);
-    }
-  }
-  return results;
-}
-
-std::vector<AstNode*> Module::GetChildren(bool want_types) const {
-  std::vector<AstNode*> results;
-  results.reserve(top_.size());
-  for (ModuleMember member : top_) {
-    results.push_back(ToAstNode(member));
-  }
-  return results;
-}
-
-absl::StatusOr<TypeDefinition> Module::GetTypeDefinition(
-    std::string_view name) const {
-  absl::flat_hash_map<std::string, TypeDefinition> map =
-      GetTypeDefinitionByName();
-  auto it = map.find(name);
-  if (it == map.end()) {
-    return absl::NotFoundError(
-        absl::StrCat("Could not find type definition for name: ", name));
-  }
-  return it->second;
-}
-
-absl::Status Module::AddTop(ModuleMember member,
-                            const MakeCollisionError& make_collision_error) {
-  // Get name
-  std::optional<std::string> member_name = absl::visit(
-      Visitor{
-          [](Function* f) { return std::make_optional(f->identifier()); },
-          [](Proc* p) { return std::make_optional(p->identifier()); },
-          [](TestFunction* tf) { return std::make_optional(tf->identifier()); },
-          [](TestProc* tp) {
-            return std::make_optional(tp->proc()->identifier());
-          },
-          [](QuickCheck* qc) { return std::make_optional(qc->identifier()); },
-          [](TypeAlias* td) { return std::make_optional(td->identifier()); },
-          [](StructDef* sd) { return std::make_optional(sd->identifier()); },
-          [](ConstantDef* cd) { return std::make_optional(cd->identifier()); },
-          [](EnumDef* ed) { return std::make_optional(ed->identifier()); },
-          [](Import* i) { return std::make_optional(i->identifier()); },
-          [](ConstAssert* n) -> std::optional<std::string> {
-            return std::nullopt;
-          },
-      },
-      member);
-
-  if (member_name.has_value() && top_by_name_.contains(member_name.value())) {
-    const AstNode* node = ToAstNode(top_by_name_.at(member_name.value()));
-    const Span existing_span = node->GetSpan().value();
-    const AstNode* new_node = ToAstNode(member);
-    const Span new_span = new_node->GetSpan().value();
-    if (make_collision_error != nullptr) {
-      return make_collision_error(name_, member_name.value(), existing_span,
-                                  node, new_span, new_node);
-    }
-    return absl::InvalidArgumentError(absl::StrFormat(
-        "Module %s already contains a member named %s @ %s: %s", name_,
-        member_name.value(), existing_span.ToString(), node->ToString()));
-  }
-
-  top_.push_back(member);
-  if (member_name.has_value()) {
-    top_by_name_.insert({member_name.value(), member});
-  }
-  return absl::OkStatus();
-}
-
-std::string_view GetModuleMemberTypeName(const ModuleMember& module_member) {
-  return absl::visit(Visitor{
-                         [](Function*) { return "function"; },
-                         [](Proc*) { return "proc"; },
-                         [](TestFunction*) { return "test-function"; },
-                         [](TestProc*) { return "test-proc"; },
-                         [](QuickCheck*) { return "quick-check"; },
-                         [](TypeAlias*) { return "type-alias"; },
-                         [](StructDef*) { return "struct-definition"; },
-                         [](ConstantDef*) { return "constant-definition"; },
-                         [](EnumDef*) { return "enum-definition"; },
-                         [](Import*) { return "import"; },
-                         [](ConstAssert*) { return "const-assert"; },
-                     },
-                     module_member);
-}
-
-absl::StatusOr<ModuleMember> AsModuleMember(AstNode* node) {
-  // clang-format off
-  if (auto* n = dynamic_cast<Function*    >(node)) { return ModuleMember(n); }
-  if (auto* n = dynamic_cast<TestFunction*>(node)) { return ModuleMember(n); }
-  if (auto* n = dynamic_cast<QuickCheck*  >(node)) { return ModuleMember(n); }
-  if (auto* n = dynamic_cast<TypeAlias*   >(node)) { return ModuleMember(n); }
-  if (auto* n = dynamic_cast<StructDef*   >(node)) { return ModuleMember(n); }
-  if (auto* n = dynamic_cast<ConstantDef* >(node)) { return ModuleMember(n); }
-  if (auto* n = dynamic_cast<EnumDef*     >(node)) { return ModuleMember(n); }
-  if (auto* n = dynamic_cast<Import*      >(node)) { return ModuleMember(n); }
-  // clang-format on
-  return absl::InvalidArgumentError("AST node is not a module-level member: " +
-                                    node->ToString());
-}
-
-absl::StatusOr<IndexRhs> AstNodeToIndexRhs(AstNode* node) {
-  // clang-format off
-  if (auto* n = dynamic_cast<Slice*     >(node)) { return IndexRhs(n); }
-  if (auto* n = dynamic_cast<WidthSlice*>(node)) { return IndexRhs(n); }
-  if (auto* n = dynamic_cast<Expr*      >(node)) { return IndexRhs(n); }
-  // clang-format on
-  return absl::InvalidArgumentError("AST node is not a valid 'index': " +
-                                    node->ToString());
+  return absl::StrFormat(
+      "%schan<%s%s>%s(%s)", channel_attribute_str, type_->ToString(),
+      fifo_depth_str, absl::StrJoin(dims, ""), channel_name_expr_.ToString());
 }
 
 TypeAnnotation::~TypeAnnotation() = default;
@@ -1158,10 +1029,12 @@ TypeAnnotation::~TypeAnnotation() = default;
 
 TypeRefTypeAnnotation::TypeRefTypeAnnotation(
     Module* owner, Span span, TypeRef* type_ref,
-    std::vector<ExprOrType> parametrics)
-    : TypeAnnotation(owner, std::move(span)),
+    std::vector<ExprOrType> parametrics,
+    std::optional<const StructInstanceBase*> instantiator)
+    : TypeAnnotation(owner, std::move(span), kAnnotationKind),
       type_ref_(type_ref),
-      parametrics_(std::move(parametrics)) {}
+      parametrics_(std::move(parametrics)),
+      instantiator_(instantiator) {}
 
 TypeRefTypeAnnotation::~TypeRefTypeAnnotation() = default;
 
@@ -1193,14 +1066,139 @@ std::string TypeRefTypeAnnotation::ToString() const {
   return absl::StrCat(type_ref_->ToString(), parametric_str);
 }
 
+// -- class TypeVariableTypeAnnotation
+
+TypeVariableTypeAnnotation::TypeVariableTypeAnnotation(
+    Module* owner, const NameRef* type_variable)
+    : TypeAnnotation(owner, type_variable->span(), kAnnotationKind),
+      type_variable_(type_variable) {}
+
+std::string TypeVariableTypeAnnotation::ToString() const {
+  return absl::StrCat("TypeVariableTypeAnnotation: ",
+                      type_variable_->ToString());
+}
+
+// -- class MemberTypeAnnotation
+
+MemberTypeAnnotation::MemberTypeAnnotation(Module* owner,
+                                           const TypeAnnotation* struct_type,
+                                           std::string_view member_name)
+    : TypeAnnotation(owner, struct_type->span(), kAnnotationKind),
+      struct_type_(struct_type),
+      member_name_(member_name) {}
+
+std::string MemberTypeAnnotation::ToString() const {
+  return absl::Substitute("MemberTypeAnnotation: $0.$1",
+                          struct_type_->ToString(), member_name_);
+}
+
+// -- class ElementTypeAnnotation
+
+ElementTypeAnnotation::ElementTypeAnnotation(
+    Module* owner, const TypeAnnotation* container_type,
+    std::optional<const Expr*> tuple_index, bool allow_bit_vector_destructuring)
+    : TypeAnnotation(owner, container_type->span(), kAnnotationKind),
+      container_type_(container_type),
+      tuple_index_(tuple_index),
+      allow_bit_vector_destructuring_(allow_bit_vector_destructuring) {
+  CHECK(!(allow_bit_vector_destructuring_ && tuple_index_.has_value()));
+}
+
+std::string ElementTypeAnnotation::ToString() const {
+  return absl::StrCat(
+      "ElementTypeAnnotation: ",
+      tuple_index_.has_value()
+          ? absl::Substitute("$0.$1", container_type_->ToString(),
+                             (*tuple_index_)->ToString())
+          : container_type_->ToString());
+}
+
+// -- class SliceTypeAnnotation
+
+SliceTypeAnnotation::SliceTypeAnnotation(
+    Module* owner, Span span, TypeAnnotation* source_type,
+    std::variant<Slice*, WidthSlice*> slice)
+    : TypeAnnotation(owner, span, kAnnotationKind),
+      source_type_(source_type),
+      slice_(slice) {}
+
+std::vector<AstNode*> SliceTypeAnnotation::GetChildren(bool want_types) const {
+  return std::vector<AstNode*>{source_type_, ToAstNode(slice_)};
+}
+
+std::string SliceTypeAnnotation::ToString() const {
+  return absl::Substitute("Slice ($0, $1)", source_type_->ToString(),
+                          ToAstNode(slice_)->ToString());
+}
+
+// -- class FunctionTypeAnnotation
+
+FunctionTypeAnnotation::FunctionTypeAnnotation(
+    Module* owner, std::vector<const TypeAnnotation*> param_types,
+    TypeAnnotation* return_type)
+    : TypeAnnotation(owner, return_type->span(), kAnnotationKind),
+      param_types_(std::move(param_types)),
+      return_type_(return_type) {
+  CHECK_NE(return_type, nullptr);
+}
+
+std::string FunctionTypeAnnotation::ToString() const {
+  std::vector<std::string> param_strings;
+  param_strings.reserve(param_types_.size());
+  for (const TypeAnnotation* param : param_types_) {
+    param_strings.push_back(param->ToString());
+  }
+  return absl::Substitute("($0) -> $1", absl::StrJoin(param_strings, ", "),
+                          return_type_->ToString());
+}
+
+std::vector<AstNode*> FunctionTypeAnnotation::GetChildren(
+    bool /*want_types*/) const {
+  // Note that, like in other TypeAnnotation subclasses, type children are
+  // returned regardless of the `want_types` flag.
+  std::vector<AstNode*> result;
+  result.reserve(param_types_.size() + 1);
+  for (const TypeAnnotation* param : param_types_) {
+    result.push_back(const_cast<TypeAnnotation*>(param));
+  }
+  result.push_back(return_type_);
+  return result;
+}
+
+// -- class ReturnTypeAnnotation
+
+ReturnTypeAnnotation::ReturnTypeAnnotation(Module* owner,
+                                           TypeAnnotation* function_type)
+    : TypeAnnotation(owner, function_type->span(), kAnnotationKind),
+      function_type_(function_type) {}
+
+std::string ReturnTypeAnnotation::ToString() const {
+  return absl::StrCat("Return type of: ", function_type_->ToString());
+}
+
+// -- class ParamTypeAnnotation
+
+ParamTypeAnnotation::ParamTypeAnnotation(Module* owner,
+                                         TypeAnnotation* function_type,
+                                         int param_index)
+    : TypeAnnotation(owner, function_type->span(), kAnnotationKind),
+      function_type_(function_type),
+      param_index_(param_index) {}
+
+std::string ParamTypeAnnotation::ToString() const {
+  return absl::Substitute("Param type $0 of: $1", param_index_,
+                          function_type_->ToString());
+}
+
 // -- class ArrayTypeAnnotation
 
 ArrayTypeAnnotation::ArrayTypeAnnotation(Module* owner, Span span,
                                          TypeAnnotation* element_type,
-                                         Expr* dim)
-    : TypeAnnotation(owner, std::move(span)),
+                                         Expr* dim, bool dim_is_min)
+    : TypeAnnotation(owner, std::move(span), kAnnotationKind),
       element_type_(element_type),
-      dim_(dim) {}
+      dim_(dim),
+      dim_is_min_(dim_is_min) {}
 
 ArrayTypeAnnotation::~ArrayTypeAnnotation() = default;
 
@@ -1209,18 +1207,33 @@ std::vector<AstNode*> ArrayTypeAnnotation::GetChildren(bool want_types) const {
 }
 
 std::string ArrayTypeAnnotation::ToString() const {
-  return absl::StrFormat("%s[%s]", element_type_->ToString(), dim_->ToString());
+  return dim_is_min_ ? absl::StrFormat("%s[>= %s]", element_type_->ToString(),
+                                       dim_->ToString())
+                     : absl::StrFormat("%s[%s]", element_type_->ToString(),
+                                       dim_->ToString());
 }
+
+// -- class SelfTypeAnnotation
+
+SelfTypeAnnotation::SelfTypeAnnotation(Module* owner, Span span,
+                                       bool explicit_type,
+                                       TypeAnnotation* struct_ref)
+    : TypeAnnotation(owner, std::move(span), kAnnotationKind),
+      explicit_type_(explicit_type),
+      struct_ref_(struct_ref) {}
+
+SelfTypeAnnotation::~SelfTypeAnnotation() = default;
 
 // -- class BuiltinNameDef
 
 BuiltinNameDef::~BuiltinNameDef() = default;
 
-// -- class SplatStructInstance
-
 bool IsConstant(AstNode* node) {
-  if (IsOneOf<ConstantArray, Number, ConstRef, ColonRef>(node)) {
+  if (IsOneOf<Number, ColonRef>(node)) {
     return true;
+  }
+  if (IsOneOf<NameRef>(node)) {
+    return false;
   }
   if (Cast* n = dynamic_cast<Cast*>(node)) {
     return IsConstant(n->expr());
@@ -1241,29 +1254,6 @@ bool IsConstant(AstNode* node) {
     return std::all_of(children.begin(), children.end(), IsConstant);
   }
   return false;
-}
-
-std::vector<AstNode*> SplatStructInstance::GetChildren(bool want_types) const {
-  std::vector<AstNode*> results;
-  results.reserve(members_.size() + 1);
-  for (auto& item : members_) {
-    results.push_back(item.second);
-  }
-  results.push_back(splatted_);
-  return results;
-}
-
-std::string SplatStructInstance::ToStringInternal() const {
-  std::string type_name = ToAstNode(struct_ref_)->ToString();
-
-  std::string members_str = absl::StrJoin(
-      members_, ", ",
-      [](std::string* out, const std::pair<std::string, Expr*>& member) {
-        absl::StrAppendFormat(out, "%s: %s", member.first,
-                              member.second->ToString());
-      });
-  return absl::StrFormat("%s { %s, ..%s }", type_name, members_str,
-                         splatted_->ToString());
 }
 
 std::vector<AstNode*> MatchArm::GetChildren(bool want_types) const {
@@ -1360,6 +1350,15 @@ EnumDef::EnumDef(Module* owner, Span span, NameDef* name_def,
 
 EnumDef::~EnumDef() = default;
 
+NameDef* EnumDef::GetNameDef(std::string_view target) {
+  for (const EnumMember& member : values_) {
+    if (member.name_def->identifier() == target) {
+      return member.name_def;
+    }
+  }
+  LOG(FATAL) << "EnumDef::GetNameDef; no member: " << target;
+}
+
 bool EnumDef::HasValue(std::string_view name) const {
   for (const auto& item : values_) {
     if (item.name_def->identifier() == name) {
@@ -1381,11 +1380,13 @@ absl::StatusOr<Expr*> EnumDef::GetValue(std::string_view name) const {
 
 std::string EnumDef::ToString() const {
   std::string type_str;
+  std::string extern_attr = MakeExternTypeAttr(extern_type_name_);
   if (type_annotation_ != nullptr) {
     type_str = absl::StrCat(" : " + type_annotation_->ToString());
   }
-  std::string result = absl::StrFormat(
-      "%senum %s%s {\n", is_public_ ? "pub " : "", identifier(), type_str);
+  std::string result =
+      absl::StrFormat("%s%senum %s%s {\n", extern_attr,
+                      is_public_ ? "pub " : "", identifier(), type_str);
 
   auto value_to_string = [](Expr* value) -> std::string {
     if (Number* number = dynamic_cast<Number*>(value)) {
@@ -1406,8 +1407,9 @@ std::string EnumDef::ToString() const {
 // -- class Instantiation
 
 Instantiation::Instantiation(Module* owner, Span span, Expr* callee,
-                             std::vector<ExprOrType> explicit_parametrics)
-    : Expr(owner, std::move(span)),
+                             std::vector<ExprOrType> explicit_parametrics,
+                             bool in_parens)
+    : Expr(owner, std::move(span), in_parens),
       callee_(callee),
       explicit_parametrics_(std::move(explicit_parametrics)) {}
 
@@ -1427,14 +1429,34 @@ std::string Instantiation::FormatParametrics() const {
                       ">");
 }
 
+// -- class FunctionRef
+
+FunctionRef::FunctionRef(Module* owner, Span span, Expr* callee,
+                         std::vector<ExprOrType> explicit_parametrics)
+    : Instantiation(owner, std::move(span), callee,
+                    std::move(explicit_parametrics)) {}
+
+FunctionRef::~FunctionRef() = default;
+
+std::vector<AstNode*> FunctionRef::GetChildren(bool want_types) const {
+  std::vector<AstNode*> results = {callee()};
+  for (const ExprOrType& eot : explicit_parametrics()) {
+    results.push_back(ToAstNode(eot));
+  }
+  return results;
+}
+
 // -- class Invocation
 
 Invocation::Invocation(Module* owner, Span span, Expr* callee,
                        std::vector<Expr*> args,
-                       std::vector<ExprOrType> explicit_parametrics)
+                       std::vector<ExprOrType> explicit_parametrics,
+                       bool in_parens,
+                       std::optional<const Invocation*> originating_invocation)
     : Instantiation(owner, std::move(span), callee,
-                    std::move(explicit_parametrics)),
-      args_(std::move(args)) {}
+                    std::move(explicit_parametrics), in_parens),
+      args_(std::move(args)),
+      originating_invocation_(originating_invocation) {}
 
 Invocation::~Invocation() = default;
 
@@ -1501,8 +1523,8 @@ std::string ConstAssert::ToString() const {
 
 // -- class ZeroMacro
 
-ZeroMacro::ZeroMacro(Module* owner, Span span, ExprOrType type)
-    : Expr(owner, std::move(span)), type_(type) {}
+ZeroMacro::ZeroMacro(Module* owner, Span span, ExprOrType type, bool in_parens)
+    : Expr(owner, std::move(span), in_parens), type_(type) {}
 
 ZeroMacro::~ZeroMacro() = default;
 
@@ -1517,15 +1539,36 @@ std::string ZeroMacro::ToStringInternal() const {
   return absl::StrFormat("zero!<%s>()", ToAstNode(type_)->ToString());
 }
 
+// -- class AllOnesMacro
+
+AllOnesMacro::AllOnesMacro(Module* owner, Span span, ExprOrType type,
+                           bool in_parens)
+    : Expr(owner, std::move(span), in_parens), type_(type) {}
+
+AllOnesMacro::~AllOnesMacro() = default;
+
+std::vector<AstNode*> AllOnesMacro::GetChildren(bool want_types) const {
+  if (want_types) {
+    return {ToAstNode(type_)};
+  }
+  return {};
+}
+
+std::string AllOnesMacro::ToStringInternal() const {
+  return absl::StrFormat("all_ones!<%s>()", ToAstNode(type_)->ToString());
+}
+
 // -- class FormatMacro
 
 FormatMacro::FormatMacro(Module* owner, Span span, std::string macro,
                          std::vector<FormatStep> format,
-                         std::vector<Expr*> args)
+                         std::vector<Expr*> args,
+                         std::optional<Expr*> verbosity)
     : Expr(owner, std::move(span)),
       macro_(std::move(macro)),
       format_(std::move(format)),
-      args_(std::move(args)) {}
+      args_(std::move(args)),
+      verbosity_(std::move(verbosity)) {}
 
 FormatMacro::~FormatMacro() = default;
 
@@ -1535,22 +1578,33 @@ std::vector<AstNode*> FormatMacro::GetChildren(bool want_types) const {
   for (Expr* arg : args_) {
     results.push_back(arg);
   }
+  if (verbosity_.has_value()) {
+    results.push_back(*verbosity_);
+  }
   return results;
 }
 
 std::string FormatMacro::ToStringInternal() const {
-  std::string format_string = "\"";
+  std::string result = absl::StrCat(macro_, "(");
+  if (verbosity_.has_value()) {
+    absl::StrAppendFormat(&result, "%s, ", (*verbosity_)->ToString());
+  }
+  absl::StrAppend(&result, "\"");
   for (const auto& step : format_) {
     if (std::holds_alternative<std::string>(step)) {
-      absl::StrAppend(&format_string, std::get<std::string>(step));
+      absl::StrAppend(&result, std::get<std::string>(step));
     } else {
-      absl::StrAppend(&format_string,
-                      std::string(FormatPreferenceToXlsSpecifier(
-                          std::get<FormatPreference>(step))));
+      absl::StrAppend(&result, std::string(FormatPreferenceToXlsSpecifier(
+                                   std::get<FormatPreference>(step))));
     }
   }
-  absl::StrAppend(&format_string, "\"");
-  return absl::StrFormat("%s(%s, %s)", macro_, format_string, FormatArgs());
+  absl::StrAppend(&result, "\"");
+  const std::string args = FormatArgs();
+  if (!args.empty()) {
+    absl::StrAppendFormat(&result, ", %s", args);
+  }
+  absl::StrAppend(&result, ")");
+  return result;
 }
 
 std::string FormatMacro::FormatArgs() const {
@@ -1559,34 +1613,45 @@ std::string FormatMacro::FormatArgs() const {
   });
 }
 
-// -- class StructDef
+// -- class StructDefBase
 
-StructDef::StructDef(Module* owner, Span span, NameDef* name_def,
-                     std::vector<ParametricBinding*> parametric_bindings,
-                     std::vector<std::pair<NameDef*, TypeAnnotation*>> members,
-                     bool is_public)
+StructDefBase::StructDefBase(
+    Module* owner, Span span, NameDef* name_def,
+    std::vector<ParametricBinding*> parametric_bindings,
+    std::vector<StructMemberNode*> members, bool is_public)
     : AstNode(owner),
       span_(std::move(span)),
       name_def_(name_def),
       parametric_bindings_(std::move(parametric_bindings)),
       members_(std::move(members)),
-      public_(is_public) {}
+      public_(is_public) {
+  for (StructMemberNode* member : members_) {
+    members_by_name_.emplace(member->name(), member);
+    struct_members_.push_back(StructMember{
+        .name_span = member->name_def()->span(),
+        .name = member->name(),
+        .type = member->type(),
+    });
+  }
+}
 
-StructDef::~StructDef() = default;
+StructDefBase::~StructDefBase() = default;
 
-std::vector<AstNode*> StructDef::GetChildren(bool want_types) const {
+std::vector<AstNode*> StructDefBase::GetChildren(bool want_types) const {
   std::vector<AstNode*> results = {name_def_};
   for (auto* pb : parametric_bindings_) {
     results.push_back(pb);
   }
-  for (const auto& pair : members_) {
-    results.push_back(pair.first);
-    results.push_back(pair.second);
+  if (want_types) {
+    for (const auto* member : members_) {
+      results.push_back(member->type());
+    }
   }
   return results;
 }
 
-std::string StructDef::ToString() const {
+std::string StructDefBase::ToStringWithEntityKeywordAndAttribute(
+    std::string_view keyword, std::string_view attribute) const {
   std::string parametric_str;
   if (!parametric_bindings_.empty()) {
     std::string guts =
@@ -1596,46 +1661,167 @@ std::string StructDef::ToString() const {
                       });
     parametric_str = absl::StrFormat("<%s>", guts);
   }
-  std::string result = absl::StrFormat(
-      "%sstruct %s%s {\n", public_ ? "pub " : "", identifier(), parametric_str);
-  for (const auto& item : members_) {
-    absl::StrAppendFormat(&result, "%s%s: %s,\n", kRustOneIndent,
-                          item.first->ToString(), item.second->ToString());
+  std::string result =
+      absl::StrFormat("%s%s%s %s%s {\n", attribute, public_ ? "pub " : "",
+                      keyword, identifier(), parametric_str);
+  for (const auto* item : members_) {
+    absl::StrAppendFormat(&result, "%s%s: %s,\n", kRustOneIndent, item->name(),
+                          item->type()->ToString());
   }
   absl::StrAppend(&result, "}");
   return result;
 }
 
-std::vector<std::string> StructDef::GetMemberNames() const {
+std::vector<std::string> StructDefBase::GetMemberNames() const {
   std::vector<std::string> names;
   names.reserve(members_.size());
-  for (auto& item : members_) {
-    names.push_back(item.first->identifier());
+  for (const auto* item : members_) {
+    names.push_back(item->name());
   }
   return names;
 }
 
-// -- class StructInstance
+std::optional<ConstantDef*> StructDefBase::GetImplConstant(
+    std::string_view constant_name) const {
+  if (!impl_.has_value()) {
+    return std::nullopt;
+  }
+  return impl_.value()->GetConstant(constant_name);
+}
 
-StructInstance::StructInstance(
+std::optional<Function*> StructDefBase::GetImplFunction(
+    std::string_view function_name) const {
+  if (!impl_.has_value()) {
+    return std::nullopt;
+  }
+  return (*impl_)->GetFunction(function_name);
+}
+
+// -- class StructDef
+
+std::string StructDef::ToString() const {
+  return ToStringWithEntityKeywordAndAttribute(
+      "struct", MakeExternTypeAttr(extern_type_name_));
+}
+
+// -- class ProcDef
+
+std::string ProcDef::ToString() const {
+  return ToStringWithEntityKeywordAndAttribute("proc");
+}
+
+// -- class Impl
+
+Impl::Impl(Module* owner, Span span, TypeAnnotation* struct_ref,
+           const std::vector<ImplMember> members, bool is_public)
+    : AstNode(owner),
+      span_(std::move(span)),
+      struct_ref_(struct_ref),
+      members_(members),
+      public_(is_public) {}
+
+Impl::~Impl() = default;
+
+std::string Impl::ToString() const {
+  std::string type_name = ToAstNode(struct_ref_)->ToString();
+  std::string result =
+      absl::StrFormat("%simpl %s {\n", public_ ? "pub " : "", type_name);
+  for (const auto& member : members_) {
+    absl::StrAppendFormat(
+        &result, "%s\n",
+        Indent(ToAstNode(member)->ToString(), kRustSpacesPerIndent));
+  }
+  absl::StrAppend(&result, "}");
+  return result;
+}
+
+std::vector<AstNode*> Impl::GetChildren(bool want_types) const {
+  std::vector<AstNode*> results;
+  results.reserve(members_.size());
+  for (auto& member : members_) {
+    results.push_back(ToAstNode(member));
+  }
+  return results;
+}
+
+template <typename T>
+std::vector<T> Impl::GetMembersOfType() const {
+  std::vector<T> results;
+  for (const auto& member : members_) {
+    if (std::holds_alternative<T>(member)) {
+      results.push_back(std::get<T>(member));
+    }
+  }
+  return results;
+}
+
+std::vector<ConstantDef*> Impl::GetConstants() const {
+  return GetMembersOfType<ConstantDef*>();
+}
+
+std::vector<Function*> Impl::GetFunctions() const {
+  return GetMembersOfType<Function*>();
+}
+
+static std::string ImplMemberIdentifier(const ImplMember member) {
+  return absl::visit(
+      Visitor{
+          [](const ConstantDef* n) { return n->name_def()->identifier(); },
+          [](const Function* n) { return n->name_def()->identifier(); },
+          [](const VerbatimNode* n) { return std::string("Verbatim"); },
+      },
+      member);
+}
+
+std::optional<ImplMember> Impl::GetMember(std::string_view name) const {
+  for (const auto& member : members_) {
+    if (ImplMemberIdentifier(member) == name) {
+      return member;
+    }
+  }
+  return std::nullopt;
+}
+
+template <typename T>
+std::optional<T> Impl::GetMemberOfType(std::string_view name) const {
+  std::optional<ImplMember> result = GetMember(name);
+  if (result.has_value() && std::holds_alternative<T>(*result)) {
+    return std::get<T>(*result);
+  }
+  return std::nullopt;
+}
+
+std::optional<ConstantDef*> Impl::GetConstant(std::string_view name) const {
+  return GetMemberOfType<ConstantDef*>(name);
+}
+
+std::optional<Function*> Impl::GetFunction(std::string_view name) const {
+  return GetMemberOfType<Function*>(name);
+}
+
+// -- class StructInstanceBase
+
+StructInstanceBase::StructInstanceBase(
     Module* owner, Span span, TypeAnnotation* struct_ref,
-    std::vector<std::pair<std::string, Expr*>> members)
-    : Expr(owner, std::move(span)),
+    std::vector<std::pair<std::string, Expr*>> members, bool in_parens)
+    : Expr(owner, std::move(span), in_parens),
       struct_ref_(struct_ref),
       members_(std::move(members)) {}
 
-StructInstance::~StructInstance() = default;
-
-std::vector<std::pair<std::string, Expr*>> StructInstance::GetOrderedMembers(
-    const StructDef* struct_def) const {
+std::vector<std::pair<std::string, Expr*>>
+StructInstanceBase::GetOrderedMembers(const StructDef* struct_def) const {
   std::vector<std::pair<std::string, Expr*>> result;
   for (const std::string& name : struct_def->GetMemberNames()) {
-    result.push_back({name, GetExpr(name).value()});
+    absl::StatusOr<Expr*> expr = GetExpr(name);
+    if (absl::IsNotFound(expr.status()) && !requires_all_members()) {
+      continue;
+    }
+    result.push_back({name, *expr});
   }
   return result;
 }
 
-absl::StatusOr<Expr*> StructInstance::GetExpr(std::string_view name) const {
+absl::StatusOr<Expr*> StructInstanceBase::GetExpr(std::string_view name) const {
   for (const auto& item : members_) {
     if (item.first == name) {
       return item.second;
@@ -1645,17 +1831,69 @@ absl::StatusOr<Expr*> StructInstance::GetExpr(std::string_view name) const {
       absl::StrFormat("Name is not present in struct instance: \"%s\"", name));
 }
 
+// -- class StructInstance
+
+StructInstance::~StructInstance() = default;
+
+std::vector<AstNode*> StructInstance::GetChildren(bool want_types) const {
+  std::vector<AstNode*> results;
+  absl::Span<const std::pair<std::string, Expr*>> members =
+      GetUnorderedMembers();
+  results.reserve(members.size());
+  for (auto& [_, member] : members) {
+    results.push_back(member);
+  }
+  return results;
+}
+
+std::string StructInstance::ToStringInternal() const {
+  std::string type_name = ToAstNode(struct_ref())->ToString();
+
+  std::string members_str = absl::StrJoin(
+      GetUnorderedMembers(), ", ",
+      [](std::string* out, const std::pair<std::string, Expr*>& member) {
+        absl::StrAppendFormat(out, "%s: %s", member.first,
+                              member.second->ToString());
+      });
+  return absl::StrFormat("%s { %s }", type_name, members_str);
+}
+
 // -- class SplatStructInstance
 
 SplatStructInstance::SplatStructInstance(
     Module* owner, Span span, TypeAnnotation* struct_ref,
-    std::vector<std::pair<std::string, Expr*>> members, Expr* splatted)
-    : Expr(owner, std::move(span)),
-      struct_ref_(struct_ref),
-      members_(std::move(members)),
+    std::vector<std::pair<std::string, Expr*>> members, Expr* splatted,
+    bool in_parens)
+    : StructInstanceBase(owner, std::move(span), struct_ref, std::move(members),
+                         in_parens),
       splatted_(splatted) {}
 
 SplatStructInstance::~SplatStructInstance() = default;
+
+std::vector<AstNode*> SplatStructInstance::GetChildren(bool want_types) const {
+  std::vector<AstNode*> results;
+  absl::Span<const std::pair<std::string, Expr*>> members =
+      GetUnorderedMembers();
+  results.reserve(members.size() + 1);
+  for (auto& item : members) {
+    results.push_back(item.second);
+  }
+  results.push_back(splatted_);
+  return results;
+}
+
+std::string SplatStructInstance::ToStringInternal() const {
+  std::string type_name = ToAstNode(struct_ref())->ToString();
+
+  std::string members_str = absl::StrJoin(
+      GetUnorderedMembers(), ", ",
+      [](std::string* out, const std::pair<std::string, Expr*>& member) {
+        absl::StrAppendFormat(out, "%s: %s", member.first,
+                              member.second->ToString());
+      });
+  return absl::StrFormat("%s { %s, ..%s }", type_name, members_str,
+                         splatted_->ToString());
+}
 
 // -- class Unop
 
@@ -1666,10 +1904,10 @@ std::string Unop::ToStringInternal() const {
   if (WeakerThan(operand_->GetPrecedence(), GetPrecedenceWithoutParens())) {
     Parenthesize(&operand);
   }
-  return absl::StrFormat("%s%s", UnopKindToString(unop_kind_), operand);
+  return absl::StrFormat("%s%s", UnopKindFormat(unop_kind_), operand);
 }
 
-std::string UnopKindToString(UnopKind k) {
+std::string UnopKindFormat(UnopKind k) {
   switch (k) {
     case UnopKind::kInvert:
       return "!";
@@ -1720,7 +1958,7 @@ Precedence Binop::GetPrecedenceWithoutParens() const {
     case BinopKind::kConcat:
       return Precedence::kConcat;
   }
-  XLS_LOG(FATAL) << "Invalid binop kind: " << static_cast<int>(binop_kind_);
+  LOG(FATAL) << "Invalid binop kind: " << static_cast<int>(binop_kind_);
 }
 
 absl::StatusOr<BinopKind> BinopKindFromString(std::string_view s) {
@@ -1735,9 +1973,10 @@ absl::StatusOr<BinopKind> BinopKindFromString(std::string_view s) {
 }
 
 Binop::Binop(Module* owner, Span span, BinopKind binop_kind, Expr* lhs,
-             Expr* rhs)
-    : Expr(owner, std::move(span)),
+             Expr* rhs, Span op_span, bool in_parens)
+    : Expr(owner, std::move(span), in_parens),
       binop_kind_(binop_kind),
+      op_span_(op_span),
       lhs_(lhs),
       rhs_(rhs) {}
 
@@ -1746,8 +1985,8 @@ std::string Binop::ToStringInternal() const {
   std::string lhs = lhs_->ToString();
   {
     Precedence lhs_precedence = lhs_->GetPrecedence();
-    XLS_VLOG(10) << "lhs_expr: `" << lhs << "` precedence: " << lhs_precedence
-                 << " op_precedence: " << op_precedence;
+    VLOG(10) << "lhs_expr: `" << lhs << "` precedence: " << lhs_precedence
+             << " op_precedence: " << op_precedence;
     if (WeakerThan(lhs_precedence, op_precedence)) {
       Parenthesize(&lhs);
     } else if (binop_kind_ == BinopKind::kLt &&
@@ -1775,26 +2014,27 @@ std::string Binop::ToStringInternal() const {
   return absl::StrFormat("%s %s %s", lhs, BinopKindFormat(binop_kind_), rhs);
 }
 
-// -- class Block
+// -- class StatementBlock
 
-Block::Block(Module* owner, Span span, std::vector<Statement*> statements,
-             bool trailing_semi)
+StatementBlock::StatementBlock(Module* owner, Span span,
+                               std::vector<Statement*> statements,
+                               bool trailing_semi)
     : Expr(owner, std::move(span)),
       statements_(std::move(statements)),
       trailing_semi_(trailing_semi) {
   if (statements_.empty()) {
-    XLS_CHECK(trailing_semi) << "empty block but trailing_semi is false";
+    CHECK(trailing_semi) << "empty block but trailing_semi is false";
   }
 }
 
-Block::~Block() = default;
+StatementBlock::~StatementBlock() = default;
 
-std::string Block::ToInlineString() const {
+std::string StatementBlock::ToInlineString() const {
   // A formatting special case: if there are no statements (and implicitly a
   // trailing semi since an empty block gives unit type) we just give back
   // braces without any semicolon inside.
   if (statements_.empty()) {
-    XLS_CHECK(trailing_semi_);
+    CHECK(trailing_semi_);
     return "{}";
   }
 
@@ -1810,12 +2050,12 @@ std::string Block::ToInlineString() const {
   return s;
 }
 
-std::string Block::ToStringInternal() const {
+std::string StatementBlock::ToStringInternal() const {
   // A formatting special case: if there are no statements (and implicitly a
   // trailing semi since an empty block gives unit type) we just give back
   // braces without any semicolon inside.
   if (statements_.empty()) {
-    XLS_CHECK(trailing_semi_);
+    CHECK(trailing_semi_);
     return "{}";
   }
 
@@ -1836,21 +2076,19 @@ std::string Block::ToStringInternal() const {
       "{\n%s\n}", Indent(absl::StrJoin(stmts, "\n"), kRustSpacesPerIndent));
 }
 
-// -- class For
+// -- class ForLoopBase
 
-For::For(Module* owner, Span span, NameDefTree* names,
-         TypeAnnotation* type_annotation, Expr* iterable, Block* body,
-         Expr* init)
-    : Expr(owner, std::move(span)),
+ForLoopBase::ForLoopBase(Module* owner, Span span, NameDefTree* names,
+                         TypeAnnotation* type_annotation, Expr* iterable,
+                         StatementBlock* body, Expr* init, bool in_parens)
+    : Expr(owner, span, in_parens),
       names_(names),
       type_annotation_(type_annotation),
       iterable_(iterable),
       body_(body),
       init_(init) {}
 
-For::~For() = default;
-
-std::vector<AstNode*> For::GetChildren(bool want_types) const {
+std::vector<AstNode*> ForLoopBase::GetChildren(bool want_types) const {
   std::vector<AstNode*> results = {names_};
   if (want_types && type_annotation_ != nullptr) {
     results.push_back(type_annotation_);
@@ -1861,12 +2099,22 @@ std::vector<AstNode*> For::GetChildren(bool want_types) const {
   return results;
 }
 
+std::string ForLoopBase::ToStringInternal() const {
+  std::string type_str;
+  if (type_annotation_ != nullptr) {
+    type_str = absl::StrCat(": ", type_annotation_->ToString());
+  }
+  return absl::StrFormat("%s %s%s in %s %s(%s)", keyword(), names_->ToString(),
+                         type_str, iterable_->ToString(), body_->ToString(),
+                         init_->ToString());
+}
+
 // -- class Function
 
 Function::Function(Module* owner, Span span, NameDef* name_def,
                    std::vector<ParametricBinding*> parametric_bindings,
                    std::vector<Param*> params, TypeAnnotation* return_type,
-                   Block* body, Tag tag, bool is_public)
+                   StatementBlock* body, FunctionTag tag, bool is_public)
     : AstNode(owner),
       span_(std::move(span)),
       name_def_(name_def),
@@ -1875,14 +2123,42 @@ Function::Function(Module* owner, Span span, NameDef* name_def,
       return_type_(return_type),
       body_(body),
       tag_(tag),
-      is_public_(is_public) {}
+      is_public_(is_public) {
+  for (const ParametricBinding* pb : parametric_bindings_) {
+    CHECK(parametric_keys_.insert(pb->identifier()).second)
+        << "Duplicate parametric binding: " << pb->identifier();
+  }
+}
 
 Function::~Function() = default;
+
+absl::StatusOr<Param*> Function::GetParamByName(
+    std::string_view param_name) const {
+  auto i = std::find_if(params_.begin(), params_.end(), [=](Param* p) -> bool {
+    return (p != nullptr) && (p->name_def()->identifier() == param_name);
+  });
+
+  if (i == params_.end()) {
+    return absl::NotFoundError(absl::StrFormat(
+        "Param '%s' not a parameter of function %s", param_name, ToString()));
+  }
+
+  return *i;
+}
+
+bool Function::IsMethod() const {
+  if (params_.empty()) {
+    return false;
+  }
+  const Param* first_arg = params_.at(0);
+  return dynamic_cast<SelfTypeAnnotation*>(first_arg->type_annotation()) !=
+         nullptr;
+}
 
 std::vector<AstNode*> Function::GetChildren(bool want_types) const {
   std::vector<AstNode*> results;
   results.push_back(name_def());
-  if (tag_ == Tag::kNormal) {
+  if (tag_ == FunctionTag::kNormal) {
     // The parametric bindings of a proc are shared between the proc itself and
     // the two functions it contains. Thus, they should have a single owner, the
     // proc, and the other two functions "borrow" them.
@@ -1958,95 +2234,42 @@ std::vector<std::string> Function::GetFreeParametricKeys() const {
 
 TestFunction::~TestFunction() = default;
 
-// -- class Proc
+// -- class Lambda
 
-Proc::Proc(Module* owner, Span span, NameDef* name_def,
-           NameDef* config_name_def, NameDef* next_name_def,
-           const std::vector<ParametricBinding*>& parametric_bindings,
-           std::vector<ProcMember*> members, Function* config, Function* next,
-           Function* init, bool is_public)
-    : AstNode(owner),
-      span_(std::move(span)),
-      name_def_(name_def),
-      config_name_def_(config_name_def),
-      next_name_def_(next_name_def),
-      parametric_bindings_(parametric_bindings),
-      config_(config),
-      next_(next),
-      init_(init),
-      members_(std::move(members)),
-      is_public_(is_public) {}
+Lambda::Lambda(Module* owner, Span span, std::vector<Param*> params,
+               TypeAnnotation* return_type, StatementBlock* body)
+    : Expr(owner, std::move(span)),
+      params_(std::move(params)),
+      return_type_(return_type),
+      body_(body) {}
 
-Proc::~Proc() = default;
+Lambda::~Lambda() = default;
 
-std::vector<AstNode*> Proc::GetChildren(bool want_types) const {
-  std::vector<AstNode*> results = {name_def()};
-  for (ParametricBinding* pb : parametric_bindings_) {
-    results.push_back(pb);
-  }
-  for (ProcMember* p : members_) {
+std::vector<AstNode*> Lambda::GetChildren(bool want_types) const {
+  std::vector<AstNode*> results;
+  for (Param* p : params()) {
     results.push_back(p);
   }
-  results.push_back(config_);
-  results.push_back(next_);
-  results.push_back(init_);
+  if (return_type_ != nullptr && want_types) {
+    results.push_back(return_type_);
+  }
+  results.push_back(body_);
   return results;
 }
 
-std::string Proc::ToString() const {
-  std::string pub_str = is_public() ? "pub " : "";
-  std::string parametric_str;
-  if (!parametric_bindings().empty()) {
-    parametric_str = absl::StrFormat(
-        "<%s>",
-        absl::StrJoin(
-            parametric_bindings(), ", ",
-            [](std::string* out, ParametricBinding* parametric_binding) {
-              absl::StrAppend(out, parametric_binding->ToString());
-            }));
-  }
-  auto param_append = [](std::string* out, const Param* p) {
-    out->append(absl::StrCat(p->ToString(), ";"));
-  };
-  auto member_append = [](std::string* out, const ProcMember* member) {
-    out->append(absl::StrCat(member->ToString(), ";"));
-  };
-  std::string config_params_str =
-      absl::StrJoin(config_->params(), ", ", param_append);
-  std::string state_params_str =
-      absl::StrJoin(next_->params(), ", ", param_append);
-  std::string members_str = absl::StrJoin(members_, "\n", member_append);
-  if (!members_str.empty()) {
-    members_str.append("\n");
-  }
+std::string Lambda::ToStringInternal() const {
+  std::string params_str =
+      absl::StrJoin(params(), ", ", [](std::string* out, Param* param) {
+        absl::StrAppend(out, param->ToString());
+      });
 
-  // Init functions are special, since they shouldn't be printed with
-  // parentheses (since they can't take args).
-  std::string init_str = Indent(
-      absl::StrCat("init ", init_->body()->ToString()), kRustSpacesPerIndent);
+  std::string return_str = return_type_ != nullptr
+                               ? absl::StrCat(" -> ", return_type_->ToString())
+                               : "";
+  std::string body_str =
+      body_->size() > 1 ? body_->ToString() : body_->ToInlineString();
 
-  constexpr std::string_view kTemplate = R"(%sproc %s%s {
-%s%s
-%s
-%s
-})";
-  return absl::StrFormat(
-      kTemplate, pub_str, name_def()->identifier(), parametric_str,
-      Indent(members_str, kRustSpacesPerIndent),
-      Indent(config_->ToUndecoratedString("config"), kRustSpacesPerIndent),
-      init_str,
-      Indent(next_->ToUndecoratedString("next"), kRustSpacesPerIndent));
-}
-
-std::vector<std::string> Proc::GetFreeParametricKeys() const {
-  // TODO(rspringer): 2021-09-29: Mutants found holes in test coverage here.
-  std::vector<std::string> results;
-  for (ParametricBinding* b : parametric_bindings_) {
-    if (b->expr() == nullptr) {
-      results.push_back(b->name_def()->identifier());
-    }
-  }
-  return results;
+  return absl::StrFormat("|%s|%s %s", params_str, return_str, body_str);
 }
 
 // -- class MatchArm
@@ -2057,7 +2280,7 @@ MatchArm::MatchArm(Module* owner, Span span, std::vector<NameDefTree*> patterns,
       span_(std::move(span)),
       patterns_(std::move(patterns)),
       expr_(expr) {
-  XLS_CHECK(!patterns_.empty());
+  CHECK(!patterns_.empty());
 }
 
 MatchArm::~MatchArm() = default;
@@ -2067,26 +2290,30 @@ Span MatchArm::GetPatternSpan() const {
 }
 
 Match::Match(Module* owner, Span span, Expr* matched,
-             std::vector<MatchArm*> arms)
-    : Expr(owner, std::move(span)), matched_(matched), arms_(std::move(arms)) {}
+             std::vector<MatchArm*> arms, bool in_parens)
+    : Expr(owner, std::move(span), in_parens),
+      matched_(matched),
+      arms_(std::move(arms)) {}
 
 // -- class NameRef
 
 NameRef::~NameRef() = default;
 
-// -- class ConstRef
-
-ConstRef::~ConstRef() = default;
-
 // -- class Range
 
-Range::Range(Module* owner, Span span, Expr* start, Expr* end)
-    : Expr(owner, std::move(span)), start_(start), end_(end) {}
+Range::Range(Module* owner, Span span, Expr* start, bool inclusive_end,
+             Expr* end, bool in_parens, bool pattern_semantics)
+    : Expr(owner, std::move(span), in_parens),
+      start_(start),
+      end_(end),
+      inclusive_end_(inclusive_end),
+      pattern_semantics_(pattern_semantics) {}
 
 Range::~Range() = default;
 
 std::string Range::ToStringInternal() const {
-  return absl::StrFormat("%s..%s", start_->ToString(), end_->ToString());
+  return absl::StrFormat("%s..%s%s", start_->ToString(),
+                         inclusive_end_ ? "=" : "", end_->ToString());
 }
 
 // -- class Cast
@@ -2097,20 +2324,11 @@ std::string Cast::ToStringInternal() const {
   std::string lhs = expr_->ToString();
   Precedence arg_precedence = expr_->GetPrecedence();
   if (WeakerThan(arg_precedence, Precedence::kAs)) {
-    XLS_VLOG(10) << absl::StreamFormat(
-        "expr `%s` precedence: %s weaker than 'as'", lhs,
-        PrecedenceToString(arg_precedence));
+    VLOG(10) << absl::StreamFormat("expr `%s` precedence: %s weaker than 'as'",
+                                   lhs, PrecedenceToString(arg_precedence));
     Parenthesize(&lhs);
   }
   return absl::StrFormat("%s as %s", lhs, type_annotation_->ToString());
-}
-
-// -- class TestProc
-
-TestProc::~TestProc() = default;
-
-std::string TestProc::ToString() const {
-  return absl::StrFormat("#[test_proc]\n%s", proc_->ToString());
 }
 
 // -- class BuiltinTypeAnnotation
@@ -2118,7 +2336,7 @@ std::string TestProc::ToString() const {
 BuiltinTypeAnnotation::BuiltinTypeAnnotation(Module* owner, Span span,
                                              BuiltinType builtin_type,
                                              BuiltinNameDef* builtin_name_def)
-    : TypeAnnotation(owner, std::move(span)),
+    : TypeAnnotation(owner, std::move(span), kAnnotationKind),
       builtin_type_(builtin_type),
       builtin_name_def_(builtin_name_def) {}
 
@@ -2130,11 +2348,11 @@ std::vector<AstNode*> BuiltinTypeAnnotation::GetChildren(
 }
 
 int64_t BuiltinTypeAnnotation::GetBitCount() const {
-  return GetBuiltinTypeBitCount(builtin_type_).value();
+  return GetBuiltinTypeBitCount(builtin_type_);
 }
 
-bool BuiltinTypeAnnotation::GetSignedness() const {
-  return GetBuiltinTypeSignedness(builtin_type_).value();
+absl::StatusOr<bool> BuiltinTypeAnnotation::GetSignedness() const {
+  return GetBuiltinTypeSignedness(builtin_type_);
 }
 
 // -- class ChannelTypeAnnotation
@@ -2142,10 +2360,10 @@ bool BuiltinTypeAnnotation::GetSignedness() const {
 ChannelTypeAnnotation::ChannelTypeAnnotation(
     Module* owner, Span span, ChannelDirection direction,
     TypeAnnotation* payload, std::optional<std::vector<Expr*>> dims)
-    : TypeAnnotation(owner, std::move(span)),
+    : TypeAnnotation(owner, std::move(span), kAnnotationKind),
       direction_(direction),
       payload_(payload),
-      dims_(dims) {}
+      dims_(std::move(dims)) {}
 
 ChannelTypeAnnotation::~ChannelTypeAnnotation() = default;
 
@@ -2165,7 +2383,8 @@ std::string ChannelTypeAnnotation::ToString() const {
 
 TupleTypeAnnotation::TupleTypeAnnotation(Module* owner, Span span,
                                          std::vector<TypeAnnotation*> members)
-    : TypeAnnotation(owner, std::move(span)), members_(std::move(members)) {}
+    : TypeAnnotation(owner, std::move(span), kAnnotationKind),
+      members_(std::move(members)) {}
 
 TupleTypeAnnotation::~TupleTypeAnnotation() = default;
 
@@ -2177,10 +2396,17 @@ std::string TupleTypeAnnotation::ToString() const {
   return absl::StrFormat("(%s%s)", guts, members_.size() == 1 ? "," : "");
 }
 
+bool TupleTypeAnnotation::HasMultipleAny() const {
+  return absl::c_any_of(members_, [](const TypeAnnotation* annotation) {
+    const auto* any = dynamic_cast<const AnyTypeAnnotation*>(annotation);
+    return any != nullptr && any->multiple();
+  });
+}
+
 // -- class Statement
 
-/* static */ absl::StatusOr<std::variant<Expr*, TypeAlias*, Let*, ConstAssert*>>
-Statement::NodeToWrapped(AstNode* n) {
+/* static */ absl::StatusOr<Statement::Wrapped> Statement::NodeToWrapped(
+    AstNode* n) {
   if (auto* e = dynamic_cast<Expr*>(n)) {
     return e;
   }
@@ -2193,19 +2419,22 @@ Statement::NodeToWrapped(AstNode* n) {
   if (auto* d = dynamic_cast<ConstAssert*>(n)) {
     return d;
   }
+  if (auto* v = dynamic_cast<VerbatimNode*>(n)) {
+    return v;
+  }
   return absl::InvalidArgumentError(absl::StrCat(
       "AST node could not be wrapped in a statement: ", n->GetNodeTypeName()));
 }
 
 Statement::Statement(Module* owner, Statement::Wrapped wrapped)
     : AstNode(owner), wrapped_(wrapped) {
-  XLS_CHECK_NE(ToAstNode(wrapped_), this);
+  CHECK_NE(ToAstNode(wrapped_), this);
 }
 
 std::optional<Span> Statement::GetSpan() const {
   AstNode* wrapped = ToAstNode(wrapped_);
-  XLS_CHECK_NE(wrapped, nullptr);
-  XLS_CHECK_NE(wrapped, this);
+  CHECK_NE(wrapped, nullptr);
+  CHECK_NE(wrapped, this);
   return wrapped->GetSpan();
 }
 
@@ -2213,28 +2442,59 @@ std::optional<Span> Statement::GetSpan() const {
 
 WildcardPattern::~WildcardPattern() = default;
 
+// -- class RestOfTuple
+
+RestOfTuple::~RestOfTuple() = default;
+
+// -- class VerbatimNode
+
+VerbatimNode::~VerbatimNode() = default;
+
 // -- class QuickCheck
 
-QuickCheck::QuickCheck(Module* owner, Span span, Function* f,
-                       std::optional<int64_t> test_count)
-    : AstNode(owner), span_(std::move(span)), f_(f), test_count_(test_count) {}
+std::string QuickCheckTestCases::ToString() const {
+  switch (tag()) {
+    case QuickCheckTestCasesTag::kExhaustive:
+      return "exhaustive";
+    case QuickCheckTestCasesTag::kCounted:
+      if (count().has_value()) {
+        return absl::StrFormat("test_count=%d", count().value());
+      }
+      return absl::StrFormat("test_count=default=%d", kDefaultTestCount);
+  }
+}
+
+QuickCheck::QuickCheck(Module* owner, Span span, Function* fn,
+                       QuickCheckTestCases test_cases)
+    : AstNode(owner),
+      span_(std::move(span)),
+      fn_(fn),
+      test_cases_(test_cases) {}
 
 QuickCheck::~QuickCheck() = default;
 
 std::string QuickCheck::ToString() const {
-  std::string test_count_str;
-  if (test_count_.has_value()) {
-    test_count_str = absl::StrFormat("(test_count=%d)", *test_count_);
+  std::string spec_str;
+  switch (test_cases_.tag()) {
+    case QuickCheckTestCasesTag::kExhaustive:
+      spec_str = "(exhaustive)";
+      break;
+    case QuickCheckTestCasesTag::kCounted:
+      if (test_cases_.count().has_value()) {
+        spec_str = absl::StrFormat("(test_count=%d)", *test_cases_.count());
+      }
+      break;
   }
-  return absl::StrFormat("#[quickcheck%s]\n%s", test_count_str, f_->ToString());
+  return absl::StrFormat("#[quickcheck%s]\n%s", spec_str, fn_->ToString());
 }
 
 // -- class TupleIndex
 
 TupleIndex::~TupleIndex() = default;
 
-TupleIndex::TupleIndex(Module* owner, Span span, Expr* lhs, Number* index)
-    : Expr(owner, std::move(span)), lhs_(lhs), index_(index) {}
+TupleIndex::TupleIndex(Module* owner, Span span, Expr* lhs, Number* index,
+                       bool in_parens)
+    : Expr(owner, std::move(span), in_parens), lhs_(lhs), index_(index) {}
 
 absl::Status TupleIndex::Accept(AstNodeVisitor* v) const {
   return v->HandleTupleIndex(this);
@@ -2380,16 +2640,37 @@ std::string Expr::ToString() const {
 
 String::~String() = default;
 
+std::string String::ToStringInternal() const {
+  return absl::StrCat("\"", Escape(text_), "\"");
+}
+
 // -- class Number
 
+static Span MakeNumberSpan(Span expr_span,
+                           const TypeAnnotation* type_annotation) {
+  if (type_annotation == nullptr) {
+    return expr_span;
+  }
+  return Span(type_annotation->span().start(), expr_span.limit());
+}
+
 Number::Number(Module* owner, Span span, std::string text,
-               NumberKind number_kind, TypeAnnotation* type_annotation)
-    : Expr(owner, std::move(span)),
+               NumberKind number_kind, TypeAnnotation* type_annotation,
+               bool in_parens, bool leave_span_intact)
+    : Expr(owner,
+           leave_span_intact ? span
+                             : MakeNumberSpan(std::move(span), type_annotation),
+           in_parens),
       text_(std::move(text)),
       number_kind_(number_kind),
       type_annotation_(type_annotation) {}
 
 Number::~Number() = default;
+
+void Number::SetTypeAnnotation(TypeAnnotation* type_annotation) {
+  type_annotation_ = type_annotation;
+  UpdateSpan(MakeNumberSpan(span(), type_annotation));
+}
 
 std::vector<AstNode*> Number::GetChildren(bool want_types) const {
   if (type_annotation_ == nullptr) {
@@ -2415,7 +2696,8 @@ std::string Number::ToStringInternal() const {
 
 std::string Number::ToStringNoType() const { return text_; }
 
-absl::StatusOr<bool> Number::FitsInType(int64_t bit_count) const {
+absl::StatusOr<bool> Number::FitsInType(int64_t bit_count,
+                                        bool is_signed) const {
   XLS_RET_CHECK_GE(bit_count, 0);
   switch (number_kind_) {
     case NumberKind::kBool:
@@ -2423,8 +2705,10 @@ absl::StatusOr<bool> Number::FitsInType(int64_t bit_count) const {
     case NumberKind::kCharacter:
       return bit_count >= CHAR_BIT;
     case NumberKind::kOther: {
-      XLS_ASSIGN_OR_RETURN(auto sm, GetSignAndMagnitude(text_));
-      auto [sign, bits] = sm;
+      XLS_ASSIGN_OR_RETURN((auto [sign, bits]), GetSignAndMagnitude(text_));
+      if (is_signed && bits.msb() && sign == Sign::kPositive) {
+        return bit_count > bits.bit_count();
+      }
       return bit_count >= bits.bit_count();
     }
   }
@@ -2432,7 +2716,8 @@ absl::StatusOr<bool> Number::FitsInType(int64_t bit_count) const {
       absl::StrFormat("Unreachable; invalid number kind: %d", number_kind_));
 }
 
-absl::StatusOr<Bits> Number::GetBits(int64_t bit_count) const {
+absl::StatusOr<Bits> Number::GetBits(int64_t bit_count,
+                                     const FileTable& file_table) const {
   XLS_RET_CHECK_GE(bit_count, 0);
   switch (number_kind_) {
     case NumberKind::kBool: {
@@ -2446,15 +2731,15 @@ absl::StatusOr<Bits> Number::GetBits(int64_t bit_count) const {
       return bits_ops::ZeroExtend(result, bit_count);
     }
     case NumberKind::kOther: {
-      XLS_ASSIGN_OR_RETURN(auto sm, GetSignAndMagnitude(text_));
-      auto [sign, bits] = sm;
+      XLS_ASSIGN_OR_RETURN((auto [sign, bits]), GetSignAndMagnitude(text_));
       XLS_RET_CHECK_GE(bits.bit_count(), 0);
       XLS_RET_CHECK(bit_count >= bits.bit_count()) << absl::StreamFormat(
           "Internal error: %s Cannot fit number value %s in %d bits; %d "
           "required: `%s`",
-          span().ToString(), text_, bit_count, bits.bit_count(), ToString());
+          span().ToString(file_table), text_, bit_count, bits.bit_count(),
+          ToString());
       bits = bits_ops::ZeroExtend(bits, bit_count);
-      if (sign) {
+      if (sign == Sign::kNegative) {
         bits = bits_ops::Negate(bits);
       }
       return bits;
@@ -2464,15 +2749,21 @@ absl::StatusOr<Bits> Number::GetBits(int64_t bit_count) const {
       "Invalid NumberKind: %d", static_cast<int64_t>(number_kind_)));
 }
 
-TypeAlias::TypeAlias(Module* owner, Span span, NameDef* name_def,
-                     TypeAnnotation* type, bool is_public)
+TypeAlias::TypeAlias(Module* owner, Span span, NameDef& name_def,
+                     TypeAnnotation& type, bool is_public)
     : AstNode(owner),
-      span_(std::move(span)),
+      span_(span),
       name_def_(name_def),
       type_annotation_(type),
       is_public_(is_public) {}
 
 TypeAlias::~TypeAlias() = default;
+
+std::string TypeAlias::ToString() const {
+  return absl::StrFormat(
+      "%s%stype %s = %s;", MakeExternTypeAttr(extern_type_name_),
+      is_public_ ? "pub " : "", identifier(), type_annotation_.ToString());
+}
 
 // -- class Array
 
@@ -2497,7 +2788,7 @@ std::vector<AstNode*> Array::GetChildren(bool want_types) const {
     results.push_back(type_annotation_);
   }
   for (Expr* member : members_) {
-    XLS_CHECK(member != nullptr);
+    CHECK(member != nullptr);
     results.push_back(member);
   }
   return results;
@@ -2507,50 +2798,16 @@ std::vector<AstNode*> Statement::GetChildren(bool want_types) const {
   return {ToAstNode(wrapped_)};
 }
 
-Span ExprOrTypeSpan(const ExprOrType &expr_or_type) {
-  return absl::visit(Visitor{
-    [](Expr* expr) { return expr->span(); },
-    [](TypeAnnotation* type) { return type->span(); },
-  }, expr_or_type);
+Span ExprOrTypeSpan(const ExprOrType& expr_or_type) {
+  return absl::visit(
+      Visitor{
+          [](auto* n) { return n->span(); },
+      },
+      expr_or_type);
 }
 
-absl::StatusOr<std::vector<AstNode*>> CollectUnder(AstNode* root,
-                                                   bool want_types) {
-  std::vector<AstNode*> nodes;
+// class GenericTypeAnnotation
 
-  class CollectVisitor : public AstNodeVisitor {
-   public:
-    explicit CollectVisitor(std::vector<AstNode*>& nodes) : nodes_(nodes) {}
-
-#define DECLARE_HANDLER(__type)                           \
-  absl::Status Handle##__type(const __type* n) override { \
-    nodes_.push_back(const_cast<__type*>(n));             \
-    return absl::OkStatus();                              \
-  }
-    XLS_DSLX_AST_NODE_EACH(DECLARE_HANDLER)
-#undef DECLARE_HANDLER
-
-   private:
-    std::vector<AstNode*>& nodes_;
-  } collect_visitor(nodes);
-
-  XLS_RETURN_IF_ERROR(WalkPostOrder(root, &collect_visitor, want_types));
-  return nodes;
-}
-
-absl::StatusOr<std::vector<const AstNode*>> CollectUnder(const AstNode* root,
-                                                         bool want_types) {
-  // Implementation note: delegate to non-const version and turn result values
-  // back to const.
-  XLS_ASSIGN_OR_RETURN(std::vector<AstNode*> got,
-                       CollectUnder(const_cast<AstNode*>(root), want_types));
-
-  std::vector<const AstNode*> result;
-  result.reserve(got.size());
-  for (AstNode* n : got) {
-    result.push_back(n);
-  }
-  return result;
-}
+GenericTypeAnnotation::~GenericTypeAnnotation() = default;
 
 }  // namespace xls::dslx

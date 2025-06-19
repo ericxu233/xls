@@ -16,13 +16,15 @@
 #define XLS_NOC_SIMULATION_TRAFFIC_DESCRIPTION_H_
 
 #include <algorithm>
-#include <queue>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/noc/simulation/common.h"
 #include "xls/noc/simulation/units.h"
@@ -305,6 +307,7 @@ class NocTrafficManager {
   // Retrieves all traffic flow ids.
   std::vector<TrafficFlowId> GetTrafficFlowIds() const {
     std::vector<TrafficFlowId> flows;
+    flows.reserve(traffic_flows_.size());
     for (const TrafficFlow& f : traffic_flows_) {
       flows.push_back(f.id());
     }

@@ -16,26 +16,42 @@
 
 #include <string_view>
 
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 
 namespace xls {
 
+constexpr std::string_view kBinaryName = "binary";
+constexpr std::string_view kDefaultName = "default";
+constexpr std::string_view kHexName = "hex";
+constexpr std::string_view kPlainBinaryName = "plain_binary";
+constexpr std::string_view kPlainHexName = "plain_hex";
+constexpr std::string_view kSignedDecimalName = "signed-decimal";
+constexpr std::string_view kUnsignedDecimalName = "unsigned-decimal";
+constexpr std::string_view kZeroPaddedBinaryName = "zero-padded-binary";
+constexpr std::string_view kZeroPaddedHexName = "zero-padded-hex";
+
 std::string_view FormatPreferenceToString(FormatPreference preference) {
   switch (preference) {
     case FormatPreference::kDefault:
-      return "default";
+      return kDefaultName;
     case FormatPreference::kBinary:
-      return "binary";
+      return kBinaryName;
     case FormatPreference::kSignedDecimal:
-      return "signed-decimal";
+      return kSignedDecimalName;
     case FormatPreference::kUnsignedDecimal:
-      return "unsigned-decimal";
+      return kUnsignedDecimalName;
     case FormatPreference::kHex:
-      return "hex";
+      return kHexName;
     case FormatPreference::kPlainBinary:
-      return "plain_binary";
+      return kPlainBinaryName;
     case FormatPreference::kPlainHex:
-      return "plain_hex";
+      return kPlainHexName;
+    case FormatPreference::kZeroPaddedBinary:
+      return kZeroPaddedBinaryName;
+    case FormatPreference::kZeroPaddedHex:
+      return kZeroPaddedHexName;
   }
 
   return "<invalid format preference>";
@@ -57,6 +73,10 @@ std::string_view FormatPreferenceToXlsSpecifier(FormatPreference preference) {
       return "{:b}";
     case FormatPreference::kPlainHex:
       return "{:x}";
+    case FormatPreference::kZeroPaddedBinary:
+      return "{:0b}";
+    case FormatPreference::kZeroPaddedHex:
+      return "{:0x}";
   }
 
   return "<invalid format preference>";
@@ -84,9 +104,21 @@ std::string_view FormatPreferenceToVerilogSpecifier(
       return "0b%b";
     case FormatPreference::kHex:
       return "0x%h";
+    // Plain binary ({:b} in dslx) now corresponds to non-zero-padded binary
+    // (%0b) in Verilog. This makes the dslx semantics the same as the Rust
+    // semantics. Similar for plain hex ({:x} in dslx/%0h in Verilog).
     case FormatPreference::kPlainBinary:
-      return "%b";
+      return "%0b";
     case FormatPreference::kPlainHex:
+      return "%0h";
+    // Zero-padded binary ({:0b} in dslx) now corresponds to zero-padded binary
+    // (%b) in Verilog. This makes the dslx semantics close to the Rust
+    // semantics; in Rust you must specify the size (e.g., {:032b} to get
+    // 32 bits with zero padding). Similar for zero-padded hex ({:0x} in dslx/%h
+    // in Verilog).
+    case FormatPreference::kZeroPaddedBinary:
+      return "%b";
+    case FormatPreference::kZeroPaddedHex:
       return "%h";
   }
 
@@ -95,20 +127,32 @@ std::string_view FormatPreferenceToVerilogSpecifier(
 
 absl::StatusOr<FormatPreference> FormatPreferenceFromString(
     std::string_view s) {
-  if (s == "default") {
+  if (s == kDefaultName) {
     return FormatPreference::kDefault;
-  } else if (s == "binary") {
+  }
+  if (s == kBinaryName) {
     return FormatPreference::kBinary;
-  } else if (s == "hex") {
+  }
+  if (s == kHexName) {
     return FormatPreference::kHex;
-  } else if (s == "signed-decimal") {
+  }
+  if (s == kSignedDecimalName) {
     return FormatPreference::kSignedDecimal;
-  } else if (s == "unsigned-decimal") {
+  }
+  if (s == kUnsignedDecimalName) {
     return FormatPreference::kUnsignedDecimal;
-  } else if (s == "plain_binary") {
+  }
+  if (s == kPlainBinaryName) {
     return FormatPreference::kPlainBinary;
-  } else if (s == "plain_hex") {
+  }
+  if (s == kPlainHexName) {
     return FormatPreference::kPlainHex;
+  }
+  if (s == kZeroPaddedBinaryName) {
+    return FormatPreference::kZeroPaddedBinary;
+  }
+  if (s == kZeroPaddedHexName) {
+    return FormatPreference::kZeroPaddedHex;
   }
   return absl::InvalidArgumentError(
       absl::StrFormat("Invalid format preference: \"%s\"", s));

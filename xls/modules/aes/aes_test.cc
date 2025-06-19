@@ -16,21 +16,25 @@
 #include "openssl/aes.h"
 
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <ostream>
 #include <string_view>
 #include <vector>
 
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_format.h"
+#include "absl/strings/str_cat.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/value.h"
 #include "xls/modules/aes/aes_decrypt_cc.h"
 #include "xls/modules/aes/aes_encrypt_cc.h"
@@ -71,7 +75,7 @@ static Block ReferenceEncrypt(const Key& key, int key_bytes,
   memcpy(local_key, key.data(), key_bytes);
 
   AES_KEY aes_key;
-  XLS_QCHECK_EQ(AES_set_encrypt_key(local_key, key_bytes * 8, &aes_key), 0);
+  QCHECK_EQ(AES_set_encrypt_key(local_key, key_bytes * 8, &aes_key), 0);
   AES_encrypt(plaintext.data(), ciphertext.data(), &aes_key);
   return ciphertext;
 }
@@ -87,9 +91,9 @@ static absl::StatusOr<bool> RunSample(const Block& input, const Key& key,
   XLS_ASSIGN_OR_RETURN(Block xls_ciphertext, XlsEncrypt(key, key_bytes, input));
   *xls_encrypt_dur += absl::Now() - start_time;
 
-  XLS_VLOG(2) << "Reference ciphertext: " << FormatBlock(reference_ciphertext)
-              << std::endl;
-  XLS_VLOG(2) << "XLS ciphertext: " << FormatBlock(xls_ciphertext) << std::endl;
+  VLOG(2) << "Reference ciphertext: " << FormatBlock(reference_ciphertext)
+          << '\n';
+  VLOG(2) << "XLS ciphertext: " << FormatBlock(xls_ciphertext) << '\n';
 
   // Verify the ciphertexts match, to ensure we're actually doing the encryption
   // properly.
@@ -105,8 +109,7 @@ static absl::StatusOr<bool> RunSample(const Block& input, const Key& key,
   XLS_ASSIGN_OR_RETURN(Block xls_decrypted, XlsDecrypt(key, key_bytes, input));
   *xls_decrypt_dur += absl::Now() - start_time;
 
-  XLS_VLOG(2) << "Decrypted plaintext: " << FormatBlock(xls_decrypted)
-              << std::endl;
+  VLOG(2) << "Decrypted plaintext: " << FormatBlock(xls_decrypted) << '\n';
 
   // We can just compare the XLS result to the input to verify we're decrypting
   // right.
@@ -140,19 +143,19 @@ static absl::Status RunTest(int32_t key_bits, int32_t num_samples) {
         bool proceed,
         RunSample(input, key, key_bytes, &xls_encrypt_dur, &xls_decrypt_dur));
     if (!proceed) {
-      std::cout << "Plaintext: " << FormatBlock(input) << std::endl;
-      std::cout << "Key: " << FormatKey(key) << std::endl;
+      std::cout << "Plaintext: " << FormatBlock(input) << '\n';
+      std::cout << "Key: " << FormatKey(key) << '\n';
       return absl::InternalError(
           absl::StrCat(key_bits, "-bit validation failed."));
     }
   }
 
   std::cout << "Successfully ran " << num_samples << " " << key_bits
-            << "-bit samples." << std::endl;
+            << "-bit samples." << '\n';
   std::cout << "Avg. XLS encryption time: " << xls_encrypt_dur / num_samples
-            << std::endl;
+            << '\n';
   std::cout << "Avg. XLS decryption time: " << xls_decrypt_dur / num_samples
-            << std::endl;
+            << '\n';
 
   return absl::OkStatus();
 }

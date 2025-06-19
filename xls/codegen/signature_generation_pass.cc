@@ -14,23 +14,38 @@
 
 #include "xls/codegen/signature_generation_pass.h"
 
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
+#include "xls/codegen/codegen_pass.h"
+#include "xls/codegen/module_signature.h"
 #include "xls/codegen/signature_generator.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/ir/node_util.h"
+#include "xls/ir/package.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls::verilog {
 
 absl::StatusOr<bool> SignatureGenerationPass::RunInternal(
-    CodegenPassUnit* unit, const CodegenPassOptions& options,
-    PassResults* results) const {
-  if (unit->signature.has_value()) {
-    return absl::InvalidArgumentError("Signature already generated.");
+    Package* package, const CodegenPassOptions& options, PassResults* results,
+    CodegenContext& context) const {
+  bool changed = false;
+  VLOG(3) << absl::StreamFormat("Metadata has %d blocks",
+                                context.metadata().size());
+  for (auto& [block, metadata] : context.metadata()) {
+    if (block->GetSignature().has_value()) {
+      return absl::InvalidArgumentError("Signature already generated.");
+    }
+    XLS_ASSIGN_OR_RETURN(
+        ModuleSignature signature,
+        GenerateSignature(
+            options.codegen_options, block,
+            metadata.streaming_io_and_pipeline.node_to_stage_map));
+    block->SetSignature(signature.proto());
+    changed = true;
   }
-  XLS_ASSIGN_OR_RETURN(unit->signature,
-                       GenerateSignature(options.codegen_options, unit->block,
-                                         options.schedule));
-  return true;
+  return changed;
 }
 
 }  // namespace xls::verilog

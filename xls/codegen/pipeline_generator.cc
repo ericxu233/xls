@@ -15,64 +15,174 @@
 #include "xls/codegen/pipeline_generator.h"
 
 #include <algorithm>
+#include <memory>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "absl/algorithm/container.h"
+#include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_format.h"
 #include "xls/codegen/block_conversion.h"
 #include "xls/codegen/block_generator.h"
+#include "xls/codegen/block_metrics.h"
 #include "xls/codegen/codegen_options.h"
 #include "xls/codegen/codegen_pass.h"
 #include "xls/codegen/codegen_pass_pipeline.h"
+#include "xls/codegen/codegen_result.h"
+#include "xls/codegen/module_signature.h"
+#include "xls/codegen/verilog_line_map.pb.h"
+#include "xls/codegen/xls_metrics.pb.h"
 #include "xls/common/logging/log_lines.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
+#include "xls/ir/function_base.h"
+#include "xls/ir/package.h"
+#include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
+#include "xls/scheduling/pipeline_schedule.h"
 
 namespace xls {
 namespace verilog {
 
-absl::StatusOr<ModuleGeneratorResult> ToPipelineModuleText(
-    const PipelineSchedule& schedule, Function* func,
-    const CodegenOptions& options, const DelayEstimator* delay_estimator) {
-  return ToPipelineModuleText(schedule, static_cast<FunctionBase*>(func),
-                              options, delay_estimator);
-}
-
-absl::StatusOr<ModuleGeneratorResult> ToPipelineModuleText(
+absl::StatusOr<CodegenResult> ToPipelineModuleText(
     const PipelineSchedule& schedule, FunctionBase* module,
     const CodegenOptions& options, const DelayEstimator* delay_estimator) {
-  XLS_VLOG(2) << "Generating pipelined module for module:";
+  VLOG(2) << "Generating pipelined module for module:";
   XLS_VLOG_LINES(2, module->DumpIr());
   XLS_VLOG_LINES(2, schedule.ToString());
 
-  CodegenPassOptions pass_options;
-  pass_options.codegen_options = options;
-  pass_options.schedule = schedule;
-  pass_options.delay_estimator = delay_estimator;
+  // Note: this is mutated below so cannot be const. It would be nice to
+  // refactor this so it could be.
+  CodegenPassOptions pass_options = {
+      .codegen_options = options,
+      .schedule = schedule,
+      .delay_estimator = delay_estimator,
+  };
 
   // Convert to block and add in pipe stages according to schedule.
-  XLS_ASSIGN_OR_RETURN(CodegenPassUnit unit,
+  XLS_ASSIGN_OR_RETURN(CodegenContext context,
                        FunctionBaseToPipelinedBlock(schedule, options, module));
   if (module->IsProc()) {
     // Force using non-pretty printed codegen when generating procs.
-    // TODO(tedhong): 2021-09-25 - Update pretty-printer to support
-    //  blocks with flow control.
+    // TODO: google/xls#1331 - Update pretty-printer to support blocks with flow
+    // control.
     pass_options.codegen_options.emit_as_pipeline(false);
   }
 
   PassResults results;
+  OptimizationContext opt_context;
   XLS_RETURN_IF_ERROR(
-      CreateCodegenPassPipeline()->Run(&unit, pass_options, &results).status());
-  XLS_RET_CHECK(unit.signature.has_value());
-  VerilogLineMap verilog_line_map;
-  XLS_ASSIGN_OR_RETURN(std::string verilog,
-                       GenerateVerilog(unit.block, pass_options.codegen_options,
-                                       &verilog_line_map));
+      CreateCodegenPassPipeline(opt_context)
+          ->Run(module->package(), pass_options, &results, context)
+          .status());
+  XLS_RET_CHECK(context.top_block() != nullptr &&
+                context.HasMetadataForBlock(context.top_block()) &&
+                context.top_block()->GetSignature().has_value());
 
-  return ModuleGeneratorResult{verilog, verilog_line_map,
-                               unit.signature.value()};
+  VerilogLineMap verilog_line_map;
+  XLS_ASSIGN_OR_RETURN(
+      std::string verilog,
+      GenerateVerilog(context.top_block(), pass_options.codegen_options,
+                      &verilog_line_map));
+
+  XLS_ASSIGN_OR_RETURN(
+      ModuleSignature signature,
+      ModuleSignature::FromProto(*context.top_block()->GetSignature()));
+
+  XlsMetricsProto metrics;
+  XLS_ASSIGN_OR_RETURN(
+      *metrics.mutable_block_metrics(),
+      GenerateBlockMetrics(context.top_block(), delay_estimator));
+
+  // TODO: google/xls#1323 - add all block signatures to ModuleGeneratorResult,
+  // not just top.
+  return CodegenResult{
+      .verilog_text = verilog,
+      .verilog_line_map = verilog_line_map,
+      .signature = signature,
+      .block_metrics = metrics,
+      .pass_pipeline_metrics = results.ToProto(),
+  };
+}
+
+absl::StatusOr<CodegenResult> ToPipelineModuleText(
+    const PackagePipelineSchedules& schedules, Package* package,
+    const CodegenOptions& options, const DelayEstimator* delay_estimator) {
+  VLOG(2) << "Generating pipelined module for module:";
+  XLS_VLOG_LINES(2, package->DumpIr());
+  if (VLOG_IS_ON(2)) {
+    // It's helpful when diffing logs to log the schedules in a consistent
+    // order, so we sort by function name.
+    std::vector<FunctionBase const*> fbs;
+    fbs.reserve(schedules.size());
+    for (const auto& [key, _] : schedules) {
+      fbs.push_back(key);
+    }
+    absl::c_sort(fbs, FunctionBase::NameLessThan);
+    for (FunctionBase const* fb : fbs) {
+      VLOG(2) << "Schedule for " << fb->name() << ":\n";
+      XLS_VLOG_LINES(2, schedules.at(fb).ToString());
+    }
+  }
+
+  // Note: this is mutated below so cannot be const. It would be nice to
+  // refactor this so it could be.
+  CodegenPassOptions pass_options = {
+      .codegen_options = options,
+      .delay_estimator = delay_estimator,
+  };
+
+  // Convert to block and add in pipe stages according to schedule.
+  XLS_ASSIGN_OR_RETURN(CodegenContext context,
+                       PackageToPipelinedBlocks(schedules, options, package));
+  if (std::any_of(
+          schedules.begin(), schedules.end(),
+          [](const std::pair<FunctionBase*, PipelineSchedule>& element) {
+            return element.first->IsProc();
+          })) {
+    // Force using non-pretty printed codegen when generating procs.
+    // TODO: google/xls#1331 - Update pretty-printer to support blocks with flow
+    // control.
+    // TODO: google/xls#1332 - Update this setting per-block.
+    pass_options.codegen_options.emit_as_pipeline(false);
+  }
+
+  PassResults results;
+  OptimizationContext opt_context;
+  XLS_RETURN_IF_ERROR(CreateCodegenPassPipeline(opt_context)
+                          ->Run(package, pass_options, &results, context)
+                          .status());
+
+  XLS_RET_CHECK(context.top_block() != nullptr &&
+                context.HasMetadataForBlock(context.top_block()) &&
+                context.top_block()->GetSignature().has_value());
+  VerilogLineMap verilog_line_map;
+  XLS_ASSIGN_OR_RETURN(
+      std::string verilog,
+      GenerateVerilog(context.top_block(), options, &verilog_line_map));
+
+  XLS_ASSIGN_OR_RETURN(
+      ModuleSignature signature,
+      ModuleSignature::FromProto(*context.top_block()->GetSignature()));
+
+  XlsMetricsProto metrics;
+  XLS_ASSIGN_OR_RETURN(
+      *metrics.mutable_block_metrics(),
+      GenerateBlockMetrics(context.top_block(), delay_estimator));
+
+  // TODO: google/xls#1323 - add all block signatures to ModuleGeneratorResult,
+  // not just top.
+  return CodegenResult{
+      .verilog_text = verilog,
+      .verilog_line_map = verilog_line_map,
+      .signature = signature,
+      .block_metrics = metrics,
+      .pass_pipeline_metrics = results.ToProto(),
+  };
 }
 
 }  // namespace verilog

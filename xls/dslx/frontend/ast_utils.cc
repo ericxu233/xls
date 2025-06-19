@@ -15,95 +15,37 @@
 #include "xls/dslx/frontend/ast_utils.h"
 
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/variant.h"
-#include "xls/common/casts.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/visitor.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/builtins_metadata.h"
+#include "xls/dslx/frontend/module.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/frontend/token_utils.h"
-#include "xls/dslx/import_data.h"
-#include "xls/dslx/type_system/type_info.h"
+#include "xls/dslx/interp_value.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/number_parser.h"
 
 namespace xls::dslx {
 namespace {
-
-// Has to be an enum or builtin-type name, given the context we're in: looking
-// for _values_ hanging off, e.g. in service of a `::` ref.
-absl::StatusOr<std::variant<EnumDef*, BuiltinNameDef*, ArrayTypeAnnotation*>>
-ResolveTypeAliasToDirectColonRefSubject(ImportData* import_data,
-                                        const TypeInfo* type_info,
-                                        TypeAlias* type_def) {
-  XLS_VLOG(5) << "ResolveTypeDefToDirectColonRefSubject; type_def: `"
-              << type_def->ToString() << "`";
-
-  TypeDefinition td = type_def;
-  while (std::holds_alternative<TypeAlias*>(td)) {
-    TypeAlias* type_def = std::get<TypeAlias*>(td);
-    XLS_VLOG(5) << "TypeAlias: `" << type_def->ToString() << "`";
-    TypeAnnotation* type = type_def->type_annotation();
-    XLS_VLOG(5) << "TypeAnnotation: `" << type->ToString() << "`";
-
-    if (auto* bti = dynamic_cast<BuiltinTypeAnnotation*>(type);
-        bti != nullptr) {
-      return bti->builtin_name_def();
-    }
-    if (auto* ata = dynamic_cast<ArrayTypeAnnotation*>(type); ata != nullptr) {
-      return ata;
-    }
-
-    TypeRefTypeAnnotation* type_ref_type =
-        dynamic_cast<TypeRefTypeAnnotation*>(type);
-    // TODO(rspringer): We'll need to collect parametrics from type_ref_type to
-    // support parametric TypeDefs.
-    XLS_RET_CHECK(type_ref_type != nullptr)
-        << type->ToString() << " :: " << type->GetNodeTypeName();
-    XLS_VLOG(5) << "TypeRefTypeAnnotation: `" << type_ref_type->ToString()
-                << "`";
-
-    td = type_ref_type->type_ref()->type_definition();
-  }
-
-  if (std::holds_alternative<ColonRef*>(td)) {
-    ColonRef* colon_ref = std::get<ColonRef*>(td);
-    XLS_ASSIGN_OR_RETURN(auto subject, ResolveColonRefSubjectForTypeChecking(
-                                           import_data, type_info, colon_ref));
-    XLS_RET_CHECK(std::holds_alternative<Module*>(subject));
-    Module* module = std::get<Module*>(subject);
-    XLS_ASSIGN_OR_RETURN(td, module->GetTypeDefinition(colon_ref->attr()));
-
-    if (std::holds_alternative<TypeAlias*>(td)) {
-      // We need to get the right type info for the enum's containing module. We
-      // can get the top-level module since [currently?] enums can't be
-      // parameterized.
-      type_info = import_data->GetRootTypeInfo(module).value();
-      return ResolveTypeAliasToDirectColonRefSubject(import_data, type_info,
-                                                     std::get<TypeAlias*>(td));
-    }
-  }
-
-  if (!std::holds_alternative<EnumDef*>(td)) {
-    return absl::InternalError(
-        "ResolveTypeDefToDirectColonRefSubject() can only be called when the "
-        "TypeAlias "
-        "directory or indirectly refers to an EnumDef.");
-  }
-
-  return std::get<EnumDef*>(td);
-}
 
 void FlattenToSetInternal(const AstNode* node,
                           absl::flat_hash_set<const AstNode*>* the_set) {
@@ -113,51 +55,85 @@ void FlattenToSetInternal(const AstNode* node,
   }
 }
 
-}  // namespace
-
-bool IsBuiltinFn(Expr* callee, std::optional<std::string_view> target) {
+BuiltinNameDef* GetBuiltinNameDef(Expr* callee) {
   NameRef* name_ref = dynamic_cast<NameRef*>(callee);
   if (name_ref == nullptr) {
+    return nullptr;
+  }
+  if (!std::holds_alternative<BuiltinNameDef*>(name_ref->name_def())) {
+    return nullptr;
+  }
+  return std::get<BuiltinNameDef*>(name_ref->name_def());
+}
+
+}  // namespace
+
+bool IsParametricFunction(const AstNode* n) {
+  // Convenience so we can check things like "definer" when the definer may be
+  // unspecified in the AST. This generally only happens with programmatically
+  // built ASTs.
+  if (n == nullptr) {
     return false;
   }
 
-  if (!std::holds_alternative<BuiltinNameDef*>(name_ref->name_def())) {
+  const auto* f = dynamic_cast<const Function*>(n);
+  return f != nullptr && f->IsParametric();
+}
+
+bool IsNameRefToParametricFunction(const AstNode* n) {
+  const auto* ref = dynamic_cast<const NameRef*>(n);
+  if (ref == nullptr) {
+    return false;
+  }
+  if (IsBuiltinParametricNameRef(ref)) {
+    return true;
+  }
+  if (std::holds_alternative<const NameDef*>(ref->name_def())) {
+    return IsParametricFunction(
+        std::get<const NameDef*>(ref->name_def())->definer());
+  }
+  return false;
+}
+
+bool ParentIsInvocationWithCallee(const NameRef* n) {
+  CHECK(n != nullptr);
+  const AstNode* parent = n->parent();
+  CHECK(parent != nullptr);
+  const auto* invocation = dynamic_cast<const Invocation*>(parent);
+  return invocation != nullptr && invocation->callee() == n;
+}
+
+bool IsBuiltinFn(Expr* callee, std::optional<std::string_view> target) {
+  BuiltinNameDef* bnd = GetBuiltinNameDef(callee);
+  if (bnd == nullptr) {
     return false;
   }
 
   if (target.has_value()) {
-    auto* bnd = std::get<BuiltinNameDef*>(name_ref->name_def());
     return bnd->identifier() == target.value();
   }
 
   return true;
 }
 
-absl::StatusOr<std::string> GetBuiltinName(Expr* callee) {
-  if (!IsBuiltinFn(callee)) {
-    return absl::InvalidArgumentError("Callee is not a builtin function.");
+std::optional<std::string_view> GetBuiltinFnName(Expr* callee) {
+  BuiltinNameDef* bnd = GetBuiltinNameDef(callee);
+  if (bnd == nullptr) {
+    return std::nullopt;
   }
-
-  NameRef* name_ref = dynamic_cast<NameRef*>(callee);
-  return name_ref->identifier();
+  return bnd->identifier();
 }
 
-absl::StatusOr<Function*> ResolveFunction(Expr* callee,
-                                          const TypeInfo* type_info) {
-  if (NameRef* name_ref = dynamic_cast<NameRef*>(callee); name_ref != nullptr) {
-    return name_ref->owner()->GetMemberOrError<Function>(
-        name_ref->identifier());
-  }
-
-  auto* colon_ref = dynamic_cast<ColonRef*>(callee);
-  XLS_RET_CHECK_NE(colon_ref, nullptr);
-  std::optional<Import*> import = colon_ref->ResolveImportSubject();
-  XLS_RET_CHECK(import.has_value())
-      << "ColonRef did not refer to an import: " << colon_ref->ToString();
-  std::optional<const ImportedInfo*> imported_info =
-      type_info->GetImported(*import);
-  return imported_info.value()->module->GetMemberOrError<Function>(
-      colon_ref->attr());
+bool GetBuiltinFnRequiresImplicitToken(Expr* callee) {
+  BuiltinNameDef* bnd = GetBuiltinNameDef(callee);
+  CHECK(bnd != nullptr) << "Callee is not a builtin function reference: "
+                        << callee->ToString();
+  const absl::flat_hash_map<std::string, BuiltinsData>& builtins =
+      GetParametricBuiltins();
+  auto it = builtins.find(bnd->identifier());
+  CHECK(it != builtins.end())
+      << "Builtin function " << bnd->identifier() << " not found";
+  return it->second.requires_implicit_token;
 }
 
 static absl::StatusOr<StructDef*> ResolveLocalStructDef(
@@ -190,164 +166,17 @@ absl::StatusOr<StructDef*> ResolveLocalStructDef(TypeDefinition td) {
   return absl::visit(
       Visitor{
           [&](TypeAlias* n) -> absl::StatusOr<StructDef*> {
-            return ResolveLocalStructDef(n->type_annotation(), td);
+            return ResolveLocalStructDef(&n->type_annotation(), td);
           },
           [&](StructDef* n) -> absl::StatusOr<StructDef*> { return n; },
+          [&](ProcDef* n) -> absl::StatusOr<StructDef*> { return error(n); },
           [&](EnumDef* n) -> absl::StatusOr<StructDef*> { return error(n); },
           [&](ColonRef* n) -> absl::StatusOr<StructDef*> { return error(n); },
+          [&](UseTreeEntry* n) -> absl::StatusOr<StructDef*> {
+            return error(n);
+          },
       },
       td);
-}
-
-absl::StatusOr<Proc*> ResolveProc(Expr* callee, const TypeInfo* type_info) {
-  if (NameRef* name_ref = dynamic_cast<NameRef*>(callee); name_ref != nullptr) {
-    return name_ref->owner()->GetMemberOrError<Proc>(name_ref->identifier());
-  }
-
-  auto* colon_ref = dynamic_cast<ColonRef*>(callee);
-  XLS_RET_CHECK_NE(colon_ref, nullptr);
-  std::optional<Import*> import = colon_ref->ResolveImportSubject();
-  XLS_RET_CHECK(import.has_value())
-      << "ColonRef did not refer to an import: " << colon_ref->ToString();
-  std::optional<const ImportedInfo*> imported_info =
-      type_info->GetImported(*import);
-  return imported_info.value()->module->GetMemberOrError<Proc>(
-      colon_ref->attr());
-}
-
-using ColonRefSubjectT =
-    std::variant<Module*, EnumDef*, BuiltinNameDef*, ArrayTypeAnnotation*,
-                 StructDef*, ColonRef*>;
-
-// When a ColonRef's subject is a NameRef, this resolves the entity referred to
-// by that ColonRef. In a valid program that can only be a limited set of
-// things, which is reflected in the return type provided.
-//
-// e.g.
-//
-//    A::B
-//    ^
-//    \- subject name_ref
-//
-// Args:
-//  name_ref: The subject in the colon ref.
-//
-// Returns the entity the subject name_ref is referring to.
-static absl::StatusOr<ColonRefSubjectT> ResolveColonRefNameRefSubject(
-    NameRef* name_ref, ImportData* import_data, const TypeInfo* type_info) {
-  XLS_VLOG(5) << "ResolveColonRefNameRefSubject for `" << name_ref->ToString()
-              << "`";
-
-  std::variant<const NameDef*, BuiltinNameDef*> any_name_def =
-      name_ref->name_def();
-  if (std::holds_alternative<BuiltinNameDef*>(any_name_def)) {
-    return std::get<BuiltinNameDef*>(any_name_def);
-  }
-
-  const NameDef* name_def = std::get<const NameDef*>(any_name_def);
-  AstNode* definer = name_def->definer();
-  XLS_VLOG(5) << " ResolveColonRefNameRefSubject definer: `"
-              << definer->ToString()
-              << "` type: " << definer->GetNodeTypeName();
-
-  if (Import* import = dynamic_cast<Import*>(definer); import != nullptr) {
-    std::optional<const ImportedInfo*> imported =
-        type_info->GetImported(import);
-    if (!imported.has_value()) {
-      return absl::InternalError(absl::StrCat(
-          "Could not find Module for Import: ", import->ToString()));
-    }
-    return imported.value()->module;
-  }
-
-  // If the LHS isn't an Import, then it has to be an EnumDef (possibly via a
-  // TypeAlias).
-  if (EnumDef* enum_def = dynamic_cast<EnumDef*>(definer);
-      enum_def != nullptr) {
-    return enum_def;
-  }
-
-  TypeAlias* type_alias = dynamic_cast<TypeAlias*>(definer);
-  XLS_RET_CHECK(type_alias != nullptr);
-
-  if (type_alias->owner() != type_info->module()) {
-    // We need to get the right type info for the enum's containing module. We
-    // can get the top-level module since [currently?] enums can't be
-    // parameterized (and we know this must be an enum, per the above).
-    type_info = import_data->GetRootTypeInfo(type_alias->owner()).value();
-  }
-  XLS_ASSIGN_OR_RETURN(auto resolved, ResolveTypeAliasToDirectColonRefSubject(
-                                          import_data, type_info, type_alias));
-  return WidenVariantTo<ColonRefSubjectT>(resolved);
-}
-
-absl::StatusOr<ColonRefSubjectT> ResolveColonRefSubjectForTypeChecking(
-    ImportData* import_data, const TypeInfo* type_info,
-    const ColonRef* colon_ref) {
-  XLS_VLOG(5) << "ResolveColonRefSubject for " << colon_ref->ToString();
-
-  if (std::holds_alternative<NameRef*>(colon_ref->subject())) {
-    NameRef* name_ref = std::get<NameRef*>(colon_ref->subject());
-    return ResolveColonRefNameRefSubject(name_ref, import_data, type_info);
-  }
-
-  XLS_RET_CHECK(std::holds_alternative<ColonRef*>(colon_ref->subject()));
-  ColonRef* subject = std::get<ColonRef*>(colon_ref->subject());
-  XLS_ASSIGN_OR_RETURN(
-      auto resolved_subject,
-      ResolveColonRefSubjectForTypeChecking(import_data, type_info, subject));
-  // Has to be a module, since it's a ColonRef inside a ColonRef.
-  XLS_RET_CHECK(std::holds_alternative<Module*>(resolved_subject));
-  Module* module = std::get<Module*>(resolved_subject);
-
-  // And the subject has to be a type, namely an enum, since the ColonRef must
-  // be of the form: <MODULE>::SOMETHING::SOMETHING_ELSE. Keep in mind, though,
-  // that we might have to traverse an EnumDef.
-  XLS_ASSIGN_OR_RETURN(TypeDefinition td,
-                       module->GetTypeDefinition(subject->attr()));
-
-  using ReturnT = absl::StatusOr<ColonRefSubjectT>;
-
-  return absl::visit(
-      Visitor{
-          [&](TypeAlias* type_alias) -> ReturnT {
-            XLS_ASSIGN_OR_RETURN(auto resolved,
-                                 ResolveTypeAliasToDirectColonRefSubject(
-                                     import_data, type_info, type_alias));
-            return WidenVariantTo<ColonRefSubjectT>(resolved);
-          },
-          [](StructDef* struct_def) -> ReturnT { return struct_def; },
-          [](EnumDef* enum_def) -> ReturnT { return enum_def; },
-          [](ColonRef* colon_ref) -> ReturnT { return colon_ref; },
-      },
-      td);
-}
-
-absl::StatusOr<
-    std::variant<Module*, EnumDef*, BuiltinNameDef*, ArrayTypeAnnotation*>>
-ResolveColonRefSubjectAfterTypeChecking(ImportData* import_data,
-                                        const TypeInfo* type_info,
-                                        const ColonRef* colon_ref) {
-  XLS_ASSIGN_OR_RETURN(auto result, ResolveColonRefSubjectForTypeChecking(
-                                        import_data, type_info, colon_ref));
-  using ReturnT = absl::StatusOr<
-      std::variant<Module*, EnumDef*, BuiltinNameDef*, ArrayTypeAnnotation*>>;
-  return absl::visit(
-      Visitor{
-          [](Module* x) -> ReturnT { return x; },
-          [](EnumDef* x) -> ReturnT { return x; },
-          [](BuiltinNameDef* x) -> ReturnT { return x; },
-          [](ArrayTypeAnnotation* x) -> ReturnT { return x; },
-          [](StructDef*) -> ReturnT {
-            return absl::InternalError(
-                "After type checking colon-ref subject cannot be a StructDef");
-          },
-          [](ColonRef*) -> ReturnT {
-            return absl::InternalError(
-                "After type checking colon-ref subject cannot be a StructDef");
-          },
-      },
-      result);
 }
 
 absl::Status VerifyParentage(const Module* module) {
@@ -388,7 +217,7 @@ absl::Status VerifyParentage(const Module* module) {
 }
 
 absl::Status VerifyParentage(const AstNode* root) {
-  XLS_CHECK(root != nullptr);
+  CHECK(root != nullptr);
 
   if (const Module* module = dynamic_cast<const Module*>(root);
       module != nullptr) {
@@ -396,7 +225,7 @@ absl::Status VerifyParentage(const AstNode* root) {
   }
 
   for (const auto* child : root->GetChildren(/*want_types=*/true)) {
-    XLS_CHECK(child != nullptr);
+    CHECK(child != nullptr);
     XLS_RETURN_IF_ERROR(VerifyParentage(child));
 
     if (child->parent() == nullptr) {
@@ -408,12 +237,15 @@ absl::Status VerifyParentage(const AstNode* root) {
     }
 
     if (child->parent() != root) {
+      FileTable& file_table = *root->owner()->file_table();
       return absl::InvalidArgumentError(absl::StrFormat(
-          "Child \"%s\" (%s) of node \"%s\" (%s) had "
-          "node \"%s\" (%s) as its parent.",
-          child->ToString(), child->GetNodeTypeName(), root->ToString(),
-          root->GetNodeTypeName(), child->parent()->ToString(),
-          child->parent()->GetNodeTypeName()));
+          "Child \"%s\" (%s, %s) of node \"%s\" (%s, %s) had "
+          "node \"%s\" (%s, %s) as its parent.",
+          child->ToString(), child->GetNodeTypeName(),
+          child->GetSpan()->ToString(file_table), root->ToString(),
+          root->GetNodeTypeName(), root->GetSpan()->ToString(file_table),
+          child->parent()->ToString(), child->parent()->GetNodeTypeName(),
+          child->parent()->GetSpan()->ToString(file_table)));
     }
   }
 
@@ -426,6 +258,28 @@ absl::flat_hash_set<const AstNode*> FlattenToSet(const AstNode* node) {
   return the_set;
 }
 
+bool IsBuiltinBitsTypeAttr(std::string_view attr) {
+  return attr == "ZERO" || attr == "MAX" || attr == "MIN";
+}
+
+static absl::StatusOr<InterpValue> GetBuiltinBitsTypeAttr(
+    bool is_signed, uint64_t width, std::string_view attr,
+    const std::function<std::string_view()>& get_subject) {
+  if (attr == "ZERO") {
+    return InterpValue::MakeZeroValue(is_signed, width);
+  }
+  if (attr == "MAX") {
+    return InterpValue::MakeMaxValue(is_signed, width);
+  }
+  if (attr == "MIN") {
+    return InterpValue::MakeMinValue(is_signed, width);
+  }
+  // We only support the above attributes on builtin types at the moment --
+  // this is checked during typechecking.
+  return absl::InvalidArgumentError(absl::StrFormat(
+      "Invalid attribute of builtin %s: %s", get_subject(), attr));
+}
+
 absl::StatusOr<InterpValue> GetBuiltinNameDefColonAttr(
     const BuiltinNameDef* builtin_name_def, std::string_view attr) {
   const auto& sized_type_keywords = GetSizedTypeKeywordsMetadata();
@@ -433,17 +287,8 @@ absl::StatusOr<InterpValue> GetBuiltinNameDefColonAttr(
   // We should have checked this was a valid type keyword in typechecking.
   XLS_RET_CHECK(it != sized_type_keywords.end());
   auto [is_signed, width] = it->second;
-  if (attr == "ZERO") {
-    return InterpValue::MakeZeroValue(is_signed, width);
-  }
-  if (attr == "MAX") {
-    return InterpValue::MakeMaxValue(is_signed, width);
-  }
-  // We only support the above attributes on builtin types at the moment -- this
-  // is checked during typechecking.
-  return absl::InvalidArgumentError(
-      absl::StrFormat("Invalid attribute of builtin name %s: %s",
-                      builtin_name_def->identifier(), attr));
+  return GetBuiltinBitsTypeAttr(is_signed, width, attr,
+                                [&] { return builtin_name_def->identifier(); });
 }
 
 absl::StatusOr<InterpValue> GetArrayTypeColonAttr(
@@ -469,41 +314,46 @@ absl::StatusOr<InterpValue> GetArrayTypeColonAttr(
           "Can only take '::' attributes of uN/sN/bits array types.");
   }
 
-  if (attr == "ZERO") {
-    return InterpValue::MakeZeroValue(is_signed, constexpr_dim);
-  }
-  if (attr == "MAX") {
-    return InterpValue::MakeMaxValue(is_signed, constexpr_dim);
-  }
-  return absl::InvalidArgumentError(
-      absl::StrFormat("Invalid attribute of builtin array type: %s", attr));
+  return GetBuiltinBitsTypeAttr(is_signed, constexpr_dim, attr,
+                                [&] { return array_type->ToString(); });
 }
 
-int64_t DetermineIndentLevel(const AstNode& n) {
-  switch (n.kind()) {
-    case AstNodeKind::kModule:
-      return 0;
-    case AstNodeKind::kBlock: {
-      XLS_CHECK(n.parent() != nullptr);
-      return DetermineIndentLevel(*n.parent()) + 1;
-    }
-    case AstNodeKind::kFunction: {
-      const Function* function = down_cast<const Function*>(&n);
-      switch (function->tag()) {
-        case Function::Tag::kProcInit:
-        case Function::Tag::kProcNext:
-        case Function::Tag::kProcConfig:
-          return 1;
-        case Function::Tag::kNormal:
-          return 0;
-      }
-    }
-    default: {
-      AstNode* parent = n.parent();
-      XLS_CHECK(parent != nullptr);
-      return DetermineIndentLevel(*parent);
+std::optional<const UseTreeEntry*> IsExternNameRef(const NameRef& name_ref) {
+  const AstNode* definer = name_ref.GetDefiner();
+  if (definer == nullptr) {
+    return std::nullopt;
+  }
+  auto* use_tree_entry = dynamic_cast<const UseTreeEntry*>(definer);
+  if (use_tree_entry == nullptr) {
+    return std::nullopt;
+  }
+  return use_tree_entry;
+}
+
+// Attempts to evaluate an expression as a literal boolean.
+//
+// This has a few simple forms:
+// - `true` / `false`
+// - `bool:0x0` / `bool:0x1`
+static std::optional<bool> TryEvaluateAsBool(const Expr* expr) {
+  const Number* number = dynamic_cast<const Number*>(expr);
+  if (number == nullptr) {
+    return std::nullopt;
+  }
+  if (number->number_kind() == NumberKind::kBool) {
+    CHECK(number->text() == "true" || number->text() == "false");
+    return number->text() == "true";
+  }
+  if (number->number_kind() == NumberKind::kOther) {
+    absl::StatusOr<std::pair<Sign, Bits>> sm =
+        GetSignAndMagnitude(number->text());
+    if (sm.ok() && sm->second.bit_count() <= 1) {
+      // Note: the zero value is given as a bit count of zero.
+      bool value = sm->second.bit_count() == 0 ? false : sm->second.Get(0);
+      return std::optional<bool>(value);
     }
   }
+  return std::nullopt;
 }
 
 std::optional<BitVectorMetadata> ExtractBitVectorMetadata(
@@ -516,8 +366,8 @@ std::optional<BitVectorMetadata> ExtractBitVectorMetadata(
     if (std::holds_alternative<TypeAlias*>(
             type_ref->type_ref()->type_definition())) {
       is_alias = true;
-      type = std::get<TypeAlias*>(type_ref->type_ref()->type_definition())
-                 ->type_annotation();
+      type = &std::get<TypeAlias*>(type_ref->type_ref()->type_definition())
+                  ->type_annotation();
     } else if (std::holds_alternative<EnumDef*>(
                    type_ref->type_ref()->type_definition())) {
       is_enum = true;
@@ -550,13 +400,44 @@ std::optional<BitVectorMetadata> ExtractBitVectorMetadata(
       default:
         break;
     }
-    return BitVectorMetadata{.bit_count = builtin->GetBitCount(),
-                             .is_signed = builtin->GetSignedness(),
-                             .kind = kind};
+
+    absl::StatusOr<bool> is_signed = builtin->GetSignedness();
+    CHECK_OK(is_signed.status());
+
+    int64_t bit_count = builtin->GetBitCount();
+    return BitVectorMetadata{
+        .bit_count = bit_count, .is_signed = is_signed.value(), .kind = kind};
   }
+
   if (const ArrayTypeAnnotation* array_type =
           dynamic_cast<const ArrayTypeAnnotation*>(type);
       array_type != nullptr) {
+    // xN[..] has yet another level of array that annotates the signedness.
+    if (const ArrayTypeAnnotation* inner_array_type =
+            dynamic_cast<const ArrayTypeAnnotation*>(
+                array_type->element_type());
+        inner_array_type != nullptr) {
+      const BuiltinTypeAnnotation* maybe_xn =
+          dynamic_cast<const BuiltinTypeAnnotation*>(
+              inner_array_type->element_type());
+      if (maybe_xn != nullptr && maybe_xn->builtin_type() == BuiltinType::kXN) {
+        // We can only extract the signedness from the inner array dimension if
+        // it's a bare number.
+        std::optional<bool> is_signed =
+            TryEvaluateAsBool(inner_array_type->dim());
+
+        // If we can't determine signedness we bail, as it's required metadata
+        // for us to return.
+        if (!is_signed.has_value()) {
+          return std::nullopt;
+        }
+
+        return BitVectorMetadata{.bit_count = array_type->dim(),
+                                 .is_signed = is_signed.value(),
+                                 .kind = kind};
+      }
+    }
+
     // bits[..], uN[..], and sN[..] are bit-vector types but a represented with
     // ArrayTypeAnnotations.
     const BuiltinTypeAnnotation* builtin_element_type =
@@ -574,6 +455,162 @@ std::optional<BitVectorMetadata> ExtractBitVectorMetadata(
     }
   }
   return std::nullopt;
+}
+
+absl::StatusOr<std::vector<AstNode*>> CollectUnder(AstNode* root,
+                                                   bool want_types) {
+  std::vector<AstNode*> nodes;
+
+  class CollectVisitor : public AstNodeVisitor {
+   public:
+    explicit CollectVisitor(std::vector<AstNode*>& nodes) : nodes_(nodes) {}
+
+#define DECLARE_HANDLER(__type)                           \
+  absl::Status Handle##__type(const __type* n) override { \
+    nodes_.push_back(const_cast<__type*>(n));             \
+    return absl::OkStatus();                              \
+  }
+    XLS_DSLX_AST_NODE_EACH(DECLARE_HANDLER)
+#undef DECLARE_HANDLER
+
+   private:
+    std::vector<AstNode*>& nodes_;
+  } collect_visitor(nodes);
+
+  XLS_RETURN_IF_ERROR(WalkPostOrder(root, &collect_visitor, want_types));
+  return nodes;
+}
+
+absl::StatusOr<std::vector<const NameRef*>> CollectNameRefsUnder(
+    const AstNode* root, const NameDef* to) {
+  XLS_ASSIGN_OR_RETURN(std::vector<const AstNode*> nodes,
+                       CollectUnder(root, /*want_types*/ true));
+  std::vector<const NameRef*> results;
+  for (const AstNode* n : nodes) {
+    if (const auto* name_ref = dynamic_cast<const NameRef*>(n);
+        name_ref != nullptr &&
+        std::holds_alternative<const NameDef*>(name_ref->name_def()) &&
+        std::get<const NameDef*>(name_ref->name_def()) == to) {
+      results.push_back(name_ref);
+    }
+  }
+  return results;
+}
+
+absl::StatusOr<std::vector<const AstNode*>> CollectUnder(const AstNode* root,
+                                                         bool want_types) {
+  // Implementation note: delegate to non-const version and turn result values
+  // back to const.
+  XLS_ASSIGN_OR_RETURN(std::vector<AstNode*> got,
+                       CollectUnder(const_cast<AstNode*>(root), want_types));
+
+  std::vector<const AstNode*> result;
+  result.reserve(got.size());
+  for (AstNode* n : got) {
+    result.push_back(n);
+  }
+  return result;
+}
+
+absl::StatusOr<std::vector<const NameDef*>> CollectReferencedUnder(
+    const AstNode* root, bool want_types) {
+  XLS_ASSIGN_OR_RETURN(std::vector<const AstNode*> nodes,
+                       CollectUnder(root, want_types));
+  std::vector<const NameDef*> name_defs;
+  for (const AstNode* n : nodes) {
+    if (const NameRef* nr = dynamic_cast<const NameRef*>(n)) {
+      if (std::holds_alternative<const NameDef*>(nr->name_def())) {
+        name_defs.push_back(std::get<const NameDef*>(nr->name_def()));
+      }
+    }
+  }
+  return name_defs;
+}
+
+bool IsBuiltinParametricNameRef(const NameRef* name_ref) {
+  // Implementation note: we also check IsNameParametricBuiltin() as future
+  // proofing -- we may add a built-in name that is not a type or parametric
+  // function.
+  return std::holds_alternative<BuiltinNameDef*>(name_ref->name_def()) &&
+         IsNameParametricBuiltin(name_ref->identifier());
+}
+
+const Number* IsBareNumber(const AstNode* node, bool* is_boolean) {
+  if (const Number* number = dynamic_cast<const Number*>(node)) {
+    if (is_boolean != nullptr) {
+      *is_boolean = number->number_kind() == NumberKind::kBool;
+    }
+    if (number->type_annotation() == nullptr) {
+      return number;
+    }
+    return nullptr;
+  }
+
+  return nullptr;
+}
+
+bool ContainedWithinFunction(const Invocation& invocation,
+                             const Function& caller) {
+  const FileTable& file_table = *caller.owner()->file_table();
+  VLOG(10) << absl::StreamFormat(
+      "Checking whether invocation `%s` @ %s is contained within caller `%s` @ "
+      "%s",
+      invocation.ToString(), invocation.span().ToString(file_table),
+      caller.identifier(), caller.span().ToString(file_table));
+  const AstNode* parent = invocation.parent();
+  CHECK(parent != nullptr) << absl::StreamFormat(
+      "invocation node had no parent set: `%s` @ %s", invocation.ToString(),
+      invocation.span().ToString(file_table));
+  VLOG(10) << absl::StreamFormat("node `%s` has parent: `%s`",
+                                 invocation.ToString(), parent->ToString());
+
+  while (parent->kind() != AstNodeKind::kFunction) {
+    const AstNode* new_parent = parent->parent();
+    CHECK(new_parent != nullptr) << absl::StreamFormat(
+        "node `%s` had no function parent (`%s` was the last node)",
+        invocation.parent()->ToString(), parent->ToString());
+    VLOG(10) << absl::StreamFormat("transitive; node `%s` has parent: `%s`",
+                                   parent->ToString(), new_parent->ToString());
+    parent = new_parent;
+  }
+
+  bool contained = &caller == parent;
+  VLOG(10) << absl::StreamFormat(
+      "caller: %p vs found parent: %p; invocation contained? %s", &caller,
+      parent, contained ? "true" : "false");
+
+  // Here we check that, if the parent links indicate the node is contained, it
+  // is also lexically/positionally contained.
+  CHECK_EQ(contained, caller.span().Contains(invocation.span()));
+
+  return contained;
+}
+
+std::optional<const Function*> GetContainingFunction(const AstNode* node) {
+  const AstNode* current = node->parent();
+  while (current != nullptr) {
+    if (current->kind() == AstNodeKind::kFunction) {
+      return dynamic_cast<const Function*>(current);
+    }
+    current = current->parent();
+  }
+  return std::nullopt;
+}
+
+bool ContainsInvocation(const AstNode* node, bool want_types) {
+  std::deque<const AstNode*> worklist;
+  worklist.push_back(node);
+  while (!worklist.empty()) {
+    const AstNode* current = worklist.front();
+    worklist.pop_front();
+    if (current->kind() == AstNodeKind::kInvocation) {
+      return true;
+    }
+    for (const AstNode* child : current->GetChildren(want_types)) {
+      worklist.push_back(child);
+    }
+  }
+  return false;
 }
 
 }  // namespace xls::dslx

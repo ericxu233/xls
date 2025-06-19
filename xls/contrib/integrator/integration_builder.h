@@ -12,17 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_INTEGRATOR_INTEGRATION_BUILDER_H_
-#define XLS_INTEGRATOR_INTEGRATION_BUILDER_H_
+#ifndef XLS_CONTRIB_INTEGRATOR_INTEGRATION_BUILDER_H_
+#define XLS_CONTRIB_INTEGRATOR_INTEGRATION_BUILDER_H_
 
 #include <memory>
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "xls/contrib/integrator/integration_options.h"
 #include "xls/contrib/integrator/ir_integrator.h"
 #include "xls/ir/function.h"
+#include "xls/ir/name_uniquer.h"
 #include "xls/ir/package.h"
 
 namespace xls {
@@ -104,4 +108,4 @@ class IntegrationBuilder {
 
 }  // namespace xls
 
-#endif  // XLS_INTEGRATOR_INTEGRATION_BUILDER_H_
+#endif  // XLS_CONTRIB_INTEGRATOR_INTEGRATION_BUILDER_H_

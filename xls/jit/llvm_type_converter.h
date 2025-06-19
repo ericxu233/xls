@@ -21,9 +21,14 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
+#include "llvm/include/llvm/IR/Constant.h"
+#include "llvm/include/llvm/IR/DataLayout.h"
 #include "llvm/include/llvm/IR/IRBuilder.h"
+#include "llvm/include/llvm/IR/LLVMContext.h"
+#include "llvm/include/llvm/IR/Type.h"
 #include "xls/ir/type.h"
 #include "xls/ir/value.h"
+#include "xls/jit/type_buffer_metadata.h"
 #include "xls/jit/type_layout.h"
 
 namespace xls {
@@ -68,6 +73,14 @@ class LlvmTypeConverter {
   // rules aren't necessarily immediately obvious, but fortunately the
   // DataLayout object can handle ~all of the work for us.
   int64_t GetTypeByteSize(const Type* type) const;
+
+  // Returns the preferred alignment for the given type.
+  int64_t GetTypePreferredAlignment(const Type* type) const;
+
+  // Returns the alignment requirement for the given type.
+  int64_t GetTypeAbiAlignment(const Type* type) const;
+
+  TypeBufferMetadata GetTypeBufferMetadata(const Type* type) const;
 
   // Returns the next position (starting from offset) where LLVM would consider
   // an object of the given type to have ended; specifically, the next position

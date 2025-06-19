@@ -15,8 +15,8 @@
 #include "xls/common/strerror.h"
 
 #include <cerrno>
+#include <cstring>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 namespace xls {

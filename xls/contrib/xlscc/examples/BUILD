@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load("@rules_hdl//synthesis:build_defs.bzl", "benchmark_synth", "synthesize_rtl")
+load("@rules_hdl//verilog:providers.bzl", "verilog_library")
 load(
     "//xls/build_rules:xls_build_defs.bzl",
     "proto_data",
@@ -22,12 +24,14 @@ load(
     "//xls/contrib/xlscc/build_rules:xlscc_build_defs.bzl",
     "xls_cc_ir",
 )
-load("@rules_hdl//verilog:providers.bzl", "verilog_library")
-load("@rules_hdl//synthesis:build_defs.bzl", "benchmark_synth", "synthesize_rtl")
 
 package(
     default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -95,6 +99,76 @@ xls_cc_ir(
     ir_file = "block_from_class.ir",
 )
 
+xls_cc_ir(
+    name = "simple_unsigned_pipelined_loop_fsm_ir",
+    src = "simple_unsigned_pipelined_loop.cc",
+    block_from_class = "MyBlock",
+    block_pb_out = "simple_unsigned_pipelined_loop_fsm.pbtxt",
+    ir_file = "simple_unsigned_pipelined_loop_fsm.ir",
+)
+
+xls_ir_opt_ir(
+    name = "simple_unsigned_pipelined_loop_fsm_opt_ir",
+    src = "simple_unsigned_pipelined_loop_fsm.ir",
+    opt_ir_file = "simple_unsigned_pipelined_loop_fsm.opt.ir",
+)
+
+xls_cc_ir(
+    name = "simple_unsigned_nested_pipelined_loop_fsm_ir",
+    src = "simple_unsigned_nested_pipelined_loop.cc",
+    block_from_class = "MyBlock",
+    block_pb_out = "simple_unsigned_nested_pipelined_loop_fsm.pbtxt",
+    ir_file = "simple_unsigned_nested_pipelined_loop_fsm.ir",
+)
+
+xls_ir_opt_ir(
+    name = "simple_unsigned_nested_pipelined_loop_fsm_opt_ir",
+    src = "simple_unsigned_nested_pipelined_loop_fsm.ir",
+    opt_ir_file = "simple_unsigned_nested_pipelined_loop_fsm.opt.ir",
+)
+
+xls_cc_ir(
+    name = "simple_pipelined_loop_fsm_ir",
+    src = "simple_pipelined_loop.cc",
+    block_from_class = "MyBlock",
+    block_pb_out = "simple_pipelined_loop_fsm.pbtxt",
+    ir_file = "simple_pipelined_loop_fsm.ir",
+)
+
+xls_ir_opt_ir(
+    name = "simple_pipelined_loop_fsm_opt_ir",
+    src = "simple_pipelined_loop_fsm.ir",
+    opt_ir_file = "simple_pipelined_loop_fsm.opt.ir",
+)
+
+xls_cc_ir(
+    name = "simple_backwards_pipelined_loop_fsm_ir",
+    src = "simple_backwards_pipelined_loop.cc",
+    block_from_class = "MyBlock",
+    block_pb_out = "simple_backwards_pipelined_loop_fsm.pbtxt",
+    ir_file = "simple_backwards_pipelined_loop_fsm.ir",
+)
+
+xls_ir_opt_ir(
+    name = "simple_backwards_pipelined_loop_fsm_opt_ir",
+    src = "simple_backwards_pipelined_loop_fsm.ir",
+    opt_ir_file = "simple_backwards_pipelined_loop_fsm.opt.ir",
+)
+
+xls_cc_ir(
+    name = "simple_nested_pipelined_loop_fsm_ir",
+    src = "simple_nested_pipelined_loop.cc",
+    block_from_class = "MyBlock",
+    block_pb_out = "simple_nested_pipelined_loop_fsm.pbtxt",
+    ir_file = "simple_nested_pipelined_loop_fsm.ir",
+)
+
+xls_ir_opt_ir(
+    name = "simple_nested_pipelined_loop_fsm_opt_ir",
+    src = "simple_nested_pipelined_loop_fsm.ir",
+    opt_ir_file = "simple_nested_pipelined_loop_fsm.opt.ir",
+)
+
 [
     # Benchmarks for multiple memory accesses.
     # The example performs N reads and a write on a 1R1W memory, codegens + synthesizes the result.
@@ -112,14 +186,11 @@ xls_cc_ir(
         xls_ir_opt_ir(
             name = "mem_iterated_read_{iterations}_opt_ir".format(iterations = read_iterations),
             src = "mem_iterated_read_{iterations}.ir".format(iterations = read_iterations),
-            opt_ir_args = {
-                "inline_procs": "True",
-            },
             opt_ir_file = "mem_iterated_read_{iterations}.opt.ir".format(iterations = read_iterations),
         ),
         xls_ir_verilog(
             name = "mem_iterated_read_{iterations}_v".format(iterations = read_iterations),
-            src = "mem_iterated_read_{iterations}.opt.ir".format(iterations = read_iterations),
+            src = "mem_iterated_read_{iterations}_opt_ir".format(iterations = read_iterations),
             codegen_args = {
                 "module_name": "mem_iterated_read",
                 "pipeline_stages": "2",
@@ -135,10 +206,10 @@ xls_cc_ir(
                 # Yosys can't handle our default asserts.
                 "use_system_verilog": "False",
                 "ram_configurations": "ram:1R1W:{rd_req}:{rd_resp}:{wr_req}:{wr_comp}".format(
-                    rd_req = "mem__read_request",
-                    rd_resp = "mem__read_response",
-                    wr_comp = "mem__write_response",
-                    wr_req = "mem__write_request",
+                    rd_req = "mem_read_request",
+                    rd_resp = "mem_read_response",
+                    wr_comp = "mem_write_response",
+                    wr_req = "mem_write_request",
                 ),
             },
             verilog_file = "mem_iterated_read_{iterations}.v".format(iterations = read_iterations),
@@ -149,7 +220,7 @@ xls_cc_ir(
         ),
         synthesize_rtl(
             name = "mem_iterated_read_{iterations}_synth_asap7".format(iterations = read_iterations),
-            standard_cells = "@org_theopenroadproject_asap7//:asap7_rvt_1x",
+            standard_cells = "@org_theopenroadproject_asap7sc7p5t_27//:asap7-sc7p5t_rev27_rvt_4x",
             tags = ["manual"],
             top_module = "mem_iterated_read",
             deps = [
@@ -173,28 +244,24 @@ xls_cc_ir(
 
 xls_ir_opt_ir(
     name = "mux3_opt_ir",
-    src = ":mux3.ir",
-    opt_ir_file = "mux3_opt_ir.opt.ir",
+    src = ":mux3_ir",
 )
 
 xls_ir_opt_ir(
     name = "switch_opt_ir",
-    src = ":switch.ir",
+    src = ":switch_ir",
     opt_ir_file = "switch_opt_ir.opt.ir",
 )
 
 xls_ir_opt_ir(
     name = "mux1to2_opt_ir",
-    src = ":mux1to2.ir",
+    src = ":mux1to2_ir",
     opt_ir_file = "mux1to2_opt_ir.opt.ir",
 )
 
 xls_ir_opt_ir(
     name = "delay1rw_raw_opt_ir",
-    src = ":delay_raw.ir",
-    opt_ir_args = {
-        "inline_procs": "true",
-    },
+    src = ":delay_raw_ir",
     opt_ir_file = "delay_raw_1rw.opt.ir",
     ram_rewrites = [
         ":delay_raw_ram1rw_rewrites.textproto",
@@ -203,10 +270,7 @@ xls_ir_opt_ir(
 
 xls_ir_opt_ir(
     name = "delay1rw_rxw_opt_ir",
-    src = ":delay_rxw.ir",
-    opt_ir_args = {
-        "inline_procs": "true",
-    },
+    src = ":delay_rxw_ir",
     opt_ir_file = "delay_rxw_1rw.opt.ir",
     ram_rewrites = [
         ":delay_rxw_ram1rw_rewrites.textproto",
@@ -215,7 +279,7 @@ xls_ir_opt_ir(
 
 xls_ir_opt_ir(
     name = "delay_raw_1r1w_opt_ir",
-    src = ":delay_raw.ir",
+    src = ":delay_raw_ir",
     opt_ir_file = "delay_raw_1r1w.opt.ir",
     ram_rewrites = [
         ":delay_raw_ram1r1w_rewrites.textproto",
@@ -224,7 +288,7 @@ xls_ir_opt_ir(
 
 xls_ir_opt_ir(
     name = "delay_rxw_1r1w_opt_ir",
-    src = ":delay_rxw.ir",
+    src = ":delay_rxw_ir",
     opt_ir_file = "delay_rxw_1r1w.opt.ir",
     ram_rewrites = [
         ":delay_rxw_ram1r1w_rewrites.textproto",
@@ -233,13 +297,13 @@ xls_ir_opt_ir(
 
 xls_ir_opt_ir(
     name = "block_from_class_opt_ir",
-    src = ":block_from_class.ir",
+    src = ":block_from_class_ir",
     opt_ir_file = "block_from_class.opt.ir",
 )
 
 xls_ir_verilog(
     name = "mux3_comb_v",
-    src = ":mux3_opt_ir.opt.ir",
+    src = ":mux3_opt_ir",
     codegen_args = {
         "generator": "combinational",
         "module_name": "mux3_comb",
@@ -250,7 +314,7 @@ xls_ir_verilog(
 
 xls_ir_verilog(
     name = "mux3_stages_5_v",
-    src = ":mux3_opt_ir.opt.ir",
+    src = ":mux3_opt_ir",
     codegen_args = {
         "module_name": "mux3_stages_5",
         "pipeline_stages": "5",
@@ -270,7 +334,7 @@ xls_ir_verilog(
 
 xls_ir_verilog(
     name = "mux1to2_stages_5_v",
-    src = ":mux1to2_opt_ir.opt.ir",
+    src = ":mux1to2_opt_ir",
     codegen_args = {
         "module_name": "mux1to2_stages_5",
         "pipeline_stages": "5",
@@ -291,19 +355,20 @@ xls_ir_verilog(
 # Read-and-write delay variant with single-port external RAM.
 xls_ir_verilog(
     name = "delay_raw_1rw_v",
-    src = ":delay_raw_1rw.opt.ir",
+    src = ":delay1rw_raw_opt_ir",
     codegen_args = {
         "generator": "pipeline",
         "delay_model": "unit",
+        "module_name": "delay_top",
         "ram_configurations": "ram:1RW:{req}:{resp}:{wr_comp}".format(
-            req = "memory__req",
-            resp = "memory__resp",
-            wr_comp = "memory__write_completion",
+            req = "memory_req",
+            resp = "memory_resp",
+            wr_comp = "memory_write_completion",
         ),
         "reset": "rst",
         "reset_data_path": "true",
         "reset_active_low": "false",
-        "reset_asynchronous": "true",
+        "reset_asynchronous": "false",
         "flop_inputs": "false",
         "flop_outputs": "false",
         "streaming_channel_data_suffix": "_data",
@@ -317,19 +382,20 @@ xls_ir_verilog(
 
 xls_ir_verilog(
     name = "delay_rxw_1rw_v",
-    src = ":delay_rxw_1rw.opt.ir",
+    src = ":delay1rw_rxw_opt_ir",
     codegen_args = {
         "generator": "pipeline",
         "delay_model": "unit",
+        "module_name": "delay_top",
         "ram_configurations": "ram:1RW:{req}:{resp}:{wr_comp}".format(
-            req = "memory__req",
-            resp = "memory__resp",
-            wr_comp = "memory__write_completion",
+            req = "memory_req",
+            resp = "memory_resp",
+            wr_comp = "memory_write_completion",
         ),
         "reset": "rst",
         "reset_data_path": "true",
         "reset_active_low": "false",
-        "reset_asynchronous": "true",
+        "reset_asynchronous": "false",
         "flop_inputs": "true",
         "flop_inputs_kind": "flop",
         "streaming_channel_data_suffix": "_data",
@@ -343,20 +409,21 @@ xls_ir_verilog(
 
 xls_ir_verilog(
     name = "delay_raw_1r1w_v",
-    src = ":delay_raw_1r1w.opt.ir",
+    src = ":delay_raw_1r1w_opt_ir",
     codegen_args = {
         "generator": "pipeline",
         "delay_model": "unit",
+        "module_name": "delay_top",
         "ram_configurations": "ram:1R1W:{rd_req}:{rd_resp}:{wr_req}:{wr_comp}".format(
-            rd_req = "memory__read_req",
-            rd_resp = "memory__read_resp",
-            wr_comp = "memory__write_completion",
-            wr_req = "memory__write_req",
+            rd_req = "memory_read_req",
+            rd_resp = "memory_read_resp",
+            wr_comp = "memory_write_completion",
+            wr_req = "memory_write_req",
         ),
         "reset": "rst",
         "reset_data_path": "true",
         "reset_active_low": "false",
-        "reset_asynchronous": "true",
+        "reset_asynchronous": "false",
         "flop_inputs": "false",
         "streaming_channel_data_suffix": "_data",
         "streaming_channel_ready_suffix": "_ready",
@@ -369,20 +436,21 @@ xls_ir_verilog(
 
 xls_ir_verilog(
     name = "delay_rxw_1r1w_v",
-    src = ":delay_rxw_1r1w.opt.ir",
+    src = ":delay_rxw_1r1w_opt_ir",
     codegen_args = {
         "generator": "pipeline",
         "delay_model": "unit",
+        "module_name": "delay_top",
         "ram_configurations": "ram:1R1W:{rd_req}:{rd_resp}:{wr_req}:{wr_comp}".format(
-            rd_req = "memory__read_req",
-            rd_resp = "memory__read_resp",
-            wr_comp = "memory__write_completion",
-            wr_req = "memory__write_req",
+            rd_req = "memory_read_req",
+            rd_resp = "memory_read_resp",
+            wr_comp = "memory_write_completion",
+            wr_req = "memory_write_req",
         ),
         "reset": "rst",
         "reset_data_path": "true",
         "reset_active_low": "false",
-        "reset_asynchronous": "true",
+        "reset_asynchronous": "false",
         "flop_inputs": "true",
         "flop_inputs_kind": "zerolatency",
         "streaming_channel_data_suffix": "_data",
@@ -420,7 +488,7 @@ verilog_library(
 
 xls_ir_verilog(
     name = "block_from_class_v",
-    src = ":block_from_class.opt.ir",
+    src = ":block_from_class_opt_ir",
     codegen_args = {
         "module_name": "block_from_class",
         "pipeline_stages": "1",
@@ -441,7 +509,6 @@ cc_test(
     srcs = ["mux3_opt_ir_test.cc"],
     data = [":mux3_opt_ir.opt.ir"],
     deps = [
-        "//xls/common:xls_gunit",
         "//xls/common:xls_gunit_main",
         "//xls/common/file:filesystem",
         "//xls/common/file:get_runfile_path",
@@ -449,6 +516,7 @@ cc_test(
         "//xls/common/status:matchers",
         "//xls/common/status:ret_check",
         "//xls/common/status:status_macros",
+        "@googletest//:gtest",
     ],
 )
 
@@ -460,7 +528,6 @@ cc_test(
         ":mux3_stages_5_v.sv",
     ],
     deps = [
-        "//xls/common:xls_gunit",
         "//xls/common:xls_gunit_main",
         "//xls/common/file:filesystem",
         "//xls/common/file:get_runfile_path",
@@ -468,5 +535,6 @@ cc_test(
         "//xls/common/status:matchers",
         "//xls/common/status:ret_check",
         "//xls/common/status:status_macros",
+        "@googletest//:gtest",
     ],
 )

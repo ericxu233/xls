@@ -32,18 +32,18 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include <cstdio>
-#include <filesystem>
+#include <filesystem>  // NOLINT
 #include <iostream>
 
 #include "absl/base/casts.h"
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/get_runfile_path.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 
 #define FFT_SIZE 1024
@@ -112,7 +112,7 @@ absl::Status ReadInputData(const char* path, float data[]) {
   int64_t data_idx = 0;
   for (auto line : absl::StrSplit(data_text, '\n')) {
     if (!line.empty()) {
-      XLS_CHECK(absl::SimpleAtof(line, &data[data_idx]));
+      CHECK(absl::SimpleAtof(line, &data[data_idx]));
       data_idx++;
     }
   }
@@ -166,6 +166,6 @@ absl::Status RealMain() {
 
 int main(int argc, char** argv) {
   xls::InitXls(argv[0], argc, argv);
-  XLS_QCHECK_OK(xls::RealMain());
+  QCHECK_OK(xls::RealMain());
   return 0;
 }

@@ -15,8 +15,9 @@
 #ifndef XLS_IR_TERNARY_H_
 #define XLS_IR_TERNARY_H_
 
-#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -24,9 +25,16 @@
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/optimization.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "xls/common/logging/logging.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
+#include "xls/common/iterator_range.h"
+#include "xls/data_structures/leaf_type_tree.h"
 #include "xls/ir/bits.h"
+#include "xls/ir/value.h"
 
 namespace xls {
 
@@ -40,146 +48,107 @@ enum class TernaryValue : int8_t {
 
 // A vector of ternary values. Analogous to the Bits object for concrete values.
 using TernaryVector = std::vector<TernaryValue>;
+using TernarySpan = absl::Span<TernaryValue const>;
+
+std::string ToString(TernaryValue value);
 
 // Format of the ternary vector is, for example: 0b10XX1
-std::string ToString(const TernaryVector& value);
-std::string ToString(const TernaryValue& value);
-
+std::string ToString(TernarySpan value);
+inline std::string ToString(const TernaryVector& value) {
+  return ToString(TernarySpan(value));
+}
 // Converts the given string to a TernaryVector. Expects string to be of form
 // emitted by ToString (for example, 0b01X0). Underscores are ignored.
 absl::StatusOr<TernaryVector> StringToTernaryVector(std::string_view s);
 
-inline std::ostream& operator<<(std::ostream& os, TernaryValue value) {
+inline std::ostream& operator<<(std::ostream& os, const TernaryValue& value) {
   os << ToString(value);
   return os;
 }
 
-inline std::ostream& operator<<(std::ostream& os, const TernaryVector& vector) {
+inline std::ostream& operator<<(std::ostream& os, TernarySpan vector) {
   os << ToString(vector);
   return os;
 }
 
 namespace ternary_ops {
 
-inline TernaryVector FromKnownBits(const Bits& known_bits,
-                                   const Bits& known_bits_values) {
-  XLS_CHECK_EQ(known_bits.bit_count(), known_bits_values.bit_count());
-  TernaryVector result;
-  result.reserve(known_bits.bit_count());
-
-  for (int64_t i = 0; i < known_bits.bit_count(); ++i) {
-    if (known_bits.Get(i)) {
-      result.push_back(known_bits_values.Get(i) ? TernaryValue::kKnownOne
-                                                : TernaryValue::kKnownZero);
-    } else {
-      result.push_back(TernaryValue::kUnknown);
-    }
-  }
-
-  return result;
-}
+// Returns a vector with known bits as represented in `known_bits`, with values
+// as given in `known_bits_values`.
+TernaryVector FromKnownBits(const Bits& known_bits,
+                            const Bits& known_bits_values);
 
 // Returns a `Bits` that contains a 1 for each element of the given ternary
 // vector that is either `kKnownZero` or `kKnownOne`, and a 0 otherwise.
-Bits ToKnownBits(const TernaryVector& ternary_vector);
+Bits ToKnownBits(TernarySpan ternary_vector);
 
 // Returns a `Bits` that contains a 1 for each element of the given ternary
-// vector that is `kKnownOne`, and a 0 otherwise.
-Bits ToKnownBitsValues(const TernaryVector& ternary_vector);
+// vector that is `kKnownOne`, a 0 for each element that is `kKnownZero`, and
+// `default_set` otherwise.
+Bits ToKnownBitsValues(TernarySpan ternary_vector, bool default_set = false);
 
 // Returns a vector with known positions for each bit known in `lhs` that isn't
 // known in `rhs`. If `lhs` and `rhs` conflict, returns `std::nullopt`.
 // CHECK fails if `lhs` and `rhs` have different lengths.
-inline std::optional<TernaryVector> Difference(const TernaryVector& lhs,
-                                               const TernaryVector& rhs) {
-  XLS_CHECK_EQ(lhs.size(), rhs.size());
-  const int64_t size = lhs.size();
+std::optional<TernaryVector> Difference(TernarySpan lhs, TernarySpan rhs);
 
-  TernaryVector result;
-  result.reserve(size);
-  for (int64_t i = 0; i < size; ++i) {
-    if (lhs[i] != TernaryValue::kUnknown) {
-      if (rhs[i] == TernaryValue::kUnknown) {
-        result.push_back(lhs[i]);
-      } else {
-        if (lhs[i] != rhs[i]) {
-          return std::nullopt;
-        }
-        result.push_back(TernaryValue::kUnknown);
-      }
-    } else {
-      result.push_back(TernaryValue::kUnknown);
-    }
-  }
+// Returns a vector with known positions for each bit known to have a value in
+// either `lhs` or `rhs`, or an error if `lhs` and `rhs` are incompatible (have
+// known bits that disagree). CHECK fails if `lhs` and `rhs` have different
+// lengths.
+absl::StatusOr<TernaryVector> Union(TernarySpan lhs, TernarySpan rhs);
 
-  return result;
-}
+// Updates `lhs` to include additional known information from `rhs`. Returns
+// false if `lhs` and `rhs` are incompatible (have known bits that disagree),
+// leaving `lhs` in an unspecified state. CHECK fails if `lhs` and `rhs` have
+// different lengths.
+bool TryUpdateWithUnion(TernaryVector& lhs, TernarySpan rhs);
+
+// Updates `lhs` to include additional known information from `rhs`, or an error
+// if `lhs` and `rhs` are incompatible (have known bits that disagree). CHECK
+// fails if `lhs` and `rhs` have different lengths.
+absl::Status UpdateWithUnion(TernaryVector& lhs, TernarySpan rhs);
 
 // Returns a vector with known positions for each bit known to have the same
 // value in both `lhs` and `rhs`. CHECK fails if `lhs` and `rhs` have different
 // lengths.
-inline TernaryVector Intersection(const TernaryVector& lhs,
-                                  const TernaryVector& rhs) {
-  XLS_CHECK_EQ(lhs.size(), rhs.size());
-  const int64_t size = lhs.size();
+TernaryVector Intersection(TernarySpan lhs, TernarySpan rhs);
 
-  TernaryVector result;
-  result.reserve(size);
-  for (int64_t i = 0; i < size; ++i) {
-    if (lhs[i] != rhs[i]) {
-      result.push_back(TernaryValue::kUnknown);
-    } else {
-      result.push_back(lhs[i]);
-    }
-  }
+// Returns true if `bits` is a possible value for `pattern`.
+bool IsCompatible(TernarySpan pattern, const Bits& bits);
 
-  return result;
-}
+// Returns true if `a` and `b` are compatible (have no known bits that
+// disagree).
+bool IsCompatible(TernarySpan a, TernarySpan b);
 
 // Updates `lhs`, turning it into a vector of bits known to have the same value
 // in both `lhs` and `rhs`. CHECK fails if `lhs` and `rhs` have different
 // lengths.
-inline void UpdateWithIntersection(TernaryVector& lhs,
-                                   const TernaryVector& rhs) {
-  XLS_CHECK_EQ(lhs.size(), rhs.size());
-
-  for (int64_t i = 0; i < lhs.size(); ++i) {
-    if (lhs[i] != rhs[i]) {
-      lhs[i] = TernaryValue::kUnknown;
-    }
-  }
-}
-inline void UpdateWithIntersection(TernaryVector& lhs, const Bits& rhs) {
-  XLS_CHECK_EQ(lhs.size(), rhs.bit_count());
-
-  for (int64_t i = 0; i < lhs.size(); ++i) {
-    if (lhs[i] == TernaryValue::kUnknown) {
-      continue;
-    }
-    const bool lhs_bit = lhs[i] == TernaryValue::kKnownOne;
-    const bool rhs_bit = rhs.Get(i);
-    if (lhs_bit != rhs_bit) {
-      lhs[i] = TernaryValue::kUnknown;
-    }
-  }
-}
+void UpdateWithIntersection(TernaryVector& lhs, TernarySpan rhs);
+void UpdateWithIntersection(TernaryVector& lhs, const Bits& rhs);
 
 // Returns the number of known bits in the given `TernaryVector`.
-inline int64_t NumberOfKnownBits(const TernaryVector& vec) {
-  int64_t result = 0;
-  for (TernaryValue value : vec) {
-    if (value != TernaryValue::kUnknown) {
-      ++result;
-    }
-  }
-  return result;
-}
+int64_t NumberOfKnownBits(TernarySpan vec);
+
+// Returns the number of bits required to represent every possible value the
+// ternary may take.
+int64_t MinimumBitCount(TernarySpan t);
 
 inline bool IsKnown(TernaryValue t) { return t != TernaryValue::kUnknown; }
 inline bool IsUnknown(TernaryValue t) { return t == TernaryValue::kUnknown; }
 
-inline bool AllUnknown(const TernaryVector& v) {
-  return std::all_of(v.begin(), v.end(), IsUnknown);
+inline bool IsFullyKnown(TernarySpan ternary) {
+  return absl::c_all_of(ternary, IsKnown);
+}
+inline bool AllUnknown(TernarySpan v) { return absl::c_all_of(v, IsUnknown); }
+
+inline bool IsKnownOne(TernarySpan ternary) {
+  return absl::c_all_of(
+      ternary, [](TernaryValue v) { return v == TernaryValue::kKnownOne; });
+}
+inline bool IsKnownZero(TernarySpan ternary) {
+  return absl::c_all_of(
+      ternary, [](TernaryValue v) { return v == TernaryValue::kKnownZero; });
 }
 
 inline TernaryValue And(const TernaryValue& a, const TernaryValue& b) {
@@ -198,6 +167,14 @@ inline TernaryValue And(const TernaryValue& a, const TernaryValue& b) {
   }
   return TernaryValue::kUnknown;
 }
+inline TernaryVector And(TernarySpan a, TernarySpan b) {
+  CHECK_EQ(a.size(), b.size());
+  TernaryVector result(a.size());
+  for (int64_t i = 0; i < a.size(); ++i) {
+    result[i] = And(a[i], b[i]);
+  }
+  return result;
+}
 
 inline TernaryValue Or(const TernaryValue& a, const TernaryValue& b) {
   // Truth table:
@@ -215,28 +192,173 @@ inline TernaryValue Or(const TernaryValue& a, const TernaryValue& b) {
   }
   return TernaryValue::kUnknown;
 }
-
-inline TernaryVector BitsToTernary(const Bits& bits) {
-  TernaryVector result;
-  result.resize(bits.bit_count());
-  for (int64_t i = 0; i < bits.bit_count(); ++i) {
-    result[i] = static_cast<TernaryValue>(bits.Get(i));
+inline TernaryVector Or(TernarySpan a, TernarySpan b) {
+  CHECK_EQ(a.size(), b.size());
+  TernaryVector result(a.size());
+  for (int64_t i = 0; i < a.size(); ++i) {
+    result[i] = Or(a[i], b[i]);
   }
   return result;
 }
 
-inline bool IsKnownOne(const TernaryVector& ternary) {
-  return absl::c_all_of(
-      ternary, [](TernaryValue v) { return v == TernaryValue::kKnownOne; });
+inline TernaryValue Not(const TernaryValue& a) {
+  switch (a) {
+    case TernaryValue::kKnownZero:
+      return TernaryValue::kKnownOne;
+    case TernaryValue::kKnownOne:
+      return TernaryValue::kKnownZero;
+    case TernaryValue::kUnknown:
+      return TernaryValue::kUnknown;
+  }
+  ABSL_UNREACHABLE();
 }
-inline bool IsKnownZero(const TernaryVector& ternary) {
-  return absl::c_all_of(
-      ternary, [](TernaryValue v) { return v == TernaryValue::kKnownZero; });
+inline TernaryVector Not(TernarySpan a) {
+  TernaryVector result;
+  result.reserve(a.size());
+  absl::c_transform(a, std::back_inserter(result),
+                    [](TernaryValue v) { return Not(v); });
+  return result;
 }
-inline bool IsFullyKnown(const TernaryVector& ternary) {
-  return absl::c_none_of(
-      ternary, [](TernaryValue v) { return v == TernaryValue::kUnknown; });
+
+inline TernaryValue Xor(const TernaryValue& a, const TernaryValue& b) {
+  // Truth table:
+  //              rhs
+  //      | |  0   1   X
+  //      --+------------
+  // lhs  0 |  0   1   X
+  //      1 |  1   0   X
+  //      X |  X   X   X
+  if (a == TernaryValue::kUnknown || b == TernaryValue::kUnknown) {
+    return TernaryValue::kUnknown;
+  }
+  return a == b ? TernaryValue::kKnownZero : TernaryValue::kKnownOne;
 }
+inline TernaryVector Xor(TernarySpan a, TernarySpan b) {
+  CHECK_EQ(a.size(), b.size());
+  TernaryVector result(a.size());
+  for (int64_t i = 0; i < a.size(); ++i) {
+    result[i] = Xor(a[i], b[i]);
+  }
+  return result;
+}
+
+TernaryVector BitsToTernary(const Bits& bits);
+
+// An iterator of possible ternary values.
+class RealizedTernaryIterator {
+ public:
+  using value_type = Bits;
+  using reference = const Bits&;
+  using pointer = const Bits*;
+  using difference_type = std::ptrdiff_t;
+  using iterator_category = std::forward_iterator_tag;
+  using iterator_concept = std::forward_iterator_tag;
+
+  RealizedTernaryIterator(const RealizedTernaryIterator&) = default;
+  RealizedTernaryIterator(RealizedTernaryIterator&&) = default;
+  RealizedTernaryIterator& operator=(const RealizedTernaryIterator&) = default;
+  RealizedTernaryIterator& operator=(RealizedTernaryIterator&&) = default;
+  explicit RealizedTernaryIterator() : finished_(true) {}
+
+  const Bits& operator*() const {
+    CHECK(!finished_);
+    return value_;
+  }
+
+  const Bits* operator->() const { return &**this; }
+
+  bool operator==(const RealizedTernaryIterator& o) const {
+    if (finished_ != o.finished_) {
+      // One is at the end and the other isn't
+      return false;
+    }
+    if (finished_ && o.finished_) {
+      return true;
+    }
+    return value_ == o.value_;
+  }
+
+  // Pre increment
+  RealizedTernaryIterator& operator++() {
+    Advance(1);
+    return *this;
+  }
+
+  RealizedTernaryIterator& operator+=(int64_t amnt) {
+    CHECK_GE(amnt, 0);
+    Advance(amnt);
+    return *this;
+  }
+
+  RealizedTernaryIterator& operator+=(const Bits& amnt) {
+    Advance(amnt);
+    return *this;
+  }
+
+  // Post increment
+  RealizedTernaryIterator operator++(int) {
+    RealizedTernaryIterator cpy = *this;
+    Advance(1);
+    return cpy;
+  }
+
+  RealizedTernaryIterator operator+(const Bits& v) const {
+    RealizedTernaryIterator res = *this;
+    res += v;
+    return res;
+  }
+
+  RealizedTernaryIterator operator+(int v) const {
+    RealizedTernaryIterator res = *this;
+    res += v;
+    return res;
+  }
+
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink, const RealizedTernaryIterator& it) {
+    if (it.finished_) {
+      absl::Format(&sink, "(ternary-iterator @ end)");
+    } else {
+      absl::Format(&sink, "(ternary-iterator @ %s)", it.value_.ToDebugString());
+    }
+  }
+
+ private:
+  explicit RealizedTernaryIterator(TernarySpan span)
+      : finished_(false),
+        value_(ToKnownBitsValues(span)),
+        unknown_bit_offsets_(
+            RealizedTernaryIterator::FindUnknownOffsets(span)) {}
+
+  void Advance(int64_t amnt);
+  void Advance(const Bits& amnt);
+  static std::vector<int64_t> FindUnknownOffsets(TernarySpan span);
+
+  bool finished_;
+  Bits value_;
+  std::vector<int64_t> unknown_bit_offsets_;
+
+  friend xabsl::iterator_range<RealizedTernaryIterator> AllBitsValues(
+      TernarySpan span);
+};
+
+// Make an iterator range that enumerates all possible values which match the
+// given ternary. The values are produced in order from smallest to largest.
+//
+// NB To match with bits convention an empty span is considered to have one
+// (0-bit) value associated with it.
+inline xabsl::iterator_range<RealizedTernaryIterator> AllBitsValues(
+    TernarySpan span) {
+  static_assert(std::forward_iterator<RealizedTernaryIterator>);
+  return {RealizedTernaryIterator(span), RealizedTernaryIterator()};
+}
+
+// Make an iterator range that enumerates all possible values which match the
+// given tree of ternaries. The values are produced in order from smallest to
+// largest at each position, in little-endian order (i.e., the first leaf
+// changes most often, and the last leaf changes least often).
+absl::StatusOr<std::vector<Value>> AllValues(
+    LeafTypeTreeView<TernaryVector> ltt);
 
 }  // namespace ternary_ops
 }  // namespace xls

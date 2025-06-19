@@ -16,12 +16,18 @@
 
 #include <optional>
 
+#include "absl/status/statusor.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
 #include "xls/ir/node_util.h"
 #include "xls/ir/nodes.h"
+#include "xls/ir/proc.h"
+#include "xls/ir/value.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
+#include "xls/passes/pass_base.h"
+#include "xls/passes/query_engine.h"
+#include "xls/passes/stateless_query_engine.h"
 
 namespace xls {
 
@@ -31,6 +37,23 @@ struct ReceiveData {
   Receive* receive;
   Node* data;
 };
+
+// Check if the node is a binary select or a binary priority select
+bool IsBinarySelectOrPrioritySelect(Node *node) {
+  // Handle Select
+  if (node->Is<Select>()) {
+    Select *select = node->As<Select>();
+    return IsBinarySelect(select);
+  }
+
+  // Handle PrioritySelect
+  if (node->Is<PrioritySelect>()) {
+    PrioritySelect *select = node->As<PrioritySelect>();
+    return IsBinaryPrioritySelect(select);
+  }
+
+  return false;
+}
 
 // Matches node against the data of a receive node. Returns the receive
 // operation and the data value if the match succeeds.
@@ -50,7 +73,7 @@ bool IsValidBitOfNonblockingReceive(Node* node) {
 }
 
 // Matches `node` against a useless binary select between the data value of a
-// conditional or non-blocking receive node and a literal 0. There are two
+// conditional or non-blocking receive node and a constant 0. There are two
 // patterns. For the conditional case:
 //
 //                            predicate
@@ -58,7 +81,7 @@ bool IsValidBitOfNonblockingReceive(Node* node) {
 //               receive <-------+
 //                  |            |
 //                  |            |
-//   Literal(0)  tuple_index(1)  |
+//  constant(0)  tuple_index(1)  |
 //          \    /               |
 //           \  /                |
 //          select <-------------+
@@ -69,33 +92,35 @@ bool IsValidBitOfNonblockingReceive(Node* node) {
 //                      |
 //                      +---------------+
 //                      |               |
-//   Literal(0)  tuple_index(1)   tuple_index(2)
+//  constant(0)  tuple_index(1)   tuple_index(2)
 //          \    /                      |
 //           \  /                       |
 //          select <--------------------+
 //
 // In these case, the select is equivalent to the data value of the receive.
-std::optional<ReceiveData> MatchUselessSelectAfterReceive(Select* select) {
-  if (!IsBinarySelect(select)) {
+std::optional<ReceiveData> MatchUselessSelectAfterReceive(
+    Node *select, Node *selector, Node *on_true_input, Node *on_false_input,
+    QueryEngine &query_engine) {
+  std::optional<ReceiveData> receive_data =
+      MatchReceiveDataValue(on_true_input);
+  if (!receive_data.has_value()) {
     return std::nullopt;
   }
 
-  std::optional<ReceiveData> receive_data =
-      MatchReceiveDataValue(select->get_case(1));
-  if (!receive_data.has_value() || !select->get_case(0)->Is<Literal>() ||
-      !select->get_case(0)->As<Literal>()->value().IsAllZeros()) {
+  std::optional<Value> constant = query_engine.KnownValue(on_false_input);
+  if (!constant.has_value() || !constant->IsAllZeros()) {
     return std::nullopt;
   }
 
   // Test for the conditional receive case.
   if (receive_data->receive->predicate().has_value() &&
-      receive_data->receive->predicate().value() == select->selector()) {
+      receive_data->receive->predicate().value() == selector) {
     return receive_data;
   }
 
   // Test for the non-blocking receive case.
   if (!receive_data->receive->is_blocking() &&
-      IsValidBitOfNonblockingReceive(select->selector())) {
+      IsValidBitOfNonblockingReceive(selector)) {
     return receive_data;
   }
 
@@ -105,15 +130,28 @@ std::optional<ReceiveData> MatchUselessSelectAfterReceive(Select* select) {
 }  // namespace
 
 absl::StatusOr<bool> ReceiveDefaultValueSimplificationPass::RunOnProcInternal(
-    Proc* proc, const OptimizationPassOptions& options,
-    PassResults* results) const {
+    Proc* proc, const OptimizationPassOptions& options, PassResults* results,
+    OptimizationContext& context) const {
+  StatelessQueryEngine query_engine;
+
   bool changed = false;
-  for (Node* node : TopoSort(proc)) {
-    if (!node->Is<Select>()) {
+  for (Node* node : context.TopoSort(proc)) {
+    if (!IsBinarySelectOrPrioritySelect(node)) {
       continue;
     }
-    std::optional<ReceiveData> receive_data =
-        MatchUselessSelectAfterReceive(node->As<Select>());
+    std::optional<ReceiveData> receive_data;
+    if (node->Is<Select>()) {
+      Select *select = node->As<Select>();
+      receive_data = MatchUselessSelectAfterReceive(
+          node, select->selector(), select->get_case(1), select->get_case(0),
+          query_engine);
+
+    } else {
+      PrioritySelect *select = node->As<PrioritySelect>();
+      receive_data = MatchUselessSelectAfterReceive(
+          node, select->selector(), select->get_case(0),
+          select->default_value(), query_engine);
+    }
     if (receive_data.has_value()) {
       XLS_RETURN_IF_ERROR(node->ReplaceUsesWith(receive_data->data));
       changed = true;
@@ -122,5 +160,7 @@ absl::StatusOr<bool> ReceiveDefaultValueSimplificationPass::RunOnProcInternal(
 
   return changed;
 }
+
+REGISTER_OPT_PASS(ReceiveDefaultValueSimplificationPass);
 
 }  // namespace xls

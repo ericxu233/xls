@@ -15,22 +15,25 @@
 #include "xls/passes/bdd_cse_pass.h"
 
 #include <algorithm>
-#include <memory>
+#include <cstdint>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/hash/hash.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
-#include "xls/common/logging/log_lines.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/delay_model/delay_estimator.h"
-#include "xls/delay_model/delay_estimators.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimators.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
-#include "xls/passes/bdd_function.h"
+#include "xls/ir/nodes.h"
+#include "xls/passes/bdd_query_engine.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
+#include "xls/passes/pass_base.h"
+#include "xls/passes/query_engine.h"
 
 namespace xls {
 
@@ -48,7 +51,8 @@ namespace {
 //     in the list. This ensures that the CSE replacement does not increase
 //     critical-path
 //
-absl::StatusOr<std::vector<Node*>> GetNodeOrder(FunctionBase* f) {
+absl::StatusOr<std::vector<Node*>> GetNodeOrder(FunctionBase* f,
+                                                OptimizationContext& context) {
   // Index of each node in the topological sort.
   absl::flat_hash_map<Node*, int64_t> topo_index;
   // Critical-path distance from root in the graph to each node.
@@ -66,7 +70,7 @@ absl::StatusOr<std::vector<Node*>> GetNodeOrder(FunctionBase* f) {
         GetStandardDelayEstimator().GetOperationDelayInPs(n);
     return delay_status.ok() ? delay_status.value() : 0;
   };
-  for (Node* node : TopoSort(f)) {
+  for (Node* node : context.TopoSort(f)) {
     topo_index[node] = i;
     int64_t node_start = 0;
     for (Node* operand : node->operands()) {
@@ -96,19 +100,22 @@ absl::StatusOr<std::vector<Node*>> GetNodeOrder(FunctionBase* f) {
 
 absl::StatusOr<bool> BddCsePass::RunOnFunctionBaseInternal(
     FunctionBase* f, const OptimizationPassOptions& options,
-    PassResults* results) const {
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<BddFunction> bdd_function,
-                       BddFunction::Run(f, BddFunction::kDefaultPathLimit));
+    PassResults* results, OptimizationContext& context) const {
+  BddQueryEngine* query_engine = context.SharedQueryEngine<BddQueryEngine>(f);
+  auto get_bdd_node = [&](Node* n, int64_t bit_index) -> int64_t {
+    return query_engine->GetBddNode(TreeBitLocation(n, bit_index))->value();
+  };
 
   // To improve efficiency, bucket potentially common nodes together. The
   // bucketing is done via a int64_t hash value of the BDD node indices of each
   // bit of the node.
   auto hasher = absl::Hash<std::vector<int64_t>>();
   auto node_hash = [&](Node* n) {
-    XLS_CHECK(n->GetType()->IsBits());
+    CHECK(n->GetType()->IsBits());
     std::vector<int64_t> values_to_hash;
+    values_to_hash.reserve(n->BitCountOrDie());
     for (int64_t i = 0; i < n->BitCountOrDie(); ++i) {
-      values_to_hash.push_back(bdd_function->GetBddNode(n, i).value());
+      values_to_hash.push_back(get_bdd_node(n, i));
     }
     return hasher(values_to_hash);
   };
@@ -118,7 +125,7 @@ absl::StatusOr<bool> BddCsePass::RunOnFunctionBaseInternal(
       return false;
     }
     for (int64_t i = 0; i < a->BitCountOrDie(); ++i) {
-      if (bdd_function->GetBddNode(a, i) != bdd_function->GetBddNode(b, i)) {
+      if (get_bdd_node(a, i) != get_bdd_node(b, i)) {
         return false;
       }
     }
@@ -128,7 +135,7 @@ absl::StatusOr<bool> BddCsePass::RunOnFunctionBaseInternal(
   bool changed = false;
   absl::flat_hash_map<int64_t, std::vector<Node*>> node_buckets;
   node_buckets.reserve(f->node_count());
-  XLS_ASSIGN_OR_RETURN(std::vector<Node*> node_order, GetNodeOrder(f));
+  XLS_ASSIGN_OR_RETURN(std::vector<Node*> node_order, GetNodeOrder(f, context));
   for (Node* node : node_order) {
     if (!node->GetType()->IsBits() || node->Is<Literal>()) {
       continue;
@@ -143,9 +150,9 @@ absl::StatusOr<bool> BddCsePass::RunOnFunctionBaseInternal(
     for (Node* candidate : node_buckets.at(hash)) {
       if (is_same_value(node, candidate)) {
         XLS_RETURN_IF_ERROR(node->ReplaceUsesWith(candidate));
-        XLS_VLOG(4) << "Found identical value:";
-        XLS_VLOG(4) << "  Node: " << node->ToString();
-        XLS_VLOG(4) << "  Replacement: " << candidate->ToString();
+        VLOG(4) << "Found identical value:";
+        VLOG(4) << "  Node: " << node->ToString();
+        VLOG(4) << "  Replacement: " << candidate->ToString();
         changed = true;
         replaced = true;
         break;
@@ -158,5 +165,7 @@ absl::StatusOr<bool> BddCsePass::RunOnFunctionBaseInternal(
 
   return changed;
 }
+
+REGISTER_OPT_PASS(BddCsePass);
 
 }  // namespace xls

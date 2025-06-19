@@ -19,38 +19,57 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "xls/codegen/block_conversion.h"
 #include "xls/codegen/block_generator.h"
 #include "xls/codegen/codegen_pass.h"
+#include "xls/codegen/module_signature.h"
 #include "xls/codegen/signature_generator.h"
-#include "xls/common/logging/logging.h"
+#include "xls/codegen/vast/vast.h"
 #include "xls/common/status/matchers.h"
+#include "xls/contrib/xlscc/cc_parser.h"
 #include "xls/contrib/xlscc/hls_block.pb.h"
 #include "xls/contrib/xlscc/translator.h"
 #include "xls/contrib/xlscc/unit_tests/unit_test.h"
 #include "xls/ir/bits.h"
-#include "xls/ir/channel.h"
+#include "xls/ir/package.h"
 #include "xls/ir/proc.h"
+#include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_pipeline.h"
+#include "xls/passes/pass_base.h"
 #include "xls/simulation/module_simulator.h"
-#include "xls/simulation/verilog_simulators.h"
 #include "xls/simulation/verilog_test_base.h"
 
 namespace xlscc {
 namespace {
 
-using testing::Pair;
-using testing::UnorderedElementsAre;
-using xls::status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
+using ::testing::Pair;
+using ::testing::UnorderedElementsAre;
 
 constexpr char kTestName[] = "translator_verilog_test";
 constexpr char kTestdataPath[] = "xls/contrib/xlscc/unit_tests/testdata";
 
 class TranslatorVerilogTest : public xls::verilog::VerilogTestBase {};
 
-// What's being tested here is that the IR produced is generatable
-//  by the combinational generator. For example, it will fail without
-//  InlineAllInvokes(). Simulation tests already occur in the
-//  combinational_generator_test
+absl::Status SimplifyAndInline(xls::Package* package) {
+  std::unique_ptr<xls::OptimizationCompoundPass> pipeline =
+      xls::CreateOptimizationPassPipeline();
+  xls::OptimizationPassOptions options;
+  xls::PassResults results;
+  xls::OptimizationContext context;
+
+  // This pass wants a delay estimator
+  options.skip_passes = {"bdd_cse"};
+
+  return pipeline->Run(package, options, &results, context).status();
+}
+
+// What's being tested here is that the IR produced is generatable by the
+// combinational generator (after simplification). Simulation tests already
+// occur in the combinational_generator_test.
 TEST_P(TranslatorVerilogTest, IOProcComboGenOneToNMux) {
   const std::string content = R"(
     #include "/xls_builtin.h"
@@ -78,22 +97,22 @@ TEST_P(TranslatorVerilogTest, IOProcComboGenOneToNMux) {
     HLSChannel* dir_in = block_spec.add_channels();
     dir_in->set_name("dir");
     dir_in->set_is_input(true);
-    dir_in->set_type(DIRECT_IN);
+    dir_in->set_type(CHANNEL_TYPE_DIRECT_IN);
 
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out1 = block_spec.add_channels();
     ch_out1->set_name("out1");
     ch_out1->set_is_input(false);
-    ch_out1->set_type(FIFO);
+    ch_out1->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out2 = block_spec.add_channels();
     ch_out2->set_name("out2");
     ch_out2->set_is_input(false);
-    ch_out2->set_type(FIFO);
+    ch_out2->set_type(CHANNEL_TYPE_FIFO);
   }
 
   auto parser = std::make_unique<xlscc::CCParser>();
@@ -102,6 +121,10 @@ TEST_P(TranslatorVerilogTest, IOProcComboGenOneToNMux) {
 
   auto translator = std::make_unique<xlscc::Translator>(
       /*error_on_init_interval=*/false,
+      /*error_on_uninitialized=*/false,
+      /*generate_fsms_for_pipelined_loops=*/false,
+      /*merge_states=*/false, /*split_states_on_channel_ops=*/false,
+      /*debug_ir_trace_flags=*/xlscc::DebugIrTraceFlags_None,
       /*warn_unroll_iters=*/100,
       /*max_unroll_iters=*/100,
       /*z3_rlimit=*/-1,
@@ -112,22 +135,22 @@ TEST_P(TranslatorVerilogTest, IOProcComboGenOneToNMux) {
   XLS_ASSERT_OK_AND_ASSIGN(xls::Proc * proc,
                            translator->GenerateIR_Block(&package, block_spec));
 
-  XLS_VLOG(1) << "Simplifying IR..." << std::endl;
-  XLS_ASSERT_OK(translator->InlineAllInvokes(&package));
+  VLOG(1) << "Simplifying IR..." << std::endl;
+  XLS_ASSERT_OK(SimplifyAndInline(&package));
 
   XLS_ASSERT_OK_AND_ASSIGN(
-      xls::verilog::CodegenPassUnit unit,
+      xls::verilog::CodegenContext context,
       xls::verilog::ProcToCombinationalBlock(proc, codegen_options()));
   XLS_ASSERT_OK_AND_ASSIGN(
       std::string verilog,
-      xls::verilog::GenerateVerilog(unit.block, codegen_options()));
+      xls::verilog::GenerateVerilog(context.top_block(), codegen_options()));
   XLS_ASSERT_OK_AND_ASSIGN(
       xls::verilog::ModuleSignature signature,
-      xls::verilog::GenerateSignature(codegen_options(), unit.block));
+      xls::verilog::GenerateSignature(codegen_options(), context.top_block()));
 
-  XLS_VLOG(1) << package.DumpIr() << std::endl;
+  VLOG(1) << package.DumpIr() << std::endl;
 
-  XLS_VLOG(1) << verilog << std::endl;
+  VLOG(1) << verilog << std::endl;
 
   ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
                                  verilog);
@@ -214,57 +237,61 @@ TEST_P(TranslatorVerilogTest, IOProcComboGenNToOneMux) {
     HLSChannel* dir_in = block_spec.add_channels();
     dir_in->set_name("dir");
     dir_in->set_is_input(true);
-    dir_in->set_type(DIRECT_IN);
+    dir_in->set_type(CHANNEL_TYPE_DIRECT_IN);
 
     HLSChannel* ch_in1 = block_spec.add_channels();
     ch_in1->set_name("in1");
     ch_in1->set_is_input(true);
-    ch_in1->set_type(FIFO);
+    ch_in1->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_in2 = block_spec.add_channels();
     ch_in2->set_name("in2");
     ch_in2->set_is_input(true);
-    ch_in2->set_type(FIFO);
+    ch_in2->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out1 = block_spec.add_channels();
     ch_out1->set_name("out");
     ch_out1->set_is_input(false);
-    ch_out1->set_type(FIFO);
+    ch_out1->set_type(CHANNEL_TYPE_FIFO);
   }
 
   auto parser = std::make_unique<xlscc::CCParser>();
   XLS_ASSERT_OK(
       XlsccTestBase::ScanTempFileWithContent(content, {}, parser.get()));
 
-  std::unique_ptr<xlscc::Translator> translator(
-      new xlscc::Translator(/*error_on_init_interval=*/false,
-                            /*max_unroll_iters=*/100,
-                            /*warn_unroll_iters=*/100,
-                            /*z3_rlimit=*/-1,
-                            /*op_ordering=*/xlscc::IOOpOrdering::kNone,
-                            /*existing_parser=*/std::move(parser)));
+  std::unique_ptr<xlscc::Translator> translator(new xlscc::Translator(
+      /*error_on_init_interval=*/false,
+      /*error_on_uninitialized=*/false,
+      /*generate_new_fsm=*/false,
+      /*merge_states=*/false, /*split_states_on_channel_ops=*/false,
+      /*debug_ir_trace_flags=*/xlscc::DebugIrTraceFlags_None,
+      /*max_unroll_iters=*/100,
+      /*warn_unroll_iters=*/100,
+      /*z3_rlimit=*/-1,
+      /*op_ordering=*/xlscc::IOOpOrdering::kNone,
+      /*existing_parser=*/std::move(parser)));
 
   xls::Package package("my_package");
   XLS_ASSERT_OK_AND_ASSIGN(xls::Proc * proc,
                            translator->GenerateIR_Block(&package, block_spec));
 
-  XLS_VLOG(1) << "Simplifying IR..." << std::endl;
-  XLS_ASSERT_OK(translator->InlineAllInvokes(&package));
+  VLOG(1) << "Simplifying IR..." << std::endl;
+  XLS_ASSERT_OK(SimplifyAndInline(&package));
 
   XLS_ASSERT_OK_AND_ASSIGN(
-      xls::verilog::CodegenPassUnit unit,
+      xls::verilog::CodegenContext context,
       xls::verilog::ProcToCombinationalBlock(proc, codegen_options()));
   XLS_ASSERT_OK_AND_ASSIGN(
       xls::verilog::ModuleSignature signature,
-      xls::verilog::GenerateSignature(codegen_options(), unit.block));
+      xls::verilog::GenerateSignature(codegen_options(), context.top_block()));
 
   XLS_ASSERT_OK_AND_ASSIGN(
       std::string verilog,
-      xls::verilog::GenerateVerilog(unit.block, codegen_options()));
+      xls::verilog::GenerateVerilog(context.top_block(), codegen_options()));
 
-  XLS_VLOG(1) << package.DumpIr() << std::endl;
+  VLOG(1) << package.DumpIr() << std::endl;
 
-  XLS_VLOG(1) << verilog << std::endl;
+  VLOG(1) << verilog << std::endl;
 
   ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
                                  verilog);

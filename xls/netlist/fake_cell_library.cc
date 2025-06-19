@@ -14,11 +14,13 @@
 
 #include "xls/netlist/fake_cell_library.h"
 
+#include <filesystem>  // NOLINT
+
 #include "absl/status/statusor.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/get_runfile_path.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/netlist/cell_library.h"
 #include "xls/netlist/netlist.pb.h"
 
 namespace xls {

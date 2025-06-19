@@ -15,9 +15,14 @@
 #ifndef XLS_PASSES_CSE_PASS_H_
 #define XLS_PASSES_CSE_PASS_H_
 
+#include <string_view>
+
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
+#include "xls/ir/node.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
@@ -28,7 +33,8 @@ namespace xls {
 // common uses of the `replacements` map, you'll want to compute the transitive
 // closure of the relation rather than using it as-is.
 absl::StatusOr<bool> RunCse(FunctionBase* f,
-                            absl::flat_hash_map<Node*, Node*>* replacements);
+                            absl::flat_hash_map<Node*, Node*>* replacements,
+                            bool common_literals = true);
 
 // Computes the fixed point of a strict partial order, i.e.: the relation that
 // solves the equation `F = R ∘ F` where `R` is the given strict partial order.
@@ -54,15 +60,21 @@ absl::flat_hash_map<T, T> FixedPointOfSPO(
 // expressions.
 class CsePass : public OptimizationFunctionBasePass {
  public:
-  CsePass()
-      : OptimizationFunctionBasePass("cse",
-                                     "Common subexpression elimination") {}
+  static constexpr std::string_view kName = "cse";
+
+  // If `common_literals` is true then literals are included in the
+  // transformations, otherwise literals are not commoned.
+  explicit CsePass(bool common_literals = true)
+      : OptimizationFunctionBasePass(kName, "Common subexpression elimination"),
+        common_literals_(common_literals) {}
   ~CsePass() override = default;
 
  protected:
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
+
+  bool common_literals_;
 };
 
 }  // namespace xls

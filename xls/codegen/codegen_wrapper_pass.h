@@ -19,8 +19,12 @@
 #include <utility>
 
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 #include "xls/codegen/codegen_pass.h"
+#include "xls/ir/package.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls::verilog {
 
@@ -28,21 +32,40 @@ namespace xls::verilog {
 // useful for adding an optimization or transformation pass (most passes in
 // xls/passes are OptimizationFunctionBasePasses) to the codegen pipeline. The
 // wrapped pass is run on the block being lowered to Verilog.
+//
+// Takes the OptimizationContext object at construction, since it's specific to
+// optimization passes & cannot be passed via a codegen pass's Run function.
 class CodegenWrapperPass : public CodegenPass {
  public:
   explicit CodegenWrapperPass(
-      std::unique_ptr<OptimizationFunctionBasePass> wrapped_pass)
+      std::unique_ptr<OptimizationFunctionBasePass> wrapped_pass,
+      OptimizationContext& opt_context)
       : CodegenPass(absl::StrFormat("codegen_%s", wrapped_pass->short_name()),
                     absl::StrFormat("%s (codegen)", wrapped_pass->long_name())),
-        wrapped_pass_(std::move(wrapped_pass)) {}
+        wrapped_pass_(std::move(wrapped_pass)),
+        opt_context_(opt_context) {}
   ~CodegenWrapperPass() override = default;
 
-  absl::StatusOr<bool> RunInternal(CodegenPassUnit* unit,
+  bool IsCompound() const override { return wrapped_pass_->IsCompound(); }
+
+  absl::StatusOr<bool> RunInternal(Package* package,
                                    const CodegenPassOptions& options,
-                                   PassResults* results) const override;
+                                   PassResults* results,
+                                   CodegenContext& context) const final;
+
+  absl::StatusOr<bool> RunNested(
+      Package* package, const CodegenPassOptions& options, PassResults* results,
+      CodegenContext& context, PassInvocation& invocation,
+      absl::Span<const CodegenInvariantChecker* const> invariant_checkers)
+      const override {
+    return wrapped_pass_->RunNested(package, OptimizationPassOptions(options),
+                                    results, opt_context_, invocation,
+                                    /*invariant_checkers=*/{});
+  }
 
  private:
   std::unique_ptr<OptimizationFunctionBasePass> wrapped_pass_;
+  OptimizationContext& opt_context_;
 };
 
 }  // namespace xls::verilog

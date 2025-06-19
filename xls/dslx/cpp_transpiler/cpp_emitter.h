@@ -28,6 +28,9 @@
 
 namespace xls::dslx {
 
+// Sanitizes the given name for C++. C++ keywords are prefixed with "_".
+std::string SanitizeCppName(std::string_view name);
+
 // Returns the C++ type name used to represent the given DSLX type name.
 std::string DslxTypeNameToCpp(std::string_view dslx_type);
 
@@ -140,4 +143,4 @@ class CppEmitter {
 
 }  // namespace xls::dslx
 
-#endif  // XLS_DSLX_CPP_TRANSPILER_CPP_EMITTER__H_
+#endif  // XLS_DSLX_CPP_TRANSPILER_CPP_EMITTER_H_

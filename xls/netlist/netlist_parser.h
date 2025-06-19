@@ -15,28 +15,33 @@
 #ifndef XLS_NETLIST_NETLIST_PARSER_H_
 #define XLS_NETLIST_NETLIST_PARSER_H_
 
-#include <sys/types.h>
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/ascii.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
-#include "absl/strings/str_join.h"
 #include "absl/strings/substitute.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/string_to_int.h"
+#include "xls/data_structures/inline_bitmap.h"
 #include "xls/ir/bits.h"
+#include "xls/netlist/cell_library.h"
 #include "xls/netlist/netlist.h"
 #include "re2/re2.h"
 
@@ -366,15 +371,18 @@ absl::StatusOr<int64_t> AbstractParser<EvalT>::PopNumberOrError() {
 template <typename EvalT>
 absl::StatusOr<std::variant<std::string, int64_t>>
 AbstractParser<EvalT>::PopNameOrNumberOrError(size_t& width) {
-  TokenKind kind = scanner_->Peek()->kind;
-  if (kind == TokenKind::kName) {
-    XLS_ASSIGN_OR_RETURN(Token token, scanner_->Pop());
-    return token.value;
-  } else if (kind == TokenKind::kNumber) {
-    return PopNumberOrError(width);
+  const TokenKind kind = scanner_->Peek()->kind;
+  switch (kind) {
+    case TokenKind::kName: {
+      XLS_ASSIGN_OR_RETURN(Token token, scanner_->Pop());
+      return token.value;
+    }
+    case TokenKind::kNumber:
+      return PopNumberOrError(width);
+    default:
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Expected name or number token; got: ", static_cast<int>(kind)));
   }
-  return absl::InvalidArgumentError(absl::StrCat(
-      "Expected name or number token; got: ", static_cast<int>(kind)));
 }
 
 template <typename EvalT>
@@ -489,7 +497,7 @@ absl::Status AbstractParser<EvalT>::ParseInstance(
     XLS_RETURN_IF_ERROR(DropTokenOrError(TokenKind::kOpenParen));
     XLS_ASSIGN_OR_RETURN(AbstractNetRef<EvalT> net, ParseNetRef(module));
     XLS_RETURN_IF_ERROR(DropTokenOrError(TokenKind::kCloseParen));
-    XLS_VLOG(3) << "Adding named parameter assignment: " << pin_name;
+    VLOG(3) << "Adding named parameter assignment: " << pin_name;
     bool is_new = named_parameter_assignments.insert({pin_name, net}).second;
     if (!is_new) {
       return absl::InvalidArgumentError("Duplicate port seen: " + pin_name);
@@ -535,7 +543,7 @@ bool AbstractParser<EvalT>::TryDropToken(TokenKind target) {
     return false;
   }
   if (scanner_->Peek().value().kind == target) {
-    XLS_CHECK_OK(scanner_->Pop().status());
+    CHECK_OK(scanner_->Pop().status());
     return true;
   }
   return false;
@@ -548,7 +556,7 @@ bool AbstractParser<EvalT>::TryDropKeyword(std::string_view target) {
   }
   Token peek = scanner_->Peek().value();
   if (peek.kind == TokenKind::kName && peek.value == target) {
-    XLS_CHECK_OK(scanner_->Pop().status());
+    CHECK_OK(scanner_->Pop().status());
     return true;
   }
   return false;
@@ -644,7 +652,7 @@ absl::Status AbstractParser<EvalT>::ParseOneEntryOfAssignDecl(
     // the MSB.
     auto bitmap = InlineBitmap::FromWord(std::get<int64_t>(token),
                                          number_bit_width, /*fill=*/false);
-    XLS_CHECK(number_bit_width > 0);
+    CHECK_GT(number_bit_width, 0);
     for (; number_bit_width; number_bit_width--) {
       side.push_back(bitmap.Get(number_bit_width - 1) ? "1" : "0");
     }
@@ -664,7 +672,7 @@ absl::Status AbstractParser<EvalT>::ParseOneEntryOfAssignDecl(
     auto has_opt_range = module->GetPortRange(name, /*is_assignable=*/is_lhs);
     if (!has_opt_range.has_value()) {
       has_opt_range = module->GetWireRange(name);
-      XLS_CHECK(has_opt_range.has_value());
+      CHECK(has_opt_range.has_value());
     }
     // Get the optional range from the result. If the optional range exists,
     // then the wire is ranged, e.g. it was declared as "output [7:0] out".

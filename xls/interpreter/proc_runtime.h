@@ -15,15 +15,25 @@
 #ifndef XLS_INTERPRETER_PROC_RUNTIME_H_
 #define XLS_INTERPRETER_PROC_RUNTIME_H_
 
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
+#include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 #include "xls/interpreter/channel_queue.h"
+#include "xls/interpreter/evaluator_options.h"
+#include "xls/interpreter/observer.h"
 #include "xls/interpreter/proc_evaluator.h"
 #include "xls/ir/events.h"
 #include "xls/ir/package.h"
+#include "xls/ir/proc_elaboration.h"
+#include "xls/ir/value.h"
 #include "xls/jit/jit_channel_queue.h"
 
 namespace xls {
@@ -32,9 +42,9 @@ namespace xls {
 class ProcRuntime {
  public:
   ProcRuntime(
-      Package* package,
       absl::flat_hash_map<Proc*, std::unique_ptr<ProcEvaluator>>&& evaluators,
-      std::unique_ptr<ChannelQueueManager>&& queue_manager);
+      std::unique_ptr<ChannelQueueManager>&& queue_manager,
+      const EvaluatorOptions& options);
 
   virtual ~ProcRuntime() = default;
 
@@ -48,14 +58,17 @@ class ProcRuntime {
   // error if no progress can be made due to a deadlock.
   absl::Status Tick();
 
-  // Tick the proc network until some output channels have produced at least a
-  // specified number of outputs as indicated by `output_counts`.
-  // `output_counts` must only contain output channels and need not contain all
-  // output channels. Returns the number of ticks executed before the conditions
-  // were met. `max_ticks` is the maximum number of ticks of the proc network
-  // before returning an error.
+  // Tick the proc network until some output channels (channel instances) have
+  // produced at least a specified number of outputs as indicated by
+  // `output_counts`. `output_counts` must only contain output channels and need
+  // not contain all output channels. Returns the number of ticks executed
+  // before the conditions were met. `max_ticks` is the maximum number of ticks
+  // of the proc network before returning an error.
   absl::StatusOr<int64_t> TickUntilOutput(
-      absl::flat_hash_map<Channel*, int64_t> output_counts,
+      const absl::flat_hash_map<Channel*, int64_t>& output_counts,
+      std::optional<int64_t> max_ticks = std::nullopt);
+  absl::StatusOr<int64_t> TickUntilOutput(
+      const absl::flat_hash_map<ChannelInstance*, int64_t>& output_counts,
       std::optional<int64_t> max_ticks = std::nullopt);
 
   // Tick until all procs with IO (send or receive nodes) are blocked on receive
@@ -76,25 +89,63 @@ class ProcRuntime {
   absl::StatusOr<JitChannelQueueManager*> GetJitChannelQueueManager();
 
   // Returns the state values for a proc in the network.
+  std::vector<Value> ResolveState(ProcInstance* instance) const {
+    return continuations_.at(instance)->GetState();
+  }
   std::vector<Value> ResolveState(Proc* proc) const {
-    return evaluator_contexts_.at(proc).continuation->GetState();
+    return continuations_.at(elaboration().GetUniqueInstance(proc).value())
+        ->GetState();
+  }
+
+  // Updates the state values for a proc in the network.
+  absl::Status SetState(ProcInstance* instance, std::vector<Value> v) {
+    return continuations_.at(instance)->SetState(std::move(v));
+  }
+  absl::Status SetState(Proc* proc, std::vector<Value> v) {
+    return continuations_.at(elaboration().GetUniqueInstance(proc).value())
+        ->SetState(std::move(v));
   }
 
   // Reset the state of all of the procs to their initial state.
   void ResetState();
 
   // Returns the events for each proc in the network.
+  const InterpreterEvents& GetInterpreterEvents(
+      const ProcInstance* instance) const {
+    return continuations_.at(instance)->GetEvents();
+  }
   const InterpreterEvents& GetInterpreterEvents(Proc* proc) const {
-    return evaluator_contexts_.at(proc).continuation->GetEvents();
+    return continuations_.at(elaboration().GetUniqueInstance(proc).value())
+        ->GetEvents();
   }
 
-  void ClearInterpreterEvents() const {
-    for (const auto& [proc, context] : evaluator_contexts_) {
-      context.continuation->ClearEvents();
-    }
+  // Return the events which are not associated with any particular proc (e.g.,
+  // trace messages for channel activity).
+  InterpreterEvents GetGlobalEvents() const;
+  void ClearInterpreterEvents();
+
+  const ProcElaboration& elaboration() const {
+    return queue_manager_->elaboration();
   }
+
+  Package* package() const { return elaboration().package(); }
+
+  void ClearObserver();
+
+  // Set the callbacks for node calculation. Only one may be set at a time. If
+  // this execution environment cannot support the observer api an
+  // absl::UnimplementedError will be returned.
+  absl::Status SetObserver(EvaluationObserver* obs);
+
+  // Does this execution environment support the observer api. If false then
+  // setting an observer might fail and callbacks might not always occur or
+  // could cause crashes.
+  bool SupportsObservers() const;
 
  protected:
+  friend class ChannelTraceRecorder;
+  void AddTraceMessage(TraceMessage message);
+
   // Execute (up to) a single iteration of every proc in the package.
   struct NetworkTickResult {
     // Whether any instruction on any proc executed.
@@ -103,17 +154,20 @@ class ProcRuntime {
     // Whether any instruction on a proc with IO executed
     bool progress_made_on_io_procs;
 
-    std::vector<Channel*> blocked_channels;
+    std::vector<ChannelInstance*> blocked_channel_instances;
   };
   virtual absl::StatusOr<NetworkTickResult> TickInternal() = 0;
 
-  Package* package_;
   std::unique_ptr<ChannelQueueManager> queue_manager_;
-  struct EvaluatorContext {
-    std::unique_ptr<ProcEvaluator> evaluator;
-    std::unique_ptr<ProcContinuation> continuation;
-  };
-  absl::flat_hash_map<Proc*, EvaluatorContext> evaluator_contexts_;
+  absl::flat_hash_map<Proc*, std::unique_ptr<ProcEvaluator>> evaluators_;
+  absl::flat_hash_map<ProcInstance*, std::unique_ptr<ProcContinuation>>
+      continuations_;
+
+  mutable absl::Mutex global_events_mutex_;
+  InterpreterEvents global_events_ ABSL_GUARDED_BY(global_events_mutex_);
+
+  EvaluatorOptions options_;
+  std::optional<EvaluationObserver*> observer_ = std::nullopt;
 };
 
 }  // namespace xls

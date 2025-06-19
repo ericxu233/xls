@@ -16,7 +16,6 @@
 #define XLS_CONTRIB_XLSCC_UNIT_TEST_H_
 
 #include <cstdint>
-#include <cstdio>
 #include <list>
 #include <memory>
 #include <optional>
@@ -24,24 +23,32 @@
 #include <string_view>
 #include <vector>
 
-#include "gtest/gtest.h"
+#include "absl/base/log_severity.h"
 #include "absl/container/flat_hash_map.h"
-#include "absl/strings/str_format.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/log_entry.h"
+#include "absl/log/log_sink.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "xls/common/file/temp_file.h"
-#include "xls/common/logging/log_entry.h"
-#include "xls/common/logging/log_sink.h"
-#include "xls/common/status/status_macros.h"
+#include "xls/common/source_location.h"
 #include "xls/contrib/xlscc/cc_parser.h"
 #include "xls/contrib/xlscc/hls_block.pb.h"
+#include "xls/contrib/xlscc/metadata_output.pb.h"
 #include "xls/contrib/xlscc/translator.h"
+#include "xls/contrib/xlscc/translator_types.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/events.h"
-#include "xls/ir/ir_test_base.h"
+#include "xls/ir/node.h"
+#include "xls/ir/proc.h"
+#include "xls/ir/source_location.h"
 #include "xls/ir/value.h"
+#include "xls/simulation/sim_test_base.h"
 
 struct CapturedLogEntry {
   CapturedLogEntry();
-  explicit CapturedLogEntry(const ::xls::LogEntry& entry);
+  explicit CapturedLogEntry(const ::absl::LogEntry& entry);
 
   std::string text_message;
   absl::LogSeverity log_severity;
@@ -54,13 +61,13 @@ struct CapturedLogEntry {
 
 // Support for XLS[cc] related tests, such as invoking XLS[cc]
 //  with the appropriate parameters for the test environment
-class XlsccTestBase : public xls::IrTestBase, public ::xls::LogSink {
+class XlsccTestBase : public xls::SimTestBase, public ::absl::LogSink {
  public:
   XlsccTestBase();
 
   ~XlsccTestBase() override;
 
-  void Send(const ::xls::LogEntry& entry) override;
+  void Send(const ::absl::LogEntry& entry) override;
 
   void Run(const absl::flat_hash_map<std::string, uint64_t>& args,
            uint64_t expected, std::string_view cpp_source,
@@ -91,6 +98,7 @@ class XlsccTestBase : public xls::IrTestBase, public ::xls::LogSink {
                         std::vector<std::string_view> clang_argv = {},
                         bool io_test_mode = false,
                         bool error_on_init_interval = false,
+                        bool error_on_uninitialized = false,
                         xls::SourceLocation loc = xls::SourceLocation(),
                         bool fail_xlscc_check = false,
                         int64_t max_unroll_iters = 0,
@@ -100,6 +108,7 @@ class XlsccTestBase : public xls::IrTestBase, public ::xls::LogSink {
                         std::vector<std::string_view> clang_argv = {},
                         bool io_test_mode = false,
                         bool error_on_init_interval = false,
+                        bool error_on_uninitialized = false,
                         xls::SourceLocation loc = xls::SourceLocation(),
                         bool fail_xlscc_check = false,
                         int64_t max_unroll_iters = 0,
@@ -136,8 +145,11 @@ class XlsccTestBase : public xls::IrTestBase, public ::xls::LogSink {
         : name(name), value(value), condition(condition) {}
     IOOpTest(std::string name, xls::Value value, const char* message,
              xlscc::TraceType trace_type, std::string label = "")
-        : name(name), value(value), message(message), trace_type(trace_type),
-          label(label){}
+        : name(name),
+          value(value),
+          message(message),
+          trace_type(trace_type),
+          label(label) {}
 
     std::string name;
     xls::Value value;
@@ -147,21 +159,41 @@ class XlsccTestBase : public xls::IrTestBase, public ::xls::LogSink {
     std::string label;
   };
 
-  void ProcTest(std::string content, std::optional<xlscc::HLSBlock> block_spec,
+  void BuildTestIR(
+      std::string_view content, std::optional<xlscc::HLSBlock> block_spec,
+      int top_level_init_interval, const char* top_class_name,
+      absl::flat_hash_set<std::string>& direct_in_channels_by_name);
+
+  void ProcTest(std::string_view content,
+                std::optional<xlscc::HLSBlock> block_spec,
                 const absl::flat_hash_map<std::string, std::list<xls::Value>>&
                     inputs_by_channel,
                 const absl::flat_hash_map<std::string, std::list<xls::Value>>&
                     outputs_by_channel,
-                const int min_ticks = 1, const int max_ticks = 100,
-                int top_level_init_interval = 0,
+                int min_ticks = 1, int max_ticks = 100,
+                int top_level_init_interval = 1,
                 const char* top_class_name = "",
                 absl::Status expected_tick_status = absl::OkStatus(),
                 const absl::flat_hash_map<std::string, xls::InterpreterEvents>&
                     expected_events_by_proc_name = {});
 
+  void BlockTest(std::string_view content, std::string top_proc_name,
+                 int64_t n_cycles, std::optional<xlscc::HLSBlock> block_spec,
+                 const absl::flat_hash_map<std::string, std::list<xls::Value>>&
+                     inputs_by_channel,
+                 const absl::flat_hash_map<std::string, std::list<xls::Value>>&
+                     outputs_by_channel,
+                 int min_clocks = 1, int max_blocks = 100,
+                 int top_level_init_interval = 1,
+                 const char* top_class_name = "",
+                 absl::Status expected_tick_status = absl::OkStatus(),
+                 const absl::flat_hash_map<std::string, xls::InterpreterEvents>&
+                     expected_events_by_proc_name = {});
+
   void IOTest(std::string_view content, std::list<IOOpTest> inputs,
               std::list<IOOpTest> outputs,
-              absl::flat_hash_map<std::string, xls::Value> args = {});
+              absl::flat_hash_map<std::string, xls::Value> args = {},
+              std::optional<int> total_io_ops = std::nullopt);
 
   absl::StatusOr<uint64_t> GetStateBitsForProcNameContains(
       std::string_view name_cont);
@@ -173,18 +205,27 @@ class XlsccTestBase : public xls::IrTestBase, public ::xls::LogSink {
   absl::StatusOr<xlscc::HLSBlock> GetBlockSpec();
 
   absl::StatusOr<std::vector<xls::Node*>> GetIOOpsForChannel(
-      xls::FunctionBase* proc, int64_t channel_id);
+      xls::FunctionBase* proc, std::string_view channel);
   static absl::Status TokensForNode(
       xls::Node* node, absl::flat_hash_set<xls::Node*>& predecessors);
-  absl::StatusOr<bool> NodeIsAfterTokenWise(xls::Proc* proc,
-                                            xls::Node* before,
+  absl::StatusOr<bool> NodeIsAfterTokenWise(xls::Proc* proc, xls::Node* before,
                                             xls::Node* after);
 
-  absl::StatusOr<std::vector<xls::Node*>> GetOpsForChannel(int64_t channel_id);
+  absl::StatusOr<std::vector<xls::Node*>> GetOpsForChannelNameContains(
+      std::string_view channel);
+
+  static void GetTokenOperandsDeeply(xls::Node* node,
+                                     absl::flat_hash_set<xls::Node*>& operands);
+
+  absl::StatusOr<absl::flat_hash_map<xls::Node*, int64_t>>
+  GetStatesByIONodeForFSMProc(std::string_view func_name);
 
   std::unique_ptr<xls::Package> package_;
   std::unique_ptr<xlscc::Translator> translator_;
   xlscc::HLSBlock block_spec_;
+  bool generate_new_fsm_ = false;
+  bool merge_states_ = false;
+  bool split_states_on_channel_ops_ = false;
 
  protected:
   std::vector<CapturedLogEntry> log_entries_;

@@ -15,6 +15,7 @@
 #include "xls/solvers/z3_lec.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <deque>
 #include <iostream>
 #include <memory>
@@ -24,24 +25,39 @@
 #include <utility>
 #include <vector>
 
-#include "absl/base/internal/sysinfo.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
+#include "absl/memory/memory.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
-#include "xls/codegen/vast.h"
+#include "xls/codegen/vast/vast.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
+#include "xls/ir/format_preference.h"
+#include "xls/ir/function.h"
+#include "xls/ir/node.h"
 #include "xls/ir/node_util.h"
+#include "xls/ir/nodes.h"
+#include "xls/netlist/netlist.h"
+#include "xls/scheduling/pipeline_schedule.h"
+#include "xls/solvers/z3_ir_translator.h"
+#include "xls/solvers/z3_netlist_translator.h"
 #include "xls/solvers/z3_utils.h"
-#include "../z3/src/api/z3_api.h"
+#include "z3/src/api/z3_api.h"
 
 namespace xls {
 namespace solvers {
 namespace z3 {
 
-using netlist::rtl::Module;
-using netlist::rtl::Netlist;
-using netlist::rtl::NetRef;
+using ::xls::netlist::rtl::Module;
+using ::xls::netlist::rtl::Netlist;
+using ::xls::netlist::rtl::NetRef;
 
 namespace {
 
@@ -96,9 +112,9 @@ absl::Status Lec::Init() {
   XLS_RETURN_IF_ERROR(CreateNetlistTranslator());
 
   XLS_RETURN_IF_ERROR(CollectIrInputs());
-  if (XLS_VLOG_IS_ON(2)) {
+  if (VLOG_IS_ON(2)) {
     for (const auto& pair : input_mapping_) {
-      XLS_LOG(INFO) << "Stage input [IR] node: " << pair.first;
+      LOG(INFO) << "Stage input [IR] node: " << pair.first;
     }
   }
   XLS_RETURN_IF_ERROR(BindNetlistInputs());
@@ -114,8 +130,8 @@ absl::Status Lec::Init() {
     // up the corresponding netlist bits. The netlist outputs do not contain
     // references to bits that are actually unused, instead having nullptr in
     // those indices.
-    XLS_VLOG(3) << "Stage output [IR] node: " << node->GetName()
-                << " : width: " << node->GetType()->GetFlatBitCount();
+    VLOG(3) << "Stage output [IR] node: " << node->GetName()
+            << " : width: " << node->GetType()->GetFlatBitCount();
     std::vector<Z3_ast> ir_bits = ir_translator_->FlattenValue(
         node->GetType(), ir_translator_->GetTranslation(node),
         /*little_endian=*/true);
@@ -125,8 +141,7 @@ absl::Status Lec::Init() {
 
     for (int i = 0; i < ir_bits.size(); i++) {
       if (netlist_bits[i] == nullptr) {
-        XLS_VLOG(3) << "  Skipping " << node->GetName() << " IR output bit "
-                    << i;
+        VLOG(3) << "  Skipping " << node->GetName() << " IR output bit " << i;
         ir_outputs_.push_back(x);
         netlist_outputs_.push_back(x);
       } else {
@@ -264,7 +279,7 @@ absl::Status Lec::AddConstraints(Function* constraints) {
 }
 
 bool Lec::Run() {
-  XLS_LOG(INFO) << "Beginning execution";
+  LOG(INFO) << "Beginning execution";
   satisfiable_ = Z3_solver_check(ctx(), solver_.value()) == Z3_L_TRUE;
   if (satisfiable_) {
     model_ = Z3_solver_get_model(ctx(), solver_.value());
@@ -347,9 +362,8 @@ absl::flat_hash_map<std::string, Z3_ast> Lec::FlattenNetlistInputs() {
       // Get the cell...
       auto status_or_cell = module_->ResolveCell(name);
       if (!status_or_cell.ok()) {
-        XLS_VLOG(3) << "Could not resolve input cell: " << name << "; skipping";
-        XLS_LOG(INFO) << "Could not resolve input cell: " << name
-                      << "; skipping";
+        VLOG(3) << "Could not resolve input cell: " << name << "; skipping";
+        LOG(INFO) << "Could not resolve input cell: " << name << "; skipping";
         continue;
       }
 
@@ -418,10 +432,10 @@ void Lec::DumpIrTree() {
     const Node* node = to_process.front();
     to_process.pop_front();
 
-    std::cout << "Node: " << node->ToString() << std::endl;
+    std::cout << "Node: " << node->ToString() << '\n';
     std::pair<std::string, std::string> outputs = GetComparisonStrings(node);
-    std::cout << "  IR: " << outputs.first << std::endl;
-    std::cout << "  NL: " << outputs.second << std::endl << std::endl;
+    std::cout << "  IR: " << outputs.first << '\n';
+    std::cout << "  NL: " << outputs.second << '\n' << '\n';
 
     for (const Node* operand : node->operands()) {
       if (!seen.contains(operand) && schedule_->cycle(operand) == stage_) {
@@ -446,7 +460,7 @@ std::pair<std::string, std::string> Lec::GetComparisonStrings(
 
   auto status_or_nl_bits = GetNetlistZ3ForIr(node);
   if (!status_or_nl_bits.ok()) {
-    XLS_VLOG(2) << "Node " << node->GetName() << " not present in netlist.";
+    VLOG(2) << "Node " << node->GetName() << " not present in netlist.";
     return std::make_pair("", "");
   }
   std::vector<Z3_ast> nl_bits = status_or_nl_bits.value();
@@ -477,9 +491,8 @@ void Lec::MarkDontCareBits(const std::vector<Z3_ast>& nl_bits,
 
 // Bit 1 of the 3-bit IR node foo.123 in stage 3 is present as p3_foo_123_1_.
 std::string Lec::NodeToNetlistName(const Node* node,
-                                   std::optional<int> bit_index,
-                                   bool is_cell) {
-  std::string name = verilog::SanitizeIdentifier(node->GetName());
+                                   std::optional<int> bit_index, bool is_cell) {
+  std::string name = node->GetName();
   for (char& c : name) {
     if (c == '.') {
       c = '_';
@@ -499,7 +512,7 @@ std::string Lec::NodeToNetlistName(const Node* node,
     absl::StrAppend(&name, "_", bit_index.value(), "_");
   }
 
-  return name;
+  return verilog::SanitizeVerilogIdentifier(name);
 }
 
 }  // namespace z3

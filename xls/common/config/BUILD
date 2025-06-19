@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("//xls/build_rules:xls_utilities.bzl", "bool_config_setting")
+
 package(
     default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -27,4 +34,19 @@ cc_library(
     name = "xls_config_oss",
     srcs = ["xls_config_oss.cc"],
     hdrs = ["xls_config.h"],
+)
+
+bool_config_setting(
+    name = "save_temps_is_requested",
+    values = {"save_temps": "true"},
+    visibility = ["//xls:xls_internal"],
+)
+
+# Tell AOT targets to emit llvm ir and asm in addition to their normal outputs.
+#
+# This can be set even if --save_temps is not passed. If --save_temps is passed this is ignored.
+bool_flag(
+    name = "emit_aot_intermediates",
+    build_setting_default = False,
+    visibility = ["//xls:xls_internal"],
 )

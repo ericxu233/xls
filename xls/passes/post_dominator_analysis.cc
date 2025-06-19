@@ -14,25 +14,20 @@
 
 #include "xls/passes/post_dominator_analysis.h"
 
-#include <algorithm>
-#include <cstdio>
+#include <cstdint>
 #include <memory>
-#include <queue>
 #include <utility>
 #include <vector>
 
-#include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
-#include "absl/memory/memory.h"
-#include "absl/meta/type_traits.h"
-#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "xls/common/status/ret_check.h"
-#include "xls/ir/function.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/ir/node.h"
 #include "xls/ir/node_util.h"
-#include "xls/ir/proc.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/topo_sort.h"
 
 namespace xls {
 namespace {
@@ -95,8 +90,7 @@ PostDominatorAnalysis::Run(FunctionBase* f) {
   auto analysis = std::make_unique<PostDominatorAnalysis>();
 
   // A reverse topological sort of the function nodes.
-  NodeIterator r = ReverseTopoSort(f);
-  std::vector<Node*> reverse_toposort(r.begin(), r.end());
+  std::vector<Node*> reverse_toposort = ReverseTopoSort(f);
 
   // Construct the postdominators for each node. Postdominators are gathered as
   // a sorted vector containing the node indices (in a reverse toposort) of the
@@ -106,17 +100,24 @@ PostDominatorAnalysis::Run(FunctionBase* f) {
     Node* node = reverse_toposort[i];
     std::vector<absl::Span<const NodeIndex>> user_postdominators;
     for (Node* user : node->users()) {
+      // If the use is only through the `state_read` parameter, then it's only
+      // being used to refer to the state element; the value is irrelevant.
+      if (user->Is<Next>() && user->As<Next>()->value() != node &&
+          user->As<Next>()->predicate() != node) {
+        continue;
+      }
       user_postdominators.push_back(postdominators.at(user));
     }
-    // The postdominators of a node is the intersection of the lists of
-    // postdominators for its users plus the node itself.
-    postdominators[node] = IntersectSortedLists(user_postdominators);
     // If a node has an implicit use, then there exists an alternate path to a
     // root node other than its users, so it can't be dominated by anything
     // other than itself.
     if (f->HasImplicitUse(node)) {
-      postdominators[node] = std::vector<NodeIndex>();
+      postdominators[node] = std::vector<NodeIndex>({i});
+      continue;
     }
+    // The postdominators of a node is the intersection of the lists of
+    // postdominators for its users plus the node itself.
+    postdominators[node] = IntersectSortedLists(user_postdominators);
     postdominators[node].push_back(i);
   }
 

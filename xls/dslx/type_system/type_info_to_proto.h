@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_DSLX_TYPE_INFO_TO_PROTO_H_
-#define XLS_DSLX_TYPE_INFO_TO_PROTO_H_
+#ifndef XLS_DSLX_TYPE_SYSTEM_TYPE_INFO_TO_PROTO_H_
+#define XLS_DSLX_TYPE_SYSTEM_TYPE_INFO_TO_PROTO_H_
 
 #include <string>
 
 #include "absl/status/statusor.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/import_data.h"
 #include "xls/dslx/type_system/type_info.h"
 #include "xls/dslx/type_system/type_info.pb.h"
@@ -31,12 +32,14 @@ absl::StatusOr<TypeInfoProto> TypeInfoToProto(const TypeInfo& type_info);
 // Converts the given protobuf representation of an AST node in module "m" into
 // a human readable string suitable for debugging and convenient testing.
 absl::StatusOr<std::string> ToHumanString(const AstNodeTypeInfoProto& antip,
-                                          const ImportData& import_data);
+                                          const ImportData& import_data,
+                                          FileTable& file_table);
 
 // As above, but puts every node in the TypeInfoProto on its own line.
 absl::StatusOr<std::string> ToHumanString(const TypeInfoProto& tip,
-                                          const ImportData& import_data);
+                                          const ImportData& import_data,
+                                          FileTable& file_table);
 
 }  // namespace xls::dslx
 
-#endif  // XLS_DSLX_TYPE_INFO_TO_PROTO_H_
+#endif  // XLS_DSLX_TYPE_SYSTEM_TYPE_INFO_TO_PROTO_H_

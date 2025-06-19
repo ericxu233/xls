@@ -14,6 +14,9 @@
 
 #include "xls/scheduling/min_cut_scheduler.h"
 
+#include <cstdint>
+#include <vector>
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 

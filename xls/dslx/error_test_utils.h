@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_DSLX_ERRORS_TEST_UTILS_H_
-#define XLS_DSLX_ERRORS_TEST_UTILS_H_
+#ifndef XLS_DSLX_ERROR_TEST_UTILS_H_
+#define XLS_DSLX_ERROR_TEST_UTILS_H_
 
 #include <string>
 
@@ -21,6 +21,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "xls/dslx/frontend/bindings.h"
+#include "xls/dslx/frontend/pos.h"
 
 namespace xls::dslx {
 
@@ -40,8 +41,9 @@ MATCHER_P2(
     *result_listener << "where status code is " << status.code();
     return false;
   }
+  FileTable file_table;
   absl::StatusOr<PositionalErrorData> data =
-      GetPositionalErrorData(status, want_kind);
+      GetPositionalErrorData(status, want_kind, file_table);
   if (!data.ok()) {
     *result_listener << "where positional error status is " << data.status();
     return false;
@@ -51,4 +53,4 @@ MATCHER_P2(
 
 }  // namespace xls::dslx
 
-#endif  // XLS_DSLX_ERRORS_TEST_UTILS_H_
+#endif  // XLS_DSLX_ERROR_TEST_UTILS_H_

@@ -22,6 +22,7 @@
 #include "absl/status/statusor.h"
 #include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/frontend/comment_data.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/import_data.h"
 #include "xls/dslx/type_system/type_info.h"
 #include "xls/dslx/warning_collector.h"
@@ -42,8 +43,9 @@ struct TypecheckedModule {
 // given to the returned `TypecheckedModule::module`. "import_data" is used to
 // get-or-insert any imported modules.
 absl::StatusOr<TypecheckedModule> ParseAndTypecheck(
-    std::string_view text, std::string_view path,
-    std::string_view module_name, ImportData* import_data);
+    std::string_view text, std::string_view path, std::string_view module_name,
+    ImportData* import_data, std::vector<CommentData>* comments = nullptr,
+    bool force_version2 = false);
 
 // Helper that parses and creates a new module from the given "text".
 //
@@ -51,13 +53,14 @@ absl::StatusOr<TypecheckedModule> ParseAndTypecheck(
 // given to the returned `TypecheckedModule::module`.
 absl::StatusOr<std::unique_ptr<Module>> ParseModule(
     std::string_view text, std::string_view path, std::string_view module_name,
-    std::vector<CommentData>* comments = nullptr);
+    FileTable& file_table, std::vector<CommentData>* comments = nullptr);
 
 // Helper that parses and created a new Module from the given DSLX file path.
 //   path - path to the file to read and parse.
 //   module_name - the name given to the returned Module;
 absl::StatusOr<std::unique_ptr<Module>> ParseModuleFromFileAtPath(
-    std::string_view path, std::string_view module_name);
+    std::string_view path, std::string_view module_name,
+    ImportData* import_data);
 
 // Helper that typechecks an already parsed module, ownership of
 // the module will be given to import_data.
@@ -66,7 +69,7 @@ absl::StatusOr<std::unique_ptr<Module>> ParseModuleFromFileAtPath(
 // "import_data" is used to get-or-insert any imported modules.
 absl::StatusOr<TypecheckedModule> TypecheckModule(
     std::unique_ptr<Module> module, std::string_view path,
-    ImportData* import_data);
+    ImportData* import_data, bool force_version2 = false);
 
 }  // namespace xls::dslx
 

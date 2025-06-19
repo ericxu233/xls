@@ -27,16 +27,16 @@
 #include <cmath>
 #include <tuple>
 
+#include "absl/flags/flag.h"
 #include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "xls/common/file/get_runfile_path.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/ir/value_helpers.h"
-#include "xls/ir/value_view_helpers.h"
-#include "xls/tools/testbench_builder.h"
+#include "xls/ir/value_utils.h"
+#include "xls/ir/value_view_utils.h"
+#include "xls/tests/testbench_builder.h"
 #include "third_party/xls_berkeley_softfloat/fpdiv_2x32_jit_wrapper.h"
 
 ABSL_FLAG(bool, use_opt_ir, true, "Use optimized IR.");
@@ -118,8 +118,8 @@ absl::Status RealMain(bool use_opt_ir, uint64_t num_samples, int num_threads) {
 
 int main(int argc, char** argv) {
   xls::InitXls(argv[0], argc, argv);
-  XLS_QCHECK_OK(xls::RealMain(absl::GetFlag(FLAGS_use_opt_ir),
-                              absl::GetFlag(FLAGS_num_samples),
-                              absl::GetFlag(FLAGS_num_threads)));
+  QCHECK_OK(xls::RealMain(absl::GetFlag(FLAGS_use_opt_ir),
+                          absl::GetFlag(FLAGS_num_samples),
+                          absl::GetFlag(FLAGS_num_threads)));
   return 0;
 }

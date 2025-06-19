@@ -41,6 +41,7 @@ xls_dslx_opt_ir(
 # udiv not supported in equivalence checking.
 xls_dslx_test(
     name = "fpdiv_2x32_dslx_test",
+    dslx_test_args = {"compare": "jit"},
     library = ":fpdiv_2x32_dslx",
     tags = ["optonly"],
 )
@@ -49,7 +50,7 @@ cc_xls_ir_jit_wrapper(
     name = "fpdiv_2x32_jit_wrapper",
     src = ":fpdiv_2x32.opt.ir",
     jit_wrapper_args = {
-        "class_name": "fpdiv_2x32",
+        "class_name": "Fpdiv2x32",
         "namespace": "xls::fp",
     },
 )
@@ -60,15 +61,15 @@ cc_test(
     tags = ["optonly"],
     deps = [
         ":fpdiv_2x32_jit_wrapper",
+        "//xls/common:init_xls",
+        "//xls/common/file:get_runfile_path",
+        "//xls/common/status:status_macros",
+        "//xls/ir:value_utils",
+        "//xls/ir:value_view_utils",
+        "//xls/tests:testbench_builder",
+        "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/random",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings:str_format",
-        "//xls/common:init_xls",
-        "//xls/common/file:get_runfile_path",
-        "//xls/common/logging",
-        "//xls/common/status:status_macros",
-        "//xls/ir:value_helpers",
-        "//xls/ir:value_view_helpers",
-        "//xls/tools:testbench_builder",
     ],
 )

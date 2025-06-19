@@ -14,16 +14,23 @@
 
 #include "xls/passes/cse_pass.h"
 
+#include <cstdint>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/hash/hash.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
-#include "xls/common/logging/logging.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/ir/function_base.h"
 #include "xls/ir/node_util.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
 #include "xls/passes/pass_base.h"
 
 namespace xls {
@@ -43,7 +50,7 @@ namespace {
 // constructed in span_backing_store from which a span is constructed.
 absl::Span<Node* const> GetOperandsForCse(
     Node* node, std::vector<Node*>* span_backing_store) {
-  XLS_CHECK(span_backing_store->empty());
+  CHECK(span_backing_store->empty());
   if (!OpIsCommutative(node->op())) {
     return node->operands();
   }
@@ -55,8 +62,9 @@ absl::Span<Node* const> GetOperandsForCse(
 
 }  // namespace
 
-absl::StatusOr<bool> RunCse(FunctionBase* f,
-                            absl::flat_hash_map<Node*, Node*>* replacements) {
+absl::StatusOr<bool> RunCse(FunctionBase* f, OptimizationContext& context,
+                            absl::flat_hash_map<Node*, Node*>* replacements,
+                            bool common_literals) {
   // To improve efficiency, bucket potentially common nodes together. The
   // bucketing is done via an int64_t hash value which is constructed from the
   // op() of the node and the uid's of the node's operands.
@@ -75,8 +83,20 @@ absl::StatusOr<bool> RunCse(FunctionBase* f,
   bool changed = false;
   absl::flat_hash_map<int64_t, std::vector<Node*>> node_buckets;
   node_buckets.reserve(f->node_count());
-  for (Node* node : TopoSort(f)) {
+  for (Node* node : context.TopoSort(f)) {
     if (OpIsSideEffecting(node->op())) {
+      continue;
+    }
+
+    if (node->Is<Literal>() && !common_literals) {
+      continue;
+    }
+
+    // Normally, dead nodes are removed by the DCE pass. However, if the node is
+    // (e.g.) an invoke, DCE won't touch it, waiting for inlining to remove
+    // it... and if we try to replace it, we'll think we changed the IR when we
+    // actually didn't.
+    if (node->IsDead()) {
       continue;
     }
 
@@ -94,9 +114,8 @@ absl::StatusOr<bool> RunCse(FunctionBase* f,
       if (node_operands_for_cse ==
               GetOperandsForCse(candidate, &candidate_span_backing_store) &&
           node->IsDefinitelyEqualTo(candidate)) {
-        XLS_VLOG(3) << absl::StreamFormat(
-            "Replacing %s with equivalent node %s", node->GetName(),
-            candidate->GetName());
+        VLOG(3) << absl::StreamFormat("Replacing %s with equivalent node %s",
+                                      node->GetName(), candidate->GetName());
         XLS_RETURN_IF_ERROR(node->ReplaceUsesWith(candidate));
         if (replacements != nullptr) {
           (*replacements)[node] = candidate;
@@ -116,8 +135,10 @@ absl::StatusOr<bool> RunCse(FunctionBase* f,
 
 absl::StatusOr<bool> CsePass::RunOnFunctionBaseInternal(
     FunctionBase* f, const OptimizationPassOptions& options,
-    PassResults* results) const {
-  return RunCse(f, nullptr);
+    PassResults* results, OptimizationContext& context) const {
+  return RunCse(f, context, nullptr, common_literals_);
 }
+
+REGISTER_OPT_PASS(CsePass);
 
 }  // namespace xls

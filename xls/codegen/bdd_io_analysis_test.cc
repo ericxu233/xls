@@ -16,37 +16,19 @@
 
 #include <memory>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "absl/status/statusor.h"
 #include "xls/common/status/matchers.h"
-#include "xls/common/status/status_macros.h"
 #include "xls/ir/bits.h"
-#include "xls/ir/function.h"
+#include "xls/ir/channel_ops.h"
 #include "xls/ir/function_builder.h"
-#include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_test_base.h"
 #include "xls/ir/package.h"
-#include "xls/passes/bdd_cse_pass.h"
-#include "xls/passes/dce_pass.h"
+#include "xls/ir/value.h"
 
 namespace xls {
 namespace {
 
 class BddIOAnalysisPassTest : public IrTestBase {};
-
-TEST_F(BddIOAnalysisPassTest, RunOnFunction) {
-  auto p = CreatePackage();
-  FunctionBuilder fb(TestName(), p.get());
-  BValue x = fb.Param("x", p->GetBitsType(4));
-  BValue y = fb.Param("y", p->GetBitsType(4));
-  fb.Concat({x, y});
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
-
-  XLS_ASSERT_OK_AND_ASSIGN(bool mutually_exclusive,
-                           AreStreamingOutputsMutuallyExclusive(f));
-  EXPECT_EQ(mutually_exclusive, true);
-}
 
 TEST_F(BddIOAnalysisPassTest, SingleStreamingSend) {
   auto package_ptr = std::make_unique<Package>(TestName());

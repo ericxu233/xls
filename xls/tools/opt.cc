@@ -14,35 +14,45 @@
 
 #include "xls/tools/opt.h"
 
+#include <filesystem>  // NOLINT
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <utility>
+#include <variant>
 #include <vector>
 
+#include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
+#include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/dslx/ir_convert/ir_converter.h"
-#include "xls/dslx/parse_and_typecheck.h"
+#include "xls/common/visitor.h"
+#include "xls/ir/function_base.h"
 #include "xls/ir/ir_parser.h"
+#include "xls/ir/package.h"
 #include "xls/ir/verifier.h"
 #include "xls/passes/optimization_pass.h"
 #include "xls/passes/optimization_pass_pipeline.h"
+#include "xls/passes/pass_base.h"
+#include "xls/passes/pass_metrics.pb.h"
+#include "xls/passes/pass_pipeline.pb.h"
+#include "xls/passes/query_engine_checker.h"
+#include "xls/passes/verifier_checker.h"
 
 namespace xls::tools {
 
-absl::StatusOr<std::string> OptimizeIrForTop(std::string_view ir,
-                                             const OptOptions& options) {
+absl::Status OptimizeIrForTop(Package* package, const OptOptions& options,
+                              OptMetadata* metadata) {
   if (!options.top.empty()) {
-    XLS_VLOG(3) << "OptimizeIrForEntry; top: '" << options.top
-                << "'; opt_level: " << options.opt_level;
+    VLOG(3) << "OptimizeIrForEntry; top: '" << options.top
+            << "'; opt_level: " << options.opt_level;
   } else {
-    XLS_VLOG(3) << "OptimizeIrForEntry; opt_level: " << options.opt_level;
+    VLOG(3) << "OptimizeIrForEntry; opt_level: " << options.opt_level;
   }
 
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Package> package,
-                       Parser::ParsePackage(ir, options.ir_path));
   if (!options.top.empty()) {
     XLS_RETURN_IF_ERROR(package->SetTopByName(options.top));
   }
@@ -51,61 +61,82 @@ absl::StatusOr<std::string> OptimizeIrForTop(std::string_view ir,
     return absl::InternalError(absl::StrFormat(
         "Top entity not set for package: %s.", package->name()));
   }
-  XLS_VLOG(3) << "Top entity: '" << top.value()->name() << "'";
+  VLOG(3) << "Top entity: '" << top.value()->name() << "'";
 
-  std::unique_ptr<OptimizationCompoundPass> pipeline =
-      CreateOptimizationPassPipeline(options.opt_level);
+  using PipelineResult = absl::StatusOr<std::unique_ptr<OptimizationPass>>;
+  XLS_ASSIGN_OR_RETURN(
+      std::unique_ptr<OptimizationPass> pipeline,
+      std::visit(
+          Visitor{
+              [&](std::nullopt_t) -> PipelineResult {
+                return CreateOptimizationPassPipeline(
+                    options.debug_optimizations);
+              },
+              [&](std::string_view list) -> PipelineResult {
+                XLS_RET_CHECK(options.skip_passes.empty())
+                    << "Skipping/restricting passes while running a custom "
+                       "pipeline is probably not something you want to do.";
+                XLS_ASSIGN_OR_RETURN(
+                    std::unique_ptr<OptimizationCompoundPass> res,
+                    GetOptimizationPipelineGenerator().GeneratePipeline(list));
+                if (options.debug_optimizations) {
+                  res->AddInvariantChecker<VerifierChecker>();
+                  res->AddInvariantChecker<QueryEngineChecker>();
+                } else {
+                  res->AddWeakInvariantChecker<VerifierChecker>();
+                }
+                return res;
+              },
+              [&](const PassPipelineProto& list) -> PipelineResult {
+                XLS_RET_CHECK(options.skip_passes.empty())
+                    << "Skipping/restricting passes while running a custom "
+                       "pipeline is probably not something you want to do.";
+                XLS_ASSIGN_OR_RETURN(
+                    std::unique_ptr<OptimizationCompoundPass> res,
+                    GetOptimizationPipelineGenerator().GeneratePipeline(list));
+                if (options.debug_optimizations) {
+                  res->AddInvariantChecker<VerifierChecker>();
+                  res->AddInvariantChecker<QueryEngineChecker>();
+                } else {
+                  res->AddWeakInvariantChecker<VerifierChecker>();
+                }
+                return res;
+              },
+          },
+          options.pass_pipeline));
   OptimizationPassOptions pass_options;
+  pass_options.opt_level = options.opt_level;
   pass_options.ir_dump_path = options.ir_dump_path;
-  pass_options.run_only_passes = options.run_only_passes;
   pass_options.skip_passes = options.skip_passes;
-  pass_options.inline_procs = options.inline_procs;
   pass_options.convert_array_index_to_select =
       options.convert_array_index_to_select;
+  pass_options.split_next_value_selects = options.split_next_value_selects;
   pass_options.ram_rewrites = options.ram_rewrites;
   pass_options.use_context_narrowing_analysis =
       options.use_context_narrowing_analysis;
+  pass_options.optimize_for_best_case_throughput =
+      options.optimize_for_best_case_throughput;
+  pass_options.enable_resource_sharing = options.enable_resource_sharing;
+  pass_options.force_resource_sharing = options.force_resource_sharing;
+  pass_options.area_model = options.area_model;
+  pass_options.bisect_limit = options.bisect_limit;
   PassResults results;
+  OptimizationContext context;
   XLS_RETURN_IF_ERROR(
-      pipeline->Run(package.get(), pass_options, &results).status());
-  return package->DumpIr();
+      pipeline->Run(package, pass_options, &results, context).status());
+  if (metadata != nullptr) {
+    metadata->metrics = results.ToProto();
+  }
+  return absl::OkStatus();
 }
 
-absl::StatusOr<std::string> OptimizeIrForTop(
-    std::string_view input_path, int64_t opt_level, std::string_view top,
-    std::string_view ir_dump_path,
-    absl::Span<const std::string> run_only_passes,
-    absl::Span<const std::string> skip_passes,
-    int64_t convert_array_index_to_select, bool inline_procs,
-    std::string_view ram_rewrites_pb, bool use_context_narrowing_analysis) {
-  XLS_ASSIGN_OR_RETURN(std::string ir, GetFileContents(input_path));
-  std::vector<RamRewrite> ram_rewrites;
-  if (!ram_rewrites_pb.empty()) {
-    RamRewritesProto ram_rewrite_proto;
-    XLS_RETURN_IF_ERROR(xls::ParseTextProtoFile(
-        std::filesystem::path(ram_rewrites_pb), &ram_rewrite_proto));
-    XLS_ASSIGN_OR_RETURN(ram_rewrites, RamRewritesFromProto(ram_rewrite_proto));
-  }
-  const OptOptions options = {
-      .opt_level = opt_level,
-      .top = top,
-      .ir_dump_path = std::string(ir_dump_path),
-      .run_only_passes =
-          run_only_passes.empty()
-              ? std::nullopt
-              : std::make_optional(std::vector<std::string>(
-                    run_only_passes.begin(), run_only_passes.end())),
-      .skip_passes =
-          std::vector<std::string>(skip_passes.begin(), skip_passes.end()),
-      .convert_array_index_to_select =
-          (convert_array_index_to_select < 0)
-              ? std::nullopt
-              : std::make_optional(convert_array_index_to_select),
-      .inline_procs = inline_procs,
-      .ram_rewrites = std::move(ram_rewrites),
-      .use_context_narrowing_analysis = use_context_narrowing_analysis,
-  };
-  return OptimizeIrForTop(ir, options);
+absl::StatusOr<std::string> OptimizeIrForTop(std::string_view ir,
+                                             const OptOptions& options,
+                                             OptMetadata* metadata) {
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Package> package,
+                       Parser::ParsePackage(ir, options.ir_path));
+  XLS_RETURN_IF_ERROR(OptimizeIrForTop(package.get(), options, metadata));
+  return package->DumpIr();
 }
 
 }  // namespace xls::tools

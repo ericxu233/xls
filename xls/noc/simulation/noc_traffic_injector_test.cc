@@ -14,15 +14,28 @@
 
 #include "xls/noc/simulation/noc_traffic_injector.h"
 
-#include "gmock/gmock.h"
+#include <cstdint>
+#include <vector>
+
 #include "gtest/gtest.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
+#include "xls/noc/config/network_config.pb.h"
+#include "xls/noc/simulation/common.h"
+#include "xls/noc/simulation/flit.h"
+#include "xls/noc/simulation/global_routing_table.h"
+#include "xls/noc/simulation/network_graph.h"
+#include "xls/noc/simulation/network_graph_builder.h"
 #include "xls/noc/simulation/packetizer.h"
+#include "xls/noc/simulation/parameters.h"
+#include "xls/noc/simulation/random_number_interface.h"
 #include "xls/noc/simulation/sample_network_graphs.h"
-#include "xls/noc/simulation/sim_objects.h"
+#include "xls/noc/simulation/simulator_shims.h"
 #include "xls/noc/simulation/traffic_description.h"
+#include "xls/noc/simulation/traffic_models.h"
 
 namespace xls::noc {
 namespace {
@@ -430,9 +443,9 @@ TEST(NocTrafficInjectorTest, MeasureTrafficInjectionRate) {
       bits_sent_per_destination_index_[source][flit.flit.destination_index] +=
           flit.flit.data_bit_count;
 
-      XLS_VLOG(1) << absl::StrFormat(
-          "  - Source %x Measured %d bits Now %d\n", source.AsUInt64(),
-          flit.flit.data_bit_count, bits_sent_[source]);
+      VLOG(1) << absl::StrFormat("  - Source %x Measured %d bits Now %d\n",
+                                 source.AsUInt64(), flit.flit.data_bit_count,
+                                 bits_sent_[source]);
       return absl::OkStatus();
     }
 

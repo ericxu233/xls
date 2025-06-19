@@ -13,12 +13,15 @@
 // limitations under the License.
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>  // NOLINT
 #include <memory>
 #include <string>
 #include <string_view>
 
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/server.h"
@@ -26,11 +29,10 @@
 #include "grpcpp/server_context.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/synthesis/credentials.h"
 #include "xls/synthesis/yosys/yosys_synthesis_service.h"
 
-const char kUsage[] =
+static constexpr std::string_view kUsage =
     R"( Launches a XLS synthesis server which uses Yosys for synthesis
 and optionally Nextpnr for place-and-route *OR* OpenSTA for static timing.
 
@@ -60,6 +62,10 @@ ABSL_FLAG(std::string, synthesis_libraries, "",
 ABSL_FLAG(
     std::string, sta_libraries, "",
     "The technology library/libraries file to target for STA; *.lib * lib.gz");
+ABSL_FLAG(std::string, default_driver_cell, "",
+          "The default driver cell to use during synthesis.");
+ABSL_FLAG(std::string, default_load, "",
+          "The default load cell to use during synthesis.");
 
 namespace xls {
 namespace synthesis {
@@ -75,12 +81,11 @@ void RealMain() {
   const bool synthesis_only = absl::GetFlag(FLAGS_synthesis_only);
 
   // Check flags -- common
-  XLS_QCHECK_OK(FileExists(yosys_path))
-      << "Valid --yosys_path must be provided";
-  XLS_QCHECK(synthesis_target.empty() || synthesis_libraries.empty())
+  QCHECK_OK(FileExists(yosys_path)) << "Valid --yosys_path must be provided";
+  QCHECK(synthesis_target.empty() || synthesis_libraries.empty())
       << "\nBoth --synthesis_target and --synthesis_libraries were provided. "
       << "Use one or the other.";
-  XLS_QCHECK(!(synthesis_target.empty() && synthesis_libraries.empty()))
+  QCHECK(!(synthesis_target.empty() && synthesis_libraries.empty()))
       << "\nMust specify either --synthesis_target or --synthesis_libraries.\n";
 
   // Check backend flags -- 'synthesis_target' determines mode
@@ -88,16 +93,16 @@ void RealMain() {
     if (!synthesis_target.empty()) {
       std::string msg =
           "\n--synthesis_target was provided, so using Nextpnr back end.\n";
-      XLS_QCHECK_OK(FileExists(nextpnr_path))
+      QCHECK_OK(FileExists(nextpnr_path))
           << msg << "Valid --nextpnr_path must be provided.";
     } else {
       std::string msg =
           "\n--synthesis_target not provided, so targeting OpenSTA.\n";
-      XLS_QCHECK(!synthesis_libraries.empty())
+      QCHECK(!synthesis_libraries.empty())
           << msg << "--synthesis_libraries must be provided";
-      XLS_QCHECK_OK(FileExists(sta_path))
+      QCHECK_OK(FileExists(sta_path))
           << msg << "Valid --sta_path must be provided.";
-      XLS_QCHECK(!sta_libraries.empty())
+      QCHECK(!sta_libraries.empty())
           << msg << "--sta_libraries must be provided";
     }
   }
@@ -106,7 +111,8 @@ void RealMain() {
   std::string server_address = absl::StrCat("0.0.0.0:", port);
   YosysSynthesisServiceImpl service(
       yosys_path, nextpnr_path, synthesis_target, sta_path, synthesis_libraries,
-      sta_libraries, absl::GetFlag(FLAGS_save_temps),
+      sta_libraries, absl::GetFlag(FLAGS_default_driver_cell),
+      absl::GetFlag(FLAGS_default_load), absl::GetFlag(FLAGS_save_temps),
       absl::GetFlag(FLAGS_return_netlist), synthesis_only);
 
   ::grpc::ServerBuilder builder;
@@ -114,8 +120,8 @@ void RealMain() {
   builder.AddListeningPort(server_address, creds);
   builder.RegisterService(&service);
   std::unique_ptr<::grpc::Server> server(builder.BuildAndStart());
-  XLS_LOG(INFO) << "Serving on port: " << port;
-  XLS_LOG(INFO) << "synthesis_target: " << synthesis_target;
+  LOG(INFO) << "Serving on port: " << port;
+  LOG(INFO) << "synthesis_target: " << synthesis_target;
   server->Wait();
 }
 

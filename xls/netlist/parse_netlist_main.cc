@@ -12,20 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdint>
+#include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/flags/flag.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/netlist/cell_library.h"
 #include "xls/netlist/find_logic_clouds.h"
+#include "xls/netlist/netlist.h"
+#include "xls/netlist/netlist.pb.h"
 #include "xls/netlist/netlist_parser.h"
 
 ABSL_FLAG(bool, show_clusters, false, "Show the logic clusters found.");
@@ -50,27 +57,27 @@ absl::Status RealMain(std::string_view netlist_path,
       std::unique_ptr<netlist::rtl::Netlist> netlist,
       netlist::rtl::Parser::ParseNetlist(&cell_library, &scanner));
   netlist::rtl::Module* module = netlist->modules()[0].get();
-  std::cout << "nets:  " << module->nets().size() << std::endl;
-  std::cout << "cells: " << module->cells().size() << std::endl;
+  std::cout << "nets:  " << module->nets().size() << '\n';
+  std::cout << "cells: " << module->cells().size() << '\n';
   absl::flat_hash_map<netlist::CellKind, int64_t> cell_kind_to_count;
   for (const auto& name_and_cell : module->cells()) {
     cell_kind_to_count[name_and_cell->kind()]++;
   }
-  std::cout << "cell-kind breakdown:" << std::endl;
+  std::cout << "cell-kind breakdown:" << '\n';
   for (int64_t i = static_cast<int64_t>(netlist::CellKind::kFlop);
        i <= static_cast<int64_t>(netlist::CellKind::kOther); ++i) {
     netlist::CellKind cell_kind = static_cast<netlist::CellKind>(i);
     std::cout << absl::StreamFormat(" %8s: %d",
                                     netlist::CellKindToString(cell_kind),
                                     cell_kind_to_count[cell_kind])
-              << std::endl;
+              << '\n';
   }
 
   std::vector<netlist::rtl::Cluster> clusters =
       netlist::rtl::FindLogicClouds(*module);
-  std::cout << "logic clusters: " << clusters.size() << std::endl;
+  std::cout << "logic clusters: " << clusters.size() << '\n';
   if (absl::GetFlag(FLAGS_show_clusters)) {
-    std::cout << netlist::rtl::ClustersToString(clusters) << std::endl;
+    std::cout << netlist::rtl::ClustersToString(clusters) << '\n';
   }
 
   return absl::OkStatus();
@@ -85,7 +92,7 @@ int main(int argc, char** argv) {
 
   if (positional_arguments.empty()) {
     std::cerr << "Usage: " << argv[0] << " netlist.gv [cell_library.textproto]"
-              << std::endl;
+              << '\n';
     return EXIT_FAILURE;
   }
 

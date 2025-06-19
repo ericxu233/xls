@@ -18,34 +18,59 @@
 #include <string>
 #include <string_view>
 
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_format.h"
 #include "re2/re2.h"
 
 namespace xls::dslx {
 
-/* static */ absl::StatusOr<Span> Span::FromString(std::string_view s) {
-  std::string filename;
+Fileno FileTable::GetOrCreate(std::string_view path) {
+  CHECK(!absl::StartsWith(path, "file://"))
+      << "FileTable does not support URIs as paths: " << path;
+  VLOG(5) << absl::StreamFormat("FileTable::GetOrCreate: %s", path);
+  auto it = path_to_number_.find(path);
+  if (it == path_to_number_.end()) {
+    Fileno this_fileno = next_fileno_++;
+    path_to_number_.emplace_hint(it, std::string(path), this_fileno);
+    number_to_path_.emplace(this_fileno, std::string(path));
+    VLOG(5) << "Added to filetable";
+    return this_fileno;
+  }
+  VLOG(5) << "Already in filetable";
+  return it->second;
+}
+
+/* static */ absl::StatusOr<Span> Span::FromString(std::string_view s,
+                                                   FileTable& file_table) {
+  static const LazyRE2 kFileLocationSpanRe = {
+      .pattern_ = R"((.*):(\d+):(\d+)-(\d+):(\d+))"};
+  std::string_view filename;
   int64_t start_lineno, start_colno, limit_lineno, limit_colno;
-  if (RE2::FullMatch(s, R"((.*):(\d+):(\d+)-(\d+):(\d+))", &filename,
-                     &start_lineno, &start_colno, &limit_lineno,
-                     &limit_colno)) {
+  if (RE2::FullMatch(s, *kFileLocationSpanRe, &filename, &start_lineno,
+                     &start_colno, &limit_lineno, &limit_colno)) {
     // The values used for display are 1-based, whereas the backing storage is
     // zero-based.
-    return Span(Pos(filename, start_lineno - 1, start_colno - 1),
-                Pos(filename, limit_lineno - 1, limit_colno - 1));
+    const Fileno fileno = file_table.GetOrCreate(filename);
+    return Span(Pos(fileno, start_lineno - 1, start_colno - 1),
+                Pos(fileno, limit_lineno - 1, limit_colno - 1));
   }
 
   return absl::InvalidArgumentError(
       absl::StrFormat("Cannot convert string to span: \"%s\"", s));
 }
 
-/* static */ absl::StatusOr<Pos> Pos::FromString(std::string_view s) {
-  std::string filename;
+/* static */ absl::StatusOr<Pos> Pos::FromString(std::string_view s,
+                                                 FileTable& file_table) {
+  static const LazyRE2 kFileLocationRe = {.pattern_ = R"((.*):(\d+):(\d+))"};
+  std::string_view filename;
   int64_t lineno, colno;
-  if (RE2::FullMatch(s, "(.*):(\\d+):(\\d+)", &filename, &lineno, &colno)) {
-    return Pos(filename, lineno - 1, colno - 1);
+  if (RE2::FullMatch(s, *kFileLocationRe, &filename, &lineno, &colno)) {
+    const Fileno fileno = file_table.GetOrCreate(filename);
+    return Pos(fileno, lineno - 1, colno - 1);
   }
 
   return absl::InvalidArgumentError(
@@ -53,7 +78,7 @@ namespace xls::dslx {
 }
 
 Span FakeSpan() {
-  Pos fake_pos("<fake>", 0, 0);
+  Pos fake_pos(Fileno(0), 0, 0);
   return Span(fake_pos, fake_pos);
 }
 

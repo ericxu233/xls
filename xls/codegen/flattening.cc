@@ -14,15 +14,25 @@
 
 #include "xls/codegen/flattening.h"
 
+#include <cstdint>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "xls/common/logging/logging.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
+#include "xls/codegen/vast/vast.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
 #include "xls/ir/package.h"
+#include "xls/ir/source_location.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
+#include "xls/ir/xls_type.pb.h"
 
 namespace xls {
 
@@ -43,7 +53,7 @@ static void GatherValueLeaves(const Value& value, std::vector<Bits>* leaves) {
       }
       break;
     default:
-      XLS_LOG(FATAL) << "Invalid value kind: " << value.kind();
+      LOG(FATAL) << "Invalid value kind: " << value.kind();
   }
 }
 
@@ -103,8 +113,8 @@ absl::StatusOr<Value> UnflattenBitsToValue(const Bits& bits,
 }
 
 int64_t GetFlatBitIndexOfElement(const TupleType* tuple_type, int64_t index) {
-  XLS_CHECK_GE(index, 0);
-  XLS_CHECK_LT(index, tuple_type->size());
+  CHECK_GE(index, 0);
+  CHECK_LT(index, tuple_type->size());
   int64_t flat_index = 0;
   for (int64_t i = tuple_type->size() - 1; i > index; --i) {
     flat_index += tuple_type->element_type(i)->GetFlatBitCount();
@@ -113,8 +123,8 @@ int64_t GetFlatBitIndexOfElement(const TupleType* tuple_type, int64_t index) {
 }
 
 int64_t GetFlatBitIndexOfElement(const ArrayType* array_type, int64_t index) {
-  XLS_CHECK_GE(index, 0);
-  XLS_CHECK_LT(index, array_type->size());
+  CHECK_GE(index, 0);
+  CHECK_LT(index, array_type->size());
   return index * array_type->element_type()->GetFlatBitCount();
 }
 
@@ -150,7 +160,7 @@ verilog::Expression* UnflattenArray(verilog::IndexableExpression* input,
 verilog::Expression* UnflattenArrayShapedTupleElement(
     verilog::IndexableExpression* input, TupleType* tuple_type,
     int64_t tuple_index, verilog::VerilogFile* file, const SourceInfo& loc) {
-  XLS_CHECK(tuple_type->element_type(tuple_index)->IsArray());
+  CHECK(tuple_type->element_type(tuple_index)->IsArray());
   ArrayType* array_type = tuple_type->element_type(tuple_index)->AsArrayOrDie();
   return UnflattenArrayHelper(
       /*flat_index_offset=*/GetFlatBitIndexOfElement(tuple_type, tuple_index),

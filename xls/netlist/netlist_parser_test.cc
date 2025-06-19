@@ -15,6 +15,7 @@
 #include "xls/netlist/netlist_parser.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -24,17 +25,20 @@
 #include "gtest/gtest.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
-#include "absl/memory/memory.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/substitute.h"
 #include "xls/common/status/matchers.h"
+#include "xls/netlist/cell_library.h"
 #include "xls/netlist/fake_cell_library.h"
+#include "xls/netlist/netlist.h"
 
 namespace xls {
 namespace netlist {
 namespace rtl {
 namespace {
 
-using status_testing::StatusIs;
+using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
 
 TEST(NetlistParserTest, EmptyModule) {

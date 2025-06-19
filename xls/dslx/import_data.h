@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <filesystem>  // NOLINT
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -25,14 +26,20 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
 #include "xls/dslx/bytecode/bytecode_cache_interface.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/module.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/import_record.h"
 #include "xls/dslx/interp_bindings.h"
 #include "xls/dslx/type_system/type_info.h"
+#include "xls/dslx/type_system_v2/inference_table.h"
+#include "xls/dslx/type_system_v2/inference_table_converter.h"
+#include "xls/dslx/virtualizable_file_system.h"
 #include "xls/dslx/warning_kind.h"
 
 namespace xls::dslx {
@@ -41,9 +48,12 @@ namespace xls::dslx {
 class ModuleInfo {
  public:
   ModuleInfo(std::unique_ptr<Module> module, TypeInfo* type_info,
-             std::filesystem::path path)
+             std::filesystem::path path,
+             std::unique_ptr<InferenceTableConverter>
+                 inference_table_converter = nullptr)
       : module_(std::move(module)),
         type_info_(type_info),
+        inference_table_converter_(std::move(inference_table_converter)),
         path_(std::move(path)) {}
 
   const Module& module() const { return *module_; }
@@ -51,10 +61,16 @@ class ModuleInfo {
   const TypeInfo* type_info() const { return type_info_; }
   TypeInfo* type_info() { return type_info_; }
   const std::filesystem::path& path() const { return path_; }
+  // TODO: erinzmoore - Once typechecking is complete, bar use of the inference
+  // objects.
+  InferenceTableConverter* inference_table_converter() {
+    return inference_table_converter_.get();
+  }
 
  private:
   std::unique_ptr<Module> module_;
   TypeInfo* type_info_;
+  std::unique_ptr<InferenceTableConverter> inference_table_converter_;
   std::filesystem::path path_;
 };
 
@@ -65,6 +81,10 @@ class ModuleInfo {
 // Hashable (usable in a flat hash map).
 class ImportTokens {
  public:
+  static ImportTokens FromSpan(absl::Span<const std::string> identifiers) {
+    return ImportTokens(
+        std::vector<std::string>(identifiers.begin(), identifiers.end()));
+  }
   static absl::StatusOr<ImportTokens> FromString(std::string_view module_name);
 
   explicit ImportTokens(std::vector<std::string> pieces)
@@ -101,12 +121,11 @@ class ImportTokens {
   std::vector<std::string> pieces_;
 };
 
-// Wrapper around a {subject: module_info} mapping that modules can be imported
-// into.
-// Use the routines in create_import_data.h to instantiate an object.
+// Wrapper around a `{subject: module_info}` mapping that modules can be
+// imported into.
 class ImportData {
  public:
-  // All instantiations of ImportData should pass a stdlib_path as below.
+  // Use the routines in `create_import_data.h` to instantiate an object.
   ImportData() = delete;
 
   bool Contains(const ImportTokens& target) const {
@@ -121,14 +140,56 @@ class ImportData {
   absl::Status AddToImporterStack(const Span& importer_span,
                                   const std::filesystem::path& imported);
 
+  // Registers a callback to be notified when we see that an importing span is
+  // beginning to import a filesystem path. This is useful for tracking the DAG
+  // of dependencies.
+  //
+  // Recursion checks are performed before this callback is invoked, so the
+  // callback results should all be validated to be DAG compliant.
+  void SetImporterStackObserver(
+      std::function<void(const Span&, const std::filesystem::path&)> f) {
+    importer_stack_observer_ = std::move(f);
+  }
+
   // This pops the entry from the import stack and verifies it's the latest
   // entry, returning an error iff it is not.
   absl::Status PopFromImporterStack(const Span& import_span);
 
-  absl::StatusOr<ModuleInfo*> Get(const ImportTokens& subject);
+  absl::StatusOr<ModuleInfo*> Get(const ImportTokens& subject) const;
 
   absl::StatusOr<ModuleInfo*> Put(const ImportTokens& subject,
                                   std::unique_ptr<ModuleInfo> module_info);
+
+  // Creates the `InferenceTable` for the corpus, if it does not already exist,
+  // and returns it. This is a data structure only used by type inference v2.
+  InferenceTable* GetOrCreateInferenceTable() {
+    if (inference_table_ == nullptr) {
+      inference_table_ = InferenceTable::Create();
+    }
+    return inference_table_.get();
+  }
+
+  // Returns whether an `InferenceTable` for the corpus has been created yet.
+  bool HasInferenceTable() const { return inference_table_ != nullptr; }
+
+  // Sets the `InferenceTableConverter` for the given module. This is for use by
+  // type inference v2 during the process of typechecking a corpus.
+  void SetInferenceTableConverter(Module* module,
+                                  InferenceTableConverter* converter) {
+    module_to_inference_table_converter_[module] = converter;
+  }
+
+  // Returns the `InferenceTableConverter` that was previously set for this
+  // module, or an error if one was not set. This is for use by type inference
+  // v2 during the process of typechecking a corpus.
+  absl::StatusOr<InferenceTableConverter*> GetInferenceTableConverter(
+      Module* module);
+
+  // Returns the `InferenceTableConverter` that was set for a previously
+  // imported module with the given name, or an error if no such module has been
+  // imported with type inference v2.
+  absl::StatusOr<InferenceTableConverter*> GetInferenceTableConverter(
+      std::string_view module_name);
 
   TypeInfoOwner& type_info_owner() { return type_info_owner_; }
 
@@ -138,6 +199,8 @@ class ImportData {
   absl::StatusOr<TypeInfo*> GetRootTypeInfoForNode(const AstNode* node);
   absl::StatusOr<const TypeInfo*> GetRootTypeInfoForNode(
       const AstNode* node) const;
+
+  // As above but gets the type info for a directly-provided `module`.
   absl::StatusOr<TypeInfo*> GetRootTypeInfo(const Module* module);
 
   // The "top level bindings" for a given module are the values that get
@@ -192,6 +255,7 @@ class ImportData {
 
   absl::StatusOr<const EnumDef*> FindEnumDef(const Span& span) const;
   absl::StatusOr<const StructDef*> FindStructDef(const Span& span) const;
+  absl::StatusOr<const ProcDef*> FindProcDef(const Span& span) const;
   absl::StatusOr<const AstNode*> FindNode(AstNodeKind kind,
                                           const Span& span) const;
 
@@ -199,28 +263,41 @@ class ImportData {
   // into this ImportData set.
   WarningKindSet enabled_warnings() const { return enabled_warnings_; }
 
+  FileTable& file_table() { return file_table_; }
+  const FileTable& file_table() const { return file_table_; }
+
+  VirtualizableFilesystem& vfs() const { return *vfs_; }
+
  private:
   friend ImportData CreateImportData(const std::filesystem::path&,
                                      absl::Span<const std::filesystem::path>,
-                                     WarningKindSet);
+                                     WarningKindSet,
+                                     std::unique_ptr<VirtualizableFilesystem>);
+
   friend std::unique_ptr<ImportData> CreateImportDataPtr(
       const std::filesystem::path&, absl::Span<const std::filesystem::path>,
       WarningKindSet);
-  friend ImportData CreateImportDataForTest();
+
+  friend ImportData CreateImportDataForTest(
+      std::unique_ptr<VirtualizableFilesystem> vfs, WarningKindSet warnings);
   friend std::unique_ptr<ImportData> CreateImportDataPtrForTest();
 
   ImportData(std::filesystem::path stdlib_path,
              absl::Span<const std::filesystem::path> additional_search_paths,
-             WarningKindSet enabled_warnings)
+             WarningKindSet enabled_warnings,
+             std::unique_ptr<VirtualizableFilesystem> vfs)
       : stdlib_path_(std::move(stdlib_path)),
-        additional_search_paths_(additional_search_paths),
-        enabled_warnings_(enabled_warnings) {}
+        additional_search_paths_(std::vector<std::filesystem::path>(
+            additional_search_paths.begin(), additional_search_paths.end())),
+        enabled_warnings_(enabled_warnings),
+        vfs_(std::move(vfs)) {}
 
   // Attempts to find a module owned by this ImportData according to the
   // filename present in "span". Returns a NotFound error if a corresponding
   // module is not available.
   absl::StatusOr<const Module*> FindModule(const Span& span) const;
 
+  FileTable file_table_;
   absl::flat_hash_map<ImportTokens, std::unique_ptr<ModuleInfo>> modules_;
   absl::flat_hash_map<std::string, ModuleInfo*> path_to_module_info_;
   absl::flat_hash_map<Module*, std::unique_ptr<InterpBindings>>
@@ -229,12 +306,22 @@ class ImportData {
   absl::flat_hash_map<Module*, AstNode*> typecheck_wip_;
   TypeInfoOwner type_info_owner_;
   const std::filesystem::path stdlib_path_;
-  absl::Span<const std::filesystem::path> additional_search_paths_;
+  std::vector<std::filesystem::path> additional_search_paths_;
   WarningKindSet enabled_warnings_;
   std::unique_ptr<BytecodeCacheInterface> bytecode_cache_;
 
+  std::function<void(const Span&, const std::filesystem::path&)>
+      importer_stack_observer_;
+
   // See comment on AddToImporterStack() above.
   std::vector<ImportRecord> importer_stack_;
+
+  // Cross-module state used by type inference v2.
+  std::unique_ptr<InferenceTable> inference_table_;
+  absl::flat_hash_map<Module*, InferenceTableConverter*>
+      module_to_inference_table_converter_;
+
+  std::unique_ptr<VirtualizableFilesystem> vfs_;
 };
 
 }  // namespace xls::dslx

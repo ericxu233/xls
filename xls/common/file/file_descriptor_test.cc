@@ -14,10 +14,15 @@
 
 #include "xls/common/file/file_descriptor.h"
 
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>  // NOLINT
+#include <string>
 #include <utility>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status_matchers.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/temp_directory.h"
 #include "xls/common/status/matchers.h"
@@ -25,8 +30,8 @@
 namespace xls {
 namespace {
 
-using status_testing::IsOk;
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOk;
+using ::absl_testing::IsOkAndHolds;
 using ::testing::Not;
 
 // Global state is necessary to test FileDescriptor; it takes a plain function
@@ -96,9 +101,7 @@ TEST_F(FileDescriptorTest, FileDescriptorIsClosedAndResetOnClose) {
 }
 
 TEST_F(FileDescriptorTest, FileDescriptorIsClosedOnDestruction) {
-  {
-    MockFileDescriptor fd(6);
-  }
+  { MockFileDescriptor fd(6); }
 
   EXPECT_EQ(recently_closed_fd, 6);
 }

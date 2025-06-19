@@ -25,6 +25,8 @@
 #include <variant>
 #include <vector>
 
+#include "absl/base/optimization.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -32,8 +34,18 @@
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
 #include "xls/common/proto_adaptor_utils.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/dslx/channel_direction.h"
+#include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/frontend/ast_node.h"
+#include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/import_data.h"
+#include "xls/dslx/interp_value.h"
+#include "xls/dslx/type_system/parametric_expression.h"
+#include "xls/dslx/type_system/type.h"
+#include "xls/dslx/type_system/type_info.h"
 #include "xls/dslx/type_system/type_info.pb.h"
+#include "xls/ir/bits.h"
 
 namespace xls::dslx {
 namespace {
@@ -53,8 +65,6 @@ AstNodeKindProto ToProto(AstNodeKind kind) {
       return AST_NODE_KIND_NAME_DEF;
     case AstNodeKind::kNameRef:
       return AST_NODE_KIND_NAME_REF;
-    case AstNodeKind::kConstRef:
-      return AST_NODE_KIND_CONST_REF;
     case AstNodeKind::kBuiltinNameDef:
       return AST_NODE_KIND_BUILTIN_NAME_DEF;
     case AstNodeKind::kConditional:
@@ -77,6 +87,8 @@ AstNodeKindProto ToProto(AstNodeKind kind) {
       return AST_NODE_KIND_PARAM;
     case AstNodeKind::kFunction:
       return AST_NODE_KIND_FUNCTION;
+    case AstNodeKind::kFunctionRef:
+      return AST_NODE_KIND_FUNCTION_REF;
     case AstNodeKind::kProc:
       return AST_NODE_KIND_PROC;
     case AstNodeKind::kArray:
@@ -85,6 +97,8 @@ AstNodeKindProto ToProto(AstNodeKind kind) {
       return AST_NODE_KIND_STRING;
     case AstNodeKind::kStructInstance:
       return AST_NODE_KIND_STRUCT_INSTANCE;
+    case AstNodeKind::kStructMember:
+      return AST_NODE_KIND_STRUCT_MEMBER;
     case AstNodeKind::kNameDefTree:
       return AST_NODE_KIND_NAME_DEF_TREE;
     case AstNodeKind::kSplatStructInstance:
@@ -129,12 +143,16 @@ AstNodeKindProto ToProto(AstNodeKind kind) {
       return AST_NODE_KIND_FORMAT_MACRO;
     case AstNodeKind::kZeroMacro:
       return AST_NODE_KIND_ZERO_MACRO;
+    case AstNodeKind::kAllOnesMacro:
+      return AST_NODE_KIND_ALL_ONES_MACRO;
     case AstNodeKind::kSlice:
       return AST_NODE_KIND_SLICE;
     case AstNodeKind::kEnumDef:
       return AST_NODE_KIND_ENUM_DEF;
     case AstNodeKind::kStructDef:
       return AST_NODE_KIND_STRUCT_DEF;
+    case AstNodeKind::kProcDef:
+      return AST_NODE_KIND_PROC_DEF;
     case AstNodeKind::kQuickCheck:
       return AST_NODE_KIND_QUICK_CHECK;
     case AstNodeKind::kXlsTuple:
@@ -153,31 +171,43 @@ AstNodeKindProto ToProto(AstNodeKind kind) {
       return AST_NODE_KIND_PARAMETRIC_BINDING;
     case AstNodeKind::kTupleIndex:
       return AST_NODE_KIND_TUPLE_INDEX;
-    case AstNodeKind::kBlock:
-      return AST_NODE_KIND_BLOCK;
+    case AstNodeKind::kStatementBlock:
+      return AST_NODE_KIND_STATEMENT_BLOCK;
     case AstNodeKind::kStatement:
       return AST_NODE_KIND_STATEMENT;
     case AstNodeKind::kUnrollFor:
       return AST_NODE_KIND_UNROLL_FOR;
     case AstNodeKind::kProcMember:
       return AST_NODE_KIND_PROC_MEMBER;
+    case AstNodeKind::kRestOfTuple:
+      return AST_NODE_KIND_REST_OF_TUPLE;
+    case AstNodeKind::kImpl:
+      return AST_NODE_KIND_IMPL;
+    case AstNodeKind::kVerbatimNode:
+      return AST_NODE_KIND_VERBATIM_NODE;
+    case AstNodeKind::kUse:
+      return AST_NODE_KIND_USE;
+    case AstNodeKind::kUseTreeEntry:
+      return AST_NODE_KIND_USE_TREE_ENTRY;
+    case AstNodeKind::kLambda:
+      return AST_NODE_KIND_LAMBDA;
   }
   // Fatal since enum class values should not be out of range.
-  XLS_LOG(FATAL) << "Out of range AstNodeKind: " << static_cast<int64_t>(kind);
+  LOG(FATAL) << "Out of range AstNodeKind: " << static_cast<int64_t>(kind);
 }
 
-PosProto ToProto(const Pos& pos) {
+PosProto ToProto(const Pos& pos, const FileTable& file_table) {
   PosProto proto;
-  proto.set_filename(pos.filename());
+  proto.set_filename(pos.GetFilename(file_table));
   proto.set_lineno(static_cast<int32_t>(pos.lineno()));
   proto.set_colno(static_cast<int32_t>(pos.colno()));
   return proto;
 }
 
-SpanProto ToProto(const Span& span) {
+SpanProto ToProto(const Span& span, const FileTable& file_table) {
   SpanProto proto;
-  *proto.mutable_start() = ToProto(span.start());
-  *proto.mutable_limit() = ToProto(span.limit());
+  *proto.mutable_start() = ToProto(span.start(), file_table);
+  *proto.mutable_limit() = ToProto(span.limit(), file_table);
   return proto;
 }
 
@@ -205,13 +235,13 @@ absl::StatusOr<InterpValueProto> ToProto(const InterpValue& v) {
   return proto;
 }
 
-absl::StatusOr<ParametricExpressionProto> ToProto(
-    const ParametricExpression& e) {
+absl::StatusOr<ParametricExpressionProto> ToProto(const ParametricExpression& e,
+                                                  const FileTable& file_table) {
   ParametricExpressionProto proto;
   if (const auto* s = dynamic_cast<const ParametricSymbol*>(&e)) {
     ParametricSymbolProto* psproto = proto.mutable_symbol();
     psproto->set_identifier(s->identifier());
-    *psproto->mutable_span() = ToProto(s->span());
+    *psproto->mutable_span() = ToProto(s->span(), file_table);
     return proto;
   }
   if (const auto* s = dynamic_cast<const ParametricConstant*>(&e)) {
@@ -221,14 +251,14 @@ absl::StatusOr<ParametricExpressionProto> ToProto(
   }
   if (const auto* p = dynamic_cast<const ParametricMul*>(&e)) {
     ParametricMulProto* pp = proto.mutable_mul();
-    XLS_ASSIGN_OR_RETURN(*pp->mutable_lhs(), ToProto(p->lhs()));
-    XLS_ASSIGN_OR_RETURN(*pp->mutable_rhs(), ToProto(p->rhs()));
+    XLS_ASSIGN_OR_RETURN(*pp->mutable_lhs(), ToProto(p->lhs(), file_table));
+    XLS_ASSIGN_OR_RETURN(*pp->mutable_rhs(), ToProto(p->rhs(), file_table));
     return proto;
   }
   if (const auto* p = dynamic_cast<const ParametricAdd*>(&e)) {
     ParametricAddProto* pp = proto.mutable_add();
-    XLS_ASSIGN_OR_RETURN(*pp->mutable_lhs(), ToProto(p->lhs()));
-    XLS_ASSIGN_OR_RETURN(*pp->mutable_rhs(), ToProto(p->rhs()));
+    XLS_ASSIGN_OR_RETURN(*pp->mutable_lhs(), ToProto(p->lhs(), file_table));
+    XLS_ASSIGN_OR_RETURN(*pp->mutable_rhs(), ToProto(p->rhs(), file_table));
     return proto;
   }
   return absl::UnimplementedError(
@@ -236,58 +266,86 @@ absl::StatusOr<ParametricExpressionProto> ToProto(
       e.ToString());
 }
 
-absl::StatusOr<ConcreteTypeDimProto> ToProto(const ConcreteTypeDim& ctd) {
-  ConcreteTypeDimProto proto;
+absl::StatusOr<TypeDimProto> ToProto(const TypeDim& ctd,
+                                     const FileTable& file_table) {
+  TypeDimProto proto;
   if (std::holds_alternative<InterpValue>(ctd.value())) {
     XLS_ASSIGN_OR_RETURN(*proto.mutable_interp_value(),
                          ToProto(std::get<InterpValue>(ctd.value())));
   } else {
-    auto& p = std::get<ConcreteTypeDim::OwnedParametric>(ctd.value());
-    XLS_ASSIGN_OR_RETURN(*proto.mutable_parametric(), ToProto(*p));
+    auto& p = std::get<TypeDim::OwnedParametric>(ctd.value());
+    XLS_ASSIGN_OR_RETURN(*proto.mutable_parametric(), ToProto(*p, file_table));
   }
   return proto;
 }
 
-absl::StatusOr<BitsTypeProto> ToProto(const BitsType& bits_type) {
+absl::StatusOr<BitsTypeProto> ToProto(const BitsType& bits_type,
+                                      const FileTable& file_table) {
   BitsTypeProto proto;
   proto.set_is_signed(bits_type.is_signed());
-  XLS_ASSIGN_OR_RETURN(*proto.mutable_dim(), ToProto(bits_type.size()));
+  XLS_ASSIGN_OR_RETURN(*proto.mutable_dim(),
+                       ToProto(bits_type.size(), file_table));
   return proto;
 }
 
-// Forward decl since this is co-recursive with the ToProto() for ConcreteType
-// subtypes.
-absl::StatusOr<ConcreteTypeProto> ToProto(const ConcreteType& concrete_type);
+absl::StatusOr<BitsConstructorTypeProto> ToProto(
+    const BitsConstructorType& bits_type, const FileTable& file_table) {
+  BitsConstructorTypeProto proto;
+  XLS_ASSIGN_OR_RETURN(*proto.mutable_is_signed(),
+                       ToProto(bits_type.is_signed(), file_table));
+  return proto;
+}
 
-absl::StatusOr<FunctionTypeProto> ToProto(const FunctionType& fn_type) {
+// Forward decl since this is co-recursive with the ToProto() for Type
+// subtypes.
+absl::StatusOr<TypeProto> ToProto(const Type& type,
+                                  const FileTable& file_table);
+
+absl::StatusOr<FunctionTypeProto> ToProto(const FunctionType& fn_type,
+                                          const FileTable& file_table) {
   FunctionTypeProto proto;
-  for (const std::unique_ptr<ConcreteType>& param : fn_type.params()) {
-    XLS_ASSIGN_OR_RETURN(*proto.add_params(), ToProto(*param));
+  for (const std::unique_ptr<Type>& param : fn_type.params()) {
+    XLS_ASSIGN_OR_RETURN(*proto.add_params(), ToProto(*param, file_table));
   }
   XLS_ASSIGN_OR_RETURN(*proto.mutable_return_type(),
-                       ToProto(fn_type.return_type()));
+                       ToProto(fn_type.return_type(), file_table));
   return proto;
 }
 
-absl::StatusOr<TupleTypeProto> ToProto(const TupleType& tuple_type) {
+absl::StatusOr<TupleTypeProto> ToProto(const TupleType& tuple_type,
+                                       const FileTable& file_table) {
   TupleTypeProto proto;
-  for (const std::unique_ptr<ConcreteType>& member : tuple_type.members()) {
-    XLS_ASSIGN_OR_RETURN(*proto.add_members(), ToProto(*member));
+  for (const std::unique_ptr<Type>& member : tuple_type.members()) {
+    XLS_ASSIGN_OR_RETURN(*proto.add_members(), ToProto(*member, file_table));
   }
   return proto;
 }
 
-absl::StatusOr<ArrayTypeProto> ToProto(const ArrayType& array_type) {
+absl::StatusOr<TokenTypeProto> ToProto(const TokenType& token_type,
+                                       const FileTable& file_table) {
+  return TokenTypeProto();
+}
+
+absl::StatusOr<ModuleTypeProto> ToProto(const ModuleType& module_type,
+                                        const FileTable& file_table) {
+  return ModuleTypeProto();
+}
+
+absl::StatusOr<ArrayTypeProto> ToProto(const ArrayType& array_type,
+                                       const FileTable& file_table) {
   ArrayTypeProto proto;
-  XLS_ASSIGN_OR_RETURN(*proto.mutable_size(), ToProto(array_type.size()));
+  XLS_ASSIGN_OR_RETURN(*proto.mutable_size(),
+                       ToProto(array_type.size(), file_table));
   XLS_ASSIGN_OR_RETURN(*proto.mutable_element_type(),
-                       ToProto(array_type.element_type()));
+                       ToProto(array_type.element_type(), file_table));
   return proto;
 }
 
-absl::StatusOr<StructDefProto> ToProto(const StructDef& struct_def) {
-  StructDefProto proto;
-  *proto.mutable_span() = ToProto(struct_def.span());
+template <typename T>
+absl::StatusOr<T> ToProto(const StructDefBase& struct_def,
+                          const FileTable& file_table) {
+  T proto;
+  *proto.mutable_span() = ToProto(struct_def.span(), file_table);
   proto.set_identifier(struct_def.identifier());
   proto.set_is_public(struct_def.is_public());
   for (int64_t i = 0; i < struct_def.size(); ++i) {
@@ -296,19 +354,34 @@ absl::StatusOr<StructDefProto> ToProto(const StructDef& struct_def) {
   return proto;
 }
 
-absl::StatusOr<StructTypeProto> ToProto(const StructType& struct_type) {
+absl::StatusOr<StructTypeProto> ToProto(const StructType& struct_type,
+                                        const FileTable& file_table) {
   StructTypeProto proto;
-  for (const std::unique_ptr<ConcreteType>& member : struct_type.members()) {
-    XLS_ASSIGN_OR_RETURN(*proto.add_members(), ToProto(*member));
+  for (const std::unique_ptr<Type>& member : struct_type.members()) {
+    XLS_ASSIGN_OR_RETURN(*proto.add_members(), ToProto(*member, file_table));
   }
-  XLS_ASSIGN_OR_RETURN(*proto.mutable_struct_def(),
-                       ToProto(struct_type.nominal_type()));
+  XLS_ASSIGN_OR_RETURN(
+      *proto.mutable_struct_def(),
+      ToProto<StructDefProto>(struct_type.nominal_type(), file_table));
   return proto;
 }
 
-absl::StatusOr<EnumDefProto> ToProto(const EnumDef& enum_def) {
+absl::StatusOr<ProcTypeProto> ToProto(const ProcType& proc_type,
+                                      const FileTable& file_table) {
+  ProcTypeProto proto;
+  for (const std::unique_ptr<Type>& member : proc_type.members()) {
+    XLS_ASSIGN_OR_RETURN(*proto.add_members(), ToProto(*member, file_table));
+  }
+  XLS_ASSIGN_OR_RETURN(
+      *proto.mutable_proc_def(),
+      ToProto<ProcDefProto>(proc_type.nominal_type(), file_table));
+  return proto;
+}
+
+absl::StatusOr<EnumDefProto> ToProto(const EnumDef& enum_def,
+                                     const FileTable& file_table) {
   EnumDefProto proto;
-  *proto.mutable_span() = ToProto(enum_def.span());
+  *proto.mutable_span() = ToProto(enum_def.span(), file_table);
   proto.set_identifier(enum_def.identifier());
   proto.set_is_public(enum_def.is_public());
   for (int64_t i = 0; i < enum_def.values().size(); ++i) {
@@ -317,88 +390,141 @@ absl::StatusOr<EnumDefProto> ToProto(const EnumDef& enum_def) {
   return proto;
 }
 
-absl::StatusOr<EnumTypeProto> ToProto(const EnumType& enum_type) {
-  XLS_VLOG(5) << "Converting EnumType to proto: " << enum_type.ToString();
+absl::StatusOr<EnumTypeProto> ToProto(const EnumType& enum_type,
+                                      const FileTable& file_table) {
+  VLOG(5) << "Converting EnumType to proto: " << enum_type.ToString();
   EnumTypeProto proto;
   XLS_ASSIGN_OR_RETURN(*proto.mutable_enum_def(),
-                       ToProto(enum_type.nominal_type()));
-  XLS_ASSIGN_OR_RETURN(*proto.mutable_size(), ToProto(enum_type.size()));
+                       ToProto(enum_type.nominal_type(), file_table));
+  XLS_ASSIGN_OR_RETURN(*proto.mutable_size(),
+                       ToProto(enum_type.size(), file_table));
   proto.set_is_signed(enum_type.is_signed());
-  XLS_VLOG(5) << "- proto: " << proto.ShortDebugString();
+  VLOG(5) << "- proto: " << proto.ShortDebugString();
   return proto;
 }
 
-absl::StatusOr<MetaTypeProto> ToProto(const MetaType& meta_type) {
-  XLS_VLOG(5) << "Converting MetaType to proto: " << meta_type.ToString();
+absl::StatusOr<MetaTypeProto> ToProto(const MetaType& meta_type,
+                                      const FileTable& file_table) {
+  VLOG(5) << "Converting MetaType to proto: " << meta_type.ToString();
   MetaTypeProto proto;
-  XLS_ASSIGN_OR_RETURN(*proto.mutable_wrapped(), ToProto(*meta_type.wrapped()));
-  XLS_VLOG(5) << "- proto: " << proto.ShortDebugString();
+  XLS_ASSIGN_OR_RETURN(*proto.mutable_wrapped(),
+                       ToProto(*meta_type.wrapped(), file_table));
+  VLOG(5) << "- proto: " << proto.ShortDebugString();
   return proto;
 }
 
+ChannelDirectionProto extracted() {
+  return ChannelDirectionProto::CHANNEL_DIRECTION_OUT;
+}
 ChannelDirectionProto ToProto(ChannelDirection d) {
   switch (d) {
     case ChannelDirection::kIn:
       return ChannelDirectionProto::CHANNEL_DIRECTION_IN;
     case ChannelDirection::kOut:
-      return ChannelDirectionProto::CHANNEL_DIRECTION_OUT;
+      return extracted();
   }
-  XLS_LOG(FATAL) << "Invalid ChannelDirection: " << static_cast<int64_t>(d);
+  LOG(FATAL) << "Invalid ChannelDirection: " << static_cast<int64_t>(d);
 }
 
-absl::StatusOr<ChannelTypeProto> ToProto(const ChannelType& channel_type) {
-  XLS_VLOG(5) << "Converting ChannelType to proto: " << channel_type.ToString();
+absl::StatusOr<ChannelTypeProto> ToProto(const ChannelType& channel_type,
+                                         const FileTable& file_table) {
+  VLOG(5) << "Converting ChannelType to proto: " << channel_type.ToString();
   ChannelTypeProto proto;
   XLS_ASSIGN_OR_RETURN(*proto.mutable_payload(),
-                       ToProto(channel_type.payload_type()));
+                       ToProto(channel_type.payload_type(), file_table));
   proto.set_direction(ToProto(channel_type.direction()));
-  XLS_VLOG(5) << "- proto: " << proto.ShortDebugString();
+  VLOG(5) << "- proto: " << proto.ShortDebugString();
   return proto;
 }
 
-absl::StatusOr<ConcreteTypeProto> ToProto(const ConcreteType& concrete_type) {
-  ConcreteTypeProto proto;
-  if (const auto* bits = dynamic_cast<const BitsType*>(&concrete_type)) {
-    XLS_ASSIGN_OR_RETURN(*proto.mutable_bits_type(), ToProto(*bits));
-  } else if (const auto* fn =
-                 dynamic_cast<const FunctionType*>(&concrete_type)) {
-    XLS_ASSIGN_OR_RETURN(*proto.mutable_fn_type(), ToProto(*fn));
-  } else if (const auto* tuple =
-                 dynamic_cast<const TupleType*>(&concrete_type)) {
-    XLS_ASSIGN_OR_RETURN(*proto.mutable_tuple_type(), ToProto(*tuple));
-  } else if (const auto* array =
-                 dynamic_cast<const ArrayType*>(&concrete_type)) {
-    XLS_ASSIGN_OR_RETURN(*proto.mutable_array_type(), ToProto(*array));
-  } else if (const auto* struct_type =
-                 dynamic_cast<const StructType*>(&concrete_type)) {
-    XLS_ASSIGN_OR_RETURN(*proto.mutable_struct_type(), ToProto(*struct_type));
-  } else if (const auto* enum_type =
-                 dynamic_cast<const EnumType*>(&concrete_type)) {
-    XLS_ASSIGN_OR_RETURN(*proto.mutable_enum_type(), ToProto(*enum_type));
-  } else if (const auto* meta_type =
-                 dynamic_cast<const MetaType*>(&concrete_type)) {
-    XLS_ASSIGN_OR_RETURN(*proto.mutable_meta_type(), ToProto(*meta_type));
-  } else if (const auto* channel_type =
-                 dynamic_cast<const ChannelType*>(&concrete_type)) {
-    XLS_ASSIGN_OR_RETURN(*proto.mutable_channel_type(), ToProto(*channel_type));
-  } else if (dynamic_cast<const TokenType*>(&concrete_type) != nullptr) {
-    proto.mutable_token_type();
-  } else {
-    return absl::UnimplementedError(
-        "TypeInfoToProto: convert ConcreteType to proto: " +
-        concrete_type.ToString());
+class ToProtoVisitor : public TypeVisitor {
+ public:
+  explicit ToProtoVisitor(const FileTable& file_table)
+      : file_table_(file_table) {}
+
+  absl::Status HandleBits(const BitsType& type) override {
+    XLS_ASSIGN_OR_RETURN(*proto_.mutable_bits_type(),
+                         ToProto(type, file_table_));
+    return absl::OkStatus();
   }
-  return proto;
+  absl::Status HandleBitsConstructor(const BitsConstructorType& type) override {
+    XLS_ASSIGN_OR_RETURN(*proto_.mutable_bits_constructor_type(),
+                         ToProto(type, file_table_));
+    return absl::OkStatus();
+  }
+  absl::Status HandleFunction(const FunctionType& type) override {
+    XLS_ASSIGN_OR_RETURN(*proto_.mutable_fn_type(), ToProto(type, file_table_));
+    return absl::OkStatus();
+  }
+  absl::Status HandleTuple(const TupleType& type) override {
+    XLS_ASSIGN_OR_RETURN(*proto_.mutable_tuple_type(),
+                         ToProto(type, file_table_));
+    return absl::OkStatus();
+  }
+  absl::Status HandleArray(const ArrayType& type) override {
+    XLS_ASSIGN_OR_RETURN(*proto_.mutable_array_type(),
+                         ToProto(type, file_table_));
+    return absl::OkStatus();
+  }
+  absl::Status HandleStruct(const StructType& type) override {
+    XLS_ASSIGN_OR_RETURN(*proto_.mutable_struct_type(),
+                         ToProto(type, file_table_));
+    return absl::OkStatus();
+  }
+  absl::Status HandleProc(const ProcType& type) override {
+    XLS_ASSIGN_OR_RETURN(*proto_.mutable_proc_type(),
+                         ToProto(type, file_table_));
+    return absl::OkStatus();
+  }
+  absl::Status HandleEnum(const EnumType& type) override {
+    XLS_ASSIGN_OR_RETURN(*proto_.mutable_enum_type(),
+                         ToProto(type, file_table_));
+    return absl::OkStatus();
+  }
+  absl::Status HandleMeta(const MetaType& type) override {
+    XLS_ASSIGN_OR_RETURN(*proto_.mutable_meta_type(),
+                         ToProto(type, file_table_));
+    return absl::OkStatus();
+  }
+  absl::Status HandleToken(const TokenType& type) override {
+    XLS_ASSIGN_OR_RETURN(*proto_.mutable_token_type(),
+                         ToProto(type, file_table_));
+    return absl::OkStatus();
+  }
+  absl::Status HandleChannel(const ChannelType& type) override {
+    XLS_ASSIGN_OR_RETURN(*proto_.mutable_channel_type(),
+                         ToProto(type, file_table_));
+    return absl::OkStatus();
+  }
+  absl::Status HandleModule(const ModuleType& type) override {
+    XLS_ASSIGN_OR_RETURN(*proto_.mutable_module_type(),
+                         ToProto(type, file_table_));
+    return absl::OkStatus();
+  }
+
+  TypeProto PopResult() { return std::move(proto_); }
+
+ private:
+  TypeProto proto_;
+  const FileTable& file_table_;
+};
+
+absl::StatusOr<TypeProto> ToProto(const Type& type,
+                                  const FileTable& file_table) {
+  ToProtoVisitor visitor(file_table);
+  XLS_RETURN_IF_ERROR(type.Accept(visitor));
+  return visitor.PopResult();
 }
 
-absl::StatusOr<AstNodeTypeInfoProto> ToProto(
-    const AstNode& node, const ConcreteType& concrete_type) {
+absl::StatusOr<AstNodeTypeInfoProto> ToProto(const AstNode& node,
+                                             const Type& type) {
+  const FileTable& file_table = *node.owner()->file_table();
   AstNodeTypeInfoProto proto;
   proto.set_kind(ToProto(node.kind()));
   if (std::optional<Span> maybe_span = node.GetSpan()) {
-    *proto.mutable_span() = ToProto(maybe_span.value());
+    *proto.mutable_span() = ToProto(maybe_span.value(), file_table);
   }
-  XLS_ASSIGN_OR_RETURN(*proto.mutable_type(), ToProto(concrete_type));
+  XLS_ASSIGN_OR_RETURN(*proto.mutable_type(), ToProto(type, file_table));
   return proto;
 }
 
@@ -412,12 +538,14 @@ std::string ToHumanString(AstNodeKindProto kind) {
       std::string_view("AST_NODE_KIND_").size());
 }
 
-Pos FromProto(const PosProto& p) {
-  return Pos(p.filename(), p.lineno(), p.colno());
+Pos FromProto(const PosProto& p, FileTable& file_table) {
+  Fileno fileno = file_table.GetOrCreate(p.filename());
+  return Pos(fileno, p.lineno(), p.colno());
 }
 
-Span FromProto(const SpanProto& p) {
-  return Span(FromProto(p.start()), FromProto(p.limit()));
+Span FromProto(const SpanProto& p, FileTable& file_table) {
+  return Span(FromProto(p.start(), file_table),
+              FromProto(p.limit(), file_table));
 }
 
 absl::Span<const uint8_t> ToU8Span(const std::string& s) {
@@ -448,17 +576,17 @@ absl::StatusOr<InterpValue> FromProto(const InterpValueProto& ivp) {
       ivp.ShortDebugString());
 }
 
-std::unique_ptr<ParametricSymbol> FromProto(
-    const ParametricSymbolProto& proto) {
-  return std::make_unique<ParametricSymbol>(proto.identifier(),
-                                            FromProto(proto.span()));
+std::unique_ptr<ParametricSymbol> FromProto(const ParametricSymbolProto& proto,
+                                            FileTable& file_table) {
+  return std::make_unique<ParametricSymbol>(
+      proto.identifier(), FromProto(proto.span(), file_table));
 }
 
 absl::StatusOr<std::unique_ptr<ParametricExpression>> FromProto(
-    const ParametricExpressionProto& proto) {
+    const ParametricExpressionProto& proto, FileTable& file_table) {
   switch (proto.expr_oneof_case()) {
     case ParametricExpressionProto::ExprOneofCase::kSymbol: {
-      return FromProto(proto.symbol());
+      return FromProto(proto.symbol(), file_table);
     }
     default:
       break;
@@ -470,63 +598,64 @@ absl::StatusOr<std::unique_ptr<ParametricExpression>> FromProto(
       proto.ShortDebugString());
 }
 
-absl::StatusOr<ConcreteTypeDim> FromProto(const ConcreteTypeDimProto& ctdp) {
+absl::StatusOr<TypeDim> FromProto(const TypeDimProto& ctdp,
+                                  FileTable& file_table) {
   switch (ctdp.dim_oneof_case()) {
-    case ConcreteTypeDimProto::DimOneofCase::kInterpValue: {
+    case TypeDimProto::DimOneofCase::kInterpValue: {
       XLS_ASSIGN_OR_RETURN(InterpValue iv, FromProto(ctdp.interp_value()));
-      return ConcreteTypeDim(std::move(iv));
+      return TypeDim(std::move(iv));
     }
-    case ConcreteTypeDimProto::DimOneofCase::kParametric: {
+    case TypeDimProto::DimOneofCase::kParametric: {
       XLS_ASSIGN_OR_RETURN(std::unique_ptr<ParametricExpression> p,
-                           FromProto(ctdp.parametric()));
-      return ConcreteTypeDim(std::move(p));
+                           FromProto(ctdp.parametric(), file_table));
+      return TypeDim(std::move(p));
     }
     default:
       return absl::UnimplementedError(
           "TypeInfoFromProto: not yet implemented for "
-          "ConcreteTypeDimProto->ConcreteTypeDim "
+          "TypeDimProto->TypeDim "
           "conversion: " +
           ctdp.ShortDebugString());
   }
 }
 
-absl::StatusOr<std::unique_ptr<ConcreteType>> FromProto(
-    const ConcreteTypeProto& ctp, const ImportData& import_data) {
-  XLS_VLOG(5) << "Converting ConcreteTypeProto to C++: "
-              << ctp.ShortDebugString();
-  switch (ctp.concrete_type_oneof_case()) {
-    case ConcreteTypeProto::ConcreteTypeOneofCase::kBitsType: {
-      XLS_ASSIGN_OR_RETURN(ConcreteTypeDim dim,
-                           FromProto(ctp.bits_type().dim()));
+absl::StatusOr<std::unique_ptr<Type>> FromProto(const TypeProto& ctp,
+                                                const ImportData& import_data,
+                                                FileTable& file_table) {
+  VLOG(5) << "Converting TypeProto to C++: " << ctp.ShortDebugString();
+  switch (ctp.type_oneof_case()) {
+    case TypeProto::TypeOneofCase::kBitsType: {
+      XLS_ASSIGN_OR_RETURN(TypeDim dim,
+                           FromProto(ctp.bits_type().dim(), file_table));
       return std::make_unique<BitsType>(ctp.bits_type().is_signed(),
                                         std::move(dim));
     }
-    case ConcreteTypeProto::ConcreteTypeOneofCase::kTupleType: {
-      std::vector<std::unique_ptr<ConcreteType>> members;
-      for (const ConcreteTypeProto& member : ctp.tuple_type().members()) {
-        XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> ct,
-                             FromProto(member, import_data));
+    case TypeProto::TypeOneofCase::kTupleType: {
+      std::vector<std::unique_ptr<Type>> members;
+      for (const TypeProto& member : ctp.tuple_type().members()) {
+        XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> ct,
+                             FromProto(member, import_data, file_table));
         members.push_back(std::move(ct));
       }
       return std::make_unique<TupleType>(std::move(members));
     }
-    case ConcreteTypeProto::ConcreteTypeOneofCase::kArrayType: {
+    case TypeProto::TypeOneofCase::kArrayType: {
       XLS_ASSIGN_OR_RETURN(
-          std::unique_ptr<ConcreteType> element_type,
-          FromProto(ctp.array_type().element_type(), import_data));
-      XLS_ASSIGN_OR_RETURN(ConcreteTypeDim size,
-                           FromProto(ctp.array_type().size()));
+          std::unique_ptr<Type> element_type,
+          FromProto(ctp.array_type().element_type(), import_data, file_table));
+      XLS_ASSIGN_OR_RETURN(TypeDim size,
+                           FromProto(ctp.array_type().size(), file_table));
       return std::make_unique<ArrayType>(std::move(element_type),
                                          std::move(size));
     }
-    case ConcreteTypeProto::ConcreteTypeOneofCase::kEnumType: {
+    case TypeProto::TypeOneofCase::kEnumType: {
       const EnumTypeProto& etp = ctp.enum_type();
       const EnumDefProto& enum_def_proto = etp.enum_def();
-      XLS_ASSIGN_OR_RETURN(ConcreteTypeDim size,
-                           FromProto(ctp.enum_type().size()));
-      XLS_ASSIGN_OR_RETURN(
-          const EnumDef* enum_def,
-          import_data.FindEnumDef(FromProto(enum_def_proto.span())));
+      XLS_ASSIGN_OR_RETURN(TypeDim size,
+                           FromProto(ctp.enum_type().size(), file_table));
+      XLS_ASSIGN_OR_RETURN(const EnumDef* enum_def,
+                           import_data.FindEnumDef(
+                               FromProto(enum_def_proto.span(), file_table)));
       std::vector<InterpValue> members;
       for (const InterpValueProto& value : etp.members()) {
         XLS_ASSIGN_OR_RETURN(InterpValue member, FromProto(value));
@@ -536,53 +665,88 @@ absl::StatusOr<std::unique_ptr<ConcreteType>> FromProto(
       return std::make_unique<EnumType>(*enum_def, std::move(size),
                                         /*is_signed=*/etp.is_signed(), members);
     }
-    case ConcreteTypeProto::ConcreteTypeOneofCase::kFnType: {
+    case TypeProto::TypeOneofCase::kModuleType: {
+      return absl::UnimplementedError(
+          "TypeInfoFromProto: not yet implemented for "
+          "TypeProto->Type "
+          "conversion: " +
+          ctp.ShortDebugString());
+    }
+    case TypeProto::TypeOneofCase::kFnType: {
       const FunctionTypeProto& ftp = ctp.fn_type();
-      std::vector<std::unique_ptr<ConcreteType>> params;
-      for (const ConcreteTypeProto& param : ftp.params()) {
-        XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> ct,
-                             FromProto(param, import_data));
+      std::vector<std::unique_ptr<Type>> params;
+      for (const TypeProto& param : ftp.params()) {
+        XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> ct,
+                             FromProto(param, import_data, file_table));
         params.push_back(std::move(ct));
       }
-      XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> rt,
-                           FromProto(ftp.return_type(), import_data));
+      XLS_ASSIGN_OR_RETURN(
+          std::unique_ptr<Type> rt,
+          FromProto(ftp.return_type(), import_data, file_table));
       return std::make_unique<FunctionType>(std::move(params), std::move(rt));
     }
-    case ConcreteTypeProto::ConcreteTypeOneofCase::kTokenType: {
+    case TypeProto::TypeOneofCase::kTokenType: {
       return std::make_unique<TokenType>();
     }
-    case ConcreteTypeProto::ConcreteTypeOneofCase::kStructType: {
+    case TypeProto::TypeOneofCase::kStructType: {
       const StructTypeProto& stp = ctp.struct_type();
       const StructDefProto& struct_def_proto = stp.struct_def();
-      XLS_ASSIGN_OR_RETURN(
-          const StructDef* struct_def,
-          import_data.FindStructDef(FromProto(struct_def_proto.span())));
-      std::vector<std::unique_ptr<ConcreteType>> members;
-      for (const ConcreteTypeProto& member_proto : stp.members()) {
-        XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> member,
-                             FromProto(member_proto, import_data));
+      XLS_ASSIGN_OR_RETURN(const StructDef* struct_def,
+                           import_data.FindStructDef(
+                               FromProto(struct_def_proto.span(), file_table)));
+      std::vector<std::unique_ptr<Type>> members;
+      for (const TypeProto& member_proto : stp.members()) {
+        XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> member,
+                             FromProto(member_proto, import_data, file_table));
         members.push_back(std::move(member));
       }
       return std::make_unique<StructType>(std::move(members), *struct_def);
     }
-    case ConcreteTypeProto::ConcreteTypeOneofCase::kMetaType: {
-      XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> wrapped,
-                           FromProto(ctp.meta_type().wrapped(), import_data));
+    case TypeProto::TypeOneofCase::kProcType: {
+      const ProcTypeProto& ptp = ctp.proc_type();
+      const ProcDefProto& proc_def_proto = ptp.proc_def();
+      XLS_ASSIGN_OR_RETURN(const ProcDef* proc_def,
+                           import_data.FindProcDef(
+                               FromProto(proc_def_proto.span(), file_table)));
+      std::vector<std::unique_ptr<Type>> members;
+      for (const TypeProto& member_proto : ptp.members()) {
+        XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> member,
+                             FromProto(member_proto, import_data, file_table));
+        members.push_back(std::move(member));
+      }
+      return std::make_unique<ProcType>(std::move(members), *proc_def);
+    }
+    case TypeProto::TypeOneofCase::kMetaType: {
+      XLS_ASSIGN_OR_RETURN(
+          std::unique_ptr<Type> wrapped,
+          FromProto(ctp.meta_type().wrapped(), import_data, file_table));
       return std::make_unique<MetaType>(std::move(wrapped));
     }
-    default:
-      return absl::UnimplementedError(
-          "TypeInfoFromProto: not yet implemented for "
-          "ConcreteTypeProto->ConcreteType "
-          "conversion: " +
-          ctp.ShortDebugString());
+    case TypeProto::TypeOneofCase::kChannelType: {
+      break;  // Not yet implemented.
+    }
+    case TypeProto::TypeOneofCase::kBitsConstructorType: {
+      const BitsConstructorTypeProto& bctp = ctp.bits_constructor_type();
+      XLS_ASSIGN_OR_RETURN(TypeDim dim,
+                           FromProto(bctp.is_signed(), file_table));
+      return std::make_unique<BitsConstructorType>(std::move(dim));
+    }
+    case TypeProto::TypeOneofCase::TYPE_ONEOF_NOT_SET:
+      return absl::InvalidArgumentError("TypeProto has no type set: " +
+                                        ctp.ShortDebugString());
   }
+  return absl::UnimplementedError(
+      "TypeInfoFromProto: not yet implemented for "
+      "TypeProto->Type "
+      "conversion: " +
+      ctp.ShortDebugString());
 }
 
-absl::StatusOr<std::string> ToHumanString(const ConcreteTypeProto& ctp,
-                                          const ImportData& import_data) {
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<ConcreteType> ct,
-                       FromProto(ctp, import_data));
+absl::StatusOr<std::string> ToHumanString(const TypeProto& ctp,
+                                          const ImportData& import_data,
+                                          FileTable& file_table) {
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Type> ct,
+                       FromProto(ctp, import_data, file_table));
   return ct->ToString();
 }
 
@@ -598,8 +762,6 @@ absl::StatusOr<AstNodeKind> FromProto(AstNodeKindProto p) {
       return AstNodeKind::kNameDef;
     case AST_NODE_KIND_NAME_REF:
       return AstNodeKind::kNameRef;
-    case AST_NODE_KIND_CONST_REF:
-      return AstNodeKind::kConstRef;
     case AST_NODE_KIND_BUILTIN_NAME_DEF:
       return AstNodeKind::kBuiltinNameDef;
     case AST_NODE_KIND_CONDITIONAL:
@@ -622,6 +784,8 @@ absl::StatusOr<AstNodeKind> FromProto(AstNodeKindProto p) {
       return AstNodeKind::kParam;
     case AST_NODE_KIND_FUNCTION:
       return AstNodeKind::kFunction;
+    case AST_NODE_KIND_FUNCTION_REF:
+      return AstNodeKind::kFunctionRef;
     case AST_NODE_KIND_PROC:
       return AstNodeKind::kProc;
     case AST_NODE_KIND_ARRAY:
@@ -630,6 +794,8 @@ absl::StatusOr<AstNodeKind> FromProto(AstNodeKindProto p) {
       return AstNodeKind::kString;
     case AST_NODE_KIND_STRUCT_INSTANCE:
       return AstNodeKind::kStructInstance;
+    case AST_NODE_KIND_STRUCT_MEMBER:
+      return AstNodeKind::kStructMember;
     case AST_NODE_KIND_NAME_DEF_TREE:
       return AstNodeKind::kNameDefTree;
     case AST_NODE_KIND_SPLAT_STRUCT_INSTANCE:
@@ -678,6 +844,8 @@ absl::StatusOr<AstNodeKind> FromProto(AstNodeKindProto p) {
       return AstNodeKind::kEnumDef;
     case AST_NODE_KIND_STRUCT_DEF:
       return AstNodeKind::kStructDef;
+    case AST_NODE_KIND_PROC_DEF:
+      return AstNodeKind::kProcDef;
     case AST_NODE_KIND_QUICK_CHECK:
       return AstNodeKind::kQuickCheck;
     case AST_NODE_KIND_XLS_TUPLE:
@@ -696,31 +864,55 @@ absl::StatusOr<AstNodeKind> FromProto(AstNodeKindProto p) {
       return AstNodeKind::kParametricBinding;
     case AST_NODE_KIND_TUPLE_INDEX:
       return AstNodeKind::kTupleIndex;
-    case AST_NODE_KIND_BLOCK:
-      return AstNodeKind::kBlock;
+    case AST_NODE_KIND_STATEMENT_BLOCK:
+      return AstNodeKind::kStatementBlock;
     case AST_NODE_KIND_UNROLL_FOR:
       return AstNodeKind::kUnrollFor;
     case AST_NODE_KIND_STATEMENT:
       return AstNodeKind::kStatement;
+    case AST_NODE_KIND_ZERO_MACRO:
+      return AstNodeKind::kZeroMacro;
+    case AST_NODE_KIND_ALL_ONES_MACRO:
+      return AstNodeKind::kAllOnesMacro;
+    case AST_NODE_KIND_CONST_ASSERT:
+      return AstNodeKind::kConstAssert;
+    case AST_NODE_KIND_PROC_MEMBER:
+      return AstNodeKind::kProcMember;
+    case AST_NODE_KIND_REST_OF_TUPLE:
+      return AstNodeKind::kRestOfTuple;
+    case AST_NODE_KIND_IMPL:
+      return AstNodeKind::kImpl;
+    case AST_NODE_KIND_VERBATIM_NODE:
+      return AstNodeKind::kVerbatimNode;
+    case AST_NODE_KIND_USE:
+      return AstNodeKind::kUse;
+    case AST_NODE_KIND_USE_TREE_ENTRY:
+      return AstNodeKind::kUseTreeEntry;
+    case AST_NODE_KIND_LAMBDA:
+      return AstNodeKind::kLambda;
     // Note: since this is a proto enum there are sentinel values defined in
-    // addition to the "real" above, which is why the enumeration of cases is
-    // not exhaustive.
+    // addition to the "real" above. Return an invalid argument error.
     case AST_NODE_KIND_INVALID:
-    default:
+    case AST_NODE_KIND_CONST_REF:  // Removed.
+    case AstNodeKindProto_INT_MIN_SENTINEL_DO_NOT_USE_:
+    case AstNodeKindProto_INT_MAX_SENTINEL_DO_NOT_USE_:
       return absl::InvalidArgumentError(
           absl::StrCat("Unknown AstNodeKindProto: ", p));
   }
+  ABSL_UNREACHABLE();
 }
 
 }  // namespace
 
 absl::StatusOr<std::string> ToHumanString(const AstNodeTypeInfoProto& antip,
-                                          const ImportData& import_data) {
+                                          const ImportData& import_data,
+                                          FileTable& file_table) {
   XLS_ASSIGN_OR_RETURN(std::string type_str,
-                       ToHumanString(antip.type(), import_data));
+                       ToHumanString(antip.type(), import_data, file_table));
   XLS_ASSIGN_OR_RETURN(AstNodeKind kind, FromProto(antip.kind()));
-  XLS_ASSIGN_OR_RETURN(const AstNode* n,
-                       import_data.FindNode(kind, FromProto(antip.span())));
+  XLS_ASSIGN_OR_RETURN(
+      const AstNode* n,
+      import_data.FindNode(kind, FromProto(antip.span(), file_table)));
   std::string node_str = n == nullptr ? std::string("") : n->ToString();
   return absl::StrFormat("%s: %s :: `%s` :: %s", ToHumanString(antip.span()),
                          ToHumanString(antip.kind()), node_str, type_str);
@@ -734,7 +926,7 @@ absl::StatusOr<TypeInfoProto> TypeInfoToProto(const TypeInfo& type_info) {
     Span span;
     AstNodeKind kind;
     const AstNode* node;
-    const ConcreteType* type;
+    const Type* type;
   };
   std::vector<Item> items;
   for (const auto& [node, type] : type_info.dict()) {
@@ -743,9 +935,9 @@ absl::StatusOr<TypeInfoProto> TypeInfoToProto(const TypeInfo& type_info) {
   }
   std::sort(items.begin(), items.end(), [](const Item& lhs, const Item& rhs) {
     return std::make_tuple(lhs.span.start(), lhs.span.limit(),
-                           static_cast<int>(lhs.kind)) <
+                           static_cast<int>(lhs.kind), lhs.node->ToString()) <
            std::make_tuple(rhs.span.start(), rhs.span.limit(),
-                           static_cast<int>(rhs.kind));
+                           static_cast<int>(rhs.kind), rhs.node->ToString());
   });
 
   for (const Item& item : items) {
@@ -755,12 +947,13 @@ absl::StatusOr<TypeInfoProto> TypeInfoToProto(const TypeInfo& type_info) {
 }
 
 absl::StatusOr<std::string> ToHumanString(const TypeInfoProto& tip,
-                                          const ImportData& import_data) {
+                                          const ImportData& import_data,
+                                          FileTable& file_table) {
   std::vector<std::string> lines;
   for (int64_t i = 0; i < tip.nodes_size(); ++i) {
-    XLS_ASSIGN_OR_RETURN(
-        std::string node_str,
-        ToHumanString(tip.nodes(static_cast<int32_t>(i)), import_data));
+    XLS_ASSIGN_OR_RETURN(std::string node_str,
+                         ToHumanString(tip.nodes(static_cast<int32_t>(i)),
+                                       import_data, file_table));
     lines.push_back(std::move(node_str));
   }
   return absl::StrJoin(lines, "\n");

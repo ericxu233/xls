@@ -13,59 +13,63 @@
 // limitations under the License.
 #include "xls/dslx/ir_convert/proc_config_ir_converter.h"
 
-#include <cstdint>
 #include <optional>
-#include <string>
 #include <variant>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/meta/type_traits.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
-#include "absl/strings/str_format.h"
-#include "absl/strings/str_join.h"
-#include "absl/strings/str_replace.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
+#include "absl/types/variant.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/common/visitor.h"
 #include "xls/dslx/constexpr_evaluator.h"
 #include "xls/dslx/frontend/ast.h"
-#include "xls/dslx/frontend/ast_utils.h"
+#include "xls/dslx/frontend/proc_id.h"
 #include "xls/dslx/import_data.h"
 #include "xls/dslx/interp_value.h"
-#include "xls/dslx/ir_convert/extract_conversion_order.h"
-#include "xls/dslx/ir_convert/ir_conversion_utils.h"
+#include "xls/dslx/ir_convert/channel_scope.h"
+#include "xls/dslx/type_system/deduce_utils.h"
 #include "xls/dslx/type_system/parametric_env.h"
 #include "xls/dslx/type_system/type_info.h"
 #include "xls/ir/channel.h"
-#include "xls/ir/channel_ops.h"
 #include "xls/ir/package.h"
 #include "xls/ir/value.h"
 
 namespace xls::dslx {
 namespace {
 
-std::string ProcStackToId(const std::vector<Proc*>& stack) {
-  return absl::StrJoin(stack, "->", [](std::string* out, const Proc* p) {
-    out->append(p->identifier());
-  });
+std::optional<ChannelOrArray> ProcConfigValueToChannelOrArray(
+    ProcConfigValue value) {
+  return absl::visit(
+      Visitor{
+          [](Channel* chan) -> std::optional<ChannelOrArray> { return chan; },
+          [](ChannelArray* ca) -> std::optional<ChannelOrArray> { return ca; },
+          [](ChannelInterface* ci) -> std::optional<ChannelOrArray> {
+            return ci;
+          },
+          [](auto) -> std::optional<ChannelOrArray> { return std::nullopt; },
+      },
+      value);
 }
 
 }  // namespace
 
-ProcConfigIrConverter::ProcConfigIrConverter(Package* package, Function* f,
-                                             TypeInfo* type_info,
+ProcConfigIrConverter::ProcConfigIrConverter(Function* f, TypeInfo* type_info,
                                              ImportData* import_data,
                                              ProcConversionData* proc_data,
+                                             ChannelScope* channel_scope,
                                              const ParametricEnv& bindings,
                                              const ProcId& proc_id)
-    : package_(package),
-      f_(f),
+    : f_(f),
       type_info_(type_info),
       import_data_(import_data),
       proc_data_(proc_data),
+      channel_scope_(channel_scope),
       bindings_(bindings),
       proc_id_(proc_id),
       final_tuple_(nullptr) {
@@ -83,16 +87,23 @@ absl::Status ProcConfigIrConverter::Finalize() {
   XLS_RET_CHECK_EQ(p->members().size(), final_tuple_->members().size());
   for (int i = 0; i < p->members().size(); i++) {
     ProcMember* member = p->members()[i];
-    proc_data_->id_to_members.at(proc_id_)[member->identifier()] =
-        node_to_ir_.at(final_tuple_->members()[i]);
+    ProcConfigValue value = node_to_ir_.at(final_tuple_->members()[i]);
+    proc_data_->id_to_members.at(proc_id_)[member->identifier()] = value;
+    std::optional<ChannelOrArray> channel_or_array =
+        ProcConfigValueToChannelOrArray(value);
+    if (channel_or_array.has_value()) {
+      XLS_RETURN_IF_ERROR(channel_scope_->AssociateWithExistingChannelOrArray(
+          proc_id_, member->name_def(), *channel_or_array));
+    }
   }
 
   return absl::OkStatus();
 }
 
-absl::Status ProcConfigIrConverter::HandleBlock(const Block* node) {
-  XLS_VLOG(4) << "ProcConfigIrConverter::HandleBlock: " << node->ToString()
-              << " : " << node->span().ToString();
+absl::Status ProcConfigIrConverter::HandleStatementBlock(
+    const StatementBlock* node) {
+  VLOG(4) << "ProcConfigIrConverter::HandleStatementBlock: " << node->ToString()
+          << " : " << node->span().ToString(file_table());
   for (const Statement* statement : node->statements()) {
     XLS_RETURN_IF_ERROR(statement->Accept(this));
   }
@@ -104,54 +115,16 @@ absl::Status ProcConfigIrConverter::HandleStatement(const Statement* node) {
 }
 
 absl::Status ProcConfigIrConverter::HandleChannelDecl(const ChannelDecl* node) {
-  XLS_VLOG(4) << "ProcConfigIrConverter::HandleChannelDecl: "
-              << node->ToString() << " : " << node->span().ToString();
-  std::string name = absl::StrCat(ProcStackToId(proc_id_.proc_stack),
-                                  "_chandecl_", node->span().ToString());
-  name = absl::StrReplaceAll(name, {{":", "_"},
-                                    {".", "_"},
-                                    {"-", "_"},
-                                    {"/", "_"},
-                                    {"\\", "_"},
-                                    {">", "_"}});
-  auto concrete_type = type_info_->GetItem(node->type());
-  XLS_RET_CHECK(concrete_type.has_value());
-  XLS_ASSIGN_OR_RETURN(xls::Type * type,
-                       TypeToIr(package_, *concrete_type.value(), bindings_));
-
-  std::optional<int64_t> fifo_depth;
-  if (node->fifo_depth().has_value()) {
-    // Note: warning collect is nullptr since all warnings should have been
-    // flagged in typechecking.
-    XLS_ASSIGN_OR_RETURN(
-        InterpValue iv,
-        ConstexprEvaluator::EvaluateToValue(
-            import_data_, type_info_, /*warning_collector=*/nullptr, bindings_,
-            node->fifo_depth().value()));
-    XLS_ASSIGN_OR_RETURN(Value fifo_depth_value, iv.ConvertToIr());
-    if (!fifo_depth_value.IsBits()) {
-      return absl::InvalidArgumentError(
-          absl::StrFormat("Expected fifo depth to be bits type, got %s.",
-                          fifo_depth_value.ToHumanString()));
-    }
-    XLS_ASSIGN_OR_RETURN(fifo_depth, fifo_depth_value.bits().ToInt64());
-  }
-
-  std::optional<FifoConfig> fifo_config;
-  if (fifo_depth.has_value()) {
-    fifo_config.emplace(FifoConfig{.depth = *fifo_depth});
-  }
-  XLS_ASSIGN_OR_RETURN(
-      StreamingChannel * channel,
-      package_->CreateStreamingChannel(name, ChannelOps::kSendReceive, type,
-                                       /*initial_values=*/{},
-                                       /*fifo_config=*/fifo_config));
-  node_to_ir_[node] = channel;
+  VLOG(4) << "ProcConfigIrConverter::HandleChannelDecl: " << node->ToString()
+          << " : " << node->span().ToString(file_table());
+  XLS_ASSIGN_OR_RETURN(ChannelOrArray channel_or_array,
+                       channel_scope_->DefineChannelOrArray(node));
+  node_to_ir_[node] = ChannelOrArrayToProcConfigValue(channel_or_array);
   return absl::OkStatus();
 }
 
 absl::Status ProcConfigIrConverter::HandleColonRef(const ColonRef* node) {
-  XLS_VLOG(4) << "ProcConfigIrConverter::HandleColonRef: " << node->ToString();
+  VLOG(4) << "ProcConfigIrConverter::HandleColonRef: " << node->ToString();
   XLS_ASSIGN_OR_RETURN(InterpValue const_value, type_info_->GetConstExpr(node));
   XLS_ASSIGN_OR_RETURN(auto ir_value, const_value.ConvertToIr());
   node_to_ir_[node] = ir_value;
@@ -166,9 +139,17 @@ absl::Status ProcConfigIrConverter::HandleFunction(const Function* node) {
   return node->body()->Accept(this);
 }
 
+absl::Status ProcConfigIrConverter::HandleIndex(const Index* node) {
+  VLOG(4) << "ProcConfigIrConverter::HandleIndex: " << node->ToString();
+  XLS_ASSIGN_OR_RETURN(
+      ChannelOrArray channel_or_array,
+      channel_scope_->GetChannelOrArrayForArrayIndex(proc_id_, node));
+  node_to_ir_[node] = ChannelOrArrayToProcConfigValue(channel_or_array);
+  return absl::OkStatus();
+}
+
 absl::Status ProcConfigIrConverter::HandleInvocation(const Invocation* node) {
-  XLS_VLOG(4) << "ProcConfigIrConverter::HandleInvocation: "
-              << node->ToString();
+  VLOG(4) << "ProcConfigIrConverter::HandleInvocation: " << node->ToString();
   XLS_ASSIGN_OR_RETURN(InterpValue const_value, type_info_->GetConstExpr(node));
   XLS_ASSIGN_OR_RETURN(auto ir_value, const_value.ConvertToIr());
   node_to_ir_[node] = ir_value;
@@ -176,15 +157,26 @@ absl::Status ProcConfigIrConverter::HandleInvocation(const Invocation* node) {
 }
 
 absl::Status ProcConfigIrConverter::HandleLet(const Let* node) {
-  XLS_VLOG(4) << "ProcConfigIrConverter::HandleLet : " << node->ToString();
+  VLOG(4) << "ProcConfigIrConverter::HandleLet : " << node->ToString();
   XLS_RETURN_IF_ERROR(node->rhs()->Accept(this));
 
-  if (ChannelDecl* decl = dynamic_cast<ChannelDecl*>(node->rhs());
-      decl != nullptr) {
-    Channel* channel = std::get<Channel*>(node_to_ir_.at(decl));
+  if (ChannelDecl* decl = dynamic_cast<ChannelDecl*>(node->rhs())) {
     std::vector<NameDefTree::Leaf> leaves = node->name_def_tree()->Flatten();
-    node_to_ir_[std::get<NameDef*>(leaves[0])] = channel;
-    node_to_ir_[std::get<NameDef*>(leaves[1])] = channel;
+    XLS_RET_CHECK_EQ(leaves.size(), 2);
+    for (int i = 0; i < 2; i++) {
+      if (std::holds_alternative<NameDef*>(leaves[i])) {
+        NameDef* name_def = std::get<NameDef*>(leaves[i]);
+        XLS_ASSIGN_OR_RETURN(
+            ChannelOrArray target,
+            channel_scope_->AssociateWithExistingChannelOrArray(
+                proc_id_, name_def, decl));
+        node_to_ir_[name_def] = ChannelOrArrayToProcConfigValue(target);
+        continue;
+      }
+      // Type checking will error before now, if it's not one of these.
+      XLS_RET_CHECK(std::holds_alternative<WildcardPattern*>(leaves[i]) ||
+                    std::holds_alternative<RestOfTuple*>(leaves[i]));
+    }
   } else {
     if (!node->name_def_tree()->is_leaf()) {
       return absl::UnimplementedError(
@@ -198,7 +190,13 @@ absl::Status ProcConfigIrConverter::HandleLet(const Let* node) {
           absl::StrCat("Let RHS not evaluated as constexpr: ", def->ToString(),
                        " : ", node->rhs()->ToString()));
     }
-    auto value = node_to_ir_.at(node->rhs());
+    ProcConfigValue value = node_to_ir_.at(node->rhs());
+    std::optional<ChannelOrArray> channel_or_array =
+        ProcConfigValueToChannelOrArray(value);
+    if (channel_or_array.has_value()) {
+      XLS_RETURN_IF_ERROR(channel_scope_->AssociateWithExistingChannelOrArray(
+          proc_id_, def, *channel_or_array));
+    }
     node_to_ir_[def] = value;
   }
 
@@ -206,7 +204,7 @@ absl::Status ProcConfigIrConverter::HandleLet(const Let* node) {
 }
 
 absl::Status ProcConfigIrConverter::HandleNameRef(const NameRef* node) {
-  XLS_VLOG(4) << "ProcConfigIrConverter::HandleNameRef : " << node->ToString();
+  VLOG(4) << "ProcConfigIrConverter::HandleNameRef : " << node->ToString();
   const NameDef* name_def = std::get<const NameDef*>(node->name_def());
   auto iter = node_to_ir_.find(name_def);
   if (iter == node_to_ir_.end()) {
@@ -226,7 +224,7 @@ absl::Status ProcConfigIrConverter::HandleNumber(const Number* node) {
 
 absl::Status ProcConfigIrConverter::HandleParam(const Param* node) {
   // Matches a param AST node to the actual arg for this Proc instance.
-  XLS_VLOG(4) << "ProcConfigIrConverter::HandleParam: " << node->ToString();
+  VLOG(4) << "ProcConfigIrConverter::HandleParam: " << node->ToString();
 
   int param_index = -1;
   for (int i = 0; i < f_->params().size(); i++) {
@@ -238,21 +236,28 @@ absl::Status ProcConfigIrConverter::HandleParam(const Param* node) {
   XLS_RET_CHECK_NE(param_index, -1);
   if (!proc_data_->id_to_config_args.contains(proc_id_)) {
     return absl::InternalError(absl::StrCat(
-        "Proc ID \"", proc_id_.ToString(), "\" was not found in arg mapping."));
+        "Proc ID \"", proc_id_.ToString(),
+        "\" was not found in arg mapping; this can occur if multiple procs are "
+        "defined in a test file and IR evaluation is used."));
   }
 
-  node_to_ir_[node->name_def()] =
+  ProcConfigValue value =
       proc_data_->id_to_config_args.at(proc_id_)[param_index];
+  std::optional<ChannelOrArray> channel_or_array =
+      ProcConfigValueToChannelOrArray(value);
+  if (channel_or_array.has_value()) {
+    XLS_RETURN_IF_ERROR(channel_scope_->AssociateWithExistingChannelOrArray(
+        proc_id_, node->name_def(), *channel_or_array));
+  }
+  node_to_ir_[node->name_def()] = value;
   return absl::OkStatus();
 }
 
 absl::Status ProcConfigIrConverter::HandleSpawn(const Spawn* node) {
-  XLS_VLOG(4) << "ProcConfigIrConverter::HandleSpawn : " << node->ToString();
+  VLOG(4) << "ProcConfigIrConverter::HandleSpawn : " << node->ToString();
   std::vector<ProcConfigValue> config_args;
   XLS_ASSIGN_OR_RETURN(Proc * p, ResolveProc(node->callee(), type_info_));
-  std::vector<Proc*> new_stack = proc_id_.proc_stack;
-  new_stack.push_back(p);
-  ProcId new_id{new_stack, instances_[new_stack]++};
+  ProcId new_id = proc_id_factory_.CreateProcId(proc_id_, p);
   for (const auto& arg : node->config()->args()) {
     XLS_RETURN_IF_ERROR(arg->Accept(this));
     config_args.push_back(node_to_ir_.at(arg));
@@ -260,13 +265,13 @@ absl::Status ProcConfigIrConverter::HandleSpawn(const Spawn* node) {
   proc_data_->id_to_config_args[new_id] = config_args;
 
   if (!node->next()->args().empty()) {
-    // Note: warning collect is nullptr since all warnings should have been
+    // Note: warning_collector is nullptr since all warnings should have been
     // flagged in typechecking.
     XLS_ASSIGN_OR_RETURN(
         InterpValue value,
         ConstexprEvaluator::EvaluateToValue(
-            import_data_, type_info_, /*warning_collector=*/nullptr, bindings_,
-            node->next()->args()[0], nullptr));
+            import_data_, type_info_, /* warning_collector= */ nullptr,
+            bindings_, node->next()->args()[0]));
     XLS_ASSIGN_OR_RETURN(auto ir_value, value.ConvertToIr());
     proc_data_->id_to_initial_value[new_id] = ir_value;
   }
@@ -276,12 +281,25 @@ absl::Status ProcConfigIrConverter::HandleSpawn(const Spawn* node) {
 
 absl::Status ProcConfigIrConverter::HandleStructInstance(
     const StructInstance* node) {
-  XLS_VLOG(3) << "ProcConfigIrConverter::HandleStructInstance: "
-              << node->ToString();
+  VLOG(3) << "ProcConfigIrConverter::HandleStructInstance: "
+          << node->ToString();
   XLS_ASSIGN_OR_RETURN(InterpValue const_value, type_info_->GetConstExpr(node));
   XLS_ASSIGN_OR_RETURN(auto ir_value, const_value.ConvertToIr());
   node_to_ir_[node] = ir_value;
   return absl::OkStatus();
+}
+
+absl::Status ProcConfigIrConverter::HandleUnrollFor(const UnrollFor* node) {
+  VLOG(4) << "ProcConfigIrConverter::HandleUnrollFor : " << node->ToString();
+  std::optional<const Expr*> unrolled =
+      type_info_->GetUnrolledLoop(node, bindings_);
+  if (unrolled.has_value()) {
+    XLS_RETURN_IF_ERROR((*unrolled)->Accept(this));
+    return absl::OkStatus();
+  }
+  return absl::InvalidArgumentError(
+      absl::StrCat("unroll_for! should have been unrolled by now at: ",
+                   node->span().ToString(file_table())));
 }
 
 absl::Status ProcConfigIrConverter::HandleXlsTuple(const XlsTuple* node) {

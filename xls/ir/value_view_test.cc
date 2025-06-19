@@ -13,14 +13,17 @@
 // limitations under the License.
 #include "xls/ir/value_view.h"
 
+#include <strings.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <vector>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/base/casts.h"
 #include "absl/status/status.h"
+#include "absl/types/span.h"
 #include "xls/common/bits_util.h"
 #include "xls/common/math_util.h"
 #include "xls/common/status/matchers.h"
@@ -28,7 +31,8 @@
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
-#include "xls/ir/value_helpers.h"
+#include "xls/ir/value.h"
+#include "xls/ir/value_utils.h"
 
 namespace xls {
 namespace {
@@ -112,7 +116,7 @@ TEST(PackedBitViewTest, ExtractsUnalignedReallyBigs) {
 
   BitsRope rope(kElementWidth + kBitOffset);
   for (int i = 0; i < kBitOffset; i++) {
-    rope.push_back(0);
+    rope.push_back(0);  // NOLINT(modernize-use-bool-literals)
   }
   int current_bit = 0;
   int current_byte = 0;
@@ -142,7 +146,7 @@ template <int64_t kBitWidth>
 absl::Status TestWidthAndOffset(int bit_offset) {
   BitsRope rope(kBitWidth + bit_offset);
   for (int i = 0; i < bit_offset; i++) {
-    rope.push_back(false);
+    rope.push_back(0);  // NOLINT(modernize-use-bool-literals)
   }
   int current_bit = 0;
   int current_byte = 0;
@@ -213,7 +217,7 @@ TEST(PackedArrayViewTest, ExtractsUnaligned) {
 
   BitsRope rope(kElementBits * kNumElements + kBitOffset);
   for (int i = 0; i < kBitOffset; i++) {
-    rope.push_back(0);
+    rope.push_back(0);  // NOLINT(modernize-use-bool-literals)
   }
 
   // Fill the n'th element with n (for each element).
@@ -248,7 +252,7 @@ TEST(PackedTupleViewTest, ExtractsSimpleUnaligned) {
   BitsRope rope(TupleT::kBitCount + kBitOffset);
 
   for (int i = 0; i < kBitOffset; i++) {
-    rope.push_back(0);
+    rope.push_back(0);  // NOLINT(modernize-use-bool-literals)
   }
   // Iterate low-to-high, keeping LSb-first ordering.
   absl::Span<const Value> elements = value.elements();

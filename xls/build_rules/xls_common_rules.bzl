@@ -14,6 +14,13 @@
 
 """This module contains helpers for XLS build rules."""
 
+load(
+    "//xls/build_rules:xls_providers.bzl",
+    "ConvIrInfo",
+    "IrFileInfo",
+    "OptIrArgInfo",
+)
+
 def append_default_to_args(arguments, default_arguments):
     """Returns a dictionary with the default arguments appended to the arguments.
 
@@ -177,6 +184,75 @@ def split_filename(filename):
     if "." not in filename:
         return [filename, None]
     return filename.rsplit(".", 1)
+
+def get_src_like_ir_file_for_xls(attr, files_attr):
+    """Returns the src IR file from a ctx.
+
+    If attr is a IrFileInfo it returns that otherwise returns the single file in the files_attr.
+
+    Args:
+      attr: The attribute to check for an IrFileInfo.
+      files_attr: The files to check for a single file.
+
+    Returns:
+      The src IrFileInfo for the current rule.
+    """
+    if IrFileInfo in attr:
+        return attr[IrFileInfo]
+    elif len(files_attr) == 1:
+        return IrFileInfo(ir_file = files_attr[0])
+    else:
+        fail(msg = "Expected exactly one \"src\" file, found " + str(len(files_attr)))
+
+def get_src_ir_for_xls(ctx):
+    """Returns the src IR file from a ctx.
+
+    Assumes the ctx has a `src` attr, with an IrFileInfo, or exactly one file.
+
+    If no supported provider is available, fails unless the `src` contains exactly one file.
+
+    Args:
+      ctx: The current rule's context object.
+
+    Returns:
+      The src IrFileInfo for the current rule.
+    """
+    return get_src_like_ir_file_for_xls(ctx.attr.src, ctx.files.src)
+
+def get_original_input_files_for_xls(ctx):
+    """Returns the src IR file from a ctx.
+
+    Assumes the ctx has a `src` attr, with a ConvIrInfo provider, or some number
+    of files.  If the providers are available, uses the appropriate field for
+    the source file.
+
+    Args:
+      ctx: The current rule's context object.
+
+    Returns:
+      The files for the current rule.
+    """
+
+    if ConvIrInfo in ctx.attr.src:
+        return ctx.attr.src[ConvIrInfo].original_input_files
+    else:
+        return ctx.files.src
+
+def get_input_infos(value):
+    """Returns the ConvIrInfo and OptIrInfo if present.
+
+    Args:
+      value: A source attribute.
+
+    Returns:
+      A list of ConvIrInfo and OptIrInfo if present.
+    """
+    out = []
+    if OptIrArgInfo in value:
+        out.append(value[OptIrArgInfo])
+    if ConvIrInfo in value:
+        out.append(value[ConvIrInfo])
+    return out
 
 def get_runfiles_for_xls(ctx, additional_runfiles_list, additional_files_list):
     """Returns the runfiles from a ctx.

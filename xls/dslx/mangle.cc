@@ -21,13 +21,16 @@
 
 #include "absl/algorithm/container.h"
 #include "absl/container/btree_set.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_replace.h"
-#include "xls/common/status/ret_check.h"
+#include "xls/dslx/interp_value.h"
+#include "xls/dslx/type_system/parametric_env.h"
+#include "xls/ir/format_preference.h"
 
 namespace xls::dslx {
 namespace {
@@ -46,7 +49,7 @@ std::string MangleInterpValue(const InterpValue& value) {
     return absl::StrReplaceAll(s, {{"-", "m"}});
   }
 
-  XLS_CHECK(value.IsArray() || value.IsTuple())
+  CHECK(value.IsArray() || value.IsTuple())
       << "Only bits, enums, arrays, or tuples can be name-mangled.";
   std::vector<std::string> members;
   for (const auto& member : value.GetValuesOrDie()) {
@@ -66,7 +69,7 @@ std::string MangleInterpValue(const InterpValue& value) {
 absl::StatusOr<std::string> MangleDslxName(
     std::string_view module_name, std::string_view function_name,
     CallingConvention convention, const absl::btree_set<std::string>& free_keys,
-    const ParametricEnv* parametric_env) {
+    const ParametricEnv* parametric_env, std::string_view scope) {
   absl::btree_set<std::string> parametric_env_keys;
   std::vector<std::string> parametric_env_values;
   if (parametric_env != nullptr) {
@@ -94,12 +97,18 @@ absl::StatusOr<std::string> MangleDslxName(
   }
   std::string module_name_str = absl::StrReplaceAll(module_name, {{".", "_"}});
 
+  std::string scope_str = "";
+  if (!scope.empty()) {
+    scope_str = absl::StrCat(scope, "__");
+  }
+
   std::string suffix;
   if (!parametric_env_values.empty()) {
     suffix = absl::StrCat("__", absl::StrJoin(parametric_env_values, "_"));
   }
-  std::string mangled_name = absl::StrFormat(
-      "__%s%s__%s%s", convention_str, module_name_str, function_name, suffix);
+  std::string mangled_name =
+      absl::StrFormat("__%s%s__%s%s%s", convention_str, module_name_str,
+                      scope_str, function_name, suffix);
   if (convention == CallingConvention::kProcNext) {
     // Note that the identifier for the next function of a proc is used to
     // identify the proc in the conversion. The config function of a proc is

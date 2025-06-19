@@ -17,14 +17,17 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "xls/common/status/matchers.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/interp_value.h"
 
 namespace xls::dslx {
 namespace {
 
 TEST(InterpreterStackTest, PushThenDoublePop) {
-  InterpreterStack stack;
+  FileTable file_table;
+  InterpreterStack stack(file_table);
   EXPECT_TRUE(stack.empty());
   stack.Push(InterpValue::MakeU32(42));
   EXPECT_FALSE(stack.empty());
@@ -33,8 +36,8 @@ TEST(InterpreterStackTest, PushThenDoublePop) {
   EXPECT_TRUE(popped.Eq(InterpValue::MakeU32(42)));
   EXPECT_TRUE(stack.empty());
   EXPECT_THAT(stack.Pop(),
-              status_testing::StatusIs(absl::StatusCode::kInternal,
-                                       "Tried to pop off an empty stack."));
+              absl_testing::StatusIs(absl::StatusCode::kInternal,
+                                     "Tried to pop off an empty stack."));
 }
 
 }  // namespace

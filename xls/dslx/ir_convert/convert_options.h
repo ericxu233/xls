@@ -15,7 +15,10 @@
 #ifndef XLS_DSLX_IR_CONVERT_CONVERT_OPTIONS_H_
 #define XLS_DSLX_IR_CONVERT_CONVERT_OPTIONS_H_
 
+#include <optional>
+
 #include "xls/dslx/warning_kind.h"
+#include "xls/ir/channel.h"
 
 namespace xls::dslx {
 
@@ -37,10 +40,30 @@ struct ConvertOptions {
   // Should warnings be treated as errors?
   bool warnings_as_errors = true;
 
-  // Set of warnings that are enabled.
+  // Set of warnings used in DSLX typechecking.
   //
   // Note that this is only used in IR conversion routines that do typechecking.
-  WarningKindSet enabled_warnings = kAllWarningsSet;
+  WarningKindSet warnings = kDefaultWarningsSet;
+
+  // Should #[test] and #[test_proc] entities be emitted to IR.
+  bool convert_tests = false;
+
+  // If present, the default FIFO config to use for any FIFO that does not
+  // specify a config.
+  std::optional<FifoConfig> default_fifo_config;
+
+  // Should we convert to proc-scoped channels after IR conversion with global
+  // channels?
+  // TODO: https://github.com/google/xls/issues/2078 - Remove this after
+  // lower_to_proc_scoped_channels is turned on for all tests.
+  bool proc_scoped_channels = false;
+
+  // Whether to use type system v2 to perform type checking.
+  bool type_inference_v2 = false;
+
+  // Should we generate proc-scoped channels without global channels as an
+  // intermediate step? See https://github.com/google/xls/issues/2078
+  bool lower_to_proc_scoped_channels = false;
 };
 
 }  // namespace xls::dslx

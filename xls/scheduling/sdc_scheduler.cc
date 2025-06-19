@@ -14,6 +14,7 @@
 
 #include "xls/scheduling/sdc_scheduler.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -27,27 +28,27 @@
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/log_lines.h"
-#include "xls/common/logging/logging.h"
-#include "xls/common/logging/vlog_is_on.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/ir/channel.h"
-#include "xls/ir/function.h"
 #include "xls/ir/function_base.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
-#include "xls/ir/node_util.h"
 #include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/ir/proc.h"
+#include "xls/ir/state_element.h"
+#include "xls/scheduling/schedule_graph.h"
+#include "xls/scheduling/schedule_util.h"
 #include "xls/scheduling/scheduling_options.h"
 #include "ortools/math_opt/cpp/math_opt.h"
 
@@ -58,34 +59,23 @@ namespace {
 using DelayMap = absl::flat_hash_map<Node*, int64_t>;
 namespace math_opt = ::operations_research::math_opt;
 
-// A helper function to compute each node's delay by calling the delay estimator
-absl::StatusOr<DelayMap> ComputeNodeDelays(
-    FunctionBase* f, const DelayEstimator& delay_estimator) {
-  DelayMap result;
-  for (Node* node : f->nodes()) {
-    XLS_ASSIGN_OR_RETURN(result[node],
-                         delay_estimator.GetOperationDelayInPs(node));
-  }
-  return result;
-}
+constexpr double kObjectiveScaling = 1024;
 
-// All transitive children (operands, operands of operands, etc.) of the given
-// node.
-absl::btree_set<Node*, Node::NodeIdLessThan> Descendants(Node* root) {
-  std::vector<Node*> stack;
-  stack.push_back(root);
-  absl::btree_set<Node*, Node::NodeIdLessThan> discovered;
-  while (!stack.empty()) {
-    Node* popped = stack.back();
-    stack.pop_back();
-    if (!discovered.contains(popped)) {
-      discovered.insert(popped);
-      for (Node* child : popped->operands()) {
-        stack.push_back(child);
-      }
+// A helper function to compute each node's delay by calling the delay
+// estimator; treats all dead-after-synthesis nodes as having a delay of 0.
+absl::StatusOr<DelayMap> ComputeNodeDelays(
+    const ScheduleGraph& graph, const DelayEstimator& delay_estimator) {
+  DelayMap result;
+  for (const ScheduleNode& schedule_node : graph.nodes()) {
+    Node* node = schedule_node.node;
+    if (schedule_node.is_dead_after_synthesis) {
+      result[node] = 0;
+    } else {
+      XLS_ASSIGN_OR_RETURN(result[node],
+                           delay_estimator.GetOperationDelayInPs(node));
     }
   }
-  return discovered;
+  return result;
 }
 
 // Compute all-pairs longest distance between all nodes in `f`. The distance
@@ -95,27 +85,27 @@ absl::btree_set<Node*, Node::NodeIdLessThan> Descendants(Node* root) {
 // `distances_to_node` where `distances_to_node[y][x]` (if present) is the
 // critical-path distance from `x` to `y`.
 absl::flat_hash_map<Node*, absl::flat_hash_map<Node*, int64_t>>
-ComputeDistancesToNodes(FunctionBase* f, const NodeIterator& topo_sort,
-                        const DelayMap& delay_map) {
+ComputeDistancesToNodes(const ScheduleGraph& graph, const DelayMap& delay_map) {
   absl::flat_hash_map<Node*, absl::flat_hash_map<Node*, int64_t>>
       distances_to_node;
-  distances_to_node.reserve(f->node_count());
-  for (Node* node : topo_sort) {
+  distances_to_node.reserve(graph.nodes().size());
+  for (const ScheduleNode& schedule_node : graph.nodes()) {
     // Initialize the distance map entry to an empty map.
-    distances_to_node[node];
+    distances_to_node[schedule_node.node];
   }
 
-  for (Node* node : topo_sort) {
-    absl::flat_hash_map<Node*, int64_t>& distances = distances_to_node.at(node);
+  for (const ScheduleNode& schedule_node : graph.nodes()) {
+    absl::flat_hash_map<Node*, int64_t>& distances =
+        distances_to_node.at(schedule_node.node);
 
     // The critical path from `node` to `node` is always `node_delay` long.
-    int64_t node_delay = delay_map.at(node);
-    distances_to_node.at(node)[node] = node_delay;
+    int64_t node_delay = delay_map.at(schedule_node.node);
+    distances_to_node.at(schedule_node.node)[schedule_node.node] = node_delay;
 
     // Compute the critical-path distance from `a` to `node` for all descendants
     // `a` of each operand, extending the critical path from `a` to each operand
     // of `node` by `node_delay`.
-    for (Node* operand : node->operands()) {
+    for (Node* operand : schedule_node.predecessors) {
       for (auto [a, operand_distance] : distances_to_node.at(operand)) {
         auto [it, newly_reachable] =
             distances.try_emplace(a, operand_distance + node_delay);
@@ -129,12 +119,14 @@ ComputeDistancesToNodes(FunctionBase* f, const NodeIterator& topo_sort,
     }
   }
 
-  if (XLS_VLOG_IS_ON(4)) {
-    XLS_VLOG(4) << "All-pairs critical-path distances:";
-    for (Node* target : topo_sort) {
-      XLS_VLOG(4) << absl::StrFormat("  distances to %s:", target->GetName());
-      for (Node* source : topo_sort) {
-        XLS_VLOG(4) << absl::StrFormat(
+  if (VLOG_IS_ON(4)) {
+    VLOG(4) << "All-pairs critical-path distances:";
+    for (const ScheduleNode& schedule_target : graph.nodes()) {
+      Node* target = schedule_target.node;
+      VLOG(4) << absl::StrFormat("  distances to %s:", target->GetName());
+      for (const ScheduleNode& schedule_source : graph.nodes()) {
+        Node* source = schedule_source.node;
+        VLOG(4) << absl::StrFormat(
             "    %s -> %s : %s", source->GetName(), target->GetName(),
             distances_to_node.at(target).contains(source)
                 ? absl::StrCat(distances_to_node.at(target).at(source))
@@ -163,17 +155,18 @@ ComputeDistancesToNodes(FunctionBase* f, const NodeIterator& topo_sort,
 // path *not* including the delay of `b` is *less than* `critical_path_period`.
 absl::flat_hash_map<Node*, std::vector<Node*>>
 ComputeCombinationalDelayConstraints(
-    FunctionBase* f, const NodeIterator& topo_sort, int64_t clock_period_ps,
+    const ScheduleGraph& graph, int64_t clock_period_ps,
     const absl::flat_hash_map<Node*, absl::flat_hash_map<Node*, int64_t>>&
         distances_to_node,
     const DelayMap& delay_map) {
   absl::flat_hash_map<Node*, std::vector<Node*>> result;
-  result.reserve(f->node_count());
-  for (Node* a : topo_sort) {
-    result[a];
+  result.reserve(graph.nodes().size());
+  for (const ScheduleNode& a : graph.nodes()) {
+    result[a.node];
   }
 
-  for (Node* node : topo_sort) {
+  for (const ScheduleNode& schedule_node : graph.nodes()) {
+    Node* node = schedule_node.node;
     const int64_t node_delay = delay_map.at(node);
 
     // For each ancestor `a`, check whether the critical-path length from `a`'s
@@ -192,12 +185,13 @@ ComputeCombinationalDelayConstraints(
     }
   }
 
-  if (XLS_VLOG_IS_ON(4)) {
-    XLS_VLOG(4) << absl::StrFormat("Constraints (clock period: %dps):",
-                                   clock_period_ps);
-    for (Node* node : topo_sort) {
-      XLS_VLOG(4) << absl::StrFormat("  %s: [%s]", node->GetName(),
-                                     absl::StrJoin(result.at(node), ", "));
+  if (VLOG_IS_ON(4)) {
+    VLOG(4) << absl::StrFormat("Constraints (clock period: %dps):",
+                               clock_period_ps);
+    for (const ScheduleNode& schedule_node : graph.nodes()) {
+      Node* node = schedule_node.node;
+      VLOG(4) << absl::StrFormat("  %s: [%s]", node->GetName(),
+                                 absl::StrJoin(result.at(node), ", "));
     }
   }
   return result;
@@ -205,58 +199,99 @@ ComputeCombinationalDelayConstraints(
 
 }  // namespace
 
-SDCSchedulingModel::SDCSchedulingModel(FunctionBase* func,
-                                       const DelayMap& delay_map,
-                                       std::string_view model_name)
-    : func_(func),
-      topo_sort_(TopoSort(func_)),
-      model_(model_name),
+SDCSchedulingModel::SDCSchedulingModel(
+    ScheduleGraph graph, const DelayMap& delay_map,
+    std::optional<int64_t> initiation_interval)
+    : graph_(std::move(graph)),
+      model_(absl::StrCat("sdc_model:", graph_.name())),
       delay_map_(delay_map),
-      last_stage_(model_.AddContinuousVariable(0.0, kInfinity, "last_stage")),
+      initiation_interval_(initiation_interval),
+      last_stage_(model_.AddContinuousVariable(0.0, kMaxStages, "last_stage")),
       cycle_at_sinknode_(model_.AddContinuousVariable(-kInfinity, kInfinity,
                                                       "cycle_at_sinknode")) {
   // when subclassed for Iterative SDC, delay_map_ and distances_to_node_
   // are not used.
   if (!delay_map_.empty()) {
-    distances_to_node_ = ComputeDistancesToNodes(func_, topo_sort_, delay_map_);
+    distances_to_node_ = ComputeDistancesToNodes(graph_, delay_map_);
   }
 
-  for (Node* node : topo_sort_) {
+  for (const ScheduleNode& schedule_node : graph_.nodes()) {
+    Node* node = schedule_node.node;
+    std::string model_node_name =
+        graph_.IsFunctionBaseScoped()
+            ? node->GetName()
+            : absl::StrCat(node->function_base()->name(),
+                           "::", node->GetName());
     cycle_var_.emplace(
-        node, model_.AddContinuousVariable(0.0, kInfinity, node->GetName()));
+        node, model_.AddContinuousVariable(0.0, kMaxStages, model_node_name));
     model_.AddLinearConstraint(
         cycle_var_.at(node) <= last_stage_,
-        absl::StrFormat("pipeline_length:%s", node->GetName()));
+        absl::StrFormat("pipeline_length:%s", model_node_name));
     lifetime_var_.emplace(
         node,
         model_.AddContinuousVariable(
-            0.0, kInfinity, absl::StrFormat("lifetime_%s", node->GetName())));
-  }
-
-  if (func_->IsFunction()) {
-    Function* function = func_->AsFunctionOrDie();
-    // For functions, all parameter nodes must be scheduled in the first stage
-    // of the pipeline...
-    for (Param* param : function->params()) {
-      model_.AddLinearConstraint(cycle_var_.at(param) <= 0,
-                                 absl::StrCat("param:", param->GetName()));
+            0.0, kInfinity, absl::StrFormat("lifetime_%s", model_node_name)));
+    if (node->Is<Next>()) {
+      unwanted_inverse_throughput_var_.emplace(
+          node, model_.AddContinuousVariable(
+                    0.0, kInfinity,
+                    absl::StrFormat("unwanted_inverse_throughput_%s",
+                                    model_node_name)));
     }
 
-    // ... and the return value must be scheduled in the final stage, unless
-    // it's a parameter.
-    if (!function->return_value()->Is<Param>()) {
+    if (schedule_node.schedule_in_first_stage) {
       model_.AddLinearConstraint(
-          cycle_var_.at(function->return_value()) >= last_stage_,
-          absl::StrCat("return:", function->return_value()->GetName()));
+          cycle_var_.at(node) <= 0,
+          absl::StrCat("in_first_stage:", model_node_name));
+    }
+    if (schedule_node.schedule_in_last_stage) {
+      CHECK(!schedule_node.schedule_in_first_stage);
+      model_.AddLinearConstraint(
+          cycle_var_.at(node) >= last_stage_,
+          absl::StrCat("in_last_stage:", model_node_name));
     }
   }
 }
 
+absl::Status SDCSchedulingModel::AddAllDefUseConstraints() {
+  for (const ScheduleNode& schedule_node : graph_.nodes()) {
+    Node* node = schedule_node.node;
+    for (Node* successor : schedule_node.successors) {
+      XLS_RETURN_IF_ERROR(AddDefUseConstraints(node, successor));
+    }
+    if (schedule_node.is_live_out) {
+      XLS_RETURN_IF_ERROR(AddDefUseConstraints(node, std::nullopt));
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::Status SDCSchedulingModel::AddDefUseConstraints(
     Node* node, std::optional<Node*> user) {
+  // Nodes must be scheduled no later than their users.
   XLS_RETURN_IF_ERROR(AddCausalConstraint(node, user));
-  XLS_RETURN_IF_ERROR(AddLifetimeConstraint(node, user));
-  return absl::OkStatus();
+
+  if (node->Is<StateRead>() && user.has_value() && user.value()->Is<Next>()) {
+    Next* next = user.value()->As<Next>();
+    if (next->state_read() == node) {
+      XLS_RETURN_IF_ERROR(AddThroughputConstraint(node->As<StateRead>(), next));
+    }
+    if (next->value() != node && next->predicate() != node) {
+      XLS_RET_CHECK_EQ(next->state_read(), node);
+      // We don't need to keep the param's value alive to this user, so no need
+      // for a lifetime constraint.
+      return absl::OkStatus();
+    }
+  }
+
+  // If the user is dead after synthesis, we don't count its contribution to the
+  // lifetime, assuming the synthesis tool will be able to strip any pipeline
+  // registers used to persist the value.
+  if (user.has_value() &&
+      graph_.GetScheduleNode(*user).is_dead_after_synthesis) {
+    return absl::OkStatus();
+  }
+  return AddLifetimeConstraint(node, user);
 }
 
 absl::Status SDCSchedulingModel::AddCausalConstraint(
@@ -276,9 +311,9 @@ absl::Status SDCSchedulingModel::AddCausalConstraint(
   model_.AddLinearConstraint(
       cycle_at_user - cycle_at_node >= static_cast<double>(min_delay),
       absl::StrFormat("causal_%s_%s", node->GetName(), user_str));
-  XLS_VLOG(2) << "Setting causal constraint: "
-              << absl::StrFormat("cycle[%s] - cycle[%s] ≥ %d", user_str,
-                                 node->GetName(), min_delay);
+  VLOG(2) << "Setting causal constraint: "
+          << absl::StrFormat("cycle[%s] - cycle[%s] ≥ %d", user_str,
+                             node->GetName(), min_delay);
 
   return absl::OkStatus();
 }
@@ -295,9 +330,35 @@ absl::Status SDCSchedulingModel::AddLifetimeConstraint(
   model_.AddLinearConstraint(
       lifetime_at_node + cycle_at_node - cycle_at_user >= 0,
       absl::StrFormat("lifetime_%s_%s", node->GetName(), user_str));
-  XLS_VLOG(2) << "Setting lifetime constraint: "
-              << absl::StrFormat("lifetime[%s] + cycle[%s] - cycle[%s] ≥ 0",
-                                 node->GetName(), node->GetName(), user_str);
+  VLOG(2) << "Setting lifetime constraint: "
+          << absl::StrFormat("lifetime[%s] + cycle[%s] - cycle[%s] ≥ 0",
+                             node->GetName(), node->GetName(), user_str);
+
+  return absl::OkStatus();
+}
+
+absl::Status SDCSchedulingModel::AddThroughputConstraint(StateRead* state_read,
+                                                         Next* next_value) {
+  XLS_RET_CHECK(graph_.IncludesProc());
+
+  StateElement* state_element = state_read->state_element();
+
+  math_opt::Variable cycle_at_param = cycle_var_.at(state_read);
+  math_opt::Variable cycle_at_next = cycle_var_.at(next_value);
+  math_opt::Variable unwanted_inverse_throughput_at_next =
+      unwanted_inverse_throughput_var_.at(next_value);
+
+  model_.AddLinearConstraint(
+      // TODO: https://github.com/google/xls/issues/2071 - incorporate target
+      // throughput in the RHS of this constraint.
+      unwanted_inverse_throughput_at_next + cycle_at_param - cycle_at_next >= 0,
+      absl::StrFormat("throughput_%s_%s", state_read->GetName(),
+                      next_value->GetName()));
+  VLOG(2) << "Setting throughput constraint: "
+          << absl::StreamFormat(
+                 "unwanted_inverse_throughput[%s] + cycle[%s] - cycle[%s] ≥ 0",
+                 state_element->name(), state_read->GetName(),
+                 next_value->GetName());
 
   return absl::OkStatus();
 }
@@ -306,25 +367,29 @@ absl::Status SDCSchedulingModel::AddLifetimeConstraint(
 // necessary while enforcing a target II.
 absl::Status SDCSchedulingModel::AddBackedgeConstraints(
     const BackedgeConstraint& constraint) {
-  Proc* proc = dynamic_cast<Proc*>(func_);
-  if (proc == nullptr) {
-    return absl::OkStatus();
-  }
-  const int64_t II = proc->GetInitiationInterval().value_or(1);
+  const int64_t II = initiation_interval_.value_or(1);
 
-  using StateIndex = int64_t;
-  for (StateIndex i = 0; i < proc->GetStateElementCount(); ++i) {
-    Node* const state = proc->GetStateParam(i);
-    Node* const next = proc->GetNextStateElement(i);
-    if (next == state) {
+  for (const ScheduleBackedge& backedge : graph_.backedges()) {
+    if (!backedge.distance.has_value() ||
+        !std::holds_alternative<LessThanInitiationInterval>(
+            *backedge.distance)) {
+      return absl::UnimplementedError(
+          "Unsupported backedge type in SDC schedule");
+    }
+    if (II <= 0) {
+      // Distance of backedge is constrained by the II, but the worst-case
+      // throughput constraint is not set.
       continue;
     }
-    XLS_VLOG(2) << "Setting backedge constraint (II): "
-                << absl::StrFormat("cycle[%s] - cycle[%s] < %d",
-                                   next->GetName(), state->GetName(), II);
+
+    VLOG(2) << "Setting backedge constraint (II): "
+            << absl::StrFormat("cycle[%s] - cycle[%s] < %d",
+                               backedge.source->GetName(),
+                               backedge.destination->GetName(), II);
     backedge_constraint_.emplace(
-        std::make_pair(state, next),
-        DiffLessThanConstraint(next, state, II, "backedge"));
+        std::make_pair(backedge.destination, backedge.source),
+        DiffLessThanConstraint(backedge.source, backedge.destination, II,
+                               "backedge"));
   }
 
   return absl::OkStatus();
@@ -353,6 +418,10 @@ absl::Status SDCSchedulingModel::AddSchedulingConstraint(
     return AddSendThenRecvConstraint(
         std::get<SendThenRecvConstraint>(constraint));
   }
+  if (std::holds_alternative<SameChannelConstraint>(constraint)) {
+    return AddSameChannelConstraint(
+        std::get<SameChannelConstraint>(constraint));
+  }
   return absl::InternalError("Unhandled scheduling constraint type");
 }
 
@@ -360,10 +429,10 @@ absl::Status SDCSchedulingModel::AddIOConstraint(
     const IOConstraint& constraint) {
   // Map from channel name to set of nodes that send/receive on that channel.
   absl::flat_hash_map<std::string, std::vector<Node*>> channel_to_nodes;
-  for (Node* node : topo_sort_) {
+  for (const ScheduleNode& schedule_node : graph_.nodes()) {
+    Node* node = schedule_node.node;
     if (node->Is<Receive>() || node->Is<Send>()) {
-      XLS_ASSIGN_OR_RETURN(Channel * channel, GetChannelUsedByNode(node));
-      channel_to_nodes[channel->name()].push_back(node);
+      channel_to_nodes[node->As<ChannelNode>()->channel_name()].push_back(node);
     }
   }
 
@@ -386,11 +455,11 @@ absl::Status SDCSchedulingModel::AddIOConstraint(
         continue;
       }
 
-      XLS_VLOG(2) << "Setting IO constraint: "
-                  << absl::StrFormat("%d ≤ cycle[%s] - cycle[%s] ≤ %d",
-                                     constraint.MinimumLatency(),
-                                     target->GetName(), source->GetName(),
-                                     constraint.MaximumLatency());
+      VLOG(2) << "Setting IO constraint: "
+              << absl::StrFormat("%d ≤ cycle[%s] - cycle[%s] ≤ %d",
+                                 constraint.MinimumLatency(), target->GetName(),
+                                 source->GetName(),
+                                 constraint.MaximumLatency());
       io_constraints_[constraint].push_back({
           .lower = DiffAtLeastConstraint(target, source,
                                          constraint.MinimumLatency(), "io"),
@@ -410,8 +479,8 @@ absl::Status SDCSchedulingModel::AddNodeInCycleConstraint(
 
   model_.AddLinearConstraint(cycle_var_.at(node) == static_cast<double>(cycle),
                              absl::StrFormat("nic_%s", node->GetName()));
-  XLS_VLOG(2) << "Setting node-in-cycle constraint: "
-              << absl::StrFormat("cycle[%s] = %d", node->GetName(), cycle);
+  VLOG(2) << "Setting node-in-cycle constraint: "
+          << absl::StrFormat("cycle[%s] = %d", node->GetName(), cycle);
 
   return absl::OkStatus();
 }
@@ -423,25 +492,26 @@ absl::Status SDCSchedulingModel::AddDifferenceConstraint(
   int64_t max_difference = constraint.GetMaxDifference();
   DiffAtMostConstraint(a, b, max_difference, "diff");
 
-  XLS_VLOG(2) << "Setting difference constraint: "
-              << absl::StrFormat("cycle[%s] - cycle[%s] ≤ %d", a->GetName(),
-                                 b->GetName(), max_difference);
+  VLOG(2) << "Setting difference constraint: "
+          << absl::StrFormat("cycle[%s] - cycle[%s] ≤ %d", a->GetName(),
+                             b->GetName(), max_difference);
 
   return absl::OkStatus();
 }
 
 absl::Status SDCSchedulingModel::AddRFSLConstraint(
     const RecvsFirstSendsLastConstraint& constraint) {
-  for (Node* node : topo_sort_) {
+  for (const ScheduleNode& schedule_node : graph_.nodes()) {
+    Node* node = schedule_node.node;
     if (node->Is<Receive>()) {
-      XLS_VLOG(2) << "Setting receive-in-first-cycle constraint: "
-                  << absl::StrFormat("cycle[%s] ≤ 0", node->GetName());
+      VLOG(2) << "Setting receive-in-first-cycle constraint: "
+              << absl::StrFormat("cycle[%s] ≤ 0", node->GetName());
       model_.AddLinearConstraint(cycle_var_.at(node) <= 0,
                                  absl::StrFormat("recv_%s", node->GetName()));
     } else if (node->Is<Send>()) {
-      XLS_VLOG(2) << "Setting send-in-last-cycle constraint: "
-                  << absl::StrFormat("%s ≤ cycle[%s]", last_stage_.name(),
-                                     node->GetName());
+      VLOG(2) << "Setting send-in-last-cycle constraint: "
+              << absl::StrFormat("%s ≤ cycle[%s]", last_stage_.name(),
+                                 node->GetName());
       model_.AddLinearConstraint(cycle_var_.at(node) >= last_stage_,
                                  absl::StrFormat("send_%s", node->GetName()));
     }
@@ -452,12 +522,13 @@ absl::Status SDCSchedulingModel::AddRFSLConstraint(
 
 absl::Status SDCSchedulingModel::AddSendThenRecvConstraint(
     const SendThenRecvConstraint& constraint) {
-  XLS_CHECK_GE(constraint.MinimumLatency(), 0);
+  CHECK_GE(constraint.MinimumLatency(), 0);
   if (constraint.MinimumLatency() == 0) {
     return absl::OkStatus();
   }
 
-  for (Node* recv : topo_sort_) {
+  for (const ScheduleNode& schedule_node : graph_.nodes()) {
+    Node* recv = schedule_node.node;
     if (!recv->Is<Receive>()) {
       continue;
     }
@@ -500,13 +571,108 @@ absl::Status SDCSchedulingModel::AddSendThenRecvConstraint(
   return absl::OkStatus();
 }
 
-void SDCSchedulingModel::SetObjective() {
+absl::Status SDCSchedulingModel::AddSameChannelConstraint(
+    const SameChannelConstraint& constraint) {
+  CHECK_GE(constraint.MinimumLatency(), 0);
+  if (constraint.MinimumLatency() == 0) {
+    return absl::OkStatus();
+  }
+
+  // Collects all operations on each channel in topological order; used to order
+  // arbitrary-static-order channels.
+  absl::flat_hash_map<ChannelRef, std::vector<Node*>> ops_on_channel;
+  // Used for all other channels.
+  absl::flat_hash_map<
+      Node*, absl::flat_hash_map<ChannelRef,
+                                 absl::btree_set<Node*, Node::NodeIdLessThan>>>
+      node_io_dependencies;
+  node_io_dependencies.reserve(graph_.nodes().size());
+  for (const ScheduleNode& schedule_node : graph_.nodes()) {
+    Node* node = schedule_node.node;
+    absl::flat_hash_map<ChannelRef,
+                        absl::btree_set<Node*, Node::NodeIdLessThan>>&
+        io_dependencies = node_io_dependencies[node];
+    for (Node* operand : schedule_node.predecessors) {
+      auto it = node_io_dependencies.find(operand);
+      if (it == node_io_dependencies.end()) {
+        continue;
+      }
+      for (const auto& [channel, nodes] : it->second) {
+        io_dependencies[channel].insert(nodes.begin(), nodes.end());
+      }
+    }
+
+    if (!node->Is<ChannelNode>()) {
+      continue;
+    }
+    XLS_ASSIGN_OR_RETURN(ChannelRef channel,
+                         node->As<ChannelNode>()->GetChannelRef());
+    std::optional<ChannelStrictness> strictness = ChannelRefStrictness(channel);
+
+    if (strictness == ChannelStrictness::kArbitraryStaticOrder) {
+      // Find the most recent operation (of the same type) on this channel.
+      auto it = std::find_if(ops_on_channel[channel].rbegin(),
+                             ops_on_channel[channel].rend(),
+                             [op = node->op()](Node* predecessor) {
+                               return predecessor->op() == op;
+                             });
+      if (it != ops_on_channel[channel].rend()) {
+        DiffAtLeastConstraint(node, *it, constraint.MinimumLatency(),
+                              "same_channel_arbitrary_order");
+      }
+      ops_on_channel[channel].push_back(node);
+    } else {
+      ops_on_channel[channel].push_back(node);
+
+      absl::btree_set<Node*, Node::NodeIdLessThan>& dependencies =
+          io_dependencies[channel];
+      if (dependencies.empty()) {
+        dependencies.insert(schedule_node.node);
+        continue;
+      }
+
+      // This operation has dependencies on other operations on the same
+      // channel. Ensure that this operation is scheduled at least
+      // MinimumLatency cycles after any dependencies of the same type, at which
+      // point we have accounted for the delay with respect to them; further
+      // operations in the chain only need to delay with respect to this node.
+      absl::btree_set<Node*, Node::NodeIdLessThan> new_dependencies;
+      for (Node* dependency : dependencies) {
+        if (dependency->op() == schedule_node.node->op()) {
+          DiffAtLeastConstraint(schedule_node.node, dependency,
+                                constraint.MinimumLatency(),
+                                "same_channel_dependency");
+        } else {
+          new_dependencies.insert(dependency);
+        }
+      }
+      new_dependencies.insert(schedule_node.node);
+      dependencies = std::move(new_dependencies);
+    }
+  }
+  return absl::OkStatus();
+}
+
+void SDCSchedulingModel::SetObjective(std::optional<double> throughput_weight) {
   math_opt::LinearExpression objective;
-  for (Node* node : topo_sort_) {
+  for (const ScheduleNode& schedule_node : graph_.nodes()) {
+    Node* node = schedule_node.node;
+    // Maximize throughput at the user-specified weight.
+    if (auto it = unwanted_inverse_throughput_var_.find(node);
+        it != unwanted_inverse_throughput_var_.end() &&
+        throughput_weight.value_or(0.0) != 0.0) {
+      CHECK(node->Is<Next>());
+      int64_t num_paths =
+          node->function_base()
+              ->next_values(node->As<Next>()->state_read()->As<StateRead>())
+              .size();
+      objective += (kObjectiveScaling * *throughput_weight / num_paths) *
+                   unwanted_inverse_throughput_var_.at(node);
+    }
     // Minimize node lifetimes.
     // The scaling makes the tie-breaker small in comparison, and is a power
     // of two so that there's no imprecision (just add to exponent).
-    objective += 1024 *
+    objective += kObjectiveScaling *
                  static_cast<double>(node->GetType()->GetFlatBitCount()) *
                  lifetime_var_.at(node);
     // This acts as a tie-breaker for under-constrained problems, favoring ASAP
@@ -521,7 +687,8 @@ void SDCSchedulingModel::RemoveObjective() { model_.Minimize(0.0); }
 absl::StatusOr<ScheduleCycleMap> SDCSchedulingModel::ExtractResult(
     const math_opt::VariableMap<double>& variable_values) const {
   ScheduleCycleMap cycle_map;
-  for (Node* node : topo_sort_) {
+  for (const ScheduleNode& schedule_node : graph_.nodes()) {
+    Node* node = schedule_node.node;
     double cycle = variable_values.at(cycle_var_.at(node));
     if (std::fabs(cycle - std::round(cycle)) > 0.001) {
       return absl::InternalError(
@@ -536,9 +703,10 @@ void SDCSchedulingModel::SetClockPeriod(int64_t clock_period_ps) {
   absl::flat_hash_map<Node*, std::vector<Node*>> prev_delay_constraints =
       std::move(delay_constraints_);
   delay_constraints_ = ComputeCombinationalDelayConstraints(
-      func_, topo_sort_, clock_period_ps, distances_to_node_, delay_map_);
+      graph_, clock_period_ps, distances_to_node_, delay_map_);
 
-  for (Node* source : topo_sort_) {
+  for (const ScheduleNode& schedule_node : graph_.nodes()) {
+    Node* source = schedule_node.node;
     if (!prev_delay_constraints.empty()) {
       // Check over all the prior constraints, dropping any that are obsolete.
       absl::flat_hash_set<Node*> new_targets(
@@ -564,13 +732,31 @@ void SDCSchedulingModel::SetClockPeriod(int64_t clock_period_ps) {
       }
 
       // Newly related; add constraint.
-      XLS_VLOG(2) << "Setting timing constraint: "
-                  << absl::StrFormat("1 ≤ %s - %s", target->GetName(),
-                                     source->GetName());
+      VLOG(2) << "Setting timing constraint: "
+              << absl::StrFormat("1 ≤ %s - %s", target->GetName(),
+                                 source->GetName());
       timing_constraint_.emplace(
           key, DiffAtLeastConstraint(target, source, 1, "timing"));
     }
   }
+}
+
+absl::Status SDCSchedulingModel::SetWorstCaseThroughput(
+    int64_t worst_case_throughput) {
+  if (!graph_.IsSingleProc()) {
+    return absl::UnimplementedError(
+        "SetWorstCaseThroughput only supports procs, since it controls state "
+        "backedges");
+  }
+  if (initiation_interval_.value_or(1) == worst_case_throughput) {
+    return absl::OkStatus();
+  }
+  initiation_interval_ = worst_case_throughput;
+  for (auto& [nodes, constraint] : backedge_constraint_) {
+    model_.DeleteLinearConstraint(constraint);
+  }
+  backedge_constraint_.clear();
+  return AddBackedgeConstraints(BackedgeConstraint());
 }
 
 void SDCSchedulingModel::SetPipelineLength(
@@ -602,26 +788,58 @@ absl::StatusOr<int64_t> SDCSchedulingModel::ExtractPipelineLength(
   return static_cast<int64_t>(std::round(last_stage)) + 1;
 }
 
-absl::Status SDCSchedulingModel::AddSlackVariables() {
+absl::Status SDCSchedulingModel::AddSlackVariables(
+    std::optional<double> infeasible_per_state_backedge_slack_pool) {
+  if (infeasible_per_state_backedge_slack_pool.has_value()) {
+    XLS_RET_CHECK_GT(*infeasible_per_state_backedge_slack_pool, 0)
+        << "infeasible_per_state_backedge_slack_pool must be positive";
+  }
   // Add slack variables to all relevant constraints.
 
-  // First, remove the upper bound on pipeline length, but try to minimize it
-  // (dropping any other objective we have). We assume users are most willing to
-  // relax this; i.e., they care about throughput more than latency.
-  model_.set_upper_bound(last_stage_, kInfinity);
-  model_.Minimize(last_stage_);
+  // Remove any pre-existing objective, and declare that we'll be minimizing our
+  // new objective.
+  model_.Minimize(0);
 
-  // Next, if this is a proc, relax the state back-edge length restriction (if
-  // present). We assume users are reasonably willing to relax this; i.e., they
-  // care about throughput, but they care more about the I/O constraints they've
-  // specified.
-  if (Proc* proc = dynamic_cast<Proc*>(func_);
-      proc != nullptr && !backedge_constraint_.empty()) {
-    backedge_slack_ = model_.AddVariable(0.0, kInfinity, /*is_integer=*/false,
-                                         "backedge_slack");
-    model_.AddToObjective((1 << 10) * *backedge_slack_);
+  // First, try to minimize the depth of the pipeline. We assume users are most
+  // willing to relax this; i.e., they care about throughput more than latency.
+  if (last_stage_.upper_bound() < kInfinity) {
+    auto [last_stage_slack, last_stage_ub] = AddUpperBoundSlack(last_stage_);
+    model_.AddToObjective(last_stage_slack);
+    last_stage_slack_ = last_stage_slack;
+  }
+
+  // Next, relax the state back-edge length restriction (if present). We assume
+  // users are reasonably willing to relax this; i.e., they care about
+  // throughput, but they care more about the I/O constraints they've specified.
+  if (!backedge_constraint_.empty()) {
+    double backedge_slack_objective_scale = static_cast<double>(1 << 10);
+    shared_backedge_slack_ = model_.AddVariable(
+        0.0, kInfinity, /*is_integer=*/false, "backedge_slack");
+    model_.AddToObjective(
+        (backedge_slack_objective_scale * shared_backedge_slack_.value()));
+    double node_to_node_slack_objective_scale = 0.0;
+    if (infeasible_per_state_backedge_slack_pool.has_value()) {
+      node_to_node_slack_objective_scale =
+          (backedge_slack_objective_scale /
+           infeasible_per_state_backedge_slack_pool.value()) *
+          // Make slightly larger to break ties with shared backedge slack.
+          (1 + 1e-6);
+    }
     for (auto& [nodes, constraint] : backedge_constraint_) {
-      AddUpperBoundSlack(constraint, backedge_slack_);
+      AddUpperBoundSlack(constraint, shared_backedge_slack_);
+      if (infeasible_per_state_backedge_slack_pool.has_value()) {
+        auto [itr, inserted] = node_backedge_slack_.try_emplace(
+            nodes,
+            model_.AddVariable(0.0, kInfinity, /*is_integer=*/false,
+                               absl::StrFormat("%v_to_%v_backedge_slack",
+                                               *nodes.first, *nodes.second)));
+        XLS_RET_CHECK(inserted);
+        operations_research::math_opt::Variable& node_to_node_slack =
+            itr->second;
+        model_.AddToObjective(node_to_node_slack_objective_scale *
+                              node_to_node_slack);
+        AddUpperBoundSlack(constraint, node_to_node_slack);
+      }
     }
   }
 
@@ -655,33 +873,51 @@ absl::Status SDCSchedulingModel::ExtractError(
     const math_opt::VariableMap<double>& variable_values) const {
   std::vector<std::string> problems;
   std::vector<std::string> suggestions;
-  double last_stage = variable_values.at(last_stage_);
-  if (last_stage > last_stage_.lower_bound() + 0.001) {
-    int64_t new_pipeline_length =
-        static_cast<int64_t>(std::ceil(last_stage)) + 1;
-    problems.push_back("the specified pipeline length");
-    suggestions.push_back(
-        absl::StrCat("`--pipeline_stages=", new_pipeline_length, "`"));
+  if (last_stage_slack_.has_value()) {
+    double last_stage_slack = variable_values.at(*last_stage_slack_);
+    if (last_stage_slack > 0.001) {
+      int64_t new_pipeline_length =
+          static_cast<int64_t>(std::round(variable_values.at(last_stage_))) + 1;
+      problems.push_back("the specified pipeline length");
+      suggestions.push_back(
+          absl::StrCat("`--pipeline_stages=", new_pipeline_length, "`"));
+    }
   }
-  if (func_->IsProc() && backedge_slack_.has_value()) {
-    double backedge_slack = variable_values.at(*backedge_slack_);
+  if (shared_backedge_slack_.has_value()) {
+    double backedge_slack = variable_values.at(*shared_backedge_slack_);
     if (backedge_slack > 0.001) {
       int64_t new_backedge_length =
-          func_->AsProcOrDie()->GetInitiationInterval().value_or(1) +
-          static_cast<int64_t>(std::ceil(backedge_slack));
-      problems.push_back("full throughput");
+          initiation_interval_.value_or(1) +
+          static_cast<int64_t>(std::round(backedge_slack));
+      if (initiation_interval_.value_or(1) == 1) {
+        problems.push_back("full throughput");
+      } else {
+        problems.push_back("the specified throughput");
+      }
       suggestions.push_back(
           absl::StrCat("`--worst_case_throughput=", new_backedge_length, "`"));
+    }
+    for (const auto& [nodes, node_backedge_var] : node_backedge_slack_) {
+      double node_backedge = variable_values.at(node_backedge_var);
+      if (node_backedge > 0.001) {
+        if (problems.back() != "full throughput") {
+          problems.push_back("full throughput");
+        }
+        suggestions.push_back(absl::StrFormat(
+            "looking at paths between %v and %v (needs %d additional slack)",
+            *nodes.first, *nodes.second,
+            static_cast<int64_t>(std::round(node_backedge))));
+      }
     }
   }
   if (!problems.empty()) {
     if (problems.size() == 1 || problems.size() == 2) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("cannot achieve ", absl::StrJoin(problems, " or "),
-                       ". Try ", absl::StrJoin(suggestions, " and ")));
+      return absl::InvalidArgumentError(absl::StrCat(
+          graph_.name(), ": cannot achieve ", absl::StrJoin(problems, " or "),
+          ". Try ", absl::StrJoin(suggestions, " and ")));
     }
     return absl::InvalidArgumentError(absl::StrCat(
-        "cannot achieve ",
+        graph_.name(), ": cannot achieve ",
         absl::StrJoin(
             absl::MakeConstSpan(problems).subspan(0, problems.size() - 1),
             ", "),
@@ -700,13 +936,13 @@ absl::Status SDCSchedulingModel::ExtractError(
     std::vector<std::string> latency_suggestions;
     if (min_slack > 0.001) {
       int64_t new_min_latency = io_constraint.MinimumLatency() -
-                                static_cast<int64_t>(std::ceil(min_slack));
+                                static_cast<int64_t>(std::round(min_slack));
       latency_suggestions.push_back(
           absl::StrCat("minimum latency ≤ ", new_min_latency));
     }
     if (max_slack > 0.001) {
       int64_t new_max_latency = io_constraint.MaximumLatency() +
-                                static_cast<int64_t>(std::ceil(max_slack));
+                                static_cast<int64_t>(std::round(max_slack));
       latency_suggestions.push_back(
           absl::StrCat("maximum latency ≥ ", new_max_latency));
     }
@@ -720,14 +956,16 @@ absl::Status SDCSchedulingModel::ExtractError(
   }
   if (!io_problems.empty()) {
     return absl::InvalidArgumentError(absl::StrCat(
-        "cannot satisfy the given I/O constraints. Would succeed with: ",
+        graph_.name(),
+        ": cannot satisfy the given I/O constraints. Would succeed with: ",
         absl::StrJoin(io_problems, ", ",
                       [](std::string* out, const std::string& entry) {
                         absl::StrAppend(out, "{", entry, "}");
                       })));
   }
 
-  return absl::UnknownError("reason unknown.");
+  return absl::UnknownError(
+      absl::StrCat("reason unknown for ", graph_.name(), "."));
 }
 
 math_opt::LinearConstraint SDCSchedulingModel::DiffAtMostConstraint(
@@ -761,8 +999,8 @@ math_opt::LinearConstraint SDCSchedulingModel::DiffGreaterThanConstraint(
 math_opt::LinearConstraint SDCSchedulingModel::DiffEqualsConstraint(
     Node* x, Node* y, int64_t diff, std::string_view name) {
   if (x == y) {
-    XLS_LOG(FATAL) << "DiffEqualsConstraint: " << x->GetName() << " - "
-                   << y->GetName() << " = " << diff << " is unsatisfiable";
+    LOG(FATAL) << "DiffEqualsConstraint: " << x->GetName() << " - "
+               << y->GetName() << " = " << diff << " is unsatisfiable";
   }
   return model_.AddLinearConstraint(
       cycle_var_.at(x) - cycle_var_.at(y) == static_cast<double>(diff),
@@ -771,10 +1009,10 @@ math_opt::LinearConstraint SDCSchedulingModel::DiffEqualsConstraint(
 
 math_opt::Variable SDCSchedulingModel::AddUpperBoundSlack(
     math_opt::LinearConstraint c, std::optional<math_opt::Variable> slack) {
-  XLS_CHECK_LT(c.upper_bound(), kInfinity)
+  CHECK_LT(c.upper_bound(), kInfinity)
       << "The constraint " << c.name() << " has no upper bound.";
   if (slack.has_value()) {
-    XLS_CHECK_EQ(c.coefficient(*slack), 0.0)
+    CHECK_EQ(c.coefficient(*slack), 0.0)
         << "The slack variable " << slack->name()
         << " is already referenced in the constraint " << c.name() << ".";
   } else {
@@ -797,10 +1035,10 @@ absl::Status SDCSchedulingModel::RemoveUpperBoundSlack(
 
 math_opt::Variable SDCSchedulingModel::AddLowerBoundSlack(
     math_opt::LinearConstraint c, std::optional<math_opt::Variable> slack) {
-  XLS_CHECK_GT(c.lower_bound(), -kInfinity)
+  CHECK_GT(c.lower_bound(), -kInfinity)
       << "The constraint " << c.name() << " has no lower bound.";
   if (slack.has_value()) {
-    XLS_CHECK_EQ(c.coefficient(*slack), 0.0)
+    CHECK_EQ(c.coefficient(*slack), 0.0)
         << "The slack variable " << slack->name()
         << " is already referenced in the constraint " << c.name() << ".";
   } else {
@@ -814,7 +1052,7 @@ math_opt::Variable SDCSchedulingModel::AddLowerBoundSlack(
 std::pair<math_opt::Variable, math_opt::LinearConstraint>
 SDCSchedulingModel::AddUpperBoundSlack(
     math_opt::Variable v, std::optional<math_opt::Variable> slack) {
-  XLS_CHECK_LT(v.upper_bound(), kInfinity)
+  CHECK_LT(v.upper_bound(), kInfinity)
       << "The variable " << v.name() << " has no fixed upper bound.";
   if (!slack.has_value()) {
     slack = model_.AddVariable(0.0, kInfinity, /*is_integer=*/false,
@@ -829,7 +1067,7 @@ SDCSchedulingModel::AddUpperBoundSlack(
 std::pair<math_opt::Variable, math_opt::LinearConstraint>
 SDCSchedulingModel::AddLowerBoundSlack(
     math_opt::Variable v, std::optional<math_opt::Variable> slack) {
-  XLS_CHECK_GT(v.lower_bound(), -kInfinity)
+  CHECK_GT(v.lower_bound(), -kInfinity)
       << "The variable " << v.name() << " has no fixed lower bound.";
   if (!slack.has_value()) {
     slack = model_.AddVariable(0.0, kInfinity, /*is_integer=*/false,
@@ -843,46 +1081,42 @@ SDCSchedulingModel::AddLowerBoundSlack(
 
 absl::StatusOr<std::unique_ptr<SDCScheduler>> SDCScheduler::Create(
     FunctionBase* f, const DelayEstimator& delay_estimator) {
+  absl::flat_hash_set<Node*> dead_after_synthesis =
+      GetDeadAfterSynthesisNodes(f);
+  ScheduleGraph graph = ScheduleGraph::Create(f, dead_after_synthesis);
   XLS_ASSIGN_OR_RETURN(DelayMap delay_map,
-                       ComputeNodeDelays(f, delay_estimator));
-  std::unique_ptr<SDCScheduler> scheduler(
-      new SDCScheduler(f, std::move(delay_map)));
+                       ComputeNodeDelays(graph, delay_estimator));
+  std::optional<int64_t> initiation_interval =
+      f->IsProc() ? std::optional<int64_t>(
+                        f->AsProcOrDie()->GetInitiationInterval().value_or(1))
+                  : std::nullopt;
+  std::unique_ptr<SDCScheduler> scheduler(new SDCScheduler(
+      std::move(graph), initiation_interval, std::move(delay_map)));
   XLS_RETURN_IF_ERROR(scheduler->Initialize());
   return std::move(scheduler);
 }
 
-SDCScheduler::SDCScheduler(FunctionBase* f, DelayMap delay_map)
-    : f_(f),
-      delay_map_(std::move(delay_map)),
-      model_(f, delay_map_, absl::StrCat("sdc_model:", f->name())) {}
+absl::StatusOr<std::unique_ptr<SDCScheduler>> SDCScheduler::Create(
+    ScheduleGraph graph, const DelayEstimator& delay_estimator) {
+  XLS_ASSIGN_OR_RETURN(DelayMap delay_map,
+                       ComputeNodeDelays(graph, delay_estimator));
+  std::unique_ptr<SDCScheduler> scheduler(
+      new SDCScheduler(std::move(graph), std::nullopt, std::move(delay_map)));
+  XLS_RETURN_IF_ERROR(scheduler->Initialize());
+  return std::move(scheduler);
+}
+
+SDCScheduler::SDCScheduler(ScheduleGraph graph,
+                           std::optional<int64_t> initiation_interval,
+                           DelayMap delay_map)
+    : delay_map_(std::move(delay_map)),
+      model_(std::move(graph), delay_map_, initiation_interval) {}
 
 absl::Status SDCScheduler::Initialize() {
   XLS_ASSIGN_OR_RETURN(
-      solver_, math_opt::IncrementalSolver::New(&model_.UnderlyingModel(),
-                                                math_opt::SolverType::kGlop));
-
-  for (Node* node : f_->nodes()) {
-    for (Node* user : node->users()) {
-      XLS_RETURN_IF_ERROR(model_.AddDefUseConstraints(node, user));
-    }
-    if (f_->IsFunction() && f_->HasImplicitUse(node)) {
-      XLS_RETURN_IF_ERROR(model_.AddDefUseConstraints(node, std::nullopt));
-    }
-  }
-
-  if (f_->IsProc()) {
-    Proc* proc = f_->AsProcOrDie();
-    for (int64_t index = 0; index < proc->GetStateElementCount(); ++index) {
-      Param* const state_access = proc->GetStateParam(index);
-      Node* const next_state_element = proc->GetNextStateElement(index);
-
-      // The next-state element always has lifetime extended to the state param
-      // node, since we can't store the new value in the state register until
-      // the old value's been used.
-      XLS_RETURN_IF_ERROR(
-          model_.AddLifetimeConstraint(next_state_element, state_access));
-    }
-  }
+      solver_, math_opt::NewIncrementalSolver(&model_.UnderlyingModel(),
+                                              math_opt::SolverType::kGlop));
+  XLS_RETURN_IF_ERROR(model_.AddAllDefUseConstraints());
   return absl::OkStatus();
 }
 
@@ -894,16 +1128,17 @@ absl::Status SDCScheduler::AddConstraints(
   return absl::OkStatus();
 }
 
-absl::Status SDCScheduler::BuildError(const math_opt::SolveResult& result,
-                                      bool explain_infeasibility) {
-  XLS_CHECK_NE(result.termination.reason,
-               math_opt::TerminationReason::kOptimal);
+absl::Status SDCScheduler::BuildError(
+    const math_opt::SolveResult& result,
+    SchedulingFailureBehavior failure_behavior) {
+  CHECK_NE(result.termination.reason, math_opt::TerminationReason::kOptimal);
 
-  if (explain_infeasibility &&
+  if (failure_behavior.explain_infeasibility &&
       (result.termination.reason == math_opt::TerminationReason::kInfeasible ||
        result.termination.reason ==
            math_opt::TerminationReason::kInfeasibleOrUnbounded)) {
-    XLS_RETURN_IF_ERROR(model_.AddSlackVariables());
+    XLS_RETURN_IF_ERROR(model_.AddSlackVariables(
+        failure_behavior.infeasible_per_state_backedge_slack_pool));
     XLS_ASSIGN_OR_RETURN(math_opt::SolveResult result_with_slack,
                          solver_->Solve());
     if (result_with_slack.termination.reason ==
@@ -927,8 +1162,16 @@ absl::Status SDCScheduler::BuildError(const math_opt::SolveResult& result,
 
 absl::StatusOr<ScheduleCycleMap> SDCScheduler::Schedule(
     std::optional<int64_t> pipeline_stages, int64_t clock_period_ps,
-    bool check_feasibility, bool explain_infeasibility) {
+    SchedulingFailureBehavior failure_behavior, bool check_feasibility,
+    std::optional<int64_t> worst_case_throughput,
+    std::optional<double> dynamic_throughput_objective_weight) {
   model_.SetClockPeriod(clock_period_ps);
+  if (worst_case_throughput.has_value()) {
+    if (model_.initiation_interval().value_or(1) != *worst_case_throughput) {
+      XLS_RETURN_IF_ERROR(
+          model_.SetWorstCaseThroughput(*worst_case_throughput));
+    }
+  }
 
   model_.SetPipelineLength(pipeline_stages);
   if (!pipeline_stages.has_value() && !check_feasibility) {
@@ -940,7 +1183,7 @@ absl::StatusOr<ScheduleCycleMap> SDCScheduler::Schedule(
     if (result_with_minimized_pipeline_length.termination.reason !=
         math_opt::TerminationReason::kOptimal) {
       return BuildError(result_with_minimized_pipeline_length,
-                        explain_infeasibility);
+                        failure_behavior);
     }
     XLS_ASSIGN_OR_RETURN(
         const int64_t min_pipeline_length,
@@ -952,7 +1195,7 @@ absl::StatusOr<ScheduleCycleMap> SDCScheduler::Schedule(
   if (check_feasibility) {
     model_.RemoveObjective();
   } else {
-    model_.SetObjective();
+    model_.SetObjective(dynamic_throughput_objective_weight);
   }
 
   XLS_ASSIGN_OR_RETURN(math_opt::SolveResult result, solver_->Solve());
@@ -961,26 +1204,7 @@ absl::StatusOr<ScheduleCycleMap> SDCScheduler::Schedule(
        result.termination.reason == math_opt::TerminationReason::kFeasible)) {
     return model_.ExtractResult(result.variable_values());
   }
-  return BuildError(result, explain_infeasibility);
-}
-
-absl::StatusOr<ScheduleCycleMap> SDCSchedule(
-    FunctionBase* f, std::optional<int64_t> pipeline_stages,
-    int64_t clock_period_ps, const DelayEstimator& delay_estimator,
-    absl::Span<const SchedulingConstraint> constraints, bool check_feasibility,
-    bool explain_infeasibility) {
-  XLS_VLOG(3) << "SDCScheduler()";
-  XLS_VLOG(3) << "  pipeline stages = "
-              << (pipeline_stages.has_value()
-                      ? absl::StrCat(pipeline_stages.value())
-                      : "(unspecified)");
-  XLS_VLOG_LINES(4, f->DumpIr());
-
-  XLS_ASSIGN_OR_RETURN(std::unique_ptr<SDCScheduler> scheduler,
-                       SDCScheduler::Create(f, delay_estimator));
-  XLS_RETURN_IF_ERROR(scheduler->AddConstraints(constraints));
-  return scheduler->Schedule(pipeline_stages, clock_period_ps,
-                             check_feasibility, explain_infeasibility);
+  return BuildError(result, failure_behavior);
 }
 
 }  // namespace xls

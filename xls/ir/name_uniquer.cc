@@ -14,18 +14,24 @@
 
 #include "xls/ir/name_uniquer.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/strings/ascii.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 
 namespace xls {
 
 namespace {
 
-bool IsAllowed(char c) { return (absl::ascii_isalnum(c) != 0) || c == '_'; }
+bool IsAllowed(char c) {
+  return (static_cast<int>(absl::ascii_isalnum(c)) != 0) || c == '_';
+}
 
 // Sanitizes and returns the name. Unallowed characters will be replaced with
 // '_'. The result will match the regexp "[a-zA-Z_][a-zA-Z0-9_]*". Names which
@@ -80,28 +86,23 @@ std::string NameUniquer::GetSanitizedUniqueName(std::string_view prefix) {
   // If the root is empty after stripping off the suffix, use a generic name.
   root = root.empty() ? "name" : root;
 
-  if (generated_names_.contains(root)) {
-    // This root has been seen before.
-    SequentialIdGenerator& generator = generated_names_[root];
-    if (numeric_suffix.has_value()) {
-      return absl::StrCat(root, separator_,
-                          generator.RegisterId(numeric_suffix.value()));
-    } else {
-      return absl::StrCat(root, separator_, generator.NextId());
-    }
-  } else {
-    // This is the first time that the name root has been seen. Create a
-    // SequentialIdGenerator to create future unique names based on this root.
-    SequentialIdGenerator& generator = generated_names_[root];
-    if (numeric_suffix.has_value()) {
-      return absl::StrCat(root, separator_,
-                          generator.RegisterId(numeric_suffix.value()));
-    } else {
-      // Root has not been seen before and there is no suffix. Just return the
-      // root.
-      return root;
-    }
+  // This will create  a map entry if it does not already exist.
+  PrefixTracker& prefix_tracker = generated_names_[root];
+
+  SequentialIdGenerator& generator = prefix_tracker.generator;
+  if (numeric_suffix.has_value()) {
+    return absl::StrCat(root, separator_,
+                        generator.RegisterId(numeric_suffix.value()));
   }
+  if (prefix_tracker.bare_prefix_taken) {
+    // There already exists a node with the same root name (no suffix), add a
+    // suffix to uniquify the name.
+    return absl::StrCat(root, separator_, generator.NextId());
+  }
+
+  // Root has not been seen before and there is no suffix. Just return it.
+  prefix_tracker.bare_prefix_taken = true;
+  return root;
 }
 
 /* static */ bool NameUniquer::IsValidIdentifier(std::string_view str) {

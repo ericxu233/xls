@@ -15,6 +15,8 @@
 #ifndef XLS_IR_DFS_VISITOR_H_
 #define XLS_IR_DFS_VISITOR_H_
 
+#include <cstdint>
+
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "xls/ir/node.h"
@@ -74,6 +76,8 @@ class DfsVisitor {
   virtual absl::Status HandleOrReduce(BitwiseReductionOp* or_reduce) = 0;
   virtual absl::Status HandleOutputPort(OutputPort* output_port) = 0;
   virtual absl::Status HandleParam(Param* param) = 0;
+  virtual absl::Status HandleStateRead(StateRead* state_read) = 0;
+  virtual absl::Status HandleNext(Next* next) = 0;
   virtual absl::Status HandleReceive(Receive* receive) = 0;
   virtual absl::Status HandleRegisterRead(RegisterRead* reg_read) = 0;
   virtual absl::Status HandleRegisterWrite(RegisterWrite* reg_write) = 0;
@@ -196,6 +200,8 @@ class DfsVisitorWithDefault : public DfsVisitor {
   absl::Status HandleOrReduce(BitwiseReductionOp* or_reduce) override;
   absl::Status HandleOutputPort(OutputPort* output_port) override;
   absl::Status HandleParam(Param* param) override;
+  absl::Status HandleStateRead(StateRead* state_read) override;
+  absl::Status HandleNext(Next* next) override;
   absl::Status HandleReceive(Receive* receive) override;
   absl::Status HandleRegisterRead(RegisterRead* reg_read) override;
   absl::Status HandleRegisterWrite(RegisterWrite* reg_write) override;

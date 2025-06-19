@@ -18,6 +18,7 @@
 #ifndef XLS_EXAMPLES_SAMPLE_PACKAGES_H_
 #define XLS_EXAMPLES_SAMPLE_PACKAGES_H_
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -80,7 +81,7 @@ std::pair<std::unique_ptr<Package>, Function*> BuildAccumulateIvar(
 //
 // Another goal is to prepare for control generation and shared FSMs.
 std::pair<std::unique_ptr<Package>, Function*> BuildTwoLoops(
-  bool same_trip_count, bool dependent_loops);
+    bool same_trip_count, bool dependent_loops);
 
 // Build up a simple function with a map().
 std::pair<std::unique_ptr<Package>, Function*> BuildSimpleMap(

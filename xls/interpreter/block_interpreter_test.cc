@@ -17,17 +17,26 @@
 #include <string>
 
 #include "gtest/gtest.h"
-#include "xls/codegen/module_signature.pb.h"
 #include "xls/interpreter/block_evaluator_test_base.h"
 
 namespace xls {
 namespace {
 
+inline constexpr BlockEvaluatorTestParam kBlockInterpreterTestParam = {
+    .evaluator = &kInterpreterBlockEvaluator,
+    .supports_fifos = true,
+    .supports_observer = true};
+
 INSTANTIATE_TEST_SUITE_P(BlockInterpreterTest, BlockEvaluatorTest,
-                         testing::Values(&kInterpreterBlockEvaluator),
+                         testing::Values(kBlockInterpreterTestParam),
                          [](const auto& v) -> std::string {
-                           return std::string(v.param->name());
+                           return std::string(v.param.evaluator->name());
                          });
+
+INSTANTIATE_TEST_SUITE_P(
+    BlockInterpreterFifoTest, FifoTest,
+    testing::ValuesIn(GenerateFifoTestParams(kBlockInterpreterTestParam)),
+    FifoTestName);
 
 }  // namespace
 }  // namespace xls

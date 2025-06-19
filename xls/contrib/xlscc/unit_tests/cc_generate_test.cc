@@ -13,33 +13,34 @@
 // limitations under the License.
 
 #include <cstdlib>
-#include <ctime>
 #include <iostream>
-#include <memory>
-#include <ostream>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "absl/flags/flag.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/contrib/xlscc/unit_tests/cc_generator.h"
 
-const char kUsage[] = R"(
+static constexpr std::string_view kUsage = R"(
 Generates XLScc fuzz samples.
 )";
 
 ABSL_FLAG(int, seed, 1, "seed for pseudo-randomizer");
+ABSL_FLAG(bool, test_ac_int, true, "tests will be run for ac_int");
+ABSL_FLAG(bool, test_ac_fixed, false, "tests will be run for ac_fixed");
 ABSL_FLAG(std::string, cc_filepath, "", "output file name");
 
 namespace {
 
-static bool GenerateTest(int seed, const std::string& filename) {
-  std::string content = xlscc::GenerateIntTest(seed);
-  std::cout << filename << std::endl;
+static bool GenerateTest(int seed, const std::string& filename,
+                         xlscc::VariableType type) {
+  std::string content = xlscc::GenerateTest(seed, type);
+  std::cout << filename << '\n';
   absl::Status contents_set = xls::SetFileContents(filename, content);
   return contents_set.ok();
 }
@@ -51,14 +52,18 @@ int main(int argc, char** argv) {
       xls::InitXls(kUsage, argc, argv);
 
   if (!positional_arguments.empty()) {
-    XLS_LOG(QFATAL) << absl::StreamFormat(
-        "Expected: %s -seed=1 -cc_filepath=xxx", argv[0]);
+    LOG(QFATAL) << absl::StreamFormat("Expected: %s -seed=1 -cc_filepath=xxx",
+                                      argv[0]);
   }
   int seed = absl::GetFlag(FLAGS_seed);
   std::string cc_filepath = absl::GetFlag(FLAGS_cc_filepath);
 
-  if (GenerateTest(seed, cc_filepath)) {
-    return EXIT_SUCCESS;
+  bool success = true;
+  if (absl::GetFlag(FLAGS_test_ac_fixed)) {
+    success &= GenerateTest(seed, cc_filepath, xlscc::VariableType::kAcFixed);
   }
-  return EXIT_FAILURE;
+  if (absl::GetFlag(FLAGS_test_ac_int)) {
+    success &= GenerateTest(seed, cc_filepath, xlscc::VariableType::kAcInt);
+  }
+  return success ? EXIT_SUCCESS : EXIT_FAILURE;
 }

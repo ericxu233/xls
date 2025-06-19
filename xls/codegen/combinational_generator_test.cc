@@ -27,12 +27,13 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "xls/codegen/vast.h"
+#include "xls/codegen/vast/vast.h"
 #include "xls/common/status/matchers.h"
 #include "xls/examples/sample_packages.h"
 #include "xls/interpreter/function_interpreter.h"
 #include "xls/interpreter/random_value.h"
 #include "xls/ir/bits.h"
+#include "xls/ir/channel.h"
 #include "xls/ir/events.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_parser.h"
@@ -41,13 +42,14 @@
 #include "xls/ir/value.h"
 #include "xls/simulation/module_simulator.h"
 #include "xls/simulation/module_testbench.h"
+#include "xls/simulation/module_testbench_thread.h"
 #include "xls/simulation/verilog_test_base.h"
 
 namespace xls {
 namespace verilog {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 
 constexpr char kTestName[] = "combinational_generator_test";
 constexpr char kTestdataPath[] = "xls/codegen/testdata";
@@ -433,8 +435,8 @@ TEST_P(CombinationalGeneratorTest, PrioritySelect) {
   std::string text = R"(
 package PrioritySelect
 
-top fn main(p: bits[2], x: bits[16], y: bits[16]) -> bits[16] {
-  ret priority_sel.1: bits[16] = priority_sel(p, cases=[x, y])
+top fn main(p: bits[2], x: bits[16], y: bits[16], d: bits[16]) -> bits[16] {
+  ret priority_sel.1: bits[16] = priority_sel(p, cases=[x, y], default=d)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
@@ -451,10 +453,12 @@ top fn main(p: bits[2], x: bits[16], y: bits[16]) -> bits[16] {
   ModuleSimulator simulator =
       NewModuleSimulator(result.verilog_text, result.signature);
   absl::flat_hash_map<std::string, Value> args = {
-      {"x", Value(UBits(0x00ff, 16))}, {"y", Value(UBits(0xf0f0, 16))}};
+      {"x", Value(UBits(0x00ff, 16))},
+      {"y", Value(UBits(0xf0f0, 16))},
+      {"d", Value(UBits(0xff00, 16))}};
   args["p"] = Value(UBits(0b00, 2));
   EXPECT_THAT(simulator.RunFunction(args),
-              IsOkAndHolds(Value(UBits(0x0000, 16))));
+              IsOkAndHolds(Value(UBits(0xff00, 16))));
   args["p"] = Value(UBits(0b01, 2));
   EXPECT_THAT(simulator.RunFunction(args),
               IsOkAndHolds(Value(UBits(0x00ff, 16))));
@@ -466,15 +470,14 @@ top fn main(p: bits[2], x: bits[16], y: bits[16]) -> bits[16] {
               IsOkAndHolds(Value(UBits(0x00ff, 16))));
 }
 
-TEST_P(CombinationalGeneratorTest, PrioritySelectNoDefault) {
+TEST_P(CombinationalGeneratorTest, PrioritySelectMultipleAreMerged) {
   std::string text = R"(
-package PrioritySelectNoDefault
+package PrioritySelect
 
-top fn main(p: bits[2], x: bits[16], y: bits[16]) -> bits[16] {
-
-  literal.1: bits[2] = literal(value=1)
-  or.2: bits[2] = or(p, literal.1)
-  ret priority_sel.3: bits[16] = priority_sel(or.2, cases=[x, y])
+top fn main(p: bits[2], x: bits[16], y: bits[16], d: bits[16]) -> bits[16] {
+  priority_sel.1: bits[16] = priority_sel(p, cases=[x, y], default=d)
+  priority_sel.2: bits[16] = priority_sel(p, cases=[y, x], default=d)
+  ret add.3: bits[16] = add(priority_sel.1, priority_sel.2)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
@@ -491,28 +494,82 @@ top fn main(p: bits[2], x: bits[16], y: bits[16]) -> bits[16] {
   ModuleSimulator simulator =
       NewModuleSimulator(result.verilog_text, result.signature);
   absl::flat_hash_map<std::string, Value> args = {
-      {"x", Value(UBits(0x00ff, 16))}, {"y", Value(UBits(0xf0f0, 16))}};
+      {"x", Value(UBits(0x00ff, 16))},
+      {"y", Value(UBits(0xf0f0, 16))},
+      {"d", Value(UBits(0xff00, 16))}};
   args["p"] = Value(UBits(0b00, 2));
+  // both priority selects return 0xff00, 0xff00 + 0xff00 = 0xfe00
   EXPECT_THAT(simulator.RunFunction(args),
-              IsOkAndHolds(Value(UBits(0x00ff, 16))));
+              IsOkAndHolds(Value(UBits(0xfe00, 16))));
   args["p"] = Value(UBits(0b01, 2));
+  // sum = 0x00ff + 0xf0f0 = 0xf1ef
   EXPECT_THAT(simulator.RunFunction(args),
-              IsOkAndHolds(Value(UBits(0x00ff, 16))));
+              IsOkAndHolds(Value(UBits(0xf1ef, 16))));
   args["p"] = Value(UBits(0b10, 2));
   EXPECT_THAT(simulator.RunFunction(args),
-              IsOkAndHolds(Value(UBits(0x00ff, 16))));
+              IsOkAndHolds(Value(UBits(0xf1ef, 16))));
   args["p"] = Value(UBits(0b11, 2));
   EXPECT_THAT(simulator.RunFunction(args),
-              IsOkAndHolds(Value(UBits(0x00ff, 16))));
+              IsOkAndHolds(Value(UBits(0xf1ef, 16))));
+}
+
+TEST_P(CombinationalGeneratorTest, PrioritySelectWithAndWithoutDefault) {
+  // Tests that the different specialized ways of codegen'ing priority selects
+  // are applied in the right context, e.g. we don't make a no-default priority
+  // select function and call it later for a needs-default priority select.
+  std::string text = R"(
+package PrioritySelect
+
+top fn main(p: bits[2], x: bits[16], y: bits[16], d: bits[16]) -> (bits[16], bits[16]) {
+  literal.1: bits[2] = literal(value=1)
+  or.2: bits[2] = or(p, literal.1)
+  priority_sel.3: bits[16] = priority_sel(or.2, cases=[x, y], default=d)
+  priority_sel.4: bits[16] = priority_sel(p, cases=[x, y], default=d)
+  ret tuple.5: (bits[16], bits[16]) = tuple(priority_sel.3, priority_sel.4)
+}
+)";
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(text));
+
+  std::optional<FunctionBase*> top = package->GetTop();
+  ASSERT_TRUE(top.has_value());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto result, GenerateCombinationalModule(top.value(), codegen_options()));
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 result.verilog_text);
+
+  ModuleSimulator simulator =
+      NewModuleSimulator(result.verilog_text, result.signature);
+  absl::flat_hash_map<std::string, Value> args = {
+      {"x", Value(UBits(0x00ff, 16))},
+      {"y", Value(UBits(0xf0f0, 16))},
+      {"d", Value(UBits(0xff00, 16))}};
+  args["p"] = Value(UBits(0b00, 2));
+  EXPECT_THAT(simulator.RunFunction(args),
+              IsOkAndHolds(Value::Tuple(
+                  {Value(UBits(0x00ff, 16)), Value(UBits(0xff00, 16))})));
+  args["p"] = Value(UBits(0b01, 2));
+  EXPECT_THAT(simulator.RunFunction(args),
+              IsOkAndHolds(Value::Tuple(
+                  {Value(UBits(0x00ff, 16)), Value(UBits(0x00ff, 16))})));
+  args["p"] = Value(UBits(0b10, 2));
+  EXPECT_THAT(simulator.RunFunction(args),
+              IsOkAndHolds(Value::Tuple(
+                  {Value(UBits(0x00ff, 16)), Value(UBits(0xf0f0, 16))})));
+  args["p"] = Value(UBits(0b11, 2));
+  EXPECT_THAT(simulator.RunFunction(args),
+              IsOkAndHolds(Value::Tuple(
+                  {Value(UBits(0x00ff, 16)), Value(UBits(0x00ff, 16))})));
 }
 
 TEST_P(CombinationalGeneratorTest, PrioritySelectOneHot) {
   std::string text = R"(
 package PrioritySelectOneHot
 
-top fn main(p: bits[1], x: bits[16], y: bits[16]) -> bits[16] {
+top fn main(p: bits[1], x: bits[16], y: bits[16], d: bits[16]) -> bits[16] {
   one_hot.1: bits[2] = one_hot(p, lsb_prio=true)
-  ret priority_sel.2: bits[16] = priority_sel(one_hot.1, cases=[x, y])
+  ret priority_sel.2: bits[16] = priority_sel(one_hot.1, cases=[x, y], default=d)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
@@ -529,7 +586,9 @@ top fn main(p: bits[1], x: bits[16], y: bits[16]) -> bits[16] {
   ModuleSimulator simulator =
       NewModuleSimulator(result.verilog_text, result.signature);
   absl::flat_hash_map<std::string, Value> args = {
-      {"x", Value(UBits(0x00ff, 16))}, {"y", Value(UBits(0xf0f0, 16))}};
+      {"x", Value(UBits(0x00ff, 16))},
+      {"y", Value(UBits(0xf0f0, 16))},
+      {"d", Value(UBits(0xff00, 16))}};
   args["p"] = Value(UBits(0b0, 1));
   EXPECT_THAT(simulator.RunFunction(args),
               IsOkAndHolds(Value(UBits(0xf0f0, 16))));
@@ -538,12 +597,144 @@ top fn main(p: bits[1], x: bits[16], y: bits[16]) -> bits[16] {
               IsOkAndHolds(Value(UBits(0x00ff, 16))));
 }
 
+TEST_P(CombinationalGeneratorTest, PrioritySelectArray) {
+  std::string text = R"(
+package PrioritySelectArray
+
+top fn main(p: bits[2], x: bits[16][4], y: bits[16][4], d: bits[16][4]) -> bits[16][4] {
+  ret priority_sel.1: bits[16][4] = priority_sel(p, cases=[x, y], default=d)
+}
+)";
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(text));
+
+  std::optional<FunctionBase*> top = package->GetTop();
+  ASSERT_TRUE(top.has_value());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto result, GenerateCombinationalModule(top.value(), codegen_options()));
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 result.verilog_text);
+
+  ModuleSimulator simulator =
+      NewModuleSimulator(result.verilog_text, result.signature);
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value x_value, Value::UBitsArray({0x00ff, 0x00ff, 0x00ff, 0x00ff}, 16));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value y_value, Value::UBitsArray({0xf0f0, 0xf0f0, 0xf0f0, 0xf0f0}, 16));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value d_value, Value::UBitsArray({0xff00, 0xff00, 0xff00, 0xff00}, 16));
+  absl::flat_hash_map<std::string, Value> args = {
+      {"x", x_value}, {"y", y_value}, {"d", d_value}};
+  args["p"] = Value(UBits(0b00, 2));
+  EXPECT_THAT(simulator.RunFunction(args), IsOkAndHolds(d_value));
+  args["p"] = Value(UBits(0b01, 2));
+  EXPECT_THAT(simulator.RunFunction(args), IsOkAndHolds(x_value));
+  args["p"] = Value(UBits(0b10, 2));
+  EXPECT_THAT(simulator.RunFunction(args), IsOkAndHolds(y_value));
+  args["p"] = Value(UBits(0b11, 2));
+  EXPECT_THAT(simulator.RunFunction(args), IsOkAndHolds(x_value));
+}
+
+TEST_P(CombinationalGeneratorTest,
+       PrioritySelectMultipleArraysWithSameElementType) {
+  std::string text = R"(
+package PrioritySelectArraysWithSameElementType
+
+top fn main(p: bits[2], x_short: bits[16][2], x_long: bits[16][4], y_short: bits[16][2], y_long: bits[16][4], d_short: bits[16][2], d_long: bits[16][4]) -> (bits[16][2], bits[16][4]) {
+  priority_sel.1: bits[16][2] = priority_sel(p, cases=[x_short, y_short], default=d_short)
+  priority_sel.2: bits[16][4] = priority_sel(p, cases=[x_long, y_long], default=d_long)
+  ret tuple.3: (bits[16][2], bits[16][4]) = tuple(priority_sel.1, priority_sel.2)
+}
+)";
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(text));
+
+  std::optional<FunctionBase*> top = package->GetTop();
+  ASSERT_TRUE(top.has_value());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto result, GenerateCombinationalModule(top.value(), codegen_options()));
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 result.verilog_text);
+
+  ModuleSimulator simulator =
+      NewModuleSimulator(result.verilog_text, result.signature);
+  XLS_ASSERT_OK_AND_ASSIGN(Value x_short_value,
+                           Value::UBitsArray({0x00ff, 0x00ff}, 16));
+  XLS_ASSERT_OK_AND_ASSIGN(Value y_short_value,
+                           Value::UBitsArray({0xf0f0, 0xf0f0}, 16));
+  XLS_ASSERT_OK_AND_ASSIGN(Value d_short_value,
+                           Value::UBitsArray({0xff00, 0xff00}, 16));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value x_long_value,
+      Value::UBitsArray({0x00ff, 0x00ff, 0x00ff, 0x00ff}, 16));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value y_long_value,
+      Value::UBitsArray({0xf0f0, 0xf0f0, 0xf0f0, 0xf0f0}, 16));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value d_long_value,
+      Value::UBitsArray({0xff00, 0xff00, 0xff00, 0xff00}, 16));
+  absl::flat_hash_map<std::string, Value> args = {
+      {"x_short", x_short_value}, {"y_short", y_short_value},
+      {"d_short", d_short_value}, {"x_long", x_long_value},
+      {"y_long", y_long_value},   {"d_long", d_long_value}};
+  args["p"] = Value(UBits(0b00, 2));
+  EXPECT_THAT(simulator.RunFunction(args),
+              IsOkAndHolds(Value::Tuple({d_short_value, d_long_value})));
+  args["p"] = Value(UBits(0b01, 2));
+  EXPECT_THAT(simulator.RunFunction(args),
+              IsOkAndHolds(Value::Tuple({x_short_value, x_long_value})));
+  args["p"] = Value(UBits(0b10, 2));
+  EXPECT_THAT(simulator.RunFunction(args),
+              IsOkAndHolds(Value::Tuple({y_short_value, y_long_value})));
+  args["p"] = Value(UBits(0b11, 2));
+  EXPECT_THAT(simulator.RunFunction(args),
+              IsOkAndHolds(Value::Tuple({x_short_value, x_long_value})));
+}
+
+TEST_P(CombinationalGeneratorTest, PrioritySelectArrayOneHot) {
+  std::string text = R"(
+package PrioritySelectArrayOneHot
+
+top fn main(p: bits[1], x: bits[16][4], y: bits[16][4], d: bits[16][4]) -> bits[16][4] {
+  one_hot.1: bits[2] = one_hot(p, lsb_prio=true)
+  ret priority_sel.2: bits[16][4] = priority_sel(one_hot.1, cases=[x, y], default=d)
+}
+)";
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(text));
+
+  std::optional<FunctionBase*> top = package->GetTop();
+  ASSERT_TRUE(top.has_value());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto result, GenerateCombinationalModule(top.value(), codegen_options()));
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 result.verilog_text);
+
+  ModuleSimulator simulator =
+      NewModuleSimulator(result.verilog_text, result.signature);
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value x_value, Value::UBitsArray({0x00ff, 0x00ff, 0x00ff, 0x00ff}, 16));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value y_value, Value::UBitsArray({0xf0f0, 0xf0f0, 0xf0f0, 0xf0f0}, 16));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Value d_value, Value::UBitsArray({0xff00, 0xff00, 0xff00, 0xff00}, 16));
+  absl::flat_hash_map<std::string, Value> args = {
+      {"x", x_value}, {"y", y_value}, {"d", d_value}};
+  args["p"] = Value(UBits(0b0, 1));
+  EXPECT_THAT(simulator.RunFunction(args), IsOkAndHolds(y_value));
+  args["p"] = Value(UBits(0b1, 1));
+  EXPECT_THAT(simulator.RunFunction(args), IsOkAndHolds(x_value));
+}
+
 TEST_P(CombinationalGeneratorTest, PrioritySelectNonBits) {
   constexpr std::string_view text = R"(
 package PrioritySelect
 
-top fn main(p: bits[2], x: (bits[16], bits[16]), y: (bits[16], bits[16])) -> (bits[16], bits[16]) {
-  ret priority_sel.1: (bits[16], bits[16]) = priority_sel(p, cases=[x, y])
+top fn main(p: bits[2], x: (bits[16], bits[16]), y: (bits[16], bits[16]), d: (bits[16], bits[16])) -> (bits[16], bits[16]) {
+  ret priority_sel.1: (bits[16], bits[16]) = priority_sel(p, cases=[x, y], default=d)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
@@ -561,12 +752,13 @@ top fn main(p: bits[2], x: (bits[16], bits[16]), y: (bits[16], bits[16])) -> (bi
       NewModuleSimulator(result.verilog_text, result.signature);
   absl::flat_hash_map<std::string, Value> args = {
       {"x", Value::Tuple({Value(UBits(0x00ff, 16)), Value(UBits(0xff00, 16))})},
-      {"y",
-       Value::Tuple({Value(UBits(0xf0f0, 16)), Value(UBits(0x0f0f, 16))})}};
+      {"y", Value::Tuple({Value(UBits(0xf0f0, 16)), Value(UBits(0x0f0f, 16))})},
+      {"d", Value::Tuple({Value(UBits(0xff00, 16)), Value(UBits(0x00ff, 16))})},
+  };
   args["p"] = Value(UBits(0b00, 2));
   EXPECT_THAT(simulator.RunFunction(args),
               IsOkAndHolds(Value::Tuple(
-                  {Value(UBits(0x0000, 16)), Value(UBits(0x0000, 16))})));
+                  {Value(UBits(0xff00, 16)), Value(UBits(0x00ff, 16))})));
   args["p"] = Value(UBits(0b01, 2));
   EXPECT_THAT(simulator.RunFunction(args),
               IsOkAndHolds(Value::Tuple(
@@ -585,18 +777,21 @@ TEST_P(CombinationalGeneratorTest, PrioritySelectMixedBitsAndNonBits) {
   constexpr std::string_view text = R"(
 package PrioritySelect
 
-top fn main(p: bits[2], x: (bits[16], bits[16]), y: (bits[16], bits[16])) -> (bits[32], bits[16], bits[16]) {
+top fn main(p: bits[2], x: (bits[16], bits[16]), y: (bits[16], bits[16]), d: (bits[16], bits[16])) -> (bits[32], bits[16], bits[16]) {
   tuple_index.1: bits[16] = tuple_index(x, index=0)
   tuple_index.2: bits[16] = tuple_index(x, index=1)
   tuple_index.3: bits[16] = tuple_index(y, index=0)
   tuple_index.4: bits[16] = tuple_index(y, index=1)
-  concat.5: bits[32] = concat(tuple_index.1, tuple_index.2)
-  concat.6: bits[32] = concat(tuple_index.3, tuple_index.4)
-  priority_sel.7: bits[32] = priority_sel(p, cases=[concat.5, concat.6])
-  priority_sel.8: (bits[16], bits[16]) = priority_sel(p, cases=[x, y])
-  tuple_index.9: bits[16] = tuple_index(priority_sel.8, index=0)
-  tuple_index.10: bits[16] = tuple_index(priority_sel.8, index=1)
-  ret tuple.11: (bits[32], bits[16], bits[16]) = tuple(priority_sel.7, tuple_index.9, tuple_index.10)
+  tuple_index.5: bits[16] = tuple_index(d, index=0)
+  tuple_index.6: bits[16] = tuple_index(d, index=1)
+  concat.7: bits[32] = concat(tuple_index.1, tuple_index.2)
+  concat.8: bits[32] = concat(tuple_index.3, tuple_index.4)
+  concat.9: bits[32] = concat(tuple_index.5, tuple_index.6)
+  priority_sel.10: bits[32] = priority_sel(p, cases=[concat.7, concat.8], default=concat.9)
+  priority_sel.11: (bits[16], bits[16]) = priority_sel(p, cases=[x, y], default=d)
+  tuple_index.12: bits[16] = tuple_index(priority_sel.11, index=0)
+  tuple_index.13: bits[16] = tuple_index(priority_sel.11, index=1)
+  ret tuple.14: (bits[32], bits[16], bits[16]) = tuple(priority_sel.10, tuple_index.12, tuple_index.13)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
@@ -614,13 +809,14 @@ top fn main(p: bits[2], x: (bits[16], bits[16]), y: (bits[16], bits[16])) -> (bi
       NewModuleSimulator(result.verilog_text, result.signature);
   absl::flat_hash_map<std::string, Value> args = {
       {"x", Value::Tuple({Value(UBits(0x00ff, 16)), Value(UBits(0xff00, 16))})},
-      {"y",
-       Value::Tuple({Value(UBits(0xf0f0, 16)), Value(UBits(0x0f0f, 16))})}};
+      {"y", Value::Tuple({Value(UBits(0xf0f0, 16)), Value(UBits(0x0f0f, 16))})},
+      {"d", Value::Tuple({Value(UBits(0xff00, 16)), Value(UBits(0x00ff, 16))})},
+  };
   args["p"] = Value(UBits(0b00, 2));
   EXPECT_THAT(simulator.RunFunction(args),
-              IsOkAndHolds(Value::Tuple({Value(UBits(0x00000000, 32)),
-                                         Value(UBits(0x0000, 16)),
-                                         Value(UBits(0x0000, 16))})));
+              IsOkAndHolds(Value::Tuple({Value(UBits(0xff0000ff, 32)),
+                                         Value(UBits(0xff00, 16)),
+                                         Value(UBits(0x00ff, 16))})));
   args["p"] = Value(UBits(0b01, 2));
   EXPECT_THAT(simulator.RunFunction(args),
               IsOkAndHolds(Value::Tuple({Value(UBits(0x00ffff00, 32)),
@@ -714,14 +910,18 @@ TEST_P(CombinationalGeneratorTest, ArrayIndexWithBoundsCheck) {
       IsOkAndHolds(Value(UBits(50, 8))));
 
   // The out of bounds value should return the highest index value.
-  ModuleTestbench tb(result.verilog_text, GetFileType(), result.signature,
-                     GetSimulator());
-  XLS_ASSERT_OK_AND_ASSIGN(ModuleTestbenchThread * tbt, tb.CreateThread());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<ModuleTestbench> tb,
+      ModuleTestbench::CreateFromVerilogText(result.verilog_text, GetFileType(),
+                                             result.signature, GetSimulator()));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      ModuleTestbenchThread * tbt,
+      tb->CreateThreadDrivingAllInputs("main", /*default_value=*/ZeroOrX::kX));
   SequentialBlock& seq = tbt->MainBlock();
   seq.Set("A", UBits(0xabcdef, 24));
   seq.Set("index", UBits(42, 8));
   seq.AtEndOfCycle().ExpectEq("out", 0xab);
-  XLS_EXPECT_OK(tb.Run());
+  XLS_EXPECT_OK(tb->Run());
 }
 
 TEST_P(CombinationalGeneratorTest, ArrayIndexWithoutBoundsCheck) {
@@ -754,14 +954,18 @@ TEST_P(CombinationalGeneratorTest, ArrayIndexWithoutBoundsCheck) {
       IsOkAndHolds(Value(UBits(50, 8))));
 
   // The out of bounds value should return X.
-  ModuleTestbench tb(result.verilog_text, GetFileType(), result.signature,
-                     GetSimulator());
-  XLS_ASSERT_OK_AND_ASSIGN(ModuleTestbenchThread * tbt, tb.CreateThread());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<ModuleTestbench> tb,
+      ModuleTestbench::CreateFromVerilogText(result.verilog_text, GetFileType(),
+                                             result.signature, GetSimulator()));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      ModuleTestbenchThread * tbt,
+      tb->CreateThreadDrivingAllInputs("main", /*default_value=*/ZeroOrX::kX));
   SequentialBlock& seq = tbt->MainBlock();
   seq.Set("A", UBits(0xabcdef, 24));
   seq.Set("index", UBits(3, 8));
   seq.AtEndOfCycle().ExpectX("out");
-  XLS_EXPECT_OK(tb.Run());
+  XLS_EXPECT_OK(tb->Run());
 }
 
 TEST_P(CombinationalGeneratorTest, TwoDArray) {
@@ -1981,6 +2185,26 @@ TEST_P(CombinationalGeneratorTest, TwoDArrayNe) {
               IsOkAndHolds(Value(UBits(1, 1))));
   EXPECT_THAT(simulator.RunFunction({{"x", a}, {"y", a}}),
               IsOkAndHolds(Value(UBits(0, 1))));
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 result.verilog_text);
+}
+
+TEST_P(CombinationalGeneratorTest, SingleProcWithProcScopedChannels) {
+  Package package(TestBaseName());
+
+  TokenlessProcBuilder pb(NewStyleProc(), "myleaf", "tkn", &package);
+  XLS_ASSERT_OK_AND_ASSIGN(ReceiveChannelInterface * in,
+                           pb.AddInputChannel("in", package.GetBitsType(32)));
+  XLS_ASSERT_OK_AND_ASSIGN(SendChannelInterface * out,
+                           pb.AddOutputChannel("out", package.GetBitsType(32)));
+
+  pb.Send(out, pb.Add(pb.Receive(in), pb.Literal(UBits(1, 32))));
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build());
+  XLS_ASSERT_OK(package.SetTop(proc));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto result, GenerateCombinationalModule(proc, codegen_options()));
 
   ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
                                  result.verilog_text);

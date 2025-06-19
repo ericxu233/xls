@@ -25,8 +25,8 @@ proc Main {
 
     init { () }
 
-    next(tok: token, state: ()) {
-        let (tok, do_recv) = recv(tok, do_recv_in);
+    next(state: ()) {
+        let (tok, do_recv) = recv(join(), do_recv_in);
         let (tok, foo, foo_valid) = recv_if_non_blocking(tok, data_in, do_recv, u32:123);
         send(tok, result_out, (foo, foo_valid));
     }
@@ -40,19 +40,19 @@ proc Tester {
     result_in: chan<(u32, bool)> in;
 
     config(terminator: chan<bool> out) {
-        let (do_recv_out, do_recv_in) = chan<bool>;
-        let (data_out, data_in) = chan<u32>;
-        let (result_out, result_in) = chan<(u32, bool)>;
+        let (do_recv_out, do_recv_in) = chan<bool>("do_recv");
+        let (data_out, data_in) = chan<u32>("data");
+        let (result_out, result_in) = chan<(u32, bool)>("result");
         spawn Main(do_recv_in, data_in, result_out);
         (terminator, do_recv_out, data_out, result_in)
     }
 
     init { () }
 
-    next(tok: token, state: ()) {
+    next(state: ()) {
         // First, tell the proc to receive without data present. Expect a
         // result of 123 (default value of recv_if_non_blocking).
-        let tok = send(tok, do_recv_out, true);
+        let tok = send(join(), do_recv_out, true);
         let (tok, result) = recv(tok, result_in);
         assert_eq(result, (u32:123, false));
 

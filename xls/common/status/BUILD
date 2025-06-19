@@ -17,6 +17,10 @@
 package(
     default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -38,9 +42,10 @@ cc_test(
     deps = [
         ":error_code_to_status",
         ":matchers",
-        "@com_google_absl//absl/status",
-        "//xls/common:xls_gunit",
         "//xls/common:xls_gunit_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@googletest//:gtest",
     ],
 )
 
@@ -51,12 +56,11 @@ cc_library(
     deps = [
         ":status_builder",
         ":status_macros",
+        "//xls/common:source_location",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/base:log_severity",
-        "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
-        "//xls/common:source_location",
     ],
 )
 
@@ -66,30 +70,37 @@ cc_test(
     deps = [
         ":matchers",
         ":ret_check",
-        "@com_google_absl//absl/flags:flag",
+        "//xls/common:xls_gunit_main",
+        "@com_google_absl//absl/base:log_severity",
+        "@com_google_absl//absl/log:scoped_mock_log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
-        "//xls/common:xls_gunit",
-        "//xls/common:xls_gunit_main",
-        "//xls/common/logging:scoped_mock_log",
+        "@googletest//:gtest",
     ],
 )
 
 cc_library(
     name = "status_builder",
-    srcs = ["status_builder.cc"],
+    srcs = [
+        "status_builder.cc",
+        "status_builder_oss.cc",
+    ],
     hdrs = ["status_builder.h"],
     deps = [
-        "@com_google_absl//absl/base:log_severity",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
         "//xls/common:source_location",
         "//xls/common:symbolized_stacktrace",
-        "//xls/common/logging",
-        "//xls/common/logging:log_sink",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/base:log_severity",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:log_entry",
+        "@com_google_absl//absl/log:log_sink",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:cord",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -98,17 +109,18 @@ cc_test(
     srcs = ["status_builder_test.cc"],
     deps = [
         ":status_builder",
-        "@com_google_absl//absl/flags:flag",
+        "//xls/common:source_location",
+        "//xls/common:xls_gunit_main",
+        "@com_google_absl//absl/base:log_severity",
+        "@com_google_absl//absl/log:globals",
+        "@com_google_absl//absl/log:log_entry",
+        "@com_google_absl//absl/log:log_sink",
+        "@com_google_absl//absl/log:scoped_mock_log",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
-        "//xls/common:source_location",
-        "//xls/common:xls_gunit",
-        "//xls/common:xls_gunit_main",
-        "//xls/common/logging:log_entry",
-        "//xls/common/logging:log_sink",
-        "//xls/common/logging:scoped_mock_log",
-        "//xls/common/logging:vlog_is_on",
+        "@googletest//:gtest",
     ],
 )
 
@@ -118,8 +130,9 @@ cc_library(
     visibility = ["//xls:xls_utility_users"],
     deps = [
         ":status_builder",
-        "@com_google_absl//absl/base:core_headers",
         "//xls/common:source_location",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status",
     ],
 )
 
@@ -129,12 +142,10 @@ cc_test(
     deps = [
         ":status_builder",
         ":status_macros",
-        "@com_google_absl//absl/memory",
+        "//xls/common:xls_gunit_main",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "//xls/common:xls_gunit",
-        "//xls/common:xls_gunit_main",
+        "@googletest//:gtest",
     ],
 )
 
@@ -146,9 +157,58 @@ cc_library(
     deps = [
         ":status_builder",
         ":status_macros",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
-        "@com_google_benchmark//:benchmark",
-        "@com_google_googletest//:gtest",
+        "@googletest//:gtest",
+    ],
+)
+
+cc_library(
+    name = "status_or_ref",
+    hdrs = ["status_or_ref.h"],
+    deps = [
+        ":status_builder",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/base:nullability",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_test(
+    name = "status_or_ref_test",
+    srcs = ["status_or_ref_test.cc"],
+    deps = [
+        ":matchers",
+        ":status_macros",
+        ":status_or_ref",
+        "//xls/common:xls_gunit_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@googletest//:gtest",
+    ],
+)
+
+cc_library(
+    name = "status_helpers",
+    hdrs = ["status_helpers.h"],
+    deps = [
+        "//xls/common:source_location",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_test(
+    name = "status_helpers_test",
+    srcs = ["status_helpers_test.cc"],
+    deps = [
+        ":status_helpers",
+        "//xls/common:xls_gunit_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@googletest//:gtest",
     ],
 )

@@ -15,17 +15,29 @@
 #include "xls/noc/simulation/noc_traffic_injector.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <memory>
 #include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
+#include "absl/types/span.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
+#include "xls/noc/simulation/common.h"
 #include "xls/noc/simulation/flit.h"
+#include "xls/noc/simulation/network_graph.h"
+#include "xls/noc/simulation/packetizer.h"
+#include "xls/noc/simulation/parameters.h"
+#include "xls/noc/simulation/random_number_interface.h"
+#include "xls/noc/simulation/traffic_description.h"
+#include "xls/noc/simulation/traffic_models.h"
 
 namespace xls::noc {
 
@@ -125,9 +137,9 @@ absl::Status MatchFlowToSourceAndRunAction(
 
         run_action(i, j);
 
-        XLS_VLOG(1) << absl::StrFormat("Mapped flow %s %s to nc %x index %d\n",
-                                       flow.GetName(), port_name,
-                                       network_components[j].AsUInt64(), j);
+        VLOG(1) << absl::StrFormat("Mapped flow %s %s to nc %x index %d\n",
+                                   flow.GetName(), port_name,
+                                   network_components[j].AsUInt64(), j);
         break;
       }
     }
@@ -252,8 +264,8 @@ absl::Status NocTrafficInjectorBuilder::AssociateFlowsToVCs(
     }
 
     injector.flows_index_to_vc_index_map_[i] = vc_index;
-    XLS_VLOG(1) << absl::StrFormat("Mapped flow %s vc %s to vc index %d\n",
-                                   flow.GetName(), flow_vc, vc_index);
+    VLOG(1) << absl::StrFormat("Mapped flow %s vc %s to vc index %d\n",
+                               flow.GetName(), flow_vc, vc_index);
   }
 
   return absl::OkStatus();

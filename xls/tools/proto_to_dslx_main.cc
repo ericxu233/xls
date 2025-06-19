@@ -17,12 +17,14 @@
 #include <string>
 
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
-#include "google/protobuf/text_format.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/dslx/frontend/module.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/tools/proto_to_dslx.h"
 
 ABSL_FLAG(std::string, proto_def_path, "",
@@ -50,9 +52,10 @@ static absl::Status RealMain(const std::string& source_root_path,
                              const std::string& var_name,
                              const std::string& output_path) {
   XLS_ASSIGN_OR_RETURN(std::string textproto, GetFileContents(textproto_path));
+  dslx::FileTable file_table;
   XLS_ASSIGN_OR_RETURN(auto module,
                        ProtoToDslx(source_root_path, proto_def_path, proto_name,
-                                   textproto, var_name));
+                                   textproto, var_name, file_table));
   return SetFileContents(output_path, module->ToString());
 }
 
@@ -62,23 +65,22 @@ int main(int argc, char* argv[]) {
   xls::InitXls(argv[0], argc, argv);
 
   std::string proto_def_path = absl::GetFlag(FLAGS_proto_def_path);
-  XLS_QCHECK(!proto_def_path.empty()) << "--proto_def_path must be specified.";
+  QCHECK(!proto_def_path.empty()) << "--proto_def_path must be specified.";
 
   std::string source_root_path = absl::GetFlag(FLAGS_source_root_path);
-  XLS_QCHECK(!source_root_path.empty())
-      << "--source_root_path must be specified.";
+  QCHECK(!source_root_path.empty()) << "--source_root_path must be specified.";
 
   std::string output_path = absl::GetFlag(FLAGS_output_path);
-  XLS_QCHECK(!output_path.empty()) << "--output_path must be specified.";
+  QCHECK(!output_path.empty()) << "--output_path must be specified.";
 
   std::string proto_name = absl::GetFlag(FLAGS_proto_name);
-  XLS_QCHECK(!proto_name.empty()) << "--proto_name must be specified.";
+  QCHECK(!proto_name.empty()) << "--proto_name must be specified.";
 
   std::string textproto_path = absl::GetFlag(FLAGS_textproto_path);
-  XLS_QCHECK(!textproto_path.empty()) << "--textproto_path must be specified.";
+  QCHECK(!textproto_path.empty()) << "--textproto_path must be specified.";
 
   std::string var_name = absl::GetFlag(FLAGS_var_name);
-  XLS_QCHECK(!var_name.empty()) << "--var_name must be specified.";
+  QCHECK(!var_name.empty()) << "--var_name must be specified.";
   return xls::ExitStatus(xls::RealMain(source_root_path, proto_def_path,
                                        proto_name, textproto_path, var_name,
                                        output_path));

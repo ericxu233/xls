@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import std
+import std;
 
 pub proc foo {
   init { () }
   config () { () }
 
-  next(tok: token, state: ()) {
-    std::umin(u32:1, u32:2);
+  next(state: ()) {
+    std::min(u32:1, u32:2);
     ()
   }
 }
@@ -31,14 +31,14 @@ proc test_case {
   init { () }
 
   config(terminator: chan<bool> out) {
-    let (ch_in, ch_out) = chan<bool>;
+    let (ch_in, ch_out) = chan<bool>("ch");
     spawn foo(ch_in, ch_out);
     (terminator, )
   }
 
-  next(tok: token, state: ()) {
-    std::umin(u32:1, u32:2);
-    let tok = send(tok, terminator, true);
+  next(state: ()) {
+    std::min(u32:1, u32:2);
+    let tok = send(join(), terminator, true);
     ()
   }
 }

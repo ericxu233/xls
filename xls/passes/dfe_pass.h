@@ -17,26 +17,30 @@
 #ifndef XLS_PASSES_DFE_PASS_H_
 #define XLS_PASSES_DFE_PASS_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/package.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
-// class DeadCodeEliminationPass iterates up from a functions result
-// nodes and marks all visited node. After that, all unvisited nodes
-// are considered dead.
+// This pass removes unreachable procs/blocks/functions from the package. The
+// pass requires `top` be set in order remove any constructs.
 class DeadFunctionEliminationPass : public OptimizationPass {
  public:
+  static constexpr std::string_view kName = "dfe";
   explicit DeadFunctionEliminationPass()
-      : OptimizationPass("dfe", "Dead Function Elimination") {}
+      : OptimizationPass(kName, "Dead Function Elimination") {}
   ~DeadFunctionEliminationPass() override = default;
 
  protected:
   // Iterate all nodes and mark and eliminate unreachable functions.
   absl::StatusOr<bool> RunInternal(Package* p,
                                    const OptimizationPassOptions& options,
-                                   PassResults* results) const override;
+                                   PassResults* results,
+                                   OptimizationContext& context) const override;
 };
 
 }  // namespace xls

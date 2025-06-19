@@ -16,6 +16,7 @@
 #define XLS_IR_BITS_OPS_H_
 
 #include <cstdint>
+#include <optional>
 #include <ostream>
 #include <string>
 
@@ -26,6 +27,14 @@
 
 namespace xls {
 namespace bits_ops {
+
+// Returns the given bits as an int64_t, returning std::nullopt if the result
+// would be too large to fit in an int64_t.
+std::optional<int64_t> TryUnsignedBitsToInt64(const Bits& bits);
+
+// Returns the given bits as an int64_t, saturating to the maximum value if the
+// result would be too large to fit in an int64_t.
+int64_t UnsignedBitsToSaturatedInt64(const Bits& bits);
 
 // Various bitwise operations. The width of the lhs and rhs must be equal, and
 // the returned Bits object has the same width as the input.
@@ -48,8 +57,8 @@ Bits XorReduce(const Bits& operand);
 
 // Various arithmetic operations. The width of all inputs must be equal, and the
 // returned Bits object is truncated to the same width as the input.
-Bits Increment(const Bits& x);
-Bits Decrement(const Bits& x);
+Bits Increment(Bits x);
+Bits Decrement(Bits x);
 Bits Add(const Bits& lhs, const Bits& rhs);
 Bits Sub(const Bits& lhs, const Bits& rhs);
 
@@ -114,8 +123,8 @@ bool SLessThan(const Bits& lhs, int64_t rhs);
 // Zero/sign extend 'bits' to the new bit count and return the result.
 //
 // Check-fails if new_bit_count is not >= bits.bit_count().
-Bits ZeroExtend(const Bits& bits, int64_t new_bit_count);
-Bits SignExtend(const Bits& bits, int64_t new_bit_count);
+Bits ZeroExtend(Bits bits, int64_t new_bit_count);
+Bits SignExtend(Bits bits, int64_t new_bit_count);
 
 // Shift Left/Right Logical or Arithmetic (shift right only). The width of the
 // returned Bits object is the same as the input.
@@ -155,6 +164,8 @@ Bits Reverse(const Bits& bits);
 // bits[8]:0b00001010 would become bits[4]:1010.
 // Returns a zero-bit/empty Bits for a zero-valued input.
 Bits DropLeadingZeroes(const Bits& bits);
+
+Bits Truncate(Bits bits, int64_t size);
 
 // Returns a Bits object with the sequence of bits starting at index 'start'
 // replaced with update_value. Any out-of-bounds updated bits are ignored.

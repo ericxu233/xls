@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -24,26 +25,30 @@
 #include "gtest/gtest.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "xls/codegen/codegen_result.h"
 #include "xls/codegen/module_signature.h"
+#include "xls/codegen/module_signature.pb.h"
+#include "xls/codegen/verilog_line_map.pb.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/get_runfile_path.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/channel.h"
-#include "xls/ir/channel_ops.h"
+#include "xls/ir/channel.pb.h"
 #include "xls/ir/package.h"
 #include "xls/ir/value.h"
-#include "xls/simulation/module_testbench.h"
+#include "xls/simulation/testbench_signal_capture.h"
 #include "xls/simulation/verilog_test_base.h"
 
 namespace xls {
 namespace verilog {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::ElementsAre;
 using ::testing::HasSubstr;
 using ::testing::Pair;
@@ -53,8 +58,9 @@ constexpr char kTestdataPath[] = "xls/simulation/testdata";
 
 // Returns a test module which can be used to monitor the ready/valid interface
 // of a streaming channel.
-absl::StatusOr<ModuleGeneratorResult> GetInputChannelMonitorModule() {
-  const std::string kModulePath = "xls/simulation/input_channel_monitor.v";
+absl::StatusOr<verilog::CodegenResult> GetInputChannelMonitorModule() {
+  constexpr std::string_view kModulePath =
+      "xls/simulation/input_channel_monitor.v";
   XLS_ASSIGN_OR_RETURN(std::string runfile_path,
                        GetXlsRunfilePath(kModulePath));
   XLS_ASSIGN_OR_RETURN(std::string verilog_text, GetFileContents(runfile_path));
@@ -68,28 +74,31 @@ absl::StatusOr<ModuleGeneratorResult> GetInputChannelMonitorModule() {
   b.AddDataInputAsBits("input_data", 8);
   b.AddDataOutputAsBits("input_ready", 1);
   b.AddDataInputAsBits("input_valid", 1);
-  b.AddStreamingChannel("input", ChannelOps::kReceiveOnly,
-                        FlowControl::kReadyValid, p.GetBitsType(8),
-                        /*fifo_config=*/std::nullopt, "input_data",
-                        "input_valid", "input_ready");
+  b.AddStreamingChannelInterface("input", CHANNEL_DIRECTION_RECEIVE,
+                                 p.GetBitsType(8), FlowControl::kReadyValid,
+                                 "input_data", "input_ready", "input_valid",
+                                 FLOP_KIND_NONE);
 
   b.AddDataOutputAsBits("monitor_data", 9);
   b.AddDataInputAsBits("monitor_ready", 1);
   b.AddDataOutputAsBits("monitor_valid", 1);
-  b.AddStreamingChannel("monitor", ChannelOps::kReceiveOnly,
-                        FlowControl::kReadyValid, p.GetBitsType(9),
-                        /*fifo_config=*/std::nullopt, "monitor_data",
-                        "monitor_valid", "monitor_ready");
+  b.AddStreamingChannelInterface("monitor", CHANNEL_DIRECTION_SEND,
+                                 p.GetBitsType(8), FlowControl::kReadyValid,
+                                 "monitor_data", "monitor_ready",
+                                 "monitor_valid", FLOP_KIND_NONE);
   XLS_ASSIGN_OR_RETURN(ModuleSignature signature, b.Build());
-  return ModuleGeneratorResult{.verilog_text = verilog_text,
-                               .verilog_line_map = VerilogLineMap(),
-                               .signature = signature};
+  return verilog::CodegenResult{
+      .verilog_text = verilog_text,
+      .verilog_line_map = VerilogLineMap(),
+      .signature = signature,
+      .block_metrics = XlsMetricsProto(),
+      .pass_pipeline_metrics = PassPipelineMetricsProto()};
 }
 
 // Returns a pipelined proc which reads from two channels `operand_0` and
 // `operand_1` and writes the sum to channel `result`.
-absl::StatusOr<ModuleGeneratorResult> GetPipelinedProc() {
-  const std::string text = R"(
+absl::StatusOr<verilog::CodegenResult> GetPipelinedProc() {
+  constexpr std::string_view text = R"(
 module proc_adder_pipeline(
   input wire clk,
   input wire rst,
@@ -190,22 +199,27 @@ endmodule
   b.AddDataOutputAsBits("result_vld", 1);
   b.AddDataOutputAsBits("operand_0_rdy", 1);
   b.AddDataOutputAsBits("operand_1_rdy", 1);
-  b.AddStreamingChannel("operand_0", ChannelOps::kReceiveOnly,
-                        FlowControl::kReadyValid, p.GetBitsType(32),
-                        /*fifo_config=*/FifoConfig{.depth = 42}, "operand_0",
-                        "operand_0_vld", "operand_0_rdy");
-  b.AddStreamingChannel("operand_1", ChannelOps::kReceiveOnly,
-                        FlowControl::kReadyValid, p.GetBitsType(32),
-                        /*fifo_config=*/FifoConfig{.depth = 42}, "operand_1",
-                        "operand_1_vld", "operand_1_rdy");
-  b.AddStreamingChannel("result", ChannelOps::kSendOnly,
-                        FlowControl::kReadyValid, p.GetBitsType(32),
-                        /*fifo_config=*/FifoConfig{.depth = 42}, "result",
-                        "result_vld", "result_rdy");
+
+  b.AddStreamingChannelInterface("operand_0", CHANNEL_DIRECTION_RECEIVE,
+                                 p.GetBitsType(32), FlowControl::kReadyValid,
+                                 "operand_0", "operand_0_rdy", "operand_0_vld",
+                                 FLOP_KIND_NONE);
+  b.AddStreamingChannelInterface("operand_1", CHANNEL_DIRECTION_RECEIVE,
+                                 p.GetBitsType(32), FlowControl::kReadyValid,
+                                 "operand_1", "operand_1_rdy", "operand_1_vld",
+                                 FLOP_KIND_NONE);
+  b.AddStreamingChannelInterface("result", CHANNEL_DIRECTION_SEND,
+                                 p.GetBitsType(32), FlowControl::kReadyValid,
+                                 "result", "result_rdy", "result_vld",
+                                 FLOP_KIND_NONE);
   XLS_ASSIGN_OR_RETURN(ModuleSignature signature, b.Build());
-  return ModuleGeneratorResult{.verilog_text = text,
-                               .verilog_line_map = VerilogLineMap(),
-                               .signature = signature};
+
+  return verilog::CodegenResult{
+      .verilog_text = std::string{text},
+      .verilog_line_map = VerilogLineMap(),
+      .signature = signature,
+      .block_metrics = XlsMetricsProto(),
+      .pass_pipeline_metrics = PassPipelineMetricsProto()};
 }
 
 // A test for ModuleSimulator which uses bare Verilog.
@@ -215,9 +229,9 @@ class ModuleSimulatorTest : public VerilogTestBase {
   // Verilog text and Module signature. Output is the sum of the input and a
   // delayed version of the input. For a correct result the input must be driven
   // for the duration of the computation.
-  absl::StatusOr<std::pair<std::string, ModuleSignature>>
+  absl::StatusOr<std::pair<std::string_view, ModuleSignature>>
   MakeFixedLatencyModule() const {
-    const std::string text = R"(
+    constexpr std::string_view text = R"(
 module fixed_latency_3(
   input wire clk,
   input wire [7:0] x,
@@ -248,9 +262,9 @@ endmodule
 
   // Returns a combinatorial Verilog module as a pair of Verilog text and Module
   // signature. Output is the difference between the two inputs.
-  absl::StatusOr<std::pair<std::string, ModuleSignature>>
+  absl::StatusOr<std::pair<std::string_view, ModuleSignature>>
   MakeCombinationalModule() const {
-    const std::string text =
+    constexpr std::string_view text =
         R"(
 module comb_diff(
   input wire clk,
@@ -275,9 +289,9 @@ endmodule
 
   // Returns a Verilog module with a ready-valid interface as a pair of Verilog
   // text and Module signature. Output is the difference between the two inputs.
-  absl::StatusOr<std::pair<std::string, ModuleSignature>> MakeReadyValidModule()
-      const {
-    const std::string text =
+  absl::StatusOr<std::pair<std::string_view, ModuleSignature>>
+  MakeReadyValidModule() const {
+    constexpr std::string_view text =
         R"(
 module comb_diff(
   input wire clk,
@@ -353,8 +367,28 @@ TEST_P(ModuleSimulatorTest, CombinationalBatched) {
   EXPECT_THAT(outputs[2], ElementsAre(Pair("out", UBits(100, 8))));
 }
 
+TEST_P(ModuleSimulatorTest, ReadyValidBatched) {
+  XLS_ASSERT_OK_AND_ASSIGN(auto verilog_signature, MakeReadyValidModule());
+  ModuleSimulator simulator =
+      NewModuleSimulator(verilog_signature.first, verilog_signature.second);
+
+  // Test using bits
+  using BitsMap = ModuleSimulator::BitsMap;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::vector<BitsMap> outputs,
+      simulator.RunBatched(
+          {BitsMap{{"x", UBits(99, 8)}, {"y", UBits(12, 8)}},
+           BitsMap{{"x", UBits(100, 8)}, {"y", UBits(25, 8)}},
+           BitsMap{{"x", UBits(255, 8)}, {"y", UBits(155, 8)}}}));
+
+  EXPECT_EQ(outputs.size(), 3);
+  EXPECT_THAT(outputs[0], ElementsAre(Pair("out", UBits(87, 8))));
+  EXPECT_THAT(outputs[1], ElementsAre(Pair("out", UBits(75, 8))));
+  EXPECT_THAT(outputs[2], ElementsAre(Pair("out", UBits(100, 8))));
+}
+
 TEST_P(ModuleSimulatorTest, MultipleOutputs) {
-  const std::string text = R"(
+  constexpr std::string_view text = R"(
 module delay_3(
   input wire the_clk,
   input wire [7:0] x,
@@ -389,7 +423,7 @@ endmodule
 }
 
 TEST_P(ModuleSimulatorTest, BadInputs) {
-  const std::string text = R"(
+  constexpr std::string_view text = R"(
 module delay_3(
   input wire clk,
   input wire [7:0] x,
@@ -442,7 +476,7 @@ endmodule
 }
 
 TEST_P(ModuleSimulatorTest, RunInputSeriesProcCombinational) {
-  const std::string text = R"(
+  constexpr std::string_view text = R"(
 module proc_adder(
   input wire [31:0] operand_0,
   input wire operand_0_vld,
@@ -478,18 +512,20 @@ endmodule
   b.AddDataOutputAsBits("result_vld", 1);
   b.AddDataOutputAsBits("operand_0_rdy", 1);
   b.AddDataOutputAsBits("operand_1_rdy", 1);
-  b.AddStreamingChannel("operand_0", ChannelOps::kReceiveOnly,
-                        FlowControl::kReadyValid, p.GetBitsType(32),
-                        /*fifo_config=*/FifoConfig{.depth = 42}, "operand_0",
-                        "operand_0_vld", "operand_0_rdy");
-  b.AddStreamingChannel("operand_1", ChannelOps::kReceiveOnly,
-                        FlowControl::kReadyValid, p.GetBitsType(32),
-                        /*fifo_config=*/FifoConfig{.depth = 42}, "operand_1",
-                        "operand_1_vld", "operand_1_rdy");
-  b.AddStreamingChannel("result", ChannelOps::kSendOnly,
-                        FlowControl::kReadyValid, p.GetBitsType(32),
-                        /*fifo_config=*/FifoConfig{.depth = 42}, "result",
-                        "result_vld", "result_rdy");
+
+  b.AddStreamingChannelInterface("operand_0", CHANNEL_DIRECTION_RECEIVE,
+                                 p.GetBitsType(32), FlowControl::kReadyValid,
+                                 "operand_0", "operand_0_rdy", "operand_0_vld",
+                                 FLOP_KIND_NONE);
+  b.AddStreamingChannelInterface("operand_1", CHANNEL_DIRECTION_RECEIVE,
+                                 p.GetBitsType(32), FlowControl::kReadyValid,
+                                 "operand_1", "operand_1_rdy", "operand_1_vld",
+                                 FLOP_KIND_NONE);
+  b.AddStreamingChannelInterface("result", CHANNEL_DIRECTION_SEND,
+                                 p.GetBitsType(32), FlowControl::kReadyValid,
+                                 "result", "result_rdy", "result_vld",
+                                 FLOP_KIND_NONE);
+
   XLS_ASSERT_OK_AND_ASSIGN(ModuleSignature signature, b.Build());
 
   ModuleSimulator simulator = NewModuleSimulator(text, signature);
@@ -530,7 +566,7 @@ endmodule
 }
 
 TEST_P(ModuleSimulatorTest, RunPipelinedProcBits) {
-  XLS_ASSERT_OK_AND_ASSIGN(ModuleGeneratorResult result, GetPipelinedProc());
+  XLS_ASSERT_OK_AND_ASSIGN(verilog::CodegenResult result, GetPipelinedProc());
   ModuleSimulator simulator =
       NewModuleSimulator(result.verilog_text, result.signature);
   absl::flat_hash_map<std::string, int64_t> output_channel_counts = {
@@ -555,7 +591,7 @@ TEST_P(ModuleSimulatorTest, RunPipelinedProcBits) {
 }
 
 TEST_P(ModuleSimulatorTest, RunPipelinedProcValues) {
-  XLS_ASSERT_OK_AND_ASSIGN(ModuleGeneratorResult result, GetPipelinedProc());
+  XLS_ASSERT_OK_AND_ASSIGN(verilog::CodegenResult result, GetPipelinedProc());
   ModuleSimulator simulator =
       NewModuleSimulator(result.verilog_text, result.signature);
 
@@ -574,7 +610,7 @@ TEST_P(ModuleSimulatorTest, RunPipelinedProcValues) {
 }
 
 TEST_P(ModuleSimulatorTest, RunPipelinedProcValidHoldoff) {
-  XLS_ASSERT_OK_AND_ASSIGN(ModuleGeneratorResult result, GetPipelinedProc());
+  XLS_ASSERT_OK_AND_ASSIGN(verilog::CodegenResult result, GetPipelinedProc());
   ModuleSimulator simulator =
       NewModuleSimulator(result.verilog_text, result.signature);
 
@@ -614,7 +650,7 @@ TEST_P(ModuleSimulatorTest, RunPipelinedProcValidHoldoff) {
 }
 
 TEST_P(ModuleSimulatorTest, RunPipelinedProcReadyHoldoff) {
-  XLS_ASSERT_OK_AND_ASSIGN(ModuleGeneratorResult result, GetPipelinedProc());
+  XLS_ASSERT_OK_AND_ASSIGN(verilog::CodegenResult result, GetPipelinedProc());
   ModuleSimulator simulator =
       NewModuleSimulator(result.verilog_text, result.signature);
 
@@ -646,7 +682,7 @@ TEST_P(ModuleSimulatorTest, RunPipelinedProcReadyHoldoff) {
 }
 
 TEST_P(ModuleSimulatorTest, TestNoValidHoldOff) {
-  XLS_ASSERT_OK_AND_ASSIGN(ModuleGeneratorResult module,
+  XLS_ASSERT_OK_AND_ASSIGN(verilog::CodegenResult module,
                            GetInputChannelMonitorModule());
   ModuleSimulator simulator =
       NewModuleSimulator(module.verilog_text, module.signature);
@@ -668,7 +704,7 @@ TEST_P(ModuleSimulatorTest, TestNoValidHoldOff) {
 }
 
 TEST_P(ModuleSimulatorTest, TestValidHoldoffWithoutDrivenValues) {
-  XLS_ASSERT_OK_AND_ASSIGN(ModuleGeneratorResult module,
+  XLS_ASSERT_OK_AND_ASSIGN(verilog::CodegenResult module,
                            GetInputChannelMonitorModule());
   ModuleSimulator simulator =
       NewModuleSimulator(module.verilog_text, module.signature);
@@ -694,7 +730,7 @@ TEST_P(ModuleSimulatorTest, TestValidHoldoffWithoutDrivenValues) {
 }
 
 TEST_P(ModuleSimulatorTest, TestValidHoldoffWithDrivenValues) {
-  XLS_ASSERT_OK_AND_ASSIGN(ModuleGeneratorResult module,
+  XLS_ASSERT_OK_AND_ASSIGN(verilog::CodegenResult module,
                            GetInputChannelMonitorModule());
   ModuleSimulator simulator =
       NewModuleSimulator(module.verilog_text, module.signature);
@@ -727,7 +763,7 @@ TEST_P(ModuleSimulatorTest, TestValidHoldoffWithDrivenValues) {
 }
 
 TEST_P(ModuleSimulatorTest, TestValidHoldoffWithDrivenX) {
-  XLS_ASSERT_OK_AND_ASSIGN(ModuleGeneratorResult module,
+  XLS_ASSERT_OK_AND_ASSIGN(verilog::CodegenResult module,
                            GetInputChannelMonitorModule());
   ModuleSimulator simulator =
       NewModuleSimulator(module.verilog_text, module.signature);
@@ -753,7 +789,7 @@ TEST_P(ModuleSimulatorTest, TestValidHoldoffWithDrivenX) {
 }
 
 TEST_P(ModuleSimulatorTest, RunInputSeriesEmptyModule) {
-  const std::string text = R"(
+  constexpr std::string_view text = R"(
 module proc_adder_pipeline(
   input wire clk,
   input wire rst

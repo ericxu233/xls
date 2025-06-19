@@ -15,27 +15,21 @@
 #ifndef XLS_IR_FUNCTION_H_
 #define XLS_IR_FUNCTION_H_
 
+#include <functional>
 #include <list>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "xls/common/iterator_range.h"
-#include "xls/common/status/ret_check.h"
-#include "xls/ir/dfs_visitor.h"
 #include "xls/ir/function_base.h"
-#include "xls/ir/name_uniquer.h"
 #include "xls/ir/node.h"
 #include "xls/ir/nodes.h"
 #include "xls/ir/package.h"
 #include "xls/ir/type.h"
-#include "xls/ir/unwrapping_iterator.h"
-#include "xls/ir/verifier.h"
 
 namespace xls {
 
@@ -52,13 +46,7 @@ class Function : public FunctionBase {
   Node* return_value() const { return return_value_; }
 
   // Sets the node that serves as the return value of this function.
-  absl::Status set_return_value(Node* n) {
-    XLS_RET_CHECK_EQ(n->function_base(), this) << absl::StreamFormat(
-        "Return value node %s is not in this function %s (is in function %s)",
-        n->GetName(), name(), n->function_base()->name());
-    return_value_ = n;
-    return absl::OkStatus();
-  }
+  absl::Status set_return_value(Node* n);
 
   FunctionType* GetType();
 
@@ -67,6 +55,11 @@ class Function : public FunctionBase {
   //   'recursive' if true, will dump counted-for body functions as well.
   //   This is only useful when dumping individual functions, and not packages.
   std::string DumpIr() const override;
+
+  // DumpIr emits the IR in a hierarchical text format with the returned
+  // annotations after each node definition.
+  std::string DumpIrWithAnnotations(
+      const std::function<std::optional<std::string>(Node*)>& annotate) const;
 
   // Creates a clone of the function with the new name 'new_name'. Function is
   // owned by target_package.  call_remapping specifies any function

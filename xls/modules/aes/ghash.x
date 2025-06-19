@@ -15,8 +15,8 @@
 // XLS implementation of the GHASH subroutine of the Galois counter mode of operation for
 // block ciphers, as described in NIST Special Publication 800-38D: "Recommendation for Block
 // Cipher Modes of Operation: Galois/Counter Mode (GCM) and GMAC".
-import xls.modules.aes.aes
-import xls.modules.aes.aes_common
+import xls.modules.aes.aes;
+import xls.modules.aes.aes_common;
 
 type Block = aes_common::Block;
 type Key = aes_common::Key;
@@ -55,7 +55,7 @@ pub fn gf128_mul(x: Block, y: Block) -> Block {
     let r = u8:0b11100001 ++ uN[120]:0;
     // TODO(rspringer): Can't currently select an element from an array or
     // tuple resulting from a for loop.
-    let z_v = for (i, (last_z, last_v)) in range(u32:0, u32:128) {
+    let z_v = for (i, (last_z, last_v)) in u32:0..u32:128 {
         let z = if (x >> (u32:127 - i)) as u1 == u1:0 { last_z } else { last_z ^ last_v };
         let v = if last_v[0:1] == u1:0 { last_v >> 1 } else { (last_v >> 1) ^ r };
         (z, v)
@@ -234,9 +234,9 @@ pub proc ghash {
         (command_in, input_in, tag_out)
     }
 
-    next(tok: token, state: State) {
+    next(state: State) {
         let (tok, command) = recv_if(
-            tok, command_in, state.step == Step::IDLE, zero!<Command>());
+            join(), command_in, state.step == Step::IDLE, zero!<Command>());
         let state = get_current_state(state, command);
 
         // Get the current working block and update block counts.
@@ -287,15 +287,15 @@ proc ghash_test {
     init { () }
 
     config(terminator: chan<bool> out) {
-        let (command_s, command_r) = chan<Command>;
-        let (data_s, data_r) = chan<Block>;
-        let (tag_s, tag_r) = chan<Block>;
+        let (command_s, command_r) = chan<Command>("command");
+        let (data_s, data_r) = chan<Block>("data");
+        let (tag_s, tag_r) = chan<Block>("tag");
 
         spawn ghash(command_r, data_r, tag_s);
         (command_s, data_s, tag_r, terminator)
     }
 
-    next(tok: token, state: ()) {
+    next(state: ()) {
         // Test 1: single AAD block, single ctxt block.
         let key = Key:[u8:0, ...];
         // No real need to use AES here, but no reason to _remove_ it, either.
@@ -318,7 +318,7 @@ proc ghash_test {
             ctxt_blocks: u32:1,
             hash_key: hash_key,
         };
-        let tok = send(tok, command_out, command);
+        let tok = send(join(), command_out, command);
         let tok = send(tok, data_out, aad);
         let tok = send(tok, data_out, ctxt);
         let (tok, tag) = recv(tok, tag_in);

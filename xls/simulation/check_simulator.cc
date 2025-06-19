@@ -14,11 +14,9 @@
 
 #include "xls/simulation/check_simulator.h"
 
-#include <cstdlib>
 #include <string_view>
 
 #include "absl/status/status.h"
-#include "xls/common/logging/logging.h"
 
 namespace xls {
 

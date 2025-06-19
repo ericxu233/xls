@@ -15,14 +15,18 @@
 #ifndef XLS_IR_INTERVAL_H_
 #define XLS_IR_INTERVAL_H_
 
+#include <compare>
+#include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <iosfwd>
+#include <iterator>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "xls/common/logging/logging.h"
+#include "absl/base/macros.h"
+#include "absl/log/check.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
 
@@ -50,7 +54,7 @@ class Interval {
   // The upper/lower bound are both considered inclusive.
   Interval(const Bits& lower_bound, const Bits& upper_bound)
       : is_valid_(true), lower_bound_(lower_bound), upper_bound_(upper_bound) {
-    XLS_CHECK_EQ(lower_bound_.bit_count(), upper_bound_.bit_count());
+    CHECK_EQ(lower_bound_.bit_count(), upper_bound_.bit_count());
   }
 
   // Returns the interval [lower_bound, upper_bound].
@@ -117,7 +121,7 @@ class Interval {
   // intersection, if one exists. Otherwise, returns `std::nullopt`.
   // Does not accept improper intervals.
   static std::optional<Interval> Intersect(const Interval& lhs,
-                                            const Interval& rhs);
+                                           const Interval& rhs);
 
   // Given two `Interval`s, return a set of `Interval`s representing their
   // set difference.
@@ -133,17 +137,98 @@ class Interval {
   // subsets are allowed). Does not accept improper intervals.
   static bool IsSubsetOf(const Interval& lhs, const Interval& rhs);
 
+  // A lazy iterator of the values in this interval.
+  //
+  // TODO(allight): Implement the random-access iterator interface. NB
+  // random-access iterator requires constant-time indexing.
+  class ValuesIterator {
+   public:
+    using difference_type = std::ptrdiff_t;
+    using value_type = Bits;
+    using reference = const Bits&;
+    using pointer = const Bits*;
+    using iterator_category = std::forward_iterator_tag;
+    static ValuesIterator None() { return ValuesIterator(Bits(0), false); }
+
+    ValuesIterator(ValuesIterator&&) = default;
+    ValuesIterator(const ValuesIterator&) = default;
+    ValuesIterator& operator=(ValuesIterator&&) = default;
+    ValuesIterator& operator=(const ValuesIterator&) = default;
+
+    const Bits& operator*() const { return cur_value_; }
+    const Bits* operator->() const { return &cur_value_; }
+    ValuesIterator& operator++() {
+      cur_value_ = bits_ops::Increment(std::move(cur_value_));
+      is_first_and_maximal = false;
+      return *this;
+    }
+    ValuesIterator operator++(int) {
+      ValuesIterator tmp = *this;
+      ++*this;
+      return tmp;
+    }
+
+    bool operator==(const ValuesIterator& o) const {
+      return cur_value_ == o.cur_value_ &&
+             is_first_and_maximal == o.is_first_and_maximal;
+    }
+
+   private:
+    explicit ValuesIterator(const Bits& cur, bool is_first_and_maximal)
+        : cur_value_(cur), is_first_and_maximal(is_first_and_maximal) {}
+    Bits cur_value_;
+    bool is_first_and_maximal;
+
+    friend class Interval;
+  };
+
+  // Begin lazy iterator fo the elements of the interval.
+  ValuesIterator begin() const {
+    EnsureValid();
+    // If we are a maximal interval we need to be sure to not consider the first
+    // element the end.
+    return ValuesIterator(lower_bound_, /*is_first_and_maximal=*/IsMaximal());
+  }
+  ValuesIterator cbegin() const { return begin(); }
+
+  // End Iterator of the elements of the interval.
+  ValuesIterator end() const {
+    EnsureValid();
+    return ValuesIterator(bits_ops::Increment(upper_bound_),
+                          /*is_first_and_maximal=*/false);
+  }
+  ValuesIterator cend() const { return end(); }
+
   // Iterate over every point in the interval, calling the given callback for
   // each point. If the callback returns `true`, terminate the iteration early
   // and return `true`. Otherwise, continue the iteration until all points have
-  // been visited and return `false`.
-  bool ForEachElement(const std::function<bool(const Bits&)>& callback) const;
+  // been visited and return `false`. The iterator interface should be prefered
+  // to this.
+  template <typename Func>
+    requires(std::is_invocable_r_v<bool, Func, const Bits&>)
+  ABSL_DEPRECATE_AND_INLINE()
+  bool ForEachElement(Func callback) const {
+    EnsureValid();
+    for (const Bits& b : *this) {
+      if (callback(b)) {
+        return true;
+      }
+    }
+    return false;
+  }
 
-  // This is similar to `ForEachElement`, except it accumulates the result
-  // into a `std::vector<Bits>` instead of using a callback. This is often
-  // impractical as it will use a lot of memory, but can be useful temporarily
-  // for debugging.
-  std::vector<Bits> Elements() const;
+  // This simply collects the results of iterating over this interval into a
+  // `std::vector<Bits>` for convenience. This is often impractical as it will
+  // use a lot of memory, but can be useful temporarily for debugging. Prefer
+  // using the iterator interface above which generates the elements lazily.
+  std::vector<Bits> Elements() const {
+    std::vector<Bits> elems;
+    elems.reserve(Size().value_or(1));
+    for (const Bits& b : *this) {
+      elems.push_back(b);
+    }
+    return elems;
+  };
 
   // Returns the number of points contained within the interval as a `Bits`.
   //
@@ -197,25 +282,22 @@ class Interval {
   std::string ToString() const;
 
   // Lexicographic ordering of intervals.
-  friend bool operator<(const Interval& lhs, const Interval& rhs) {
-    const int64_t lower_bound_cmp =
-        bits_ops::UCmp(lhs.lower_bound_, rhs.lower_bound_);
-    if (lower_bound_cmp < 0) {
-      return true;
+  friend std::strong_ordering operator<=>(const Interval& lhs,
+                                          const Interval& rhs) {
+    auto cmp_bits = [](const Bits& l, const Bits& r) {
+      return bits_ops::UCmp(l, r) <=> 0;
+    };
+    std::strong_ordering lower_cmp =
+        cmp_bits(lhs.LowerBound(), rhs.LowerBound());
+    if (lower_cmp == std::strong_ordering::equal) {
+      return cmp_bits(lhs.UpperBound(), rhs.UpperBound());
     }
-    if (lower_bound_cmp > 0) {
-      return false;
-    }
-    return bits_ops::ULessThan(lhs.upper_bound_, rhs.upper_bound_);
+    return lower_cmp;
   }
 
   // Equality of intervals.
   friend bool operator==(const Interval& lhs, const Interval& rhs) {
-    if (bits_ops::UEqual(lhs.lower_bound_, rhs.lower_bound_) &&
-        bits_ops::UEqual(lhs.upper_bound_, rhs.upper_bound_)) {
-      return true;
-    }
-    return false;
+    return (lhs <=> rhs) == std::strong_ordering::equal;
   }
 
   template <typename H>
@@ -224,8 +306,13 @@ class Interval {
                       interval.upper_bound_);
   }
 
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink, const Interval& interval) {
+    absl::Format(&sink, "%s", interval.ToString());
+  }
+
  private:
-  void EnsureValid() const { XLS_CHECK(is_valid_); }
+  void EnsureValid() const { CHECK(is_valid_); }
 
   bool is_valid_;
   Bits lower_bound_;

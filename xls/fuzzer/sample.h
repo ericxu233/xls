@@ -15,6 +15,7 @@
 #ifndef XLS_FUZZER_SAMPLE_H_
 #define XLS_FUZZER_SAMPLE_H_
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -23,11 +24,13 @@
 #include <utility>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xls/common/proto_adaptor_utils.h"
 #include "xls/dslx/interp_value.h"
 #include "xls/fuzzer/sample.pb.h"
+#include "xls/tests/testvector.pb.h"
 #include "re2/re2.h"
 
 namespace xls {
@@ -59,8 +62,6 @@ class SampleOptions {
 
   // Convert to/from text serialized SampleOptionsProto.
   static absl::StatusOr<SampleOptions> FromPbtxt(std::string_view text);
-  std::string ToPbtxt() const;
-
   static absl::StatusOr<SampleOptions> FromProto(
       fuzzer::SampleOptionsProto proto);
 
@@ -100,8 +101,16 @@ class SampleOptions {
   bool codegen() const { return proto_.codegen(); }
   void set_codegen(bool value) { proto_.set_codegen(value); }
 
+  bool codegen_ng() const { return proto_.codegen_ng(); }
+  void set_codegen_ng(bool value) { proto_.set_codegen_ng(value); }
+
   bool simulate() const { return proto_.simulate(); }
   void set_simulate(bool value) { proto_.set_simulate(value); }
+
+  bool with_valid_holdoff() const { return proto_.with_valid_holdoff(); }
+  void set_with_valid_holdoff(bool value) {
+    proto_.set_with_valid_holdoff(value);
+  }
 
   const std::string& simulator() const { return proto_.simulator(); }
   void set_simulator(std::string_view value) {
@@ -137,6 +146,13 @@ class SampleOptions {
 
   int64_t proc_ticks() const { return proto_.proc_ticks(); }
   void set_proc_ticks(int64_t value) { proto_.set_proc_ticks(value); }
+
+  bool disable_unopt_interpreter() const {
+    return proto_.disable_unopt_interpreter();
+  }
+  void set_disable_unopt_interpreter(bool value = true) {
+    proto_.set_disable_unopt_interpreter(value);
+  }
 
   const std::vector<KnownFailure>& known_failures() const {
     if (known_failures_.empty() && proto_.known_failure_size() > 0) {
@@ -214,6 +230,16 @@ class Sample {
   //  // END_CONFIG
   //  <code sample>
   static absl::StatusOr<Sample> Deserialize(std::string_view s);
+
+  // Utility function to convert testvector::SampleInputsProto to
+  // args batch and channel names used in this object.
+  // TODO(google/xls#1645) remove.
+  static absl::Status ExtractArgsBatch(
+      const SampleOptions& options,
+      const testvector::SampleInputsProto& testvector,
+      std::vector<std::vector<dslx::InterpValue>>& args_batch,
+      std::vector<std::string>* ir_channel_names = nullptr);
+
   std::string Serialize(
       std::optional<std::string_view> error_message = std::nullopt) const;
 
@@ -225,40 +251,41 @@ class Sample {
   std::string ToCrasher(std::string_view error_message) const;
 
   Sample(std::string input_text, SampleOptions options,
-         std::vector<std::vector<dslx::InterpValue>> args_batch,
-         std::vector<std::string> ir_channel_names = {})
+         testvector::SampleInputsProto testvector)
       : input_text_(std::move(input_text)),
         options_(std::move(options)),
-        args_batch_(std::move(args_batch)),
-        ir_channel_names_(std::move(ir_channel_names)) {}
+        testvector_(std::move(testvector)) {}
+
+  // Legacy constructor for compatibility, but to be removed. Use above instead.
+  [[deprecated("Use constructor taking testvector instead")]] Sample(
+      std::string input_text, SampleOptions options,
+      const std::vector<std::vector<dslx::InterpValue>>& args_batch,
+      const std::vector<std::string>& ir_channel_names = {});
 
   const SampleOptions& options() const { return options_; }
+  const testvector::SampleInputsProto& testvector() const {
+    return testvector_;
+  }
+
   const std::string& input_text() const { return input_text_; }
-  const std::vector<std::vector<dslx::InterpValue>>& args_batch() const {
-    return args_batch_;
-  }
-  const std::vector<std::string>& ir_channel_names() const {
-    return ir_channel_names_;
-  }
 
   bool operator==(const Sample& other) const {
     return input_text_ == other.input_text_ && options_ == other.options_ &&
-           ArgsBatchEqual(other) &&
-           ir_channel_names_ == other.ir_channel_names_;
+           TestVectorEqual(other.testvector_);
   }
-  bool operator!=(const Sample& other) const { return !((*this) == other); }
+  bool operator!=(const Sample& other) const = default;
+
+  // Get legacy representations.
+  absl::Status GetArgsAndChannels(
+      std::vector<std::vector<dslx::InterpValue>>& args_batch,
+      std::vector<std::string>* ir_channel_names = nullptr) const;
 
  private:
-  // Returns whether the argument batch is the same as in "other".
-  bool ArgsBatchEqual(const Sample& other) const;
+  bool TestVectorEqual(const testvector::SampleInputsProto& tv) const;
 
-  std::string input_text_;  // Code sample as text.
-  SampleOptions options_;   // How to run the sample.
-
-  // Argument values to use for interpretation and simulation.
-  std::vector<std::vector<dslx::InterpValue>> args_batch_;
-  // Channel names as they appear in the IR.
-  std::vector<std::string> ir_channel_names_;
+  std::string input_text_;                    // Code sample as text.
+  SampleOptions options_;                     // How to run the sample.
+  testvector::SampleInputsProto testvector_;  // Input data.
 };
 
 std::ostream& operator<<(std::ostream& os, const Sample& sample);

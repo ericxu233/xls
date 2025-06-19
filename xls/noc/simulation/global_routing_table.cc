@@ -25,12 +25,16 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/variant.h"
 #include "xls/common/status/ret_check.h"
-#include "xls/noc/config/network_config.pb.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/noc/simulation/common.h"
+#include "xls/noc/simulation/indexer.h"
 #include "xls/noc/simulation/network_graph.h"
 #include "xls/noc/simulation/parameters.h"
 
@@ -89,7 +93,7 @@ DistributedRoutingTable::ComputeRoute(NetworkComponentId source,
     if (route.size() > max_hops) {
       std::stringstream route_error_msg;
       route_error_msg << "Network components in the route thus far are:"
-                      << std::endl;
+                      << '\n';
       for (const NetworkComponentId nc_id : route) {
         XLS_ASSIGN_OR_RETURN(
             NetworkComponentParam nc_param,
@@ -100,7 +104,7 @@ DistributedRoutingTable::ComputeRoute(NetworkComponentId source,
         } else if (std::holds_alternative<LinkParam>(nc_param)) {
           name = std::get<LinkParam>(nc_param).GetName();
         }
-        route_error_msg << name << std::endl;
+        route_error_msg << name << '\n';
       }
       return absl::InternalError(absl::StrFormat(
           "Route from source %x to sink %x exceeded max hops %d. %s",
@@ -206,7 +210,7 @@ absl::Status DistributedRoutingTable::DumpRouterRoutingTable(
       routing_tables_.at(network_id.id());
   XLS_ASSIGN_OR_RETURN(NetworkParam network_param,
                        network_parameters_->GetNetworkParam(network_id));
-  XLS_LOG(INFO) << "Routing table for network: " << network_param.GetName();
+  LOG(INFO) << "Routing table for network: " << network_param.GetName();
   for (const NetworkComponentId& nc_id : network.GetNetworkComponentIds()) {
     const NetworkComponent& nc = network.GetNetworkComponent(nc_id);
     if (nc.kind() != NetworkComponentKind::kRouter) {
@@ -214,10 +218,10 @@ absl::Status DistributedRoutingTable::DumpRouterRoutingTable(
     }
     XLS_ASSIGN_OR_RETURN(NetworkComponentParam nc_param,
                          network_parameters_->GetNetworkComponentParam(nc_id));
-    XLS_LOG(INFO) << "Routing table for network component: "
-                  << std::get<RouterParam>(nc_param).GetName();
-    XLS_LOG(INFO) << "Input Port Name | Input VC Name | Sink Name | Output "
-                     "Port Name | Output VC Name";
+    LOG(INFO) << "Routing table for network component: "
+              << std::get<RouterParam>(nc_param).GetName();
+    LOG(INFO) << "Input Port Name | Input VC Name | Sink Name | Output "
+                 "Port Name | Output VC Name";
     RouterRoutingTable& router_routing_table = nc_routing_tables.at(nc_id.id());
     for (PortId input_port_id : nc.GetInputPortIds()) {
       XLS_ASSIGN_OR_RETURN(PortParam input_port_param,
@@ -252,7 +256,7 @@ absl::Status DistributedRoutingTable::DumpRouterRoutingTable(
           std::string_view output_port_name = output_port_param.GetName();
           std::vector<VirtualChannelParam> output_vc_params =
               output_port_param.GetVirtualChannels();
-          XLS_LOG(INFO)
+          LOG(INFO)
               << input_port_name << "   " << vc_name << "   "
               << std::get<NetworkInterfaceSinkParam>(sink_param).GetName()
               << "   " << output_port_name << "   "
@@ -321,7 +325,7 @@ DistributedRoutingTableBuilderBase::BuildPortAndVirtualChannelIndices(
     int64_t output_port_index = 0;
 
     for (Port& ports : nc.GetPorts()) {
-      // This function assigns port indicies in-order.
+      // This function assigns port indices in-order.
       if (ports.direction() == PortDirection::kInput) {
         XLS_RET_CHECK_OK(port_index_builder.SetPortIndex(
             ports.id(), ports.direction(), input_port_index));

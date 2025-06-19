@@ -22,9 +22,11 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/escaping.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/frontend/scanner_keywords.inc"
 
 namespace xls::dslx {
@@ -72,17 +74,6 @@ std::string TokenKindToString(TokenKind kind) {
   return absl::StrFormat("<invalid TokenKind(%d)>", static_cast<int>(kind));
 }
 
-absl::StatusOr<TokenKind> TokenKindFromString(std::string_view s) {
-#define MAKE_CASE(__enum, unused, __str, ...) \
-  if (s == __str) {                           \
-    return TokenKind::__enum;                 \
-  }
-  XLS_DSLX_TOKEN_KINDS(MAKE_CASE)
-#undef MAKE_CASE
-  return absl::InvalidArgumentError(
-      absl::StrFormat("Not a token kind: \"%s\"", s));
-}
-
 absl::StatusOr<int64_t> Token::GetValueAsInt64() const {
   std::optional<std::string> value = GetValue();
   if (!value) {
@@ -112,7 +103,11 @@ std::string Token::ToString() const {
     return absl::StrCat("//", GetValue().value());
   }
   if (kind() == TokenKind::kCharacter) {
-    return absl::StrCat("'", GetValue().value(), "'");
+    return absl::StrCat("'", absl::Utf8SafeCHexEscape(GetValue().value()), "'");
+  }
+  if (kind() == TokenKind::kString) {
+    return absl::StrCat("\"", absl::Utf8SafeCHexEscape(GetValue().value()),
+                        "\"");
   }
   if (GetValue().has_value()) {
     return GetValue().value();
@@ -120,17 +115,17 @@ std::string Token::ToString() const {
   return TokenKindToString(kind_);
 }
 
-std::string Token::ToRepr() const {
+std::string Token::ToRepr(const FileTable& file_table) const {
   if (kind_ == TokenKind::kKeyword) {
-    return absl::StrFormat("Token(%s, %s)", span_.ToRepr(),
+    return absl::StrFormat("Token(%s, %s)", span_.ToRepr(file_table),
                            KeywordToString(GetKeyword()));
   }
   if (GetValue().has_value()) {
     return absl::StrFormat("Token(%s, %s, \"%s\")", TokenKindToString(kind_),
-                           span_.ToRepr(), GetValue().value());
+                           span_.ToRepr(file_table), GetValue().value());
   }
   return absl::StrFormat("Token(%s, %s)", TokenKindToString(kind_),
-                         span_.ToRepr());
+                         span_.ToRepr(file_table));
 }
 
 }  // namespace xls::dslx

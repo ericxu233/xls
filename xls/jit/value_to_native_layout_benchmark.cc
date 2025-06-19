@@ -12,17 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdint>
 #include <memory>
 #include <random>
 #include <vector>
 
-#include "include/benchmark/benchmark.h"
+#include "benchmark/benchmark.h"
+#include "xls/common/benchmark_support.h"
+#include "xls/common/init_xls.h"
 #include "xls/interpreter/random_value.h"
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/package.h"
+#include "xls/ir/type.h"
 #include "xls/ir/value.h"
 #include "xls/jit/llvm_type_converter.h"
 #include "xls/jit/orc_jit.h"
+#include "xls/jit/type_layout.h"
 
 namespace xls {
 namespace {
@@ -78,4 +83,8 @@ BENCHMARK(BM_NativeLayoutToValue)->DenseRange(0, kNumTypes - 1);
 }  // namespace
 }  // namespace xls
 
-BENCHMARK_MAIN();
+int main(int argc, char* argv[]) {
+  xls::InitXls(argv[0], argc, argv);
+  xls::RunSpecifiedBenchmarks(/*default_spec=*/"all");
+  return 0;
+}

@@ -24,17 +24,21 @@
 
 namespace xls::dslx {
 
+// Forward decl.
+class ImportData;
+
 // Defines the interface a type must provide in order to serve as a bytecode
 // cache. In practice, this type exists to avoid attaching too many concrete
 // dependencies onto ImportData, which is the primary cache owner.
 class BytecodeCacheInterface {
  public:
   virtual ~BytecodeCacheInterface() = default;
+
   // Returns the BytecodeFunction for the given function, whose types and
   // constants are held inside the given TypeInfo - different instances of a
   // parametric function will have different TypeInfos associated with them.
   virtual absl::StatusOr<BytecodeFunction*> GetOrCreateBytecodeFunction(
-      const Function* f, const TypeInfo* type_info,
+      ImportData& import_data, const Function& f, const TypeInfo* type_info,
       const std::optional<ParametricEnv>& caller_bindings) = 0;
 };
 

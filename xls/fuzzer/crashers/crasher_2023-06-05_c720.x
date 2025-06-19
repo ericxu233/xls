@@ -184,8 +184,9 @@ proc main {
   init {
     u30:715827882
   }
-  next(x0: token, x1: u30) {
+  next(x1: u30) {
     {
+      let x0: token = join();
       let x2: u19 = x1[11+:u19];
       let x3: u19 = x2 | x1 as u19;
       let x5: x4[7] = [x2, x3, x3, x2, x3, x2, x3];
@@ -198,7 +199,7 @@ proc main {
       let x13: u19 = x11.1;
       let x14: bool = x11.2;
       let x16: token = send(x0, x15, x2);
-      let x17: x4[1] = slice(x5, x7, x4[1]:[x5[u32:0x0], ...]);
+      let x17: x4[1] = array_slice(x5, x7, x4[1]:[x5[u32:0x0], ...]);
       let x18: u30 = for (i, x): (u4, u30) in u4:0x0..u4:0x8 {
         x
       }(x1);

@@ -19,8 +19,8 @@ proc counter {
 
     init { u8:0 }
 
-    next(tok: token, state: u8) {
-        let tok = send(tok, output, state);
+    next(state: u8) {
+        let tok = send(join(), output, state);
         state + u8:1
     }
 }
@@ -32,22 +32,22 @@ proc counter_test {
     output_r: chan<u8> in;
 
     config(t: chan<bool> out) {
-        let (output_s, output_r) = chan<u8>;
+        let (output_s, output_r) = chan<u8>("output");
         spawn counter(output_s);
         (t, output_s, output_r)
     }
 
     init { () }
 
-    next(tok: token, state: ()) {
+    next(state: ()) {
         let increment = u8:1;
         for (_, expected) in u32:0..u32:32 {
             assert_eq(increment, u8:1);
             //assert_eq(state, ());
-            let (tok, value) = recv(tok, output_r);
+            let (tok, value) = recv(join(), output_r);
             assert_eq(value, expected);
             value + increment
         }(u8:0);
-        let tok = send(tok, terminator, true);
+        let tok = send(join(), terminator, true);
     }
 }

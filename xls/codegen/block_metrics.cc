@@ -15,15 +15,27 @@
 #include "xls/codegen/block_metrics.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
 
-#include "absl/strings/str_format.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "xls/codegen/xls_metrics.pb.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/ir/block.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/ir/node.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/op.h"
+#include "xls/ir/register.h"
+#include "xls/ir/source_location.h"
+#include "xls/ir/topo_sort.h"
+#include "xls/ir/type.h"
 
 namespace xls::verilog {
 namespace {
@@ -89,9 +101,9 @@ absl::Status SetDelayFields(Block* block, const DelayEstimator& delay_estimator,
       }
       return value;
     };
-    absl::StatusOr<int64_t> node_delay_or =
+    absl::StatusOr<int64_t> node_delay_estimate =
         delay_estimator.GetOperationDelayInPs(node);
-    int64_t node_delay = node_delay_or.ok() ? node_delay_or.value() : 0;
+    int64_t node_delay = node_delay_estimate.ok() ? *node_delay_estimate : 0;
 
     std::optional<int64_t> input_delay;
     std::optional<int64_t> reg_delay;
@@ -284,6 +296,8 @@ BomKindProto OpToBomKind(Op op) {
     case Op::kOutputPort:
     case Op::kMap:
     case Op::kParam:
+    case Op::kStateRead:
+    case Op::kNext:
     case Op::kRegisterRead:
     case Op::kRegisterWrite:
     case Op::kInstantiationOutput:
@@ -295,7 +309,7 @@ BomKindProto OpToBomKind(Op op) {
       // warn when we add a new op.
   }
 
-  XLS_LOG(FATAL) << "OpToBomKind: unsupported op: " << OpToString(op);
+  LOG(FATAL) << "OpToBomKind: unsupported op: " << OpToString(op);
 }
 
 // Generate a BOM entry for a single node.

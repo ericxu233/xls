@@ -26,37 +26,60 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/random/bit_gen_ref.h"
-#include "absl/random/distributions.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
 #include "absl/types/span.h"
+#include "xls/codegen/block_conversion_test_fixture.h"
 #include "xls/codegen/codegen_options.h"
 #include "xls/codegen/codegen_pass.h"
+#include "xls/codegen/codegen_result.h"
+#include "xls/common/casts.h"
 #include "xls/common/logging/log_lines.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
+#include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
+#include "xls/interpreter/block_evaluator.h"
 #include "xls/interpreter/block_interpreter.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/block.h"
+#include "xls/ir/channel.h"
 #include "xls/ir/channel_ops.h"
+#include "xls/ir/clone_package.h"
 #include "xls/ir/function_builder.h"
+#include "xls/ir/instantiation.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/op.h"
+#include "xls/ir/proc.h"
+#include "xls/ir/proc_elaboration.h"
+#include "xls/ir/register.h"
+#include "xls/ir/source_location.h"
 #include "xls/ir/value.h"
 #include "xls/ir/verifier.h"
 #include "xls/scheduling/pipeline_schedule.h"
 #include "xls/scheduling/run_pipeline_schedule.h"
 #include "xls/scheduling/scheduling_options.h"
+#include "xls/scheduling/scheduling_result.h"
+#include "xls/tools/codegen.h"
+#include "xls/tools/codegen_flags.pb.h"
+#include "xls/tools/scheduling_options_flags.pb.h"
 
 namespace m = xls::op_matchers;
 
@@ -64,14 +87,18 @@ namespace xls {
 namespace verilog {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
-using testing::_;
-using testing::ElementsAre;
-using testing::Ge;
-using testing::Pair;
-using testing::SizeIs;
-using testing::UnorderedElementsAre;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
+using ::testing::_;
+using ::testing::Each;
+using ::testing::ElementsAre;
+using ::testing::Eq;
+using ::testing::Ge;
+using ::testing::HasSubstr;
+using ::testing::Optional;
+using ::testing::Pair;
+using ::testing::SizeIs;
+using ::testing::UnorderedElementsAre;
 
 MATCHER_P2(First, n, matcher,
            absl::StrFormat("(looking at just the first %d elements) %s", n,
@@ -94,8 +121,8 @@ MATCHER_P2(Skipping, n, matcher,
                                      result_listener);
 }
 
-// Specialization of IrTestBase for testing of simple blocks.
-class BlockConversionTest : public IrTestBase {
+// Specialization of BlockConversionTestFixture for testing of simple blocks.
+class BlockConversionTest : public BlockConversionTestFixture {
  protected:
   // Returns the unique output port of the block (send over a port
   // channel). Check fails if no such unique send exists.
@@ -106,7 +133,7 @@ class BlockConversionTest : public IrTestBase {
         output_port = node->As<OutputPort>();
       }
     }
-    XLS_CHECK(output_port != nullptr);
+    CHECK(output_port != nullptr);
     return output_port;
   }
 
@@ -125,6 +152,8 @@ class TestDelayEstimator : public DelayEstimator {
       case Op::kAfterAll:
       case Op::kMinDelay:
       case Op::kParam:
+      case Op::kStateRead:
+      case Op::kNext:
       case Op::kInputPort:
       case Op::kOutputPort:
       case Op::kLiteral:
@@ -179,21 +208,6 @@ class IsPrefixOf : public ::testing::MatcherInterface<std::vector<T>> {
 // test pipelined proc to block conversion
 class ProcConversionTestFixture : public BlockConversionTest {
  protected:
-  // A pair of cycle and value for returning traces.
-  struct CycleAndValue {
-    int64_t cycle;
-    uint64_t value;
-  };
-
-  enum class SignalType { kInput, kOutput, kExpectedOutput };
-
-  // Specification for a column when printing out a signal trace.
-  struct SignalSpec {
-    std::string signal_name;
-    SignalType signal_type;
-    bool active_low_reset = false;
-  };
-
   // Creates a simple pipelined block named "the_proc" within a package.
   //
   // Returns the newly created package.
@@ -202,200 +216,47 @@ class ProcConversionTestFixture : public BlockConversionTest {
     return absl::UnimplementedError("BuildBlockInPackage() unimplemented");
   }
 
-  // For cycles in range [first_cycle, last_cycle] inclusive,
-  // add the IO signals as described in signals to io.
-  absl::Status SetSignalsOverCycles(
-      int64_t first_cycle, int64_t last_cycle,
-      const absl::flat_hash_map<std::string, uint64_t>& signals,
-      std::vector<absl::flat_hash_map<std::string, uint64_t>>& io) const {
-    XLS_CHECK_GE(first_cycle, 0);
-    XLS_CHECK_GE(last_cycle, 0);
-    XLS_CHECK_LE(first_cycle, last_cycle);
+  absl::StatusOr<std::unique_ptr<Package>> CreateMultiProcPackage(
+      bool with_functions = false) {
+    auto p = CreatePackage();
+    Type* u32 = p->GetBitsType(32);
+    XLS_ASSIGN_OR_RETURN(
+        Channel * ch_in,
+        p->CreateStreamingChannel("in", ChannelOps::kReceiveOnly, u32));
+    XLS_ASSIGN_OR_RETURN(
+        Channel * ch_internal,
+        p->CreateStreamingChannel("internal", ChannelOps::kSendReceive, u32,
+                                  /*initial_values=*/{}, /*fifo_config=*/
+                                  FifoConfig(/*depth=*/0, /*bypass=*/true,
+                                             /*register_push_outputs=*/false,
+                                             /*register_pop_outputs=*/false)));
+    XLS_ASSIGN_OR_RETURN(
+        Channel * ch_out,
+        p->CreateStreamingChannel("out", ChannelOps::kSendOnly, u32));
+    ProcBuilder pb0("proc0", p.get());
+    BValue rcv0 = pb0.Receive(ch_in, pb0.Literal(Value::Token()));
+    pb0.Send(ch_internal, pb0.TupleIndex(rcv0, 0), pb0.TupleIndex(rcv0, 1));
+    XLS_ASSIGN_OR_RETURN(Proc * proc0, pb0.Build());
+    XLS_RETURN_IF_ERROR(p->SetTop(proc0));
 
-    if (io.size() <= last_cycle) {
-      io.resize(last_cycle + 1);
+    ProcBuilder pb1("proc1", p.get());
+    BValue rcv1 = pb1.Receive(ch_internal, pb1.Literal(Value::Token()));
+    pb1.Send(ch_out, pb1.TupleIndex(rcv1, 0), pb1.TupleIndex(rcv1, 1));
+    XLS_RET_CHECK_OK(pb1.Build().status());
+
+    if (with_functions) {
+      FunctionBuilder fb0("f0", p.get());
+      BValue x0 = fb0.Param("x", p->GetBitsType(32));
+      BValue y0 = fb0.Param("y", p->GetBitsType(32));
+      XLS_RET_CHECK_OK(fb0.BuildWithReturnValue(fb0.Add(x0, y0)).status());
+
+      FunctionBuilder fb1("f1", p.get());
+      BValue x1 = fb1.Param("x", p->GetBitsType(32));
+      BValue y1 = fb1.Param("y", p->GetBitsType(32));
+      XLS_RET_CHECK_OK(fb1.BuildWithReturnValue(fb1.Subtract(x1, y1)).status());
     }
 
-    for (auto [name, value] : signals) {
-      for (int64_t i = first_cycle; i <= last_cycle; ++i) {
-        io.at(i)[name] = value;
-      }
-    }
-
-    return absl::OkStatus();
-  }
-
-  // For cycles in range [first_cycle, last_cycle] inclusive,
-  // set given input signal to a incrementing value starting with start_val.
-  //
-  // One after the last signal value used is returned.
-  absl::StatusOr<uint64_t> SetIncrementingSignalOverCycles(
-      int64_t first_cycle, int64_t last_cycle, std::string_view signal_name,
-      uint64_t signal_val,
-      std::vector<absl::flat_hash_map<std::string, uint64_t>>& io) const {
-    XLS_CHECK_GE(first_cycle, 0);
-    XLS_CHECK_GE(last_cycle, 0);
-    XLS_CHECK_LE(first_cycle, last_cycle);
-
-    if (io.size() <= last_cycle) {
-      io.resize(last_cycle + 1);
-    }
-
-    for (int64_t i = first_cycle; i <= last_cycle; ++i) {
-      io.at(i)[signal_name] = signal_val;
-      ++signal_val;
-    }
-
-    return signal_val;
-  }
-
-  // For cycles in range [first_cycle, last_cycle] inclusive,  set given
-  // input signal to uniformly random input in range [min_value, max_value].
-  absl::Status SetRandomSignalOverCycles(
-      int64_t first_cycle, int64_t last_cycle, std::string_view signal_name,
-      uint64_t min_value, uint64_t max_value, absl::BitGenRef rng,
-      std::vector<absl::flat_hash_map<std::string, uint64_t>>& io) const {
-    XLS_CHECK_GE(first_cycle, 0);
-    XLS_CHECK_GE(last_cycle, 0);
-    XLS_CHECK_LE(first_cycle, last_cycle);
-
-    if (io.size() <= last_cycle) {
-      io.resize(last_cycle + 1);
-    }
-
-    for (int64_t i = first_cycle; i <= last_cycle; ++i) {
-      io.at(i)[signal_name] =
-          absl::Uniform(absl::IntervalClosed, rng, min_value, max_value);
-    }
-
-    return absl::OkStatus();
-  }
-
-  // From either an input or output channel, retrieve the sequence of
-  // sent/received data.
-  //
-  // Data is deemed sent/received if not under reset and valid and ready are 1.
-  absl::StatusOr<std::vector<CycleAndValue>> GetChannelSequenceFromIO(
-      const SignalSpec& data_signal, const SignalSpec& valid_signal,
-      const SignalSpec& ready_signal, const SignalSpec& reset_signal,
-      absl::Span<const absl::flat_hash_map<std::string, uint64_t>> inputs,
-      absl::Span<const absl::flat_hash_map<std::string, uint64_t>> outputs)
-      const {
-    XLS_CHECK_EQ(inputs.size(), outputs.size());
-
-    std::vector<CycleAndValue> sequence;
-
-    for (int64_t i = 0; i < inputs.size(); ++i) {
-      XLS_ASSIGN_OR_RETURN(
-          bool rst,
-          FindWithinIOHashMaps(reset_signal, inputs.at(i), outputs.at(i)));
-
-      XLS_ASSIGN_OR_RETURN(
-          uint64_t data,
-          FindWithinIOHashMaps(data_signal, inputs.at(i), outputs.at(i)));
-      XLS_ASSIGN_OR_RETURN(
-          bool data_vld,
-          FindWithinIOHashMaps(valid_signal, inputs.at(i), outputs.at(i)));
-      XLS_ASSIGN_OR_RETURN(
-          bool data_rdy,
-          FindWithinIOHashMaps(ready_signal, inputs.at(i), outputs.at(i)));
-
-      bool rst_active = reset_signal.active_low_reset ? !rst : rst;
-
-      if (data_vld && data_rdy && !rst_active) {
-        sequence.push_back({i, data});
-      }
-    }
-
-    return sequence;
-  }
-
-  // Log at verbose level 1, a table of signals and their values.
-  absl::Status VLogTestPipelinedIO(
-      absl::Span<const SignalSpec> table_spec, int64_t column_width,
-      absl::Span<const absl::flat_hash_map<std::string, uint64_t>> inputs,
-      absl::Span<const absl::flat_hash_map<std::string, uint64_t>> outputs,
-      std::optional<
-          absl::Span<const absl::flat_hash_map<std::string, uint64_t>>>
-          expected_outputs = std::nullopt) const {
-    XLS_CHECK_EQ(inputs.size(), outputs.size());
-    if (expected_outputs.has_value()) {
-      XLS_CHECK_EQ(inputs.size(), expected_outputs->size());
-    }
-
-    std::string header;
-    for (const SignalSpec& col : table_spec) {
-      if (col.signal_type == SignalType::kExpectedOutput) {
-        std::string signal_name_with_suffix =
-            absl::StrCat(col.signal_name, "_e");
-        absl::StrAppend(&header, absl::StrFormat(" %*s", column_width,
-                                                 signal_name_with_suffix));
-      } else {
-        absl::StrAppend(&header,
-                        absl::StrFormat(" %*s", column_width, col.signal_name));
-      }
-    }
-
-    XLS_VLOG(1) << header;
-
-    for (int64_t i = 0; i < inputs.size(); ++i) {
-      std::string row;
-
-      for (const SignalSpec& col : table_spec) {
-        std::string_view signal_name = col.signal_name;
-        SignalType signal_type = col.signal_type;
-
-        XLS_CHECK(signal_type == SignalType::kInput ||
-                  signal_type == SignalType::kOutput ||
-                  signal_type == SignalType::kExpectedOutput);
-
-        uint64_t signal_value = 0;
-        if (signal_type == SignalType::kInput) {
-          signal_value = inputs.at(i).at(signal_name);
-        } else if (signal_type == SignalType::kOutput) {
-          signal_value = outputs.at(i).at(signal_name);
-        } else {
-          XLS_CHECK(expected_outputs.has_value());
-          signal_value = expected_outputs->at(i).at(signal_name);
-        }
-
-        absl::StrAppend(&row,
-                        absl::StrFormat(" %*d", column_width, signal_value));
-      }
-
-      XLS_VLOG(1) << row;
-    }
-
-    return absl::OkStatus();
-  }
-
-  // Find signal value either the input or output hash maps depending on the
-  // spec.
-  absl::StatusOr<uint64_t> FindWithinIOHashMaps(
-      const SignalSpec& signal,
-      const absl::flat_hash_map<std::string, uint64_t>& inputs,
-      const absl::flat_hash_map<std::string, uint64_t>& outputs) const {
-    SignalType signal_type = signal.signal_type;
-    std::string_view signal_name = signal.signal_name;
-
-    if (signal_type == SignalType::kInput) {
-      if (!inputs.contains(signal_name)) {
-        return absl::InternalError(
-            absl::StrFormat("%s not found in input", signal_name));
-      }
-      return inputs.at(signal_name);
-    }
-    if (signal_type == SignalType::kOutput ||
-        signal_type == SignalType::kExpectedOutput) {
-      if (!outputs.contains(signal_name)) {
-        return absl::InternalError(
-            absl::StrFormat("%s not found in output", signal_name));
-      }
-      return outputs.at(signal_name);
-    }
-
-    return absl::InternalError(absl::StrFormat(
-        "Unsupported SignalType %d for %s", signal_type, signal_name));
+    return p;
   }
 
   // Name of the block created by BuildBlockInPackage().
@@ -409,15 +270,40 @@ TEST_F(BlockConversionTest, SimpleFunction) {
   BValue y = fb.Param("y", p->GetBitsType(32));
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.BuildWithReturnValue(fb.Add(x, y)));
   XLS_ASSERT_OK_AND_ASSIGN(
-      CodegenPassUnit unit,
+      CodegenContext context,
       FunctionToCombinationalBlock(
           f, codegen_options().module_name("SimpleFunctionBlock")));
 
-  EXPECT_EQ(unit.block->name(), "SimpleFunctionBlock");
-  EXPECT_EQ(unit.block->GetPorts().size(), 3);
+  EXPECT_EQ(context.top_block()->name(), "SimpleFunctionBlock");
+  EXPECT_EQ(context.top_block()->GetPorts().size(), 3);
+  EXPECT_EQ(context.GetMetadataForBlock(context.top_block()).concurrent_stages,
+            std::nullopt);
 
-  EXPECT_THAT(GetOutputPort(unit.block),
-              m::OutputPort(m::Add(m::InputPort("x"), m::InputPort("y"))));
+  EXPECT_THAT(
+      GetOutputPort(context.top_block()),
+      m::OutputPort("out", m::Add(m::InputPort("x"), m::InputPort("y"))));
+}
+
+TEST_F(BlockConversionTest, SimpleFunctionWithNamedOutput) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue x = fb.Param("x", p->GetBitsType(32));
+  BValue y = fb.Param("y", p->GetBitsType(32));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.BuildWithReturnValue(fb.Add(x, y)));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionToCombinationalBlock(f, codegen_options()
+                                          .module_name("SimpleFunctionBlock")
+                                          .output_port_name("simple_output")));
+
+  EXPECT_EQ(context.top_block()->name(), "SimpleFunctionBlock");
+  EXPECT_EQ(context.top_block()->GetPorts().size(), 3);
+  EXPECT_EQ(context.GetMetadataForBlock(context.top_block()).concurrent_stages,
+            std::nullopt);
+
+  EXPECT_THAT(GetOutputPort(context.top_block()),
+              m::OutputPort("simple_output",
+                            m::Add(m::InputPort("x"), m::InputPort("y"))));
 }
 
 TEST_F(BlockConversionTest, ZeroInputs) {
@@ -425,12 +311,13 @@ TEST_F(BlockConversionTest, ZeroInputs) {
   FunctionBuilder fb(TestName(), p.get());
   XLS_ASSERT_OK_AND_ASSIGN(Function * f,
                            fb.BuildWithReturnValue(fb.Literal(UBits(42, 32))));
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            FunctionToCombinationalBlock(f, codegen_options()));
 
-  EXPECT_EQ(unit.block->GetPorts().size(), 1);
+  EXPECT_EQ(context.top_block()->GetPorts().size(), 1);
 
-  EXPECT_THAT(GetOutputPort(unit.block), m::OutputPort("out", m::Literal(42)));
+  EXPECT_THAT(GetOutputPort(context.top_block()),
+              m::OutputPort("out", m::Literal(42)));
 }
 
 TEST_F(BlockConversionTest, ZeroWidthInputsAndOutput) {
@@ -441,10 +328,10 @@ TEST_F(BlockConversionTest, ZeroWidthInputsAndOutput) {
   fb.Param("z", p->GetBitsType(1234));
   XLS_ASSERT_OK_AND_ASSIGN(Function * f,
                            fb.BuildWithReturnValue(fb.Tuple({x, y})));
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            FunctionToCombinationalBlock(f, codegen_options()));
 
-  EXPECT_EQ(unit.block->GetPorts().size(), 4);
+  EXPECT_EQ(context.top_block()->GetPorts().size(), 4);
 }
 
 TEST_F(BlockConversionTest, SimplePipelinedFunction) {
@@ -461,14 +348,14 @@ TEST_F(BlockConversionTest, SimplePipelinedFunction) {
                           SchedulingOptions().pipeline_stages(3)));
 
   XLS_ASSERT_OK_AND_ASSIGN(
-      CodegenPassUnit unit,
-      FunctionToPipelinedBlock(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(
           schedule,
           CodegenOptions().flop_inputs(false).flop_outputs(false).clock_name(
               "clk"),
           f));
 
-  EXPECT_THAT(GetOutputPort(unit.block),
+  EXPECT_THAT(GetOutputPort(context.top_block()),
               m::OutputPort(m::Neg(m::Register(m::Not(m::Register(
                   m::Add(m::InputPort("x"), m::InputPort("y"))))))));
 }
@@ -488,64 +375,64 @@ TEST_F(BlockConversionTest, TrivialPipelinedFunction) {
   {
     // No flopping inputs or outputs.
     XLS_ASSERT_OK_AND_ASSIGN(
-        CodegenPassUnit unit,
-        FunctionToPipelinedBlock(
+        CodegenContext context,
+        FunctionBaseToPipelinedBlock(
             schedule,
             CodegenOptions().flop_inputs(false).flop_outputs(false).clock_name(
                 "clk"),
             f));
 
-    EXPECT_THAT(GetOutputPort(unit.block),
+    EXPECT_THAT(GetOutputPort(context.top_block()),
                 m::OutputPort(m::Neg(m::Register(m::Not(m::Register(
                     m::Add(m::InputPort("x"), m::InputPort("y"))))))));
-    XLS_ASSERT_OK(p->RemoveBlock(unit.block));
+    XLS_ASSERT_OK(p->RemoveBlock(context.top_block()));
   }
   {
     // Flop inputs.
     XLS_ASSERT_OK_AND_ASSIGN(
-        CodegenPassUnit unit,
-        FunctionToPipelinedBlock(
+        CodegenContext context,
+        FunctionBaseToPipelinedBlock(
             schedule,
             CodegenOptions().flop_inputs(true).flop_outputs(false).clock_name(
                 "clk"),
             f));
 
-    EXPECT_THAT(GetOutputPort(unit.block),
+    EXPECT_THAT(GetOutputPort(context.top_block()),
                 m::OutputPort(m::Neg(m::Register(m::Not(
                     m::Register(m::Add(m::Register(m::InputPort("x")),
                                        m::Register(m::InputPort("y")))))))));
-    XLS_ASSERT_OK(p->RemoveBlock(unit.block));
+    XLS_ASSERT_OK(p->RemoveBlock(context.top_block()));
   }
   {
     // Flop outputs.
     XLS_ASSERT_OK_AND_ASSIGN(
-        CodegenPassUnit unit,
-        FunctionToPipelinedBlock(
+        CodegenContext context,
+        FunctionBaseToPipelinedBlock(
             schedule,
             CodegenOptions().flop_inputs(false).flop_outputs(true).clock_name(
                 "clk"),
             f));
 
-    EXPECT_THAT(GetOutputPort(unit.block),
+    EXPECT_THAT(GetOutputPort(context.top_block()),
                 m::OutputPort(m::Register(m::Neg(m::Register(m::Not(m::Register(
                     m::Add(m::InputPort("x"), m::InputPort("y")))))))));
-    XLS_ASSERT_OK(p->RemoveBlock(unit.block));
+    XLS_ASSERT_OK(p->RemoveBlock(context.top_block()));
   }
   {
     // Flop inputs and outputs.
     XLS_ASSERT_OK_AND_ASSIGN(
-        CodegenPassUnit unit,
-        FunctionToPipelinedBlock(
+        CodegenContext context,
+        FunctionBaseToPipelinedBlock(
             schedule,
             CodegenOptions().flop_inputs(true).flop_outputs(true).clock_name(
                 "clk"),
             f));
 
-    EXPECT_THAT(GetOutputPort(unit.block),
+    EXPECT_THAT(GetOutputPort(context.top_block()),
                 m::OutputPort(m::Register(m::Neg(m::Register(m::Not(
                     m::Register(m::Add(m::Register(m::InputPort("x")),
                                        m::Register(m::InputPort("y"))))))))));
-    XLS_ASSERT_OK(p->RemoveBlock(unit.block));
+    XLS_ASSERT_OK(p->RemoveBlock(context.top_block()));
   }
 }
 
@@ -561,14 +448,14 @@ TEST_F(BlockConversionTest, ZeroWidthPipeline) {
       RunPipelineSchedule(f, TestDelayEstimator(),
                           SchedulingOptions().pipeline_stages(3)));
   XLS_ASSERT_OK_AND_ASSIGN(
-      CodegenPassUnit unit,
-      FunctionToPipelinedBlock(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(
           schedule,
           CodegenOptions().flop_inputs(false).flop_outputs(false).clock_name(
               "clk"),
           f));
 
-  EXPECT_EQ(unit.block->GetRegisters().size(), 4);
+  EXPECT_EQ(context.top_block()->GetRegisters().size(), 4);
 }
 
 // Verifies that an implicit token, as generated by the DSLX IR converter, is
@@ -596,36 +483,141 @@ fn __implicit_token__main() -> () {
   )";
   XLS_ASSERT_OK_AND_ASSIGN(auto p, Parser::ParsePackage(kIrText));
   XLS_ASSERT_OK_AND_ASSIGN(auto f, p->GetFunction("__implicit_token__main"));
-  XLS_ASSERT_OK_AND_ASSIGN(auto unit,
+  XLS_ASSERT_OK_AND_ASSIGN(auto context,
                            FunctionToCombinationalBlock(f, codegen_options()));
-  XLS_ASSERT_OK(VerifyBlock(unit.block));
+  XLS_ASSERT_OK(VerifyBlock(context.top_block()));
 }
 
 TEST_F(BlockConversionTest, SimpleProc) {
   const std::string ir_text = R"(package test
 
-chan in(bits[32], id=0, kind=single_value, ops=receive_only,
-        metadata="""module_port { flopped: false,  port_order: 1 }""")
-chan out(bits[32], id=1, kind=single_value, ops=send_only,
-         metadata="""module_port { flopped: false,  port_order: 0 }""")
+chan in(bits[32], id=0, kind=single_value, ops=receive_only)
+chan out(bits[32], id=1, kind=single_value, ops=send_only)
 
-proc my_proc(my_token: token, my_state: (), init={()}) {
-  rcv: (token, bits[32]) = receive(my_token, channel_id=0)
+proc my_proc(my_state: (), init={()}) {
+  my_token: token = literal(value=token, id=1)
+  rcv: (token, bits[32]) = receive(my_token, channel=in)
   data: bits[32] = tuple_index(rcv, index=1)
   negate: bits[32] = neg(data)
   rcv_token: token = tuple_index(rcv, index=0)
-  send: token = send(rcv_token, negate, channel_id=1)
-  next (send, my_state)
+  send: token = send(rcv_token, negate, channel=out)
+  next_my_state: () = next_value(param=my_state, value=my_state)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
                            Parser::ParsePackage(ir_text));
 
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("my_proc"));
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, codegen_options()));
-  EXPECT_THAT(FindNode("out", unit.block),
+  EXPECT_THAT(FindNode("out", context.top_block()),
               m::OutputPort("out", m::Neg(m::InputPort("in"))));
+}
+
+TEST_F(BlockConversionTest, StreamingChannelMetadataForSimpleProc) {
+  Package package(TestName());
+  Type* u32 = package.GetBitsType(32);
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * ch_in,
+      package.CreateStreamingChannel("in", ChannelOps::kReceiveOnly, u32));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * ch_out,
+      package.CreateStreamingChannel("out", ChannelOps::kSendOnly, u32));
+
+  TokenlessProcBuilder pb(TestName(), /*token_name=*/"tkn", &package);
+  BValue a = pb.Receive(ch_in);
+  pb.Send(ch_out, a);
+
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build({}));
+
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
+                           ProcToCombinationalBlock(proc, codegen_options()));
+  Block* block = FindBlock(TestName(), &package);
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      ChannelPortMetadata in_metadata,
+      block->GetChannelPortMetadata("in", ChannelDirection::kReceive));
+  EXPECT_EQ(in_metadata.channel_name, "in");
+  EXPECT_EQ(in_metadata.direction, ChannelDirection::kReceive);
+  EXPECT_THAT(in_metadata.data_port, Optional(std::string{"in"}));
+  EXPECT_THAT(in_metadata.valid_port, Optional(std::string{"in_vld"}));
+  EXPECT_THAT(in_metadata.ready_port, Optional(std::string{"in_rdy"}));
+
+  EXPECT_THAT(block->GetDataPortForChannel("in", ChannelDirection::kReceive),
+              IsOkAndHolds(Optional(m::InputPort("in"))));
+  EXPECT_THAT(block->GetValidPortForChannel("in", ChannelDirection::kReceive),
+              IsOkAndHolds(Optional(m::InputPort("in_vld"))));
+  EXPECT_THAT(block->GetReadyPortForChannel("in", ChannelDirection::kReceive),
+              IsOkAndHolds(Optional(m::OutputPort("in_rdy"))));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      ChannelPortMetadata out_metadata,
+      block->GetChannelPortMetadata("out", ChannelDirection::kSend));
+  EXPECT_EQ(out_metadata.channel_name, "out");
+  EXPECT_EQ(out_metadata.direction, ChannelDirection::kSend);
+  EXPECT_THAT(out_metadata.data_port, Optional(std::string{"out"}));
+  EXPECT_THAT(out_metadata.valid_port, Optional(std::string{"out_vld"}));
+  EXPECT_THAT(out_metadata.ready_port, Optional(std::string{"out_rdy"}));
+
+  EXPECT_THAT(block->GetDataPortForChannel("out", ChannelDirection::kSend),
+              IsOkAndHolds(Optional(m::OutputPort("out"))));
+  EXPECT_THAT(block->GetValidPortForChannel("out", ChannelDirection::kSend),
+              IsOkAndHolds(Optional(m::OutputPort("out_vld"))));
+  EXPECT_THAT(block->GetReadyPortForChannel("out", ChannelDirection::kSend),
+              IsOkAndHolds(Optional(m::InputPort("out_rdy"))));
+}
+
+TEST_F(BlockConversionTest, SingleValueChannelMetadataForSimpleProc) {
+  Package package(TestName());
+  Type* u32 = package.GetBitsType(32);
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * ch_in,
+      package.CreateSingleValueChannel("in", ChannelOps::kReceiveOnly, u32));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * ch_out,
+      package.CreateSingleValueChannel("out", ChannelOps::kSendOnly, u32));
+
+  TokenlessProcBuilder pb(TestName(), /*token_name=*/"tkn", &package);
+  BValue a = pb.Receive(ch_in);
+  pb.Send(ch_out, a);
+
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build({}));
+
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
+                           ProcToCombinationalBlock(proc, codegen_options()));
+  Block* block = FindBlock(TestName(), &package);
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      ChannelPortMetadata in_metadata,
+      block->GetChannelPortMetadata("in", ChannelDirection::kReceive));
+  EXPECT_EQ(in_metadata.channel_name, "in");
+  EXPECT_EQ(in_metadata.direction, ChannelDirection::kReceive);
+  EXPECT_THAT(in_metadata.data_port, Optional(std::string{"in"}));
+  EXPECT_THAT(in_metadata.valid_port, Eq(std::nullopt));
+  EXPECT_THAT(in_metadata.ready_port, Eq(std::nullopt));
+
+  EXPECT_THAT(block->GetDataPortForChannel("in", ChannelDirection::kReceive),
+              IsOkAndHolds(Optional(m::InputPort("in"))));
+  EXPECT_THAT(block->GetValidPortForChannel("in", ChannelDirection::kReceive),
+              IsOkAndHolds(std::nullopt));
+  EXPECT_THAT(block->GetReadyPortForChannel("in", ChannelDirection::kReceive),
+              IsOkAndHolds(std::nullopt));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      ChannelPortMetadata out_metadata,
+      block->GetChannelPortMetadata("out", ChannelDirection::kSend));
+  EXPECT_EQ(out_metadata.channel_name, "out");
+  EXPECT_EQ(out_metadata.direction, ChannelDirection::kSend);
+  EXPECT_THAT(out_metadata.data_port, Optional(std::string{"out"}));
+  EXPECT_THAT(out_metadata.valid_port, Eq(std::nullopt));
+  EXPECT_THAT(out_metadata.ready_port, Eq(std::nullopt));
+
+  EXPECT_THAT(block->GetDataPortForChannel("out", ChannelDirection::kSend),
+              IsOkAndHolds(Optional(m::OutputPort("out"))));
+  EXPECT_THAT(block->GetValidPortForChannel("out", ChannelDirection::kSend),
+              IsOkAndHolds(std::nullopt));
+  EXPECT_THAT(block->GetReadyPortForChannel("out", ChannelDirection::kSend),
+              IsOkAndHolds(std::nullopt));
 }
 
 TEST_F(BlockConversionTest, ProcWithVariousNextStateNodes) {
@@ -668,8 +660,11 @@ TEST_F(BlockConversionTest, ProcWithVariousNextStateNodes) {
   b.Send(q_out, q);
 
   // `x_plus_one` is the next state value for both `x` and `y` state elements.
-  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc,
-                           b.Build({x_plus_one, x_plus_one, z, literal_one}));
+  b.Next(/*state_read=*/x, /*value=*/x_plus_one);
+  b.Next(/*state_read=*/y, /*value=*/x_plus_one);
+  b.Next(/*state_read=*/z, /*value=*/z);
+  b.Next(/*state_read=*/q, /*value=*/literal_one);
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, b.Build());
 
   XLS_ASSERT_OK_AND_ASSIGN(
       PipelineSchedule schedule,
@@ -684,9 +679,10 @@ TEST_F(BlockConversionTest, ProcWithVariousNextStateNodes) {
   options.streaming_channel_ready_suffix("_ready");
   options.module_name("pipelined_proc");
 
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
-                           ProcToPipelinedBlock(schedule, options, proc));
-  Block* block = unit.block;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+  Block* block = context.top_block();
 
   std::vector<ChannelSource> sources{
       ChannelSource("input_data", "input_valid", "input_ready", 1.0, block),
@@ -733,8 +729,8 @@ TEST_F(BlockConversionTest, ProcWithNextStateNodeBeforeParam) {
       Channel * in_out,
       p->CreateStreamingChannel("in_out", ChannelOps::kSendOnly, u32));
 
-  ProcBuilder b(TestName(), "tkn", p.get());
-  BValue tkn = b.GetTokenParam();
+  ProcBuilder b(TestName(), p.get());
+  BValue tkn = b.Literal(Value::Token());
   BValue q = b.StateElement("q", Value(UBits(0, 32)));
 
   BValue received_pair = b.Receive(in, tkn);
@@ -744,7 +740,8 @@ TEST_F(BlockConversionTest, ProcWithNextStateNodeBeforeParam) {
   BValue min_delay = b.MinDelay(send_received, 1);
   BValue send_q = b.Send(q_out, min_delay, q);
 
-  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, b.Build(send_q, {received_data}));
+  BValue next_q = b.Next(/*state_read=*/q, /*value=*/received_data);
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, b.Build());
 
   PipelineSchedule schedule(proc,
                             ScheduleCycleMap({{tkn.node(), 0},
@@ -754,12 +751,12 @@ TEST_F(BlockConversionTest, ProcWithNextStateNodeBeforeParam) {
                                               {send_received.node(), 0},
                                               {q.node(), 1},
                                               {min_delay.node(), 1},
-                                              {send_q.node(), 1}}),
+                                              {send_q.node(), 1},
+                                              {next_q.node(), 1}}),
                             /*length=*/3);
 
   // Verify that we really did schedule the param after the next-state node.
-  ASSERT_GT(schedule.cycle(proc->GetStateParam(0)),
-            schedule.cycle(proc->GetNextStateElement(0)));
+  ASSERT_GT(schedule.cycle(q.node()), schedule.cycle(received_data.node()));
 
   CodegenOptions options;
   options.flop_inputs(false).flop_outputs(false).clock_name("clk");
@@ -769,9 +766,10 @@ TEST_F(BlockConversionTest, ProcWithNextStateNodeBeforeParam) {
   options.streaming_channel_ready_suffix("_ready");
   options.module_name("pipelined_proc");
 
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
-                           ProcToPipelinedBlock(schedule, options, proc));
-  Block* block = unit.block;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+  Block* block = context.top_block();
 
   std::vector<ChannelSource> sources{
       ChannelSource("input_data", "input_valid", "input_ready", 1.0, block),
@@ -798,15 +796,16 @@ TEST_F(BlockConversionTest, ChannelDefaultAndNonDefaultSuffixName) {
   const std::string ir_text = R"(package test
 
 chan in(bits[32], id=0, kind=streaming, ops=receive_only,
-        flow_control=ready_valid, metadata="")
+        flow_control=ready_valid)
 chan out(bits[32], id=1, kind=streaming, ops=send_only,
-        flow_control=ready_valid, metadata="")
-chan in2(bits[32], id=2, kind=single_value, ops=receive_only, metadata="")
-chan out2(bits[32], id=3, kind=single_value, ops=send_only, metadata="")
+        flow_control=ready_valid)
+chan in2(bits[32], id=2, kind=single_value, ops=receive_only)
+chan out2(bits[32], id=3, kind=single_value, ops=send_only)
 
-proc my_proc(my_token: token, my_state: (), init={()}) {
-  rcv: (token, bits[32]) = receive(my_token, channel_id=0)
-  rcv2: (token, bits[32]) = receive(my_token, channel_id=2)
+proc my_proc(my_state: (), init={()}) {
+  my_token: token = literal(value=token)
+  rcv: (token, bits[32]) = receive(my_token, channel=in)
+  rcv2: (token, bits[32]) = receive(my_token, channel=in2)
 
   data: bits[32] = tuple_index(rcv, index=1)
   rcv_token: token = tuple_index(rcv, index=0)
@@ -816,10 +815,10 @@ proc my_proc(my_token: token, my_state: (), init={()}) {
   rcv2_token: token = tuple_index(rcv2, index=0)
   negate2: bits[32] = neg(data2)
 
-  send: token = send(rcv_token, negate, channel_id=1)
-  send2: token = send(rcv2_token, negate2, channel_id=3)
-  fin : token = after_all(send, send2)
-  next (fin, my_state)
+  send: token = send(rcv_token, negate, channel=out)
+  send2: token = send(rcv2_token, negate2, channel=out2)
+  fin: token = after_all(send, send2)
+  next_my_state: () = next_value(param=my_state, value=my_state)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
@@ -827,9 +826,9 @@ proc my_proc(my_token: token, my_state: (), init={()}) {
 
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("my_proc"));
 
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit_default_suffix,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context_default_suffix,
                            ProcToCombinationalBlock(proc, codegen_options()));
-  Block* block_default_suffix = unit_default_suffix.block;
+  Block* block_default_suffix = context_default_suffix.top_block();
 
   EXPECT_TRUE(HasNode("in", block_default_suffix));
   EXPECT_TRUE(HasNode("in_rdy", block_default_suffix));
@@ -848,12 +847,13 @@ proc my_proc(my_token: token, my_state: (), init={()}) {
   EXPECT_FALSE(HasNode("out2_vld", block_default_suffix));
 
   CodegenOptions options = codegen_options()
+                               .module_name("with_explicit_suffixs")
                                .streaming_channel_data_suffix("_data")
                                .streaming_channel_ready_suffix("_ready")
                                .streaming_channel_valid_suffix("_valid");
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit_nondefault_suffix,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context_nondefault_suffix,
                            ProcToCombinationalBlock(proc, options));
-  Block* block_nondefault_suffix = unit_nondefault_suffix.block;
+  Block* block_nondefault_suffix = context_nondefault_suffix.top_block();
 
   XLS_VLOG_LINES(3, block_nondefault_suffix->DumpIr());
 
@@ -880,21 +880,18 @@ proc my_proc(my_token: token, my_state: (), init={()}) {
 TEST_F(BlockConversionTest, ProcWithMultipleInputChannels) {
   const std::string ir_text = R"(package test
 
-chan in0(bits[32], id=0, kind=single_value, ops=receive_only,
-        metadata="""module_port { flopped: false,  port_order: 0 }""")
-chan in1(bits[32], id=1, kind=single_value, ops=receive_only,
-        metadata="""module_port { flopped: false,  port_order: 2 }""")
-chan in2(bits[32], id=2, kind=single_value, ops=receive_only,
-        metadata="""module_port { flopped: false,  port_order: 1 }""")
-chan out(bits[32], id=3, kind=single_value, ops=send_only,
-         metadata="""module_port { flopped: false,  port_order: 0 }""")
+chan in0(bits[32], id=0, kind=single_value, ops=receive_only)
+chan in1(bits[32], id=1, kind=single_value, ops=receive_only)
+chan in2(bits[32], id=2, kind=single_value, ops=receive_only)
+chan out(bits[32], id=3, kind=single_value, ops=send_only)
 
-proc my_proc(my_token: token, my_state: (), init={()}) {
-  rcv0: (token, bits[32]) = receive(my_token, channel_id=0)
+proc my_proc(my_state: (), init={()}) {
+  my_token: token = literal(value=token, id=1)
+  rcv0: (token, bits[32]) = receive(my_token, channel=in0)
   rcv0_token: token = tuple_index(rcv0, index=0)
-  rcv1: (token, bits[32]) = receive(rcv0_token, channel_id=1)
+  rcv1: (token, bits[32]) = receive(rcv0_token, channel=in1)
   rcv1_token: token = tuple_index(rcv1, index=0)
-  rcv2: (token, bits[32]) = receive(rcv1_token, channel_id=2)
+  rcv2: (token, bits[32]) = receive(rcv1_token, channel=in2)
   rcv2_token: token = tuple_index(rcv2, index=0)
   data0: bits[32] = tuple_index(rcv0, index=1)
   data1: bits[32] = tuple_index(rcv1, index=1)
@@ -904,18 +901,18 @@ proc my_proc(my_token: token, my_state: (), init={()}) {
   data2_times_two: bits[32] = umul(data2, two)
   tmp: bits[32] = add(neg_data1, data2_times_two)
   sum: bits[32] = add(tmp, data0)
-  send: token = send(rcv2_token, sum, channel_id=3)
-  next (send, my_state)
+  send: token = send(rcv2_token, sum, channel=out)
+  next_my_state: () = next_value(param=my_state, value=my_state)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
                            Parser::ParsePackage(ir_text));
 
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("my_proc"));
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, codegen_options()));
   EXPECT_THAT(
-      FindNode("out", unit.block),
+      FindNode("out", context.top_block()),
       m::OutputPort("out",
                     m::Add(m::Add(m::Neg(m::InputPort("in1")),
                                   m::UMul(m::InputPort("in2"), m::Literal(2))),
@@ -924,16 +921,17 @@ proc my_proc(my_token: token, my_state: (), init={()}) {
 
 TEST_F(BlockConversionTest, OnlyFIFOOutProc) {
   const std::string ir_text = R"(package test
-chan in(bits[32], id=0, kind=single_value, ops=receive_only, metadata="")
-chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="")
+chan in(bits[32], id=0, kind=single_value, ops=receive_only)
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
 
-proc my_proc(tkn: token, st: (), init={()}) {
-  receive.13: (token, bits[32]) = receive(tkn, channel_id=0, id=13)
+proc my_proc(st: (), init={()}) {
+  tkn: token = literal(value=token, id=1)
+  receive.13: (token, bits[32]) = receive(tkn, channel=in, id=13)
   tuple_index.14: token = tuple_index(receive.13, index=0, id=14)
   literal.21: bits[1] = literal(value=1, id=21, pos=[(1,8,3)])
   tuple_index.15: bits[32] = tuple_index(receive.13, index=1, id=15)
-  send.20: token = send(tuple_index.14, tuple_index.15, predicate=literal.21, channel_id=1, id=20, pos=[(1,5,1)])
-  next (send.20, st)
+  send.20: token = send(tuple_index.14, tuple_index.15, predicate=literal.21, channel=out, id=20, pos=[(1,5,1)])
+  next_st: () = next_value(param=st, value=st)
 }
 
 )";
@@ -941,65 +939,95 @@ proc my_proc(tkn: token, st: (), init={()}) {
                            Parser::ParsePackage(ir_text));
 
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("my_proc"));
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, codegen_options()));
-  EXPECT_THAT(FindNode("out", unit.block),
+  EXPECT_THAT(FindNode("out", context.top_block()),
               m::OutputPort("out", m::InputPort("in")));
-  EXPECT_THAT(FindNode("out_vld", unit.block),
+  EXPECT_THAT(FindNode("out_vld", context.top_block()),
               m::OutputPort("out_vld", m::And(m::Literal(1), m::Literal(1),
                                               m::Literal(1), m::Literal(1))));
 }
 
+TEST_F(BlockConversionTest, NoRegsIfChannelsHaveNoFlopsSet) {
+  constexpr std::string_view kIrText = R"(
+package my_package
+
+chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid, strictness=proven_mutually_exclusive, input_flop_kind=none, output_flop_kind=none)
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid, strictness=proven_mutually_exclusive, input_flop_kind=none, output_flop_kind=none)
+
+top proc my_proc() {
+  literal.16: token = literal(value=token, id=16)
+  Test__in_recv: (token, bits[32]) = receive(literal.16, channel=in, id=99)
+  Test__in_recv_value: bits[32] = tuple_index(Test__in_recv, index=1, id=36)
+  bit_slice.110: bits[30] = bit_slice(Test__in_recv_value, start=2, width=30, id=110)
+  bit_slice.97: bits[30] = bit_slice(Test__in_recv_value, start=0, width=30, id=97)
+  add.112: bits[30] = add(bit_slice.110, bit_slice.97, id=112)
+  bit_slice.113: bits[2] = bit_slice(Test__in_recv_value, start=0, width=2, id=113)
+  tuple_index.101: token = tuple_index(Test__in_recv, index=0, id=101)
+  Test__out_send_value: bits[32] = concat(add.112, bit_slice.113, id=114)
+  Test__out_send: token = send(tuple_index.101, Test__out_send_value, channel=out, id=100)
+}
+  )";
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(kIrText));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("my_proc"));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      ProcToCombinationalBlock(
+          proc, codegen_options().flop_inputs(true).flop_outputs(true)));
+  RecordProperty("res", context.top_block()->DumpIr());
+  EXPECT_THAT(context.top_block()->GetRegisters(), testing::IsEmpty());
+}
+
 TEST_F(BlockConversionTest, OnlyFIFOInProcGateRecvsTrue) {
   const std::string ir_text = R"(package test
-chan in(bits[32], id=0, kind=streaming, ops=receive_only,
-flow_control=ready_valid, metadata="""module_port { flopped: false
-port_order: 0 }""") chan out(bits[32], id=1, kind=single_value,
-ops=send_only, metadata="""module_port { flopped: false port_order: 1 }""")
+chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid)
+chan out(bits[32], id=1, kind=single_value, ops=send_only)
 
-proc my_proc(tkn: token, st: (), init={()}) {
+proc my_proc(st: (), init={()}) {
+  tkn: token = literal(value=token, id=1)
   literal.21: bits[1] = literal(value=1, id=21, pos=[(1,8,3)])
-  receive.13: (token, bits[32]) = receive(tkn, predicate=literal.21, channel_id=0, id=13)
+  receive.13: (token, bits[32]) = receive(tkn, predicate=literal.21, channel=in, id=13)
   tuple_index.14: token = tuple_index(receive.13, index=0, id=14)
   tuple_index.15: bits[32] = tuple_index(receive.13, index=1, id=15)
   send.20: token = send(tuple_index.14, tuple_index.15,
-                        channel_id=1, id=20, pos=[(1,5,1)])
-  next (send.20, st)
+                        channel=out, id=20, pos=[(1,5,1)])
+  next_st: () = next_value(param=st, value=st)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
                            Parser::ParsePackage(ir_text));
 
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("my_proc"));
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, codegen_options()));
 
   // A select node is inferred by the `receive.13` node.
   EXPECT_THAT(
-      FindNode("out", unit.block),
+      FindNode("out", context.top_block()),
       m::OutputPort("out", m::Select(m::Literal(1),
                                      {m::Literal(0), m::InputPort("in")})));
-  EXPECT_THAT(FindNode("in", unit.block), m::InputPort("in"));
-  EXPECT_THAT(FindNode("in_vld", unit.block), m::InputPort("in_vld"));
-  EXPECT_THAT(FindNode("in_rdy", unit.block),
+  EXPECT_THAT(FindNode("in", context.top_block()), m::InputPort("in"));
+  EXPECT_THAT(FindNode("in_vld", context.top_block()), m::InputPort("in_vld"));
+  EXPECT_THAT(FindNode("in_rdy", context.top_block()),
               m::OutputPort("in_rdy", m::And(m::Literal(1), m::Literal(1))));
 }
 
 TEST_F(BlockConversionTest, OnlyFIFOInProcGateRecvsFalse) {
   const std::string ir_text = R"(package test
-chan in(bits[32], id=0, kind=streaming, ops=receive_only,
-flow_control=ready_valid, metadata="""module_port { flopped: false
-port_order: 0 }""") chan out(bits[32], id=1, kind=single_value,
-ops=send_only, metadata="""module_port { flopped: false port_order: 1 }""")
+chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid)
+chan out(bits[32], id=1, kind=single_value, ops=send_only)
 
-proc my_proc(tkn: token, st: (), init={()}) {
+proc my_proc(st: (), init={()}) {
+  tkn: token = literal(value=token, id=1)
   literal.21: bits[1] = literal(value=1, id=21, pos=[(1,8,3)])
-  receive.13: (token, bits[32]) = receive(tkn, predicate=literal.21, channel_id=0, id=13)
+  receive.13: (token, bits[32]) = receive(tkn, predicate=literal.21, channel=in, id=13)
   tuple_index.14: token = tuple_index(receive.13, index=0, id=14)
   tuple_index.15: bits[32] = tuple_index(receive.13, index=1, id=15)
   send.20: token = send(tuple_index.14, tuple_index.15,
-                        channel_id=1, id=20, pos=[(1,5,1)])
-  next (send.20, st)
+                        channel=out, id=20, pos=[(1,5,1)])
+  next_st: () = next_value(param=st, value=st)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
@@ -1008,9 +1036,9 @@ proc my_proc(tkn: token, st: (), init={()}) {
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("my_proc"));
   CodegenOptions options = codegen_options();
   options.gate_recvs(false);
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, options));
-  Block* block = unit.block;
+  Block* block = context.top_block();
 
   EXPECT_THAT(FindNode("out", block), m::OutputPort("out", m::InputPort("in")));
   EXPECT_THAT(FindNode("in", block), m::InputPort("in"));
@@ -1021,14 +1049,16 @@ proc my_proc(tkn: token, st: (), init={()}) {
 
 TEST_F(BlockConversionTest, UnconditionalSendRdyVldProc) {
   const std::string ir_text = R"(package test
-chan in(bits[32], id=0, kind=single_value, ops=receive_only, metadata="")
-chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="")
+chan in(bits[32], id=0, kind=single_value, ops=receive_only)
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
 
-proc my_proc(tkn: token, st: (), init={()}) {
-  receive.13: (token, bits[32]) = receive(tkn, channel_id=0, id=13)
+proc my_proc(st: (), init={()}) {
+  tkn: token = literal(value=token, id=1)
+  receive.13: (token, bits[32]) = receive(tkn, channel=in, id=13)
   tuple_index.14: token = tuple_index(receive.13, index=0, id=14)
   tuple_index.15: bits[32] = tuple_index(receive.13, index=1, id=15)
-  send.20: token = send(tuple_index.14, tuple_index.15, channel_id=1, id=20) next (send.20, st)
+  send.20: token = send(tuple_index.14, tuple_index.15, channel=out, id=20)
+  next_st: () = next_value(param=st, value=st)
 }
 )";
 
@@ -1036,9 +1066,9 @@ proc my_proc(tkn: token, st: (), init={()}) {
                            Parser::ParsePackage(ir_text));
 
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("my_proc"));
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, codegen_options()));
-  Block* block = unit.block;
+  Block* block = context.top_block();
 
   EXPECT_THAT(FindNode("out", block), m::OutputPort("out", m::InputPort("in")));
   EXPECT_THAT(FindNode("out_vld", block),
@@ -1069,23 +1099,23 @@ TEST_F(BlockConversionTest, ReceiveIfIsZeroWhenPredicateIsFalse) {
 
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build({}));
 
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, codegen_options()));
 
   // Assert the predicate to false. Note out contains the value of 0 although
   // the value of in is 42.
-  EXPECT_THAT(
-      InterpretCombinationalBlock(
-          unit.block, {{"pred", 0}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
-      IsOkAndHolds(UnorderedElementsAre(Pair("in_rdy", 0), Pair("out_vld", 1),
-                                        Pair("out", 0))));
+  EXPECT_THAT(InterpretCombinationalBlock(
+                  context.top_block(),
+                  {{"pred", 0}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
+              IsOkAndHolds(UnorderedElementsAre(
+                  Pair("in_rdy", 0), Pair("out_vld", 1), Pair("out", 0))));
 
   // Assert the predicate to true. Note out contains the value of in (42).
-  EXPECT_THAT(
-      InterpretCombinationalBlock(
-          unit.block, {{"pred", 1}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
-      IsOkAndHolds(UnorderedElementsAre(Pair("in_rdy", 1), Pair("out_vld", 1),
-                                        Pair("out", 42))));
+  EXPECT_THAT(InterpretCombinationalBlock(
+                  context.top_block(),
+                  {{"pred", 1}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
+              IsOkAndHolds(UnorderedElementsAre(
+                  Pair("in_rdy", 1), Pair("out_vld", 1), Pair("out", 42))));
 }
 
 // Ensure that the output of the receive is passthrough when the predicate is
@@ -1113,22 +1143,22 @@ TEST_F(BlockConversionTest, ReceiveIfIsPassthroughWhenPredicateIsFalse) {
 
   CodegenOptions options = codegen_options();
   options.gate_recvs(false);
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, options));
 
   // Assert the predicate to false. Note out contains the value of in (42).
-  EXPECT_THAT(
-      InterpretCombinationalBlock(
-          unit.block, {{"pred", 0}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
-      IsOkAndHolds(UnorderedElementsAre(Pair("in_rdy", 0), Pair("out_vld", 1),
-                                        Pair("out", 42))));
+  EXPECT_THAT(InterpretCombinationalBlock(
+                  context.top_block(),
+                  {{"pred", 0}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
+              IsOkAndHolds(UnorderedElementsAre(
+                  Pair("in_rdy", 0), Pair("out_vld", 1), Pair("out", 42))));
 
   // Assert the predicate to true. Note out contains the value of in (42).
-  EXPECT_THAT(
-      InterpretCombinationalBlock(
-          unit.block, {{"pred", 1}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
-      IsOkAndHolds(UnorderedElementsAre(Pair("in_rdy", 1), Pair("out_vld", 1),
-                                        Pair("out", 42))));
+  EXPECT_THAT(InterpretCombinationalBlock(
+                  context.top_block(),
+                  {{"pred", 1}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
+              IsOkAndHolds(UnorderedElementsAre(
+                  Pair("in_rdy", 1), Pair("out_vld", 1), Pair("out", 42))));
 }
 
 // Ensure that the output of the receive is zero when the data is not valid.
@@ -1142,29 +1172,31 @@ TEST_F(BlockConversionTest, NonblockingReceiveIsZeroWhenDataInvalid) {
       Channel * ch_out,
       package.CreateStreamingChannel("out", ChannelOps::kSendOnly, u32));
 
-  ProcBuilder pb(TestName(), /*token_name=*/"tkn", &package);
-  BValue in = pb.ReceiveNonBlocking(ch_in, pb.GetTokenParam());
+  ProcBuilder pb(TestName(), &package);
+  BValue in = pb.ReceiveNonBlocking(ch_in, pb.Literal(Value::Token()));
   BValue in_tkn = pb.TupleIndex(in, 0);
   BValue in_data = pb.TupleIndex(in, 1);
-  BValue tok_fin = pb.Send(ch_out, in_tkn, in_data);
-  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build(tok_fin, {}));
+  pb.Send(ch_out, in_tkn, in_data);
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build());
 
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, codegen_options()));
 
   // `in`'s valid signal is deasserted. Note `out` contains the value of 0
   // although the value of `in` is 42.
-  EXPECT_THAT(InterpretCombinationalBlock(
-                  unit.block, {{"in", 42}, {"in_vld", 0}, {"out_rdy", 1}}),
-              IsOkAndHolds(UnorderedElementsAre(
-                  Pair("in_rdy", 1), Pair("out_vld", 1), Pair("out", 0))));
+  EXPECT_THAT(
+      InterpretCombinationalBlock(context.top_block(),
+                                  {{"in", 42}, {"in_vld", 0}, {"out_rdy", 1}}),
+      IsOkAndHolds(UnorderedElementsAre(Pair("in_rdy", 1), Pair("out_vld", 1),
+                                        Pair("out", 0))));
 
   // `in`'s valid signal is asserted. Note `out` contains the value of `in`
   // which is 42.
-  EXPECT_THAT(InterpretCombinationalBlock(
-                  unit.block, {{"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
-              IsOkAndHolds(UnorderedElementsAre(
-                  Pair("in_rdy", 1), Pair("out_vld", 1), Pair("out", 42))));
+  EXPECT_THAT(
+      InterpretCombinationalBlock(context.top_block(),
+                                  {{"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
+      IsOkAndHolds(UnorderedElementsAre(Pair("in_rdy", 1), Pair("out_vld", 1),
+                                        Pair("out", 42))));
 }
 
 // Ensure that the output of the receive is passthrough when the data is not
@@ -1179,31 +1211,33 @@ TEST_F(BlockConversionTest, NonblockingReceiveIsPassthroughWhenDataInvalid) {
       Channel * ch_out,
       package.CreateStreamingChannel("out", ChannelOps::kSendOnly, u32));
 
-  ProcBuilder pb(TestName(), /*token_name=*/"tkn", &package);
-  BValue in = pb.ReceiveNonBlocking(ch_in, pb.GetTokenParam());
+  ProcBuilder pb(TestName(), &package);
+  BValue in = pb.ReceiveNonBlocking(ch_in, pb.Literal(Value::Token()));
   BValue in_tkn = pb.TupleIndex(in, 0);
   BValue in_data = pb.TupleIndex(in, 1);
-  BValue tok_fin = pb.Send(ch_out, in_tkn, in_data);
-  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build(tok_fin, {}));
+  pb.Send(ch_out, in_tkn, in_data);
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build());
 
   CodegenOptions options = codegen_options();
   options.gate_recvs(false);
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, options));
 
   // `in`'s valid signal is deasserted. Note `out` contains the value of `in`
   // which is 42.
-  EXPECT_THAT(InterpretCombinationalBlock(
-                  unit.block, {{"in", 42}, {"in_vld", 0}, {"out_rdy", 1}}),
-              IsOkAndHolds(UnorderedElementsAre(
-                  Pair("in_rdy", 1), Pair("out_vld", 1), Pair("out", 42))));
+  EXPECT_THAT(
+      InterpretCombinationalBlock(context.top_block(),
+                                  {{"in", 42}, {"in_vld", 0}, {"out_rdy", 1}}),
+      IsOkAndHolds(UnorderedElementsAre(Pair("in_rdy", 1), Pair("out_vld", 1),
+                                        Pair("out", 42))));
 
   // `in`'s valid signal is asserted. Note `out` contains the value of `in`
   // which is 42.
-  EXPECT_THAT(InterpretCombinationalBlock(
-                  unit.block, {{"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
-              IsOkAndHolds(UnorderedElementsAre(
-                  Pair("in_rdy", 1), Pair("out_vld", 1), Pair("out", 42))));
+  EXPECT_THAT(
+      InterpretCombinationalBlock(context.top_block(),
+                                  {{"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
+      IsOkAndHolds(UnorderedElementsAre(Pair("in_rdy", 1), Pair("out_vld", 1),
+                                        Pair("out", 42))));
 }
 
 // Ensure that the output of the receive is zero when the predicate is false.
@@ -1221,34 +1255,34 @@ TEST_F(BlockConversionTest, NonblockingReceiveIsZeroWhenPredicateIsFalse) {
       Channel * ch_out,
       package.CreateStreamingChannel("out", ChannelOps::kSendOnly, u32));
 
-  ProcBuilder pb(TestName(), /*token_name=*/"tkn", &package);
-  BValue ch_pred_response = pb.Receive(ch_pred, pb.GetTokenParam());
+  ProcBuilder pb(TestName(), &package);
+  BValue ch_pred_response = pb.Receive(ch_pred, pb.Literal(Value::Token()));
   BValue ch_pred_tkn = pb.TupleIndex(ch_pred_response, 0);
   BValue ch_pred_value = pb.TupleIndex(ch_pred_response, 1);
   BValue in_response =
       pb.ReceiveIfNonBlocking(ch_in, ch_pred_tkn, ch_pred_value);
   BValue in_tkn = pb.TupleIndex(in_response, 0);
   BValue in_data = pb.TupleIndex(in_response, 1);
-  BValue tok_fin = pb.Send(ch_out, in_tkn, in_data);
-  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build(tok_fin, {}));
+  pb.Send(ch_out, in_tkn, in_data);
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build());
 
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, codegen_options()));
 
   // Assert the predicate to false. Note `out` contains the value of 0 although
   // the value of `in` is 42.
-  EXPECT_THAT(
-      InterpretCombinationalBlock(
-          unit.block, {{"pred", 0}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
-      IsOkAndHolds(UnorderedElementsAre(Pair("in_rdy", 0), Pair("out_vld", 1),
-                                        Pair("out", 0))));
+  EXPECT_THAT(InterpretCombinationalBlock(
+                  context.top_block(),
+                  {{"pred", 0}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
+              IsOkAndHolds(UnorderedElementsAre(
+                  Pair("in_rdy", 0), Pair("out_vld", 1), Pair("out", 0))));
 
   // Assert the predicate to true. Note `out` contains the value of `in` (42).
-  EXPECT_THAT(
-      InterpretCombinationalBlock(
-          unit.block, {{"pred", 1}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
-      IsOkAndHolds(UnorderedElementsAre(Pair("in_rdy", 1), Pair("out_vld", 1),
-                                        Pair("out", 42))));
+  EXPECT_THAT(InterpretCombinationalBlock(
+                  context.top_block(),
+                  {{"pred", 1}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
+              IsOkAndHolds(UnorderedElementsAre(
+                  Pair("in_rdy", 1), Pair("out_vld", 1), Pair("out", 42))));
 }
 
 // Ensure that the output of the receive is passthrough when the predicate is
@@ -1268,35 +1302,35 @@ TEST_F(BlockConversionTest,
       Channel * ch_out,
       package.CreateStreamingChannel("out", ChannelOps::kSendOnly, u32));
 
-  ProcBuilder pb(TestName(), /*token_name=*/"tkn", &package);
-  BValue ch_pred_response = pb.Receive(ch_pred, pb.GetTokenParam());
+  ProcBuilder pb(TestName(), &package);
+  BValue ch_pred_response = pb.Receive(ch_pred, pb.Literal(Value::Token()));
   BValue ch_pred_tkn = pb.TupleIndex(ch_pred_response, 0);
   BValue ch_pred_value = pb.TupleIndex(ch_pred_response, 1);
   BValue in_response =
       pb.ReceiveIfNonBlocking(ch_in, ch_pred_tkn, ch_pred_value);
   BValue in_tkn = pb.TupleIndex(in_response, 0);
   BValue in_data = pb.TupleIndex(in_response, 1);
-  BValue tok_fin = pb.Send(ch_out, in_tkn, in_data);
-  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build(tok_fin, {}));
+  pb.Send(ch_out, in_tkn, in_data);
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build());
 
   CodegenOptions options = codegen_options();
   options.gate_recvs(false);
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, options));
 
   // Assert the predicate to false. Note out contains the value of in (42).
-  EXPECT_THAT(
-      InterpretCombinationalBlock(
-          unit.block, {{"pred", 0}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
-      IsOkAndHolds(UnorderedElementsAre(Pair("in_rdy", 0), Pair("out_vld", 1),
-                                        Pair("out", 42))));
+  EXPECT_THAT(InterpretCombinationalBlock(
+                  context.top_block(),
+                  {{"pred", 0}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
+              IsOkAndHolds(UnorderedElementsAre(
+                  Pair("in_rdy", 0), Pair("out_vld", 1), Pair("out", 42))));
 
   // Assert the predicate to true. Note `out` contains the value of `in` (42).
-  EXPECT_THAT(
-      InterpretCombinationalBlock(
-          unit.block, {{"pred", 1}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
-      IsOkAndHolds(UnorderedElementsAre(Pair("in_rdy", 1), Pair("out_vld", 1),
-                                        Pair("out", 42))));
+  EXPECT_THAT(InterpretCombinationalBlock(
+                  context.top_block(),
+                  {{"pred", 1}, {"in", 42}, {"in_vld", 1}, {"out_rdy", 1}}),
+              IsOkAndHolds(UnorderedElementsAre(
+                  Pair("in_rdy", 1), Pair("out_vld", 1), Pair("out", 42))));
 }
 
 TEST_F(BlockConversionTest, TwoToOneProc) {
@@ -1324,9 +1358,9 @@ TEST_F(BlockConversionTest, TwoToOneProc) {
 
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build({}));
 
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, codegen_options()));
-  Block* block = unit.block;
+  Block* block = context.top_block();
 
   // Input B selected, input valid and output ready asserted.
   EXPECT_THAT(
@@ -1400,9 +1434,9 @@ TEST_F(BlockConversionTest, OneToTwoProc) {
 
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build({}));
 
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
+  XLS_ASSERT_OK_AND_ASSIGN(CodegenContext context,
                            ProcToCombinationalBlock(proc, codegen_options()));
-  Block* block = unit.block;
+  Block* block = context.top_block();
 
   // Output B selected. Input valid and output readies asserted.
   EXPECT_THAT(
@@ -1443,14 +1477,16 @@ TEST_F(BlockConversionTest, OneToTwoProc) {
 
 TEST_F(BlockConversionTest, FlopSingleValueChannelProc) {
   const std::string ir_text = R"(package test
-chan in(bits[32], id=0, kind=single_value, ops=receive_only, metadata="")
-chan out(bits[32], id=1, kind=single_value, ops=send_only, metadata="")
+chan in(bits[32], id=0, kind=single_value, ops=receive_only)
+chan out(bits[32], id=1, kind=single_value, ops=send_only)
 
-proc my_proc(tkn: token, st: (), init={()}) {
-  receive.13: (token, bits[32]) = receive(tkn, channel_id=0, id=13)
+proc my_proc(tkn: token, st: (), init={token, ()}) {
+  receive.13: (token, bits[32]) = receive(tkn, channel=in, id=13)
   tuple_index.14: token = tuple_index(receive.13, index=0, id=14)
   tuple_index.15: bits[32] = tuple_index(receive.13, index=1, id=15)
-  send.20: token = send(tuple_index.14, tuple_index.15, channel_id=1, id=20) next (send.20, st)
+  send.20: token = send(tuple_index.14, tuple_index.15, channel=out, id=20)
+  next_st: () = next_value(param=st, value=st)
+  next_tkn: () = next_value(param=tkn, value=send.20)
 }
 )";
 
@@ -1471,11 +1507,13 @@ proc my_proc(tkn: token, st: (), init={()}) {
   options.reset("rst_n", false, /*active_low=*/true, false);
 
   {
-    options.flop_single_value_channels(true);
+    options.flop_single_value_channels(true).module_name(
+        "with_single_value_channel");
 
-    XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
-                             ProcToPipelinedBlock(schedule, options, proc));
-    Block* block = unit.block;
+    XLS_ASSERT_OK_AND_ASSIGN(
+        CodegenContext context,
+        FunctionBaseToPipelinedBlock(schedule, options, proc));
+    Block* block = context.top_block();
 
     XLS_VLOG_LINES(2, block->DumpIr());
 
@@ -1487,15 +1525,17 @@ proc my_proc(tkn: token, st: (), init={()}) {
   }
 
   {
-    options.flop_single_value_channels(false);
+    options.flop_single_value_channels(false).module_name(
+        "no_single_value_channel");
 
-    XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
-                             ProcToPipelinedBlock(schedule, options, proc));
+    XLS_ASSERT_OK_AND_ASSIGN(
+        CodegenContext context,
+        FunctionBaseToPipelinedBlock(schedule, options, proc));
 
-    XLS_VLOG_LINES(2, unit.block->DumpIr());
+    XLS_VLOG_LINES(2, context.top_block()->DumpIr());
 
-    EXPECT_FALSE(HasNode("__out_reg", unit.block));
-    EXPECT_FALSE(HasNode("__in_reg", unit.block));
+    EXPECT_FALSE(HasNode("__out_reg", context.top_block()));
+    EXPECT_FALSE(HasNode("__in_reg", context.top_block()));
   }
 }
 
@@ -1526,7 +1566,7 @@ class SimplePipelinedProcTest : public ProcConversionTestFixture {
     pb.Send(ch_out, buffered_in_val);
     XLS_ASSIGN_OR_RETURN(Proc * proc, pb.Build({}));
 
-    XLS_VLOG(2) << "Simple streaming proc";
+    VLOG(2) << "Simple streaming proc";
     XLS_VLOG_LINES(2, proc->DumpIr());
 
     XLS_ASSIGN_OR_RETURN(
@@ -1540,7 +1580,8 @@ class SimplePipelinedProcTest : public ProcConversionTestFixture {
     CodegenOptions codegen_options = options;
     codegen_options.module_name(kBlockName);
 
-    XLS_RET_CHECK_OK(ProcToPipelinedBlock(schedule, codegen_options, proc));
+    XLS_RET_CHECK_OK(
+        FunctionBaseToPipelinedBlock(schedule, codegen_options, proc));
 
     return package_ptr;
   }
@@ -1601,7 +1642,7 @@ TEST_F(SimplePipelinedProcTest, BasicDatapathResetAndInputFlop) {
                            BuildBlockInPackage(/*stage_count=*/4, options));
   XLS_ASSERT_OK_AND_ASSIGN(Block * block, package->GetBlock(kBlockName));
 
-  XLS_VLOG(2) << "Simple streaming pipelined block";
+  VLOG(2) << "Simple streaming pipelined block";
   XLS_VLOG_LINES(2, block->DumpIr());
 
   std::vector<absl::flat_hash_map<std::string, uint64_t>> inputs;
@@ -1693,7 +1734,7 @@ TEST_F(SimplePipelinedProcTest, BasicResetAndStall) {
                            BuildBlockInPackage(/*stage_count=*/4, options));
   XLS_ASSERT_OK_AND_ASSIGN(Block * block, package->GetBlock(kBlockName));
 
-  XLS_VLOG(2) << "Simple streaming pipelined block";
+  VLOG(2) << "Simple streaming pipelined block";
   XLS_VLOG_LINES(2, block->DumpIr());
 
   std::vector<absl::flat_hash_map<std::string, uint64_t>> inputs;
@@ -1910,7 +1951,7 @@ TEST_P(SimplePipelinedProcTestSweepFixture, RandomStalling) {
       BuildBlockInPackage(/*stage_count=*/stage_count, options));
   XLS_ASSERT_OK_AND_ASSIGN(Block * block, package->GetBlock(kBlockName));
 
-  XLS_VLOG(2) << "Simple streaming pipelined block";
+  VLOG(2) << "Simple streaming pipelined block";
   XLS_VLOG_LINES(2, block->DumpIr());
 
   // The input stimulus to this test are
@@ -2075,9 +2116,10 @@ class SimpleRunningCounterProcTestSweepFixture
 
     BValue buffered_state = pb.Not(pb.Not(pb.Not(pb.Not(next_state))));
     pb.Send(ch_out, buffered_state);
-    XLS_ASSIGN_OR_RETURN(Proc * proc, pb.Build({next_state}));
+    pb.Next(/*state_read=*/state, /*value=*/next_state);
+    XLS_ASSIGN_OR_RETURN(Proc * proc, pb.Build());
 
-    XLS_VLOG(2) << "Simple counting proc";
+    VLOG(2) << "Simple counting proc";
     XLS_VLOG_LINES(2, proc->DumpIr());
 
     XLS_ASSIGN_OR_RETURN(PipelineSchedule schedule,
@@ -2089,7 +2131,8 @@ class SimpleRunningCounterProcTestSweepFixture
     CodegenOptions codegen_options = options;
     codegen_options.module_name(kBlockName);
 
-    XLS_RET_CHECK_OK(ProcToPipelinedBlock(schedule, codegen_options, proc));
+    XLS_RET_CHECK_OK(
+        FunctionBaseToPipelinedBlock(schedule, codegen_options, proc));
 
     return package_ptr;
   }
@@ -2117,7 +2160,7 @@ TEST_P(SimpleRunningCounterProcTestSweepFixture, RandomStalling) {
 
   XLS_ASSERT_OK_AND_ASSIGN(Block * block, package->GetBlock(kBlockName));
 
-  XLS_VLOG(2) << "Simple counting pipelined block";
+  VLOG(2) << "Simple counting pipelined block";
   XLS_VLOG_LINES(2, block->DumpIr());
 
   // The input stimulus to this test are
@@ -2271,7 +2314,7 @@ class MultiInputPipelinedProcTest : public ProcConversionTestFixture {
     pb.Send(ch_out, sum_val);
     XLS_ASSIGN_OR_RETURN(Proc * proc, pb.Build({}));
 
-    XLS_VLOG(2) << "Multi input streaming proc";
+    VLOG(2) << "Multi input streaming proc";
     XLS_VLOG_LINES(2, proc->DumpIr());
 
     XLS_ASSIGN_OR_RETURN(
@@ -2285,7 +2328,8 @@ class MultiInputPipelinedProcTest : public ProcConversionTestFixture {
     CodegenOptions codegen_options = options;
     codegen_options.module_name(kBlockName);
 
-    XLS_RET_CHECK_OK(ProcToPipelinedBlock(schedule, codegen_options, proc));
+    XLS_RET_CHECK_OK(
+        FunctionBaseToPipelinedBlock(schedule, codegen_options, proc));
 
     return package_ptr;
   }
@@ -2336,7 +2380,7 @@ TEST_P(MultiInputPipelinedProcTestSweepFixture, RandomStalling) {
 
   XLS_ASSERT_OK_AND_ASSIGN(Block * block, package->GetBlock(kBlockName));
 
-  XLS_VLOG(2) << "Multi input counting pipelined block";
+  VLOG(2) << "Multi input counting pipelined block";
   XLS_VLOG_LINES(2, block->DumpIr());
 
   // The input stimulus to this test are
@@ -2457,6 +2501,339 @@ INSTANTIATE_TEST_SUITE_P(
                         CodegenOptions::IOKind::kZeroLatencyBuffer)),
     MultiInputPipelinedProcTestSweepFixture::PrintToStringParamName);
 
+class SpecificIoKindsTest : public ProcConversionTestFixture,
+                            public testing::WithParamInterface<FlopKind> {};
+TEST_P(SpecificIoKindsTest, InputChannelSpecificFlopKindsRespected) {
+  // Compile once with a specific override for the channel and once with the
+  // default set and compare outputs.
+  auto p = CreatePackage();
+  ProcBuilder pb(TestName(), p.get());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto chan, p->CreateStreamingChannel(
+                     "input_chan", ChannelOps::kReceiveOnly, p->GetBitsType(32),
+                     /*initial_values=*/{},
+                     ChannelConfig(/*fifo_config=*/std::nullopt,
+                                   /*input_flop_kind=*/GetParam(),
+                                   /*output_flop_kind=*/std::nullopt)));
+  BValue recv =
+      pb.Receive(chan, pb.Literal(Value::Token()), SourceInfo(), "recv");
+  pb.Trace(pb.TupleIndex(recv, 0), pb.Literal(UBits(1, 1)),
+           {pb.TupleIndex(recv, 1)}, "val {}");
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build());
+  // Make a copy without any channel config.
+  XLS_ASSERT_OK_AND_ASSIGN(auto p2, ClonePackage(p.get()));
+  down_cast<StreamingChannel*>(p2->channels().front())
+      ->channel_config(ChannelConfig());
+
+  CodegenOptions test_options;
+  test_options.flop_inputs(false).flop_outputs(false).clock_name("clk");
+  test_options.valid_control("input_valid", "output_valid");
+  test_options.reset("rst_n", false, /*active_low=*/false, false);
+  test_options.module_name(absl::StrCat(TestName(), "_block"));
+
+  CodegenOptions oracle_options;
+  oracle_options.flop_outputs(false).clock_name("clk");
+  oracle_options.valid_control("input_valid", "output_valid");
+  oracle_options.reset("rst_n", false, /*active_low=*/false, false);
+  switch (GetParam()) {
+    case FlopKind::kNone:
+      oracle_options.flop_inputs(false);
+      break;
+    case FlopKind::kFlop:
+      oracle_options.flop_inputs(true).flop_inputs_kind(
+          CodegenOptions::IOKind::kFlop);
+      break;
+    case FlopKind::kSkid:
+      oracle_options.flop_inputs(true).flop_inputs_kind(
+          CodegenOptions::IOKind::kSkidBuffer);
+      break;
+    case FlopKind::kZeroLatency:
+      oracle_options.flop_inputs(true).flop_inputs_kind(
+          CodegenOptions::IOKind::kZeroLatencyBuffer);
+      break;
+  }
+  oracle_options.module_name(absl::StrCat(TestName(), "_block"));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule test_schedule,
+      RunPipelineSchedule(proc, TestDelayEstimator(),
+                          SchedulingOptions().pipeline_stages(1).add_constraint(
+                              RecvsFirstSendsLastConstraint())));
+
+  XLS_ASSERT_OK(
+      FunctionBaseToPipelinedBlock(test_schedule, test_options, proc));
+
+  Proc* oracle_proc = p2->procs().front().get();
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule oracle_schedule,
+      RunPipelineSchedule(oracle_proc, TestDelayEstimator(),
+                          SchedulingOptions().pipeline_stages(1).add_constraint(
+                              RecvsFirstSendsLastConstraint())));
+
+  XLS_ASSERT_OK(FunctionBaseToPipelinedBlock(oracle_schedule, oracle_options,
+                                             oracle_proc));
+
+  EXPECT_EQ(p->blocks().front()->DumpIr(), p2->blocks().front()->DumpIr());
+}
+TEST_P(SpecificIoKindsTest, InputChannelDefaultFlopKindsChange) {
+  // Compile once with a specific override for the channel and once with the
+  // default set and compare outputs.
+  auto p = CreatePackage();
+  ProcBuilder pb(TestName(), p.get());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto chan, p->CreateStreamingChannel(
+                     "input_chan", ChannelOps::kReceiveOnly, p->GetBitsType(32),
+                     /*initial_values=*/{},
+                     ChannelConfig(/*fifo_config=*/std::nullopt,
+                                   /*input_flop_kind=*/GetParam(),
+                                   /*output_flop_kind=*/std::nullopt)));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto chan2,
+      p->CreateStreamingChannel(
+          "input_chan2", ChannelOps::kReceiveOnly, p->GetBitsType(32),
+          /*initial_values=*/{},
+          ChannelConfig(/*fifo_config=*/std::nullopt,
+                        /*input_flop_kind=*/std::nullopt,
+                        /*output_flop_kind=*/std::nullopt)));
+  BValue recv =
+      pb.Receive(chan, pb.Literal(Value::Token()), SourceInfo(), "recv");
+  BValue recv2 =
+      pb.Receive(chan2, pb.Literal(Value::Token()), SourceInfo(), "recv2");
+  pb.Trace(pb.TupleIndex(recv, 0), pb.Literal(UBits(1, 1)),
+           {pb.TupleIndex(recv, 1)}, "val {}");
+  pb.Trace(pb.TupleIndex(recv2, 0), pb.Literal(UBits(1, 1)),
+           {pb.TupleIndex(recv2, 1)}, "val2 {}");
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build());
+  // Make a copy without any channel config.
+  XLS_ASSERT_OK_AND_ASSIGN(auto p2, ClonePackage(p.get()));
+  down_cast<StreamingChannel*>(p2->channels().front())
+      ->channel_config(ChannelConfig());
+
+  CodegenOptions test_options;
+  test_options.flop_inputs(false).flop_outputs(false).clock_name("clk");
+  test_options.valid_control("input_valid", "output_valid");
+  test_options.reset("rst_n", false, /*active_low=*/false, false);
+  test_options.module_name(absl::StrCat(TestName(), "_block"));
+
+  CodegenOptions oracle_options;
+  oracle_options.flop_outputs(false).clock_name("clk");
+  oracle_options.valid_control("input_valid", "output_valid");
+  oracle_options.reset("rst_n", false, /*active_low=*/false, false);
+  switch (GetParam()) {
+    case FlopKind::kNone:
+      oracle_options.flop_inputs(false);
+      test_options.flop_inputs(true).flop_inputs_kind(
+          CodegenOptions::IOKind::kSkidBuffer);
+      break;
+    case FlopKind::kFlop:
+      oracle_options.flop_inputs(true).flop_inputs_kind(
+          CodegenOptions::IOKind::kFlop);
+      break;
+    case FlopKind::kSkid:
+      oracle_options.flop_inputs(true).flop_inputs_kind(
+          CodegenOptions::IOKind::kSkidBuffer);
+      break;
+    case FlopKind::kZeroLatency:
+      oracle_options.flop_inputs(true).flop_inputs_kind(
+          CodegenOptions::IOKind::kZeroLatencyBuffer);
+      break;
+  }
+  oracle_options.module_name(absl::StrCat(TestName(), "_block"));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule test_schedule,
+      RunPipelineSchedule(proc, TestDelayEstimator(),
+                          SchedulingOptions().pipeline_stages(1).add_constraint(
+                              RecvsFirstSendsLastConstraint())));
+
+  XLS_ASSERT_OK(
+      FunctionBaseToPipelinedBlock(test_schedule, test_options, proc));
+
+  Proc* oracle_proc = p2->procs().front().get();
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule oracle_schedule,
+      RunPipelineSchedule(oracle_proc, TestDelayEstimator(),
+                          SchedulingOptions().pipeline_stages(1).add_constraint(
+                              RecvsFirstSendsLastConstraint())));
+
+  XLS_ASSERT_OK(FunctionBaseToPipelinedBlock(oracle_schedule, oracle_options,
+                                             oracle_proc));
+
+  // Make sure that only the single block is changed.
+  EXPECT_NE(p->blocks().front()->DumpIr(), p2->blocks().front()->DumpIr());
+}
+TEST_P(SpecificIoKindsTest, OutputChannelSpecificFlopKindsRespected) {
+  // Compile once with a specific override for the channel and once with the
+  // default set and compare outputs.
+  auto p = CreatePackage();
+  ProcBuilder pb(TestName(), p.get());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto in_chan,
+      p->CreateStreamingChannel("input_chan", ChannelOps::kReceiveOnly,
+                                p->GetBitsType(32)));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto chan, p->CreateStreamingChannel(
+                     "output_chan", ChannelOps::kSendOnly, p->GetBitsType(32),
+                     /*initial_values=*/{},
+                     ChannelConfig(/*fifo_config=*/std::nullopt,
+                                   /*input_flop_kind=*/std::nullopt,
+                                   /*output_flop_kind=*/GetParam())));
+  BValue recv =
+      pb.Receive(in_chan, pb.Literal(Value::Token()), SourceInfo(), "recv");
+  pb.Send(chan, pb.TupleIndex(recv, 0), pb.TupleIndex(recv, 1), SourceInfo(),
+          "snd");
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build());
+  // Make a copy without any channel config.
+  XLS_ASSERT_OK_AND_ASSIGN(auto p2, ClonePackage(p.get()));
+  for (auto* chan : p2->channels()) {
+    down_cast<StreamingChannel*>(chan)->channel_config(ChannelConfig());
+  }
+
+  CodegenOptions test_options;
+  test_options.flop_inputs(false).flop_outputs(false).clock_name("clk");
+  test_options.valid_control("input_valid", "output_valid");
+  test_options.reset("rst_n", false, /*active_low=*/false, false);
+  test_options.module_name(absl::StrCat(TestName(), "_block"));
+
+  CodegenOptions oracle_options;
+  oracle_options.flop_inputs(false).clock_name("clk");
+  oracle_options.valid_control("input_valid", "output_valid");
+  oracle_options.reset("rst_n", false, /*active_low=*/false, false);
+  switch (GetParam()) {
+    case FlopKind::kNone:
+      oracle_options.flop_outputs(false);
+      break;
+    case FlopKind::kFlop:
+      oracle_options.flop_outputs(true).flop_outputs_kind(
+          CodegenOptions::IOKind::kFlop);
+      break;
+    case FlopKind::kSkid:
+      oracle_options.flop_outputs(true).flop_outputs_kind(
+          CodegenOptions::IOKind::kSkidBuffer);
+      break;
+    case FlopKind::kZeroLatency:
+      oracle_options.flop_outputs(true).flop_outputs_kind(
+          CodegenOptions::IOKind::kZeroLatencyBuffer);
+      break;
+  }
+  oracle_options.module_name(absl::StrCat(TestName(), "_block"));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule test_schedule,
+      RunPipelineSchedule(proc, TestDelayEstimator(),
+                          SchedulingOptions().pipeline_stages(1).add_constraint(
+                              RecvsFirstSendsLastConstraint())));
+
+  XLS_ASSERT_OK(
+      FunctionBaseToPipelinedBlock(test_schedule, test_options, proc));
+
+  Proc* oracle_proc = p2->procs().front().get();
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule oracle_schedule,
+      RunPipelineSchedule(oracle_proc, TestDelayEstimator(),
+                          SchedulingOptions().pipeline_stages(1).add_constraint(
+                              RecvsFirstSendsLastConstraint())));
+
+  XLS_ASSERT_OK(FunctionBaseToPipelinedBlock(oracle_schedule, oracle_options,
+                                             oracle_proc));
+
+  EXPECT_EQ(p->blocks().front()->DumpIr(), p2->blocks().front()->DumpIr());
+}
+TEST_P(SpecificIoKindsTest, OutputChannelDefaultFlopKindsChange) {
+  // Compile once with a specific override for the channel and once with the
+  // default set and compare outputs.
+  auto p = CreatePackage();
+  ProcBuilder pb(TestName(), p.get());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto in_chan,
+      p->CreateStreamingChannel("input_chan", ChannelOps::kReceiveOnly,
+                                p->GetBitsType(32)));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto chan, p->CreateStreamingChannel(
+                     "output_chan", ChannelOps::kSendOnly, p->GetBitsType(32),
+                     /*initial_values=*/{},
+                     ChannelConfig(/*fifo_config=*/std::nullopt,
+                                   /*input_flop_kind=*/std::nullopt,
+                                   /*output_flop_kind=*/GetParam())));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto chan2, p->CreateStreamingChannel(
+                      "output_chan2", ChannelOps::kSendOnly, p->GetBitsType(32),
+                      /*initial_values=*/{},
+                      ChannelConfig(/*fifo_config=*/std::nullopt,
+                                    /*input_flop_kind=*/std::nullopt,
+                                    /*output_flop_kind=*/std::nullopt)));
+  BValue recv =
+      pb.Receive(in_chan, pb.Literal(Value::Token()), SourceInfo(), "recv");
+  pb.Send(chan, pb.TupleIndex(recv, 0), pb.TupleIndex(recv, 1), SourceInfo(),
+          "snd");
+  pb.Send(chan2, pb.TupleIndex(recv, 0), pb.TupleIndex(recv, 1), SourceInfo(),
+          "snd2");
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build());
+  // Make a copy without any channel config.
+  XLS_ASSERT_OK_AND_ASSIGN(auto p2, ClonePackage(p.get()));
+  for (auto* chan : p2->channels()) {
+    down_cast<StreamingChannel*>(chan)->channel_config(ChannelConfig());
+  }
+
+  CodegenOptions test_options;
+  test_options.flop_inputs(false).flop_outputs(false).clock_name("clk");
+  test_options.valid_control("input_valid", "output_valid");
+  test_options.reset("rst_n", false, /*active_low=*/false, false);
+  test_options.module_name(absl::StrCat(TestName(), "_block"));
+
+  CodegenOptions oracle_options;
+  oracle_options.flop_inputs(false).clock_name("clk");
+  oracle_options.valid_control("input_valid", "output_valid");
+  oracle_options.reset("rst_n", false, /*active_low=*/false, false);
+  switch (GetParam()) {
+    case FlopKind::kNone:
+      oracle_options.flop_outputs(false);
+      test_options.flop_outputs(true).flop_outputs_kind(
+          CodegenOptions::IOKind::kFlop);
+      break;
+    case FlopKind::kFlop:
+      oracle_options.flop_outputs(true).flop_outputs_kind(
+          CodegenOptions::IOKind::kFlop);
+      break;
+    case FlopKind::kSkid:
+      oracle_options.flop_outputs(true).flop_outputs_kind(
+          CodegenOptions::IOKind::kSkidBuffer);
+      break;
+    case FlopKind::kZeroLatency:
+      oracle_options.flop_outputs(true).flop_outputs_kind(
+          CodegenOptions::IOKind::kZeroLatencyBuffer);
+      break;
+  }
+  oracle_options.module_name(absl::StrCat(TestName(), "_block"));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule test_schedule,
+      RunPipelineSchedule(proc, TestDelayEstimator(),
+                          SchedulingOptions().pipeline_stages(1).add_constraint(
+                              RecvsFirstSendsLastConstraint())));
+
+  XLS_ASSERT_OK(
+      FunctionBaseToPipelinedBlock(test_schedule, test_options, proc));
+
+  Proc* oracle_proc = p2->procs().front().get();
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule oracle_schedule,
+      RunPipelineSchedule(oracle_proc, TestDelayEstimator(),
+                          SchedulingOptions().pipeline_stages(1).add_constraint(
+                              RecvsFirstSendsLastConstraint())));
+
+  XLS_ASSERT_OK(FunctionBaseToPipelinedBlock(oracle_schedule, oracle_options,
+                                             oracle_proc));
+
+  EXPECT_NE(p->blocks().front()->DumpIr(), p2->blocks().front()->DumpIr());
+}
+
+INSTANTIATE_TEST_SUITE_P(SpecificIoKindsTest, SpecificIoKindsTest,
+                         testing::Values(FlopKind::kFlop, FlopKind::kSkid,
+                                         FlopKind::kZeroLatency,
+                                         FlopKind::kNone),
+                         testing::PrintToStringParamName());
+
 TEST_F(MultiInputPipelinedProcTest, IdleSignalNoFlops) {
   int64_t stage_count = 4;
   bool active_low_reset = true;
@@ -2473,7 +2850,7 @@ TEST_F(MultiInputPipelinedProcTest, IdleSignalNoFlops) {
 
   XLS_ASSERT_OK_AND_ASSIGN(Block * block, package->GetBlock(kBlockName));
 
-  XLS_VLOG(2) << "Multi input counting pipelined block";
+  VLOG(2) << "Multi input counting pipelined block";
   XLS_VLOG_LINES(2, block->DumpIr());
 
   // The input stimulus to this test are
@@ -2714,9 +3091,11 @@ class MultiInputWithStatePipelinedProcTest : public ProcConversionTestFixture {
     BValue sum = pb.Add(next_accum0, next_accum1);
 
     pb.Send(ch_out, sum);
-    XLS_ASSIGN_OR_RETURN(Proc * proc, pb.Build({next_accum0, next_accum1}));
+    pb.Next(/*state_read=*/accum0, /*value=*/next_accum0);
+    pb.Next(/*state_read=*/accum1, /*value=*/next_accum1);
+    XLS_ASSIGN_OR_RETURN(Proc * proc, pb.Build());
 
-    XLS_VLOG(2) << "Multi input streaming proc";
+    VLOG(2) << "Multi input streaming proc";
     XLS_VLOG_LINES(2, proc->DumpIr());
 
     XLS_ASSIGN_OR_RETURN(
@@ -2727,7 +3106,8 @@ class MultiInputWithStatePipelinedProcTest : public ProcConversionTestFixture {
     CodegenOptions codegen_options = options;
     codegen_options.module_name(kBlockName);
 
-    XLS_RET_CHECK_OK(ProcToPipelinedBlock(schedule, codegen_options, proc));
+    XLS_RET_CHECK_OK(
+        FunctionBaseToPipelinedBlock(schedule, codegen_options, proc));
 
     return package_ptr;
   }
@@ -2782,7 +3162,7 @@ TEST_P(MultiInputWithStatePipelinedProcTestSweepFixture, RandomStalling) {
 
   XLS_ASSERT_OK_AND_ASSIGN(Block * block, package->GetBlock(kBlockName));
 
-  XLS_VLOG(2) << "Multi input counting pipelined block";
+  VLOG(2) << "Multi input counting pipelined block";
   XLS_VLOG_LINES(2, block->DumpIr());
 
   // The input stimulus to this test are
@@ -2943,7 +3323,8 @@ TEST_F(BlockConversionTest, BlockWithNonMutuallyExclusiveSends) {
     options.valid_control("input_valid", "output_valid");
     options.reset("rst_n", false, /*active_low=*/true, false);
 
-    XLS_EXPECT_OK(ProcToPipelinedBlock(schedule, options, proc).status());
+    XLS_EXPECT_OK(
+        FunctionBaseToPipelinedBlock(schedule, options, proc).status());
   }
 
   // Combinational test
@@ -2996,9 +3377,10 @@ class MultiIOWithStatePipelinedProcTest : public ProcConversionTestFixture {
     BValue state_plus_in1 = pb.Add(state, in1_val);
     pb.Send(ch_out1, state_plus_in1);
 
-    XLS_ASSIGN_OR_RETURN(Proc * proc, pb.Build({next_state}));
+    pb.Next(/*state_read=*/state, /*value=*/next_state);
+    XLS_ASSIGN_OR_RETURN(Proc * proc, pb.Build());
 
-    XLS_VLOG(2) << "Multi io streaming proc";
+    VLOG(2) << "Multi io streaming proc";
     XLS_VLOG_LINES(2, proc->DumpIr());
 
     XLS_ASSIGN_OR_RETURN(
@@ -3009,7 +3391,8 @@ class MultiIOWithStatePipelinedProcTest : public ProcConversionTestFixture {
     CodegenOptions codegen_options = options;
     codegen_options.module_name(kBlockName);
 
-    XLS_RET_CHECK_OK(ProcToPipelinedBlock(schedule, codegen_options, proc));
+    XLS_RET_CHECK_OK(
+        FunctionBaseToPipelinedBlock(schedule, codegen_options, proc));
 
     return package_ptr;
   }
@@ -3065,7 +3448,7 @@ TEST_P(MultiIOWithStatePipelinedProcTestSweepFixture, RandomStalling) {
 
   XLS_ASSERT_OK_AND_ASSIGN(Block * block, package->GetBlock(kBlockName));
 
-  XLS_VLOG(2) << "Multi io counting pipelined block";
+  VLOG(2) << "Multi io counting pipelined block";
   XLS_VLOG_LINES(2, block->DumpIr());
 
   // The input stimulus to this test are
@@ -3213,7 +3596,7 @@ INSTANTIATE_TEST_SUITE_P(
                         CodegenOptions::IOKind::kZeroLatencyBuffer)),
     MultiIOWithStatePipelinedProcTestSweepFixture::PrintToStringParamName);
 
-TEST_F(BlockConversionTest, IOSignatureProcToPipelinedBlock) {
+TEST_F(BlockConversionTest, IOSignatureFunctionBaseToPipelinedBlock) {
   Package package(TestName());
   Type* u32 = package.GetBitsType(32);
 
@@ -3244,11 +3627,6 @@ TEST_F(BlockConversionTest, IOSignatureProcToPipelinedBlock) {
   pb.Send(out_streaming_rv, in1);
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build({}));
 
-  EXPECT_FALSE(in_single_val->HasCompletedBlockPortNames());
-  EXPECT_FALSE(out_single_val->HasCompletedBlockPortNames());
-  EXPECT_FALSE(in_streaming_rv->HasCompletedBlockPortNames());
-  EXPECT_FALSE(out_streaming_rv->HasCompletedBlockPortNames());
-
   XLS_ASSERT_OK_AND_ASSIGN(
       PipelineSchedule schedule,
       RunPipelineSchedule(proc, TestDelayEstimator(),
@@ -3262,32 +3640,10 @@ TEST_F(BlockConversionTest, IOSignatureProcToPipelinedBlock) {
   options.streaming_channel_ready_suffix("_ready");
   options.module_name("pipelined_proc");
 
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
-                           ProcToPipelinedBlock(schedule, options, proc));
-  XLS_VLOG_LINES(2, unit.block->DumpIr());
-
-  EXPECT_TRUE(in_single_val->HasCompletedBlockPortNames());
-  EXPECT_TRUE(out_single_val->HasCompletedBlockPortNames());
-  EXPECT_TRUE(in_streaming_rv->HasCompletedBlockPortNames());
-  EXPECT_TRUE(out_streaming_rv->HasCompletedBlockPortNames());
-
-  EXPECT_EQ(in_single_val->GetBlockName().value(), "pipelined_proc");
-  EXPECT_EQ(in_single_val->GetDataPortName().value(), "in_single_val");
-
-  EXPECT_EQ(out_single_val->GetBlockName().value(), "pipelined_proc");
-  EXPECT_EQ(out_single_val->GetDataPortName().value(), "out_single_val");
-
-  EXPECT_EQ(in_streaming_rv->GetBlockName().value(), "pipelined_proc");
-  EXPECT_EQ(in_streaming_rv->GetDataPortName().value(), "in_streaming_data");
-  EXPECT_EQ(in_streaming_rv->GetValidPortName().value(), "in_streaming_valid");
-  EXPECT_EQ(in_streaming_rv->GetReadyPortName().value(), "in_streaming_ready");
-
-  EXPECT_EQ(out_streaming_rv->GetBlockName().value(), "pipelined_proc");
-  EXPECT_EQ(out_streaming_rv->GetDataPortName().value(), "out_streaming_data");
-  EXPECT_EQ(out_streaming_rv->GetValidPortName().value(),
-            "out_streaming_valid");
-  EXPECT_EQ(out_streaming_rv->GetReadyPortName().value(),
-            "out_streaming_ready");
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+  XLS_VLOG_LINES(2, context.top_block()->DumpIr());
 }
 
 TEST_F(BlockConversionTest, IOSignatureProcToCombBlock) {
@@ -3322,46 +3678,21 @@ TEST_F(BlockConversionTest, IOSignatureProcToCombBlock) {
 
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build({}));
 
-  EXPECT_FALSE(in_single_val->HasCompletedBlockPortNames());
-  EXPECT_FALSE(out_single_val->HasCompletedBlockPortNames());
-  EXPECT_FALSE(in_streaming_rv->HasCompletedBlockPortNames());
-  EXPECT_FALSE(out_streaming_rv->HasCompletedBlockPortNames());
-
   XLS_ASSERT_OK_AND_ASSIGN(
-      CodegenPassUnit unit,
+      CodegenContext context,
       ProcToCombinationalBlock(proc,
                                codegen_options().module_name("the_proc")));
-  XLS_VLOG_LINES(2, unit.block->DumpIr());
-
-  EXPECT_TRUE(in_single_val->HasCompletedBlockPortNames());
-  EXPECT_TRUE(out_single_val->HasCompletedBlockPortNames());
-  EXPECT_TRUE(in_streaming_rv->HasCompletedBlockPortNames());
-  EXPECT_TRUE(out_streaming_rv->HasCompletedBlockPortNames());
-
-  EXPECT_EQ(in_single_val->GetBlockName().value(), "the_proc");
-  EXPECT_EQ(in_single_val->GetDataPortName().value(), "in_single_val");
-
-  EXPECT_EQ(out_single_val->GetBlockName().value(), "the_proc");
-  EXPECT_EQ(out_single_val->GetDataPortName().value(), "out_single_val");
-
-  EXPECT_EQ(in_streaming_rv->GetBlockName().value(), "the_proc");
-  EXPECT_EQ(in_streaming_rv->GetDataPortName().value(), "in_streaming");
-  EXPECT_EQ(in_streaming_rv->GetValidPortName().value(), "in_streaming_vld");
-  EXPECT_EQ(in_streaming_rv->GetReadyPortName().value(), "in_streaming_rdy");
-
-  EXPECT_EQ(out_streaming_rv->GetBlockName().value(), "the_proc");
-  EXPECT_EQ(out_streaming_rv->GetDataPortName().value(), "out_streaming");
-  EXPECT_EQ(out_streaming_rv->GetValidPortName().value(), "out_streaming_vld");
-  EXPECT_EQ(out_streaming_rv->GetReadyPortName().value(), "out_streaming_rdy");
+  XLS_VLOG_LINES(2, context.top_block()->DumpIr());
 }
 
 TEST_F(ProcConversionTestFixture, ProcSendDuringReset) {
   const std::string ir_text = R"(package test
-chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="")
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
 
-proc pipelined_proc(tkn: token, st: bits[32], init={1}) {
-  send.1: token = send(tkn, st, channel_id=1, id=1)
-  next (send.1, st)
+proc pipelined_proc(tkn: token, st: bits[32], init={token, 1}) {
+  send.1: token = send(tkn, st, channel=out, id=1)
+  next_st: () = next_value(param=st, value=st)
+  next_tkn: () = next_value(param=tkn, value=send.1)
 }
 )";
 
@@ -3384,13 +3715,15 @@ proc pipelined_proc(tkn: token, st: bits[32], init={1}) {
   options.streaming_channel_ready_suffix("_ready");
   options.module_name("pipelined_proc");
 
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
-                           ProcToPipelinedBlock(schedule, options, proc));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
 
   std::vector<ChannelSource> sources{};
   std::vector<ChannelSink> sinks{
-      ChannelSink("out_data", "out_valid", "out_ready", 1.0, unit.block,
-                  /*reset_behavior=*/ChannelSink::kAttendValid),
+      ChannelSink(
+          "out_data", "out_valid", "out_ready", 1.0, context.top_block(),
+          /*reset_behavior=*/ChannelSink::BehaviorDuringReset::kAttendValid),
   };
 
   std::string reset_name = options.reset()->name();
@@ -3407,7 +3740,7 @@ proc pipelined_proc(tkn: token, st: bits[32], init={1}) {
 
   XLS_ASSERT_OK_AND_ASSIGN(BlockIOResultsAsUint64 results,
                            InterpretChannelizedSequentialBlockWithUint64(
-                               unit.block, absl::MakeSpan(sources),
+                               context.top_block(), absl::MakeSpan(sources),
                                absl::MakeSpan(sinks), inputs, options.reset()));
   EXPECT_THAT(sinks.at(0).GetOutputSequenceAsUint64(),
               IsOkAndHolds(testing::ElementsAreArray(expected_output)));
@@ -3415,19 +3748,20 @@ proc pipelined_proc(tkn: token, st: bits[32], init={1}) {
 
 TEST_F(ProcConversionTestFixture, ProcIIGreaterThanOne) {
   const std::string ir_text = R"(package test
-chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid, metadata="")
-chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="")
-chan in_out(bits[32], id=2, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="")
+chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid)
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
+chan in_out(bits[32], id=2, kind=streaming, ops=send_only, flow_control=ready_valid)
 
 #[initiation_interval(2)]
-proc pipelined_proc(tkn: token, st: bits[32], init={0}) {
-  send.1: token = send(tkn, st, channel_id=1, id=1)
+proc pipelined_proc(tkn: token, st: bits[32], init={token, 0}) {
+  send.1: token = send(tkn, st, channel=out, id=1)
   min_delay.2: token = min_delay(send.1, delay=1, id=2)
-  receive.3: (token, bits[32]) = receive(min_delay.2, channel_id=0, id=3)
+  receive.3: (token, bits[32]) = receive(min_delay.2, channel=in, id=3)
   tuple_index.4: token = tuple_index(receive.3, index=0, id=4)
   tuple_index.5: bits[32] = tuple_index(receive.3, index=1, id=5)
-  send.6: token = send(tuple_index.4, tuple_index.5, channel_id=2, id=6)
-  next (send.6, tuple_index.5)
+  send.6: token = send(tuple_index.4, tuple_index.5, channel=in_out, id=6)
+  next_st: () = next_value(param=st, value=tuple_index.5)
+  next_tkn: () = next_value(param=tkn, value=send.6)
 }
 )";
 
@@ -3450,19 +3784,23 @@ proc pipelined_proc(tkn: token, st: bits[32], init={0}) {
   options.streaming_channel_ready_suffix("_ready");
   options.module_name("pipelined_proc");
 
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
-                           ProcToPipelinedBlock(schedule, options, proc));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
 
   std::vector<ChannelSource> sources{
-      ChannelSource("in_data", "in_valid", "in_ready", 1.0, unit.block),
+      ChannelSource("in_data", "in_valid", "in_ready", 1.0,
+                    context.top_block()),
   };
   XLS_ASSERT_OK(sources.front().SetDataSequence({10, 20, 30}));
   std::vector<ChannelSink> sinks{
-      ChannelSink("out_data", "out_valid", "out_ready", 1.0, unit.block,
-                  /*reset_behavior=*/ChannelSink::kIgnoreValid),
-      ChannelSink("in_out_data", "in_out_valid", "in_out_ready", 1.0,
-                  unit.block,
-                  /*reset_behavior=*/ChannelSink::kIgnoreValid),
+      ChannelSink(
+          "out_data", "out_valid", "out_ready", 1.0, context.top_block(),
+          /*reset_behavior=*/ChannelSink::BehaviorDuringReset::kIgnoreValid),
+      ChannelSink(
+          "in_out_data", "in_out_valid", "in_out_ready", 1.0,
+          context.top_block(),
+          /*reset_behavior=*/ChannelSink::BehaviorDuringReset::kIgnoreValid),
   };
 
   std::string reset_name = options.reset()->name();
@@ -3474,7 +3812,7 @@ proc pipelined_proc(tkn: token, st: bits[32], init={0}) {
       SetSignalsOverCycles(0, 9, {{reset_name, reset_active}}, inputs));
   XLS_ASSERT_OK_AND_ASSIGN(BlockIOResultsAsUint64 results,
                            InterpretChannelizedSequentialBlockWithUint64(
-                               unit.block, absl::MakeSpan(sources),
+                               context.top_block(), absl::MakeSpan(sources),
                                absl::MakeSpan(sinks), inputs, options.reset()));
   EXPECT_THAT(
       sinks.at(0).GetOutputCycleSequenceAsUint64(),
@@ -3494,19 +3832,20 @@ proc pipelined_proc(tkn: token, st: bits[32], init={0}) {
 
 TEST_F(ProcConversionTestFixture, ProcIIGreaterThanOneRandomStalls) {
   const std::string ir_text = R"(package test
-chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid, metadata="")
-chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="")
-chan in_out(bits[32], id=2, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="")
+chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid)
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
+chan in_out(bits[32], id=2, kind=streaming, ops=send_only, flow_control=ready_valid)
 
 #[initiation_interval(2)]
-proc pipelined_proc(tkn: token, st: bits[32], init={0}) {
-  send.1: token = send(tkn, st, channel_id=1, id=1)
+proc pipelined_proc(tkn: token, st: bits[32], init={token, 0}) {
+  send.1: token = send(tkn, st, channel=out, id=1)
   min_delay.2: token = min_delay(send.1, delay=1, id=2)
-  receive.3: (token, bits[32]) = receive(min_delay.2, channel_id=0, id=3)
+  receive.3: (token, bits[32]) = receive(min_delay.2, channel=in, id=3)
   tuple_index.4: token = tuple_index(receive.3, index=0, id=4)
   tuple_index.5: bits[32] = tuple_index(receive.3, index=1, id=5)
-  send.6: token = send(tuple_index.4, tuple_index.5, channel_id=2, id=6)
-  next (send.6, tuple_index.5)
+  send.6: token = send(tuple_index.4, tuple_index.5, channel=in_out, id=6)
+  next_st: () = next_value(param=st, value=tuple_index.5)
+  next_tkn: () = next_value(param=tkn, value=send.6)
 }
 )";
 
@@ -3529,9 +3868,10 @@ proc pipelined_proc(tkn: token, st: bits[32], init={0}) {
   options.streaming_channel_ready_suffix("_ready");
   options.module_name("pipelined_proc");
 
-  XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
-                           ProcToPipelinedBlock(schedule, options, proc));
-  XLS_VLOG(2) << "Block IR:\n" << unit.block->DumpIr();
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+  VLOG(2) << "Block IR:\n" << context.top_block()->DumpIr();
 
   std::string reset_name = options.reset()->name();
   uint64_t reset_active = options.reset()->active_low() ? 0 : 1;
@@ -3546,23 +3886,25 @@ proc pipelined_proc(tkn: token, st: bits[32], init={0}) {
 
     std::vector<ChannelSource> sources{
         ChannelSource("in_data", "in_valid", "in_ready",
-                      /*lambda=*/0.5, unit.block),
+                      /*lambda=*/0.5, context.top_block()),
     };
     XLS_ASSERT_OK(sources.front().SetDataSequence({10, 20, 30}));
     std::vector<ChannelSink> sinks{
-        ChannelSink("out_data", "out_valid", "out_ready", /*lambda=*/0.5,
-                    unit.block,
-                    /*reset_behavior=*/ChannelSink::kIgnoreValid),
-        ChannelSink("in_out_data", "in_out_valid", "in_out_ready", 1.0,
-                    unit.block,
-                    /*reset_behavior=*/ChannelSink::kIgnoreValid),
+        ChannelSink(
+            "out_data", "out_valid", "out_ready", /*lambda=*/0.5,
+            context.top_block(),
+            /*reset_behavior=*/ChannelSink::BehaviorDuringReset::kIgnoreValid),
+        ChannelSink(
+            "in_out_data", "in_out_valid", "in_out_ready", 1.0,
+            context.top_block(),
+            /*reset_behavior=*/ChannelSink::BehaviorDuringReset::kIgnoreValid),
     };
 
     XLS_ASSERT_OK_AND_ASSIGN(
         BlockIOResultsAsUint64 results,
         InterpretChannelizedSequentialBlockWithUint64(
-            unit.block, absl::MakeSpan(sources), absl::MakeSpan(sinks), inputs,
-            options.reset(), seed));
+            context.top_block(), absl::MakeSpan(sources), absl::MakeSpan(sinks),
+            inputs, options.reset(), seed));
     EXPECT_THAT(sinks.at(0).GetOutputSequenceAsUint64(),
                 IsOkAndHolds(ElementsAre(0, 10, 20, 30)));
     EXPECT_THAT(sinks.at(1).GetOutputSequenceAsUint64(),
@@ -3603,11 +3945,12 @@ TEST_F(ProcConversionTestFixture, SimpleProcRandomScheduler) {
     options.streaming_channel_data_suffix("_data");
     options.streaming_channel_valid_suffix("_valid");
     options.streaming_channel_ready_suffix("_ready");
-    options.module_name("pipelined_proc");
+    options.module_name(absl::StrFormat("pipelined_proc-%d", i));
 
-    XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
-                             ProcToPipelinedBlock(schedule, options, proc));
-    XLS_VLOG_LINES(2, unit.block->DumpIr());
+    XLS_ASSERT_OK_AND_ASSIGN(
+        CodegenContext context,
+        FunctionBaseToPipelinedBlock(schedule, options, proc));
+    XLS_VLOG_LINES(2, context.top_block()->DumpIr());
 
     int64_t input_count = 40;
     int64_t simulation_cycle_count = 200;
@@ -3619,17 +3962,19 @@ TEST_F(ProcConversionTestFixture, SimpleProcRandomScheduler) {
     std::iota(in_values.begin(), in_values.end(), 0);
 
     std::vector<ChannelSource> sources{
-        ChannelSource("in_data", "in_valid", "in_ready", 0.5, unit.block),
+        ChannelSource("in_data", "in_valid", "in_ready", 0.5,
+                      context.top_block()),
     };
     XLS_ASSERT_OK(sources.at(0).SetDataSequence(in_values));
 
     std::vector<ChannelSink> sinks{
-        ChannelSink("out_data", "out_valid", "out_ready", 0.5, unit.block),
+        ChannelSink("out_data", "out_valid", "out_ready", 0.5,
+                    context.top_block()),
     };
 
     XLS_ASSERT_OK_AND_ASSIGN(BlockIOResultsAsUint64 io_results,
                              InterpretChannelizedSequentialBlockWithUint64(
-                                 unit.block, absl::MakeSpan(sources),
+                                 context.top_block(), absl::MakeSpan(sources),
                                  absl::MakeSpan(sinks), non_streaming_inputs));
 
     std::vector<absl::flat_hash_map<std::string, uint64_t>>& inputs =
@@ -3699,11 +4044,12 @@ TEST_F(ProcConversionTestFixture, AddRandomScheduler) {
     options.streaming_channel_data_suffix("_data");
     options.streaming_channel_valid_suffix("_valid");
     options.streaming_channel_ready_suffix("_ready");
-    options.module_name("pipelined_proc");
+    options.module_name(absl::StrFormat("pipelined_proc-%d", i));
 
-    XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
-                             ProcToPipelinedBlock(schedule, options, proc));
-    XLS_VLOG_LINES(2, unit.block->DumpIr());
+    XLS_ASSERT_OK_AND_ASSIGN(
+        CodegenContext context,
+        FunctionBaseToPipelinedBlock(schedule, options, proc));
+    XLS_VLOG_LINES(2, context.top_block()->DumpIr());
 
     int64_t input_count = 40;
     int64_t simulation_cycle_count = 200;
@@ -3715,19 +4061,22 @@ TEST_F(ProcConversionTestFixture, AddRandomScheduler) {
     std::iota(in_values.begin(), in_values.end(), 0);
 
     std::vector<ChannelSource> sources{
-        ChannelSource("in_a_data", "in_a_valid", "in_a_ready", 0.5, unit.block),
-        ChannelSource("in_b_data", "in_b_valid", "in_b_ready", 0.5, unit.block),
+        ChannelSource("in_a_data", "in_a_valid", "in_a_ready", 0.5,
+                      context.top_block()),
+        ChannelSource("in_b_data", "in_b_valid", "in_b_ready", 0.5,
+                      context.top_block()),
     };
     XLS_ASSERT_OK(sources.at(0).SetDataSequence(in_values));
     XLS_ASSERT_OK(sources.at(1).SetDataSequence(in_values));
 
     std::vector<ChannelSink> sinks{
-        ChannelSink("out_data", "out_valid", "out_ready", 0.5, unit.block),
+        ChannelSink("out_data", "out_valid", "out_ready", 0.5,
+                    context.top_block()),
     };
 
     XLS_ASSERT_OK_AND_ASSIGN(BlockIOResultsAsUint64 io_results,
                              InterpretChannelizedSequentialBlockWithUint64(
-                                 unit.block, absl::MakeSpan(sources),
+                                 context.top_block(), absl::MakeSpan(sources),
                                  absl::MakeSpan(sinks), non_streaming_inputs));
 
     std::vector<absl::flat_hash_map<std::string, uint64_t>>& inputs =
@@ -3806,11 +4155,12 @@ TEST_F(ProcConversionTestFixture, TwoReceivesTwoSendsRandomScheduler) {
     options.streaming_channel_data_suffix("_data");
     options.streaming_channel_valid_suffix("_valid");
     options.streaming_channel_ready_suffix("_ready");
-    options.module_name("pipelined_proc");
+    options.module_name(absl::StrFormat("pipelined_proc-%d", i));
 
-    XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
-                             ProcToPipelinedBlock(schedule, options, proc));
-    XLS_VLOG_LINES(2, unit.block->DumpIr());
+    XLS_ASSERT_OK_AND_ASSIGN(
+        CodegenContext context,
+        FunctionBaseToPipelinedBlock(schedule, options, proc));
+    XLS_VLOG_LINES(2, context.top_block()->DumpIr());
 
     int64_t input_count = 40;
     int64_t simulation_cycle_count = 200;
@@ -3822,22 +4172,24 @@ TEST_F(ProcConversionTestFixture, TwoReceivesTwoSendsRandomScheduler) {
     std::iota(in_values.begin(), in_values.end(), 0);
 
     std::vector<ChannelSource> sources{
-        ChannelSource("in_a_data", "in_a_valid", "in_a_ready", 0.5, unit.block),
-        ChannelSource("in_b_data", "in_b_valid", "in_b_ready", 0.5, unit.block),
+        ChannelSource("in_a_data", "in_a_valid", "in_a_ready", 0.5,
+                      context.top_block()),
+        ChannelSource("in_b_data", "in_b_valid", "in_b_ready", 0.5,
+                      context.top_block()),
     };
     XLS_ASSERT_OK(sources.at(0).SetDataSequence(in_values));
     XLS_ASSERT_OK(sources.at(1).SetDataSequence(in_values));
 
     std::vector<ChannelSink> sinks{
         ChannelSink("out_a_data", "out_a_valid", "out_a_ready", 0.5,
-                    unit.block),
+                    context.top_block()),
         ChannelSink("out_b_data", "out_b_valid", "out_b_ready", 0.5,
-                    unit.block),
+                    context.top_block()),
     };
 
     XLS_ASSERT_OK_AND_ASSIGN(BlockIOResultsAsUint64 io_results,
                              InterpretChannelizedSequentialBlockWithUint64(
-                                 unit.block, absl::MakeSpan(sources),
+                                 context.top_block(), absl::MakeSpan(sources),
                                  absl::MakeSpan(sinks), non_streaming_inputs));
 
     std::vector<absl::flat_hash_map<std::string, uint64_t>>& inputs =
@@ -3902,11 +4254,12 @@ class NonblockingReceivesProcTest : public ProcConversionTestFixture {
         Channel * out0,
         package.CreateStreamingChannel("out", ChannelOps::kSendOnly, u32));
 
-    ProcBuilder pb(TestName(), /*token_name=*/"tok", &package);
+    ProcBuilder pb(TestName(), &package);
+    BValue tok = pb.Literal(Value::Token());
 
-    BValue in0_data_and_valid = pb.ReceiveNonBlocking(in0, pb.GetTokenParam());
-    BValue in1_data_and_valid = pb.ReceiveNonBlocking(in1, pb.GetTokenParam());
-    BValue in2_data_and_valid = pb.ReceiveNonBlocking(in2, pb.GetTokenParam());
+    BValue in0_data_and_valid = pb.ReceiveNonBlocking(in0, tok);
+    BValue in1_data_and_valid = pb.ReceiveNonBlocking(in1, tok);
+    BValue in2_data_and_valid = pb.ReceiveNonBlocking(in2, tok);
 
     BValue sum = pb.Literal(UBits(0, 32));
 
@@ -3929,11 +4282,11 @@ class NonblockingReceivesProcTest : public ProcConversionTestFixture {
     BValue sum2 = pb.Select(in2_valid, {sum1, add_sum1_in2});
 
     BValue after_in_tok = pb.AfterAll({in0_tok, in1_tok, in2_tok});
-    BValue tok_fin = pb.Send(out0, after_in_tok, sum2);
+    pb.Send(out0, after_in_tok, sum2);
 
-    XLS_ASSIGN_OR_RETURN(Proc * proc, pb.Build(tok_fin, {}));
+    XLS_ASSIGN_OR_RETURN(Proc * proc, pb.Build());
 
-    XLS_VLOG(2) << "Non-blocking proc";
+    VLOG(2) << "Non-blocking proc";
     XLS_VLOG_LINES(2, proc->DumpIr());
 
     XLS_ASSIGN_OR_RETURN(
@@ -3947,7 +4300,8 @@ class NonblockingReceivesProcTest : public ProcConversionTestFixture {
     CodegenOptions codegen_options = options;
     codegen_options.module_name(kBlockName);
 
-    XLS_RET_CHECK_OK(ProcToPipelinedBlock(schedule, codegen_options, proc));
+    XLS_RET_CHECK_OK(
+        FunctionBaseToPipelinedBlock(schedule, codegen_options, proc));
 
     return package_ptr;
   }
@@ -4003,7 +4357,7 @@ TEST_P(NonblockingReceivesProcTestSweepFixture, RandomInput) {
 
   XLS_ASSERT_OK_AND_ASSIGN(Block * block, package->GetBlock(kBlockName));
 
-  XLS_VLOG(2) << "Nonblocking receives pipelined block";
+  VLOG(2) << "Nonblocking receives pipelined block";
   XLS_VLOG_LINES(2, block->DumpIr());
 
   // The input stimulus to this test are
@@ -4046,7 +4400,7 @@ TEST_P(NonblockingReceivesProcTestSweepFixture, RandomInput) {
   XLS_ASSERT_OK(SetIncrementingSignalOverCycles(0, outputs.size() - 1, "cycle",
                                                 0, outputs));
 
-  XLS_VLOG(1) << "Signal Trace";
+  VLOG(1) << "Signal Trace";
   XLS_ASSERT_OK(VLogTestPipelinedIO(
       std::vector<SignalSpec>{{"cycle", SignalType::kOutput},
                               {"rst", SignalType::kInput},
@@ -4145,23 +4499,24 @@ class ProcWithStateTest : public BlockConversionTest {
   void TestBlockWithSchedule(const xls::SchedulingOptions& scheduling_options) {
     const std::string ir_text = R"(package my_package
 
-  chan a_in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid, metadata="""""")
-  chan a_out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="""""")
-  chan b_in(bits[32], id=2, kind=streaming, ops=receive_only, flow_control=ready_valid, metadata="""""")
-  chan b_out(bits[32], id=3, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="""""")
-  chan c_in(bits[32], id=4, kind=streaming, ops=receive_only, flow_control=ready_valid, metadata="""""")
-  chan c_out(bits[32], id=5, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="""""")
+  chan a_in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid)
+  chan a_out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
+  chan b_in(bits[32], id=2, kind=streaming, ops=receive_only, flow_control=ready_valid)
+  chan b_out(bits[32], id=3, kind=streaming, ops=send_only, flow_control=ready_valid)
+  chan c_in(bits[32], id=4, kind=streaming, ops=receive_only, flow_control=ready_valid)
+  chan c_out(bits[32], id=5, kind=streaming, ops=send_only, flow_control=ready_valid)
 
-  top proc test_proc(tkn: token, st_0: bits[32], st_1: bits[32], st_2: bits[32], init={3, 5, 9}) {
-    receive.107: (token, bits[32]) = receive(tkn, channel_id=0, id=107)
-    receive.108: (token, bits[32]) = receive(tkn, channel_id=2, id=108)
-    receive.109: (token, bits[32]) = receive(tkn, channel_id=4, id=109)
+  top proc test_proc(st_0: bits[32], st_1: bits[32], st_2: bits[32], init={3, 5, 9}) {
+    tkn: token = literal(value=token)
+    receive.107: (token, bits[32]) = receive(tkn, channel=a_in, id=107)
+    receive.108: (token, bits[32]) = receive(tkn, channel=b_in, id=108)
+    receive.109: (token, bits[32]) = receive(tkn, channel=c_in, id=109)
     tuple_index.34: token = tuple_index(receive.107, index=0, id=34)
-    send.110: token = send(tkn, st_0, channel_id=1, id=110)
+    send.110: token = send(tkn, st_0, channel=a_out, id=110)
     tuple_index.43: token = tuple_index(receive.108, index=0, id=43)
-    send.111: token = send(tkn, st_1, channel_id=3, id=111)
+    send.111: token = send(tkn, st_1, channel=b_out, id=111)
     tuple_index.52: token = tuple_index(receive.109, index=0, id=52)
-    send.112: token = send(tkn, st_2, channel_id=5, id=112)
+    send.112: token = send(tkn, st_2, channel=c_out, id=112)
     tuple_index.35: bits[32] = tuple_index(receive.107, index=1, id=35)
     tuple_index.44: bits[32] = tuple_index(receive.108, index=1, id=44)
     tuple_index.53: bits[32] = tuple_index(receive.109, index=1, id=53)
@@ -4169,7 +4524,9 @@ class ProcWithStateTest : public BlockConversionTest {
     add.100: bits[32] = add(st_0, tuple_index.35, id=100)
     add.101: bits[32] = add(st_1, tuple_index.44, id=101)
     add.102: bits[32] = add(st_2, tuple_index.53, id=102)
-    next (after_all.59, add.100, add.101, add.102)
+    next_st_0: () = next_value(param=st_0, value=add.100)
+    next_st_1: () = next_value(param=st_1, value=add.101)
+    next_st_2: () = next_value(param=st_2, value=add.102)
   }
   )";
     XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
@@ -4187,8 +4544,9 @@ class ProcWithStateTest : public BlockConversionTest {
     options.valid_control("input_valid", "output_valid");
     options.reset("rst", false, false, false);
 
-    XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
-                             ProcToPipelinedBlock(schedule, options, proc));
+    XLS_ASSERT_OK_AND_ASSIGN(
+        CodegenContext context,
+        FunctionBaseToPipelinedBlock(schedule, options, proc));
 
     const double io_probability = 0.5;
     const uint64_t run_cycles = 128;
@@ -4201,11 +4559,11 @@ class ProcWithStateTest : public BlockConversionTest {
 
     std::vector<ChannelSource> sources{
         ChannelSource("a_in", "a_in_vld", "a_in_rdy", io_probability,
-                      unit.block),
+                      context.top_block()),
         ChannelSource("b_in", "b_in_vld", "b_in_rdy", io_probability,
-                      unit.block),
+                      context.top_block()),
         ChannelSource("c_in", "c_in_vld", "c_in_rdy", io_probability,
-                      unit.block),
+                      context.top_block()),
     };
 
     XLS_ASSERT_OK(sources.at(0).SetDataSequence(
@@ -4217,18 +4575,18 @@ class ProcWithStateTest : public BlockConversionTest {
 
     std::vector<ChannelSink> sinks{
         ChannelSink("a_out", "a_out_vld", "a_out_rdy", io_probability,
-                    unit.block),
+                    context.top_block()),
         ChannelSink("b_out", "b_out_vld", "b_out_rdy", io_probability,
-                    unit.block),
+                    context.top_block()),
         ChannelSink("c_out", "c_out_vld", "c_out_rdy", io_probability,
-                    unit.block),
+                    context.top_block()),
     };
 
     XLS_ASSERT_OK_AND_ASSIGN(
         BlockIOResultsAsUint64 results,
         InterpretChannelizedSequentialBlockWithUint64(
-            unit.block, absl::MakeSpan(sources), absl::MakeSpan(sinks), inputs,
-            options.reset()));
+            context.top_block(), absl::MakeSpan(sources), absl::MakeSpan(sinks),
+            inputs, options.reset()));
     EXPECT_THAT(
         sinks.at(0).GetOutputSequenceAsUint64(),
         IsOkAndHolds(IsPrefixOf<uint64_t>(std::vector<uint64_t>{
@@ -4257,7 +4615,7 @@ TEST_F(ProcWithStateTest, ProcWithStateBackedgesIn2Stages) {
 
   scheduling_options.add_constraint(xls::IOConstraint(
       "a_in", xls::IODirection::kReceive, "b_in", xls::IODirection::kReceive,
-      /*min_latency=*/1, /* max_latency=*/1));
+      /*minimum_latency=*/1, /* maximum_latency=*/1));
 
   TestBlockWithSchedule(scheduling_options);
 }
@@ -4268,10 +4626,10 @@ TEST_F(ProcWithStateTest, ProcWithStateBackedgesIn3Stages) {
 
   scheduling_options.add_constraint(xls::IOConstraint(
       "a_in", xls::IODirection::kReceive, "b_in", xls::IODirection::kReceive,
-      /*min_latency=*/1, /* max_latency=*/1));
+      /*minimum_latency=*/1, /* maximum_latency=*/1));
   scheduling_options.add_constraint(xls::IOConstraint(
       "b_in", xls::IODirection::kReceive, "c_in", xls::IODirection::kReceive,
-      /*min_latency=*/1, /* max_latency=*/1));
+      /*minimum_latency=*/1, /* maximum_latency=*/1));
 
   TestBlockWithSchedule(scheduling_options);
 }
@@ -4282,10 +4640,10 @@ TEST_F(ProcWithStateTest, ProcWithStateBackedgesIn3StagesWithExtra) {
 
   scheduling_options.add_constraint(xls::IOConstraint(
       "a_in", xls::IODirection::kReceive, "b_in", xls::IODirection::kReceive,
-      /*min_latency=*/1, /* max_latency=*/1));
+      /*minimum_latency=*/1, /* maximum_latency=*/1));
   scheduling_options.add_constraint(xls::IOConstraint(
       "b_in", xls::IODirection::kReceive, "c_in", xls::IODirection::kReceive,
-      /*min_latency=*/1, /* max_latency=*/1));
+      /*minimum_latency=*/1, /* maximum_latency=*/1));
 
   TestBlockWithSchedule(scheduling_options);
 }
@@ -4344,11 +4702,12 @@ TEST_F(ProcConversionTestFixture, RecvDataFeedingSendPredicate) {
     options.streaming_channel_data_suffix("_data");
     options.streaming_channel_valid_suffix("_valid");
     options.streaming_channel_ready_suffix("_ready");
-    options.module_name("pipelined_proc");
+    options.module_name(absl::StrFormat("pipelined_proc-%d", i));
 
-    XLS_ASSERT_OK_AND_ASSIGN(CodegenPassUnit unit,
-                             ProcToPipelinedBlock(schedule, options, proc));
-    XLS_VLOG_LINES(2, unit.block->DumpIr());
+    XLS_ASSERT_OK_AND_ASSIGN(
+        CodegenContext context,
+        FunctionBaseToPipelinedBlock(schedule, options, proc));
+    XLS_VLOG_LINES(2, context.top_block()->DumpIr());
 
     int64_t input_count = 80;
     int64_t simulation_cycle_count = 500;
@@ -4366,19 +4725,22 @@ TEST_F(ProcConversionTestFixture, RecvDataFeedingSendPredicate) {
                       in_values.begin() + sequence_values.size());
 
     std::vector<ChannelSource> sources{
-        ChannelSource("in_data", "in_valid", "in_ready", 0.25, unit.block),
+        ChannelSource("in_data", "in_valid", "in_ready", 0.25,
+                      context.top_block()),
     };
     XLS_ASSERT_OK(sources.at(0).SetDataSequence(in_values));
 
     std::vector<ChannelSink> sinks{
-        ChannelSink("out0_data", "out0_valid", "out0_ready", 1, unit.block),
-        ChannelSink("out1_data", "out1_valid", "out1_ready", 0.5, unit.block),
+        ChannelSink("out0_data", "out0_valid", "out0_ready", 1,
+                    context.top_block()),
+        ChannelSink("out1_data", "out1_valid", "out1_ready", 0.5,
+                    context.top_block()),
     };
 
     XLS_ASSERT_OK_AND_ASSIGN(
         BlockIOResultsAsUint64 io_results,
         InterpretChannelizedSequentialBlockWithUint64(
-            unit.block, absl::MakeSpan(sources), absl::MakeSpan(sinks),
+            context.top_block(), absl::MakeSpan(sources), absl::MakeSpan(sinks),
             non_streaming_inputs, std::nullopt, seed));
 
     std::vector<absl::flat_hash_map<std::string, uint64_t>>& inputs =
@@ -4418,6 +4780,1716 @@ TEST_F(ProcConversionTestFixture, RecvDataFeedingSendPredicate) {
             33, 34, 35, 36, 37, 38, 39, 39, 38, 37, 36, 35, 34, 33, 32, 31, 30,
             29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16)));
   }
+}
+
+TEST_F(ProcConversionTestFixture, SingleLoopbackChannel) {
+  constexpr std::string_view ir_text = R"(package test
+chan loopback(bits[32], id=0, kind=streaming, ops=send_receive, flow_control=ready_valid, fifo_depth=1, register_pop_outputs=true, register_push_outputs=true)
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
+
+proc loopback_proc(tkn: token, st: bits[32], init={token, 1}) {
+  lit1: bits[32] = literal(value=1)
+  not_first_cycle: bits[1] = ne(st, lit1)
+  loopback_recv: (token, bits[32]) = receive(tkn, predicate=not_first_cycle, channel=loopback)
+  loopback_tkn: token = tuple_index(loopback_recv, index=0)
+  loopback_data: bits[32] = tuple_index(loopback_recv, index=1)
+  sum: bits[32] = add(loopback_data, st)
+  out_send: token = send(loopback_tkn, sum, channel=out)
+  loopback_send: token = send(out_send, sum, channel=loopback)
+  next_st: () = next_value(param=st, value=sum)
+  next_tkn: () = next_value(param=tkn, value=loopback_send)
+}
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(ir_text));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("loopback_proc"));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule schedule,
+      RunPipelineSchedule(proc, TestDelayEstimator(),
+                          SchedulingOptions().pipeline_stages(3)));
+
+  CodegenOptions options;
+  options.flop_inputs(false).flop_outputs(false).clock_name("clk");
+  options.valid_control("input_valid", "output_valid");
+  options.reset("rst", false, false, true);
+  options.streaming_channel_data_suffix("_data");
+  options.streaming_channel_valid_suffix("_valid");
+  options.streaming_channel_ready_suffix("_ready");
+  options.module_name("loopback_proc");
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+
+  EXPECT_THAT(context.top_block()->GetInstantiations(),
+              UnorderedElementsAre(m::Instantiation(HasSubstr("loopback"),
+                                                    InstantiationKind::kFifo)));
+  // TODO(google/xls#1158): add functional test when we have a block IR FIFO
+  // model to evaluate the block with.
+}
+
+TEST_F(ProcConversionTestFixture, MultipleLoopbackChannel) {
+  constexpr std::string_view ir_text = R"(package test
+chan loopback0(bits[32], id=0, kind=streaming, ops=send_receive, flow_control=ready_valid, fifo_depth=1, register_push_outputs=true, register_pop_outputs=true)
+chan loopback1(bits[32], id=1, kind=streaming, ops=send_receive, flow_control=ready_valid, fifo_depth=1, register_push_outputs=true, register_pop_outputs=true)
+chan out(bits[32], id=2, kind=streaming, ops=send_only, flow_control=ready_valid)
+
+proc loopback_proc(tkn: token, st: bits[32], init={token, 1}) {
+  lit1: bits[32] = literal(value=1)
+  not_first_cycle: bits[1] = ne(st, lit1)
+  loopback0_recv: (token, bits[32]) = receive(tkn, predicate=not_first_cycle, channel=loopback0)
+  loopback0_tkn: token = tuple_index(loopback0_recv, index=0)
+  loopback0_data: bits[32] = tuple_index(loopback0_recv, index=1)
+  loopback1_recv: (token, bits[32]) = receive(tkn, predicate=not_first_cycle, channel=loopback1)
+  loopback1_tkn: token = tuple_index(loopback1_recv, index=0)
+  loopback1_data: bits[32] = tuple_index(loopback1_recv, index=1)
+  sum: bits[32] = add(loopback0_data, loopback1_data)
+  loopback_tkn: token = after_all(loopback0_tkn, loopback1_tkn)
+  out_send: token = send(loopback_tkn, sum, channel=out)
+  loopback0_send: token = send(out_send, sum, channel=loopback0)
+  loopback1_send: token = send(out_send, sum, channel=loopback1)
+  loopback_send: token = after_all(loopback0_send, loopback1_send)
+  next_st: () = next_value(param=st, value=sum)
+  next_tkn: () = next_value(param=tkn, value=loopback_send)
+}
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(ir_text));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("loopback_proc"));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule schedule,
+      RunPipelineSchedule(proc, TestDelayEstimator(),
+                          SchedulingOptions().pipeline_stages(3)));
+
+  CodegenOptions options;
+  options.flop_inputs(false).flop_outputs(false).clock_name("clk");
+  options.valid_control("input_valid", "output_valid");
+  options.reset("rst", false, false, true);
+  options.streaming_channel_data_suffix("_data");
+  options.streaming_channel_valid_suffix("_valid");
+  options.streaming_channel_ready_suffix("_ready");
+  options.module_name("loopback_proc");
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+
+  EXPECT_THAT(
+      context.top_block()->GetInstantiations(),
+      UnorderedElementsAre(
+          m::Instantiation(HasSubstr("loopback0"), InstantiationKind::kFifo),
+          m::Instantiation(HasSubstr("loopback1"), InstantiationKind::kFifo)));
+  // TODO(google/xls#1158): add functional test when we have a block IR FIFO
+  // model to evaluate the block with.
+}
+
+TEST_F(ProcConversionTestFixture, ProcIdleWithoutInputChannels) {
+  const std::string ir_text = R"(package test
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
+
+proc proc_ut(tkn: token, st: bits[32], init={token, 0}) {
+  lit1: bits[32] = literal(value=1)
+  next_state: bits[32] = add(st, lit1)
+  send.1: token = send(tkn, st, channel=out, id=1)
+  next_st: () = next_value(param=st, value=next_state)
+  next_tkn: () = next_value(param=tkn, value=send.1)
+}
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(ir_text));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("proc_ut"));
+
+  Node* next_state_node = FindNode("next_state", proc);
+  Node* send_node = FindNode("send.1", proc);
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule schedule,
+      RunPipelineSchedule(
+          proc, TestDelayEstimator(),
+          SchedulingOptions()
+              .pipeline_stages(2)
+              .add_constraint(NodeInCycleConstraint(next_state_node, 0))
+              .add_constraint(NodeInCycleConstraint(send_node, 1))));
+
+  CodegenOptions options;
+  options.flop_inputs(false).flop_outputs(false).clock_name("clk");
+  options.valid_control("input_valid", "output_valid");
+  options.reset("rst", false, false, true);
+  options.streaming_channel_data_suffix("_data");
+  options.streaming_channel_valid_suffix("_valid");
+  options.streaming_channel_ready_suffix("_ready");
+  options.add_idle_output(true);
+  options.module_name("proc_ut");
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+
+  std::vector<ChannelSource> sources{};
+  std::vector<ChannelSink> sinks{
+      ChannelSink(
+          "out_data", "out_valid", "out_ready", 1.0, context.top_block(),
+          /*reset_behavior=*/ChannelSink::BehaviorDuringReset::kAttendValid),
+  };
+
+  std::string reset_name = options.reset()->name();
+  uint64_t reset_active = options.reset()->active_low() ? 0 : 1;
+  uint64_t reset_inactive = options.reset()->active_low() ? 1 : 0;
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> non_streaming_inputs(
+      25, {{reset_name, reset_inactive}});
+  XLS_ASSERT_OK(SetSignalsOverCycles(0, 9, {{reset_name, reset_active}},
+                                     non_streaming_inputs));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      BlockIOResultsAsUint64 results,
+      InterpretChannelizedSequentialBlockWithUint64(
+          context.top_block(), absl::MakeSpan(sources), absl::MakeSpan(sinks),
+          non_streaming_inputs, options.reset()));
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>>& inputs =
+      results.inputs;
+  std::vector<absl::flat_hash_map<std::string, uint64_t>>& outputs =
+      results.outputs;
+
+  // Add a cycle count for easier comparison with simulation results.
+  XLS_ASSERT_OK(SetIncrementingSignalOverCycles(0, outputs.size() - 1, "cycle",
+                                                0, outputs));
+
+  VLOG(1) << "Signal Trace";
+  XLS_ASSERT_OK(VLogTestPipelinedIO(
+      std::vector<SignalSpec>{{"cycle", SignalType::kOutput},
+                              {"rst", SignalType::kInput},
+                              {"idle", SignalType::kOutput},
+                              {"out_data", SignalType::kOutput},
+                              {"out_valid", SignalType::kOutput},
+                              {"out_ready", SignalType::kInput}},
+      /*column_width=*/10, inputs, outputs));
+
+  // Check that idle is false, even during reset.
+  for (int64_t i = 0; i < outputs.size(); ++i) {
+    if (i < 10) {
+      EXPECT_EQ(inputs[i]["rst"], 1)
+          << absl::StrFormat("Cycle %d, expected rst==1", i);
+    } else {
+      EXPECT_EQ(inputs[i]["rst"], 0)
+          << absl::StrFormat("Cycle %d, expected rst==0", i);
+    }
+
+    EXPECT_EQ(outputs[i]["idle"], 0)
+        << absl::StrFormat("Cycle %d, expected idle==0", i);
+  }
+}
+
+TEST_F(ProcConversionTestFixture, ProcIdleWithStageZeroRecvIfs) {
+  const std::string ir_text = R"(package test
+chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid)
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
+
+proc proc_ut(st: bits[32], init={0}) {
+  tkn: token = literal(value=token)
+  lit1: bits[32] = literal(value=1)
+  lit5: bits[32] = literal(value=5)
+  lit10: bits[32] = literal(value=10)
+
+  st_gt_5: bits[1] = ult(lit5, st)
+  st_lt_10: bits[1] = ult(st, lit10)
+  recv_pred: bits[1] = and(st_gt_5, st_lt_10)
+
+  recv_plus_token: (token, bits[32]) = receive(tkn, predicate=recv_pred, channel=in)
+  recv_token : token = tuple_index(recv_plus_token, index=0)
+  in_data : bits[32] = tuple_index(recv_plus_token, index=1)
+
+  recv_plus_one: bits[32] = add(in_data, lit1)
+  next_state: bits[32] = add(st, recv_plus_one)
+
+  send_token: token = send(tkn, st, channel=out, id=1)
+
+  next_st: () = next_value(param=st, value=next_state)
+}
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(ir_text));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("proc_ut"));
+
+  Node* next_state_node = FindNode("next_state", proc);
+  Node* send_node = FindNode("send_token", proc);
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule schedule,
+      RunPipelineSchedule(
+          proc, TestDelayEstimator(),
+          SchedulingOptions()
+              .pipeline_stages(2)
+              .add_constraint(NodeInCycleConstraint(next_state_node, 0))
+              .add_constraint(NodeInCycleConstraint(send_node, 1))));
+
+  CodegenOptions options;
+  options.flop_inputs(false).flop_outputs(false).clock_name("clk");
+  options.valid_control("input_valid", "output_valid");
+  options.reset("rst", false, false, true);
+  options.streaming_channel_data_suffix("_data");
+  options.streaming_channel_valid_suffix("_valid");
+  options.streaming_channel_ready_suffix("_ready");
+  options.add_idle_output(true);
+  options.module_name("proc_ut");
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> inputs;
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> outputs;
+
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      0, 9, {{"rst", 1}, {"in_valid", 0}, {"in_data", 0}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      10, 15, {{"rst", 0}, {"in_valid", 0}, {"in_data", 1}, {"out_ready", 1}},
+      inputs));
+
+  // Cycle 16: Blocked on input, stage 1 has valid so stil not idle
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      16, 16, {{"rst", 0}, {"in_valid", 0}, {"in_data", 2}, {"out_ready", 1}},
+      inputs));
+  // Cycle 17-18: Blocked on input, stage 1 no longer has valid so idle
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      17, 18, {{"rst", 0}, {"in_valid", 0}, {"in_data", 2}, {"out_ready", 1}},
+      inputs));
+  // Cycle 19: No longer blocked, so not idle
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      19, 19, {{"rst", 0}, {"in_valid", 1}, {"in_data", 2}, {"out_ready", 1}},
+      inputs));
+  // Cycle 20: Blocked on input, again, but not idle
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      20, 20, {{"rst", 0}, {"in_valid", 0}, {"in_data", 3}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      21, 21, {{"rst", 0}, {"in_valid", 1}, {"in_data", 3}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      22, 22, {{"rst", 0}, {"in_valid", 1}, {"in_data", 3}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      23, 23, {{"rst", 0}, {"in_valid", 0}, {"in_data", 0}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      24, 24, {{"rst", 0}, {"in_valid", 0}, {"in_data", 0}, {"out_ready", 1}},
+      inputs));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      outputs, InterpretSequentialBlock(context.top_block(), inputs));
+
+  // Add a cycle count for easier comparison with simulation results.
+  XLS_ASSERT_OK(SetIncrementingSignalOverCycles(0, outputs.size() - 1, "cycle",
+                                                0, outputs));
+
+  VLOG(1) << "Signal Trace";
+  XLS_ASSERT_OK(VLogTestPipelinedIO(
+      std::vector<SignalSpec>{{"cycle", SignalType::kOutput},
+                              {"rst", SignalType::kInput},
+                              {"idle", SignalType::kOutput},
+                              {"in_data", SignalType::kInput},
+                              {"in_valid", SignalType::kInput},
+                              {"in_ready", SignalType::kOutput},
+                              {"out_data", SignalType::kOutput},
+                              {"out_valid", SignalType::kOutput},
+                              {"out_ready", SignalType::kInput}},
+      /*column_width=*/10, inputs, outputs));
+
+  for (int64_t i = 0; i < outputs.size(); ++i) {
+    if (i < 10) {
+      EXPECT_EQ(inputs[i]["rst"], 1)
+          << absl::StrFormat("Cycle %d, expected rst==1", i);
+      EXPECT_EQ(outputs[i]["idle"], 0)
+          << absl::StrFormat("Cycle %d, expected idle==1", i);
+    } else if (i == 17 || i == 18) {
+      EXPECT_EQ(inputs[i]["rst"], 0)
+          << absl::StrFormat("Cycle %d, expected rst==0", i);
+      EXPECT_EQ(outputs[i]["idle"], 1)
+          << absl::StrFormat("Cycle %d, expected idle==1", i);
+    } else {
+      EXPECT_EQ(inputs[i]["rst"], 0)
+          << absl::StrFormat("Cycle %d, expected rst==0", i);
+      EXPECT_EQ(outputs[i]["idle"], 0)
+          << absl::StrFormat("Cycle %d, expected idle==0", i);
+    }
+  }
+}
+
+TEST_F(ProcConversionTestFixture, b315378547) {
+  const std::string ir_text = R"(package test
+
+chan out(bits[8], id=0, kind=single_value, ops=send_only)
+
+top proc proc_ut(_ZZN4Test4mainEvE1i__1: bits[8], init={4}) {
+  tkn: token = literal(value=token)
+  literal.35: bits[8] = literal(value=1, id=35, pos=[(1,2,1)])
+  add.37: bits[8] = add(_ZZN4Test4mainEvE1i__1, literal.35, id=37, pos=[(1,10,3)])
+  send.41: token = send(tkn, _ZZN4Test4mainEvE1i__1, channel=out, id=41, pos=[(1,9,6)])
+  next_st: () = next_value(param=_ZZN4Test4mainEvE1i__1, value=add.37)
+}
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(ir_text));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("proc_ut"));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule schedule,
+      RunPipelineSchedule(proc, TestDelayEstimator(),
+                          SchedulingOptions().pipeline_stages(1)));
+
+  CodegenOptions options;
+  options.flop_inputs(false).flop_outputs(false).clock_name("clk");
+  options.valid_control("input_valid", "output_valid");
+  options.reset("rst", false, false, true);
+  options.streaming_channel_data_suffix("_data");
+  options.streaming_channel_valid_suffix("_valid");
+  options.streaming_channel_ready_suffix("_ready");
+  options.add_idle_output(true);
+  options.module_name("proc_ut");
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+}
+
+MATCHER_P(RegFoundInBlock, block, "") {
+  absl::flat_hash_set<Node*> nodes(block->nodes().begin(),
+                                   block->nodes().end());
+  absl::Span<Register* const> registers = block->GetRegisters();
+  if (absl::c_find(registers, arg.reg) == registers.end()) {
+    *result_listener << absl::StreamFormat("reg not in %s", block->name());
+    return false;
+  }
+  if (absl::c_find(nodes, arg.reg_read) == nodes.end()) {
+    *result_listener << absl::StreamFormat("reg_read for %s not in %s",
+                                           arg.reg->name(), block->name());
+    return false;
+  }
+  if (absl::c_find(nodes, arg.reg_write) == nodes.end()) {
+    *result_listener << absl::StreamFormat("reg_write for %s not in %s",
+                                           arg.reg->name(), block->name());
+    return false;
+  }
+  return true;
+}
+
+MATCHER_P(StateRegFoundInBlock, block, "") {
+  absl::flat_hash_set<Node*> nodes(block->nodes().begin(),
+                                   block->nodes().end());
+  absl::Span<Register* const> registers = block->GetRegisters();
+  bool has_reg = (arg.reg != nullptr || arg.reg_read != nullptr ||
+                  arg.reg_write != nullptr);
+  bool has_reg_full =
+      (arg.reg_full != nullptr || arg.reg_full_read != nullptr ||
+       arg.reg_full_write != nullptr);
+  if (has_reg) {
+    if (absl::c_find(registers, arg.reg) == registers.end()) {
+      *result_listener << absl::StreamFormat("reg for %s not in %s", arg.name,
+                                             block->name());
+      return false;
+    }
+    if (absl::c_find(nodes, arg.reg_read) == nodes.end()) {
+      *result_listener << absl::StreamFormat("reg_read for %s not in %s",
+                                             arg.name, block->name());
+      return false;
+    }
+    if (absl::c_find(nodes, arg.reg_write) == nodes.end()) {
+      *result_listener << absl::StreamFormat("reg_write for %s not in %s",
+                                             arg.name, block->name());
+      return false;
+    }
+  }
+  if (has_reg_full) {
+    if (absl::c_find(registers, arg.reg_full) == registers.end()) {
+      *result_listener << absl::StreamFormat("reg_full for %s not in %s",
+                                             arg.name, block->name());
+      return false;
+    }
+    if (absl::c_find(nodes, arg.reg_full_read) == nodes.end()) {
+      *result_listener << absl::StreamFormat("reg_full_read for %s not in %s",
+                                             arg.name, block->name());
+      return false;
+    }
+    if (absl::c_find(nodes, arg.reg_full_write) == nodes.end()) {
+      *result_listener << absl::StreamFormat("reg_full_write for %s not in %s",
+                                             arg.name, block->name());
+      return false;
+    }
+  }
+  return true;
+}
+
+TEST_F(BlockConversionTest, NoDanglingPipelinePointers) {
+  constexpr std::string_view kIrText = R"(
+package subrosa
+
+chan chan_0(bits[3], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid, strictness=proven_mutually_exclusive)
+
+top proc proc_0(param: token, param__1: bits[18], param__2: bits[3], init={token, 0, 0}) {
+  literal.4: bits[18] = literal(value=0, id=4)
+  eq.5: bits[1] = eq(param__1, literal.4, id=5)
+  receive.6: (token, bits[3]) = receive(param, predicate=eq.5, channel=chan_0, id=6)
+  tuple_index.9: bits[3] = tuple_index(receive.6, index=1, id=9)
+  tuple_index.10: token = tuple_index(receive.6, index=0, id=10)
+  sel.11: bits[3] = sel(eq.5, cases=[param__2, tuple_index.9], id=11)
+  next_value.12: () = next_value(param=param__1, value=literal.4, id=12)
+  next_value.13: () = next_value(param=param__2, value=sel.11, id=13)
+  next_value.14: () = next_value(param=param, value=tuple_index.10, id=14)
+})";
+
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           xls::Parser::ParsePackage(kIrText));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("proc_0"));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule schedule,
+      RunPipelineSchedule(proc, TestDelayEstimator(),
+                          SchedulingOptions().pipeline_stages(2)));
+
+  CodegenOptions options;
+  options.reset("rst", false, false, false);
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+
+  EXPECT_THAT(context.GetMetadataForBlock(context.top_block())
+                  .streaming_io_and_pipeline.pipeline_registers,
+              Each(Each(RegFoundInBlock(context.top_block()))));
+  EXPECT_THAT(context.GetMetadataForBlock(context.top_block())
+                  .streaming_io_and_pipeline.state_registers,
+              Each(Optional(StateRegFoundInBlock(context.top_block()))));
+}
+
+TEST_F(ProcConversionTestFixture, ProcWithConditionalNextValues) {
+  const std::string ir_text = R"(package test
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
+
+proc slow_counter(tkn: token, counter: bits[32], odd_iteration: bits[1], init={token, 0, 0}) {
+  lit1: bits[32] = literal(value=1)
+  incremented_counter: bits[32] = add(counter, lit1)
+  even_iteration: bits[1] = not(odd_iteration)
+  send.1: token = send(tkn, counter, channel=out, id=1)
+  next_counter_odd: () = next_value(param=counter, value=counter, predicate=odd_iteration)
+  next_counter_even: () = next_value(param=counter, value=incremented_counter, predicate=even_iteration)
+  next_value.2: () = next_value(param=odd_iteration, value=even_iteration, id=2)
+  next_value.3: () = next_value(param=tkn, value=send.1, id=3)
+}
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(ir_text));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("slow_counter"));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule schedule,
+      RunPipelineSchedule(proc, TestDelayEstimator(),
+                          SchedulingOptions().pipeline_stages(1)));
+
+  CodegenOptions options;
+  options.flop_inputs(false).flop_outputs(false).clock_name("clk");
+  options.valid_control("input_valid", "output_valid");
+  options.reset("rst", false, false, true);
+  options.streaming_channel_data_suffix("_data");
+  options.streaming_channel_valid_suffix("_valid");
+  options.streaming_channel_ready_suffix("_ready");
+  options.module_name("slow_counter");
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+
+  std::vector<ChannelSource> sources{};
+  std::vector<ChannelSink> sinks{
+      ChannelSink("out_data", "out_valid", "out_ready", 1.0,
+                  context.top_block(),
+                  /*reset_behavior=*/
+                  ChannelSink::BehaviorDuringReset::kAttendValid),
+  };
+
+  std::string reset_name = options.reset()->name();
+  uint64_t reset_active = options.reset()->active_low() ? 0 : 1;
+  uint64_t reset_inactive = options.reset()->active_low() ? 1 : 0;
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> non_streaming_inputs(
+      25, {{reset_name, reset_inactive}});
+  XLS_ASSERT_OK(SetSignalsOverCycles(0, 9, {{reset_name, reset_active}},
+                                     non_streaming_inputs));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      BlockIOResultsAsUint64 results,
+      InterpretChannelizedSequentialBlockWithUint64(
+          context.top_block(), absl::MakeSpan(sources), absl::MakeSpan(sinks),
+          non_streaming_inputs, options.reset()));
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>>& inputs =
+      results.inputs;
+  std::vector<absl::flat_hash_map<std::string, uint64_t>>& outputs =
+      results.outputs;
+
+  // Add a cycle count for easier comparison with simulation results.
+  XLS_ASSERT_OK(SetIncrementingSignalOverCycles(0, outputs.size() - 1, "cycle",
+                                                0, outputs));
+
+  VLOG(1) << "Signal Trace";
+  XLS_ASSERT_OK(VLogTestPipelinedIO(
+      std::vector<SignalSpec>{{"cycle", SignalType::kOutput},
+                              {"rst", SignalType::kInput},
+                              {"out_data", SignalType::kOutput},
+                              {"out_valid", SignalType::kOutput},
+                              {"out_ready", SignalType::kInput}},
+      /*column_width=*/10, inputs, outputs));
+
+  EXPECT_THAT(sinks.at(0).GetOutputCycleSequenceAsUint64(),
+              IsOkAndHolds(Skipping(10, ElementsAre(0, 1, 1, 2, 2, 3, 3, 4, 4,
+                                                    5, 5, 6, 6, 7, 7))));
+}
+
+TEST_F(ProcConversionTestFixture, ProcWithDynamicStateFeedback) {
+  const std::string ir_text = R"(package test
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
+
+proc slow_counter(counter: bits[32], odd_iteration: bits[1], init={0, 0}) {
+  tkn: token = literal(value=token)
+  lit1: bits[32] = literal(value=1)
+  incremented_counter: bits[32] = add(counter, lit1)
+  even_iteration: bits[1] = not(odd_iteration)
+  send.1: token = send(tkn, counter, channel=out, id=1)
+  next_counter_odd: () = next_value(param=counter, value=counter, predicate=odd_iteration)
+  next_counter_even: () = next_value(param=counter, value=incremented_counter, predicate=even_iteration)
+  next_value.2: () = next_value(param=odd_iteration, value=even_iteration, id=2)
+}
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(ir_text));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, package->GetProc("slow_counter"));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule schedule,
+      RunPipelineSchedule(proc, TestDelayEstimator(),
+                          SchedulingOptions()
+                              .pipeline_stages(2)
+                              .worst_case_throughput(2)
+                              .add_constraint(NodeInCycleConstraint(
+                                  *proc->GetNode("next_counter_odd"), 0))
+                              .add_constraint(NodeInCycleConstraint(
+                                  *proc->GetNode("next_counter_even"), 1))));
+
+  CodegenOptions options;
+  options.flop_inputs(false).flop_outputs(false).clock_name("clk");
+  options.valid_control("input_valid", "output_valid");
+  options.reset("rst", false, false, true);
+  options.streaming_channel_data_suffix("_data");
+  options.streaming_channel_valid_suffix("_valid");
+  options.streaming_channel_ready_suffix("_ready");
+  options.module_name("slow_counter");
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+
+  std::vector<ChannelSource> sources{};
+  std::vector<ChannelSink> sinks{
+      ChannelSink(
+          "out_data", "out_valid", "out_ready", 1.0, context.top_block(),
+          /*reset_behavior=*/ChannelSink::BehaviorDuringReset::kAttendValid),
+  };
+
+  std::string reset_name = options.reset()->name();
+  uint64_t reset_active = options.reset()->active_low() ? 0 : 1;
+  uint64_t reset_inactive = options.reset()->active_low() ? 1 : 0;
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> non_streaming_inputs(
+      32, {{reset_name, reset_inactive}});
+  XLS_ASSERT_OK(SetSignalsOverCycles(0, 9, {{reset_name, reset_active}},
+                                     non_streaming_inputs));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      BlockIOResultsAsUint64 results,
+      InterpretChannelizedSequentialBlockWithUint64(
+          context.top_block(), absl::MakeSpan(sources), absl::MakeSpan(sinks),
+          non_streaming_inputs, options.reset()));
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>>& inputs =
+      results.inputs;
+  std::vector<absl::flat_hash_map<std::string, uint64_t>>& outputs =
+      results.outputs;
+
+  // Add a cycle count for easier comparison with simulation results.
+  XLS_ASSERT_OK(SetIncrementingSignalOverCycles(0, outputs.size() - 1, "cycle",
+                                                0, outputs));
+
+  VLOG(1) << "Signal Trace";
+  XLS_ASSERT_OK(VLogTestPipelinedIO(
+      std::vector<SignalSpec>{{"cycle", SignalType::kOutput},
+                              {"rst", SignalType::kInput},
+                              {"out_data", SignalType::kOutput},
+                              {"out_valid", SignalType::kOutput},
+                              {"out_ready", SignalType::kInput}},
+      /*column_width=*/10, inputs, outputs));
+
+  EXPECT_THAT(
+      sinks.at(0).GetOutputCycleSequenceAsUint64(),
+      IsOkAndHolds(Skipping(
+          10, ElementsAre(0, std::nullopt, 1, 1, std::nullopt, 2, 2,
+                          std::nullopt, 3, 3, std::nullopt, 4, 4, std::nullopt,
+                          5, 5, std::nullopt, 6, 6, std::nullopt, 7, 7))));
+}
+
+class AddPredicate : public Proc::StateElementTransformer {
+ public:
+  explicit AddPredicate(Node* predicate) : predicate_(predicate) {}
+  ~AddPredicate() override = default;
+
+  absl::StatusOr<std::optional<Node*>> TransformReadPredicate(
+      Proc* proc, StateRead* old_state_read) override {
+    return predicate_;
+  }
+
+ private:
+  Node* predicate_;
+};
+
+TEST_F(ProcConversionTestFixture, ProcWithDynamicStateReads) {
+  const std::string ir_text = R"(package test
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
+
+proc alternating_counter(counter0: bits[32], counter1: bits[32], index: bits[1], init={0, 5, 0}) {
+  tkn: token = literal(value=token)
+  lit1: bits[32] = literal(value=1)
+  selected_counter: bits[32] = sel(index, cases=[counter0, counter1])
+  send.1: token = send(tkn, selected_counter, channel=out)
+  incremented_counter: bits[32] = add(selected_counter, lit1)
+  index_is_0: bits[1] = not(index)
+  index_is_1: bits[1] = identity(index)
+  increment_counter0: () = next_value(param=counter0, value=incremented_counter, predicate=index_is_0)
+  increment_counter1: () = next_value(param=counter1, value=incremented_counter, predicate=index_is_1)
+  next_index: () = next_value(param=index, value=index_is_0)
+}
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(ir_text));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc,
+                           package->GetProc("alternating_counter"));
+  AddPredicate only_on_0(*proc->GetNode("index_is_0"));
+  AddPredicate only_on_1(*proc->GetNode("index_is_1"));
+  XLS_ASSERT_OK(proc->TransformStateElement(
+                        proc->GetStateRead(*proc->GetStateElement("counter0")),
+                        Value(UBits(0, 32)), only_on_0)
+                    .status());
+  XLS_ASSERT_OK(proc->TransformStateElement(
+                        proc->GetStateRead(*proc->GetStateElement("counter1")),
+                        Value(UBits(5, 32)), only_on_1)
+                    .status());
+
+  ASSERT_THAT(
+      proc->next_values(proc->GetStateRead(*proc->GetStateElement("counter0"))),
+      SizeIs(1));
+  ASSERT_THAT(
+      proc->next_values(proc->GetStateRead(*proc->GetStateElement("counter1"))),
+      SizeIs(1));
+  SchedulingOptions scheduling_options =
+      SchedulingOptions()
+          .pipeline_stages(3)
+          .worst_case_throughput(2)
+          .add_constraint(
+              NodeInCycleConstraint(*proc->GetNode("selected_counter"), 0))
+          .add_constraint(NodeInCycleConstraint(
+              *proc->next_values(
+                       proc->GetStateRead(*proc->GetStateElement("counter0")))
+                   .begin(),
+              1))
+          .add_constraint(NodeInCycleConstraint(
+              *proc->next_values(
+                       proc->GetStateRead(*proc->GetStateElement("counter1")))
+                   .begin(),
+              1));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule schedule,
+      RunPipelineSchedule(proc, TestDelayEstimator(), scheduling_options));
+
+  CodegenOptions options;
+  options.flop_inputs(false).flop_outputs(false).clock_name("clk");
+  options.valid_control("input_valid", "output_valid");
+  options.reset("rst", false, false, true);
+  options.streaming_channel_data_suffix("_data");
+  options.streaming_channel_valid_suffix("_valid");
+  options.streaming_channel_ready_suffix("_ready");
+  options.module_name("alternating_counter");
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+
+  std::vector<ChannelSource> sources{};
+  std::vector<ChannelSink> sinks{
+      ChannelSink(
+          "out_data", "out_valid", "out_ready", 1.0, context.top_block(),
+          /*reset_behavior=*/ChannelSink::BehaviorDuringReset::kAttendValid),
+  };
+
+  std::string reset_name = options.reset()->name();
+  uint64_t reset_active = options.reset()->active_low() ? 0 : 1;
+  uint64_t reset_inactive = options.reset()->active_low() ? 1 : 0;
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> non_streaming_inputs(
+      32, {{reset_name, reset_inactive}});
+  XLS_ASSERT_OK(SetSignalsOverCycles(0, 9, {{reset_name, reset_active}},
+                                     non_streaming_inputs));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      BlockIOResultsAsUint64 results,
+      InterpretChannelizedSequentialBlockWithUint64(
+          context.top_block(), absl::MakeSpan(sources), absl::MakeSpan(sinks),
+          non_streaming_inputs, options.reset()));
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>>& inputs =
+      results.inputs;
+  std::vector<absl::flat_hash_map<std::string, uint64_t>>& outputs =
+      results.outputs;
+
+  // Add a cycle count for easier comparison with simulation results.
+  XLS_ASSERT_OK(SetIncrementingSignalOverCycles(0, outputs.size() - 1, "cycle",
+                                                0, outputs));
+
+  VLOG(1) << "Signal Trace";
+  XLS_ASSERT_OK(VLogTestPipelinedIO(
+      std::vector<SignalSpec>{{"cycle", SignalType::kOutput},
+                              {"rst", SignalType::kInput},
+                              {"out_data", SignalType::kOutput},
+                              {"out_valid", SignalType::kOutput},
+                              {"out_ready", SignalType::kInput}},
+      /*column_width=*/10, inputs, outputs));
+
+  EXPECT_THAT(sinks.at(0).GetOutputCycleSequenceAsUint64(),
+              IsOkAndHolds(Skipping(
+                  10, ElementsAre(0, 5, 1, 6, 2, 7, 3, 8, 4, 9, 5, 10, 6, 11, 7,
+                                  12, 8, 13, 9, 14, 10, 15))));
+}
+
+TEST_F(ProcConversionTestFixture, ProcWithComplexDynamicStateFeedback) {
+  const std::string ir_text = R"(package test
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
+
+proc alternating_counter(counter0: bits[32], counter1: bits[32], index: bits[1], init={0, 5, 0}) {
+  tkn: token = literal(value=token)
+  lit1: bits[32] = literal(value=1)
+  selected_counter: bits[32] = sel(index, cases=[counter0, counter1])
+  send.1: token = send(tkn, selected_counter, channel=out)
+  incremented_counter: bits[32] = add(selected_counter, lit1)
+  index_is_0: bits[1] = not(index)
+  index_is_1: bits[1] = identity(index)
+  increment_counter0: () = next_value(param=counter0, value=incremented_counter, predicate=index_is_0)
+  increment_counter1: () = next_value(param=counter1, value=incremented_counter, predicate=index_is_1)
+  next_index: () = next_value(param=index, value=index_is_0)
+}
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> package,
+                           Parser::ParsePackage(ir_text));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc,
+                           package->GetProc("alternating_counter"));
+  AddPredicate only_on_0(*proc->GetNode("index_is_0"));
+  AddPredicate only_on_1(*proc->GetNode("index_is_1"));
+  XLS_ASSERT_OK(proc->TransformStateElement(
+                        proc->GetStateRead(*proc->GetStateElement("counter0")),
+                        Value(UBits(0, 32)), only_on_0)
+                    .status());
+  XLS_ASSERT_OK(proc->TransformStateElement(
+                        proc->GetStateRead(*proc->GetStateElement("counter1")),
+                        Value(UBits(5, 32)), only_on_1)
+                    .status());
+
+  SchedulingOptions scheduling_options =
+      SchedulingOptions()
+          .pipeline_stages(3)
+          .worst_case_throughput(3)
+          .add_constraint(
+              NodeInCycleConstraint(*proc->GetNode("selected_counter"), 0))
+          .add_constraint(NodeInCycleConstraint(
+              *proc->next_values(
+                       proc->GetStateRead(*proc->GetStateElement("counter0")))
+                   .begin(),
+              2))
+          .add_constraint(NodeInCycleConstraint(
+              *proc->next_values(
+                       proc->GetStateRead(*proc->GetStateElement("counter1")))
+                   .begin(),
+              1));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      PipelineSchedule schedule,
+      RunPipelineSchedule(proc, TestDelayEstimator(), scheduling_options));
+
+  CodegenOptions options;
+  options.flop_inputs(false).flop_outputs(false).clock_name("clk");
+  options.valid_control("input_valid", "output_valid");
+  options.reset("rst", false, false, true);
+  options.streaming_channel_data_suffix("_data");
+  options.streaming_channel_valid_suffix("_valid");
+  options.streaming_channel_ready_suffix("_ready");
+  options.module_name("alternating_counter");
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(schedule, options, proc));
+
+  std::vector<ChannelSource> sources{};
+  std::vector<ChannelSink> sinks{
+      ChannelSink(
+          "out_data", "out_valid", "out_ready", 1.0, context.top_block(),
+          /*reset_behavior=*/ChannelSink::BehaviorDuringReset::kAttendValid),
+  };
+
+  std::string reset_name = options.reset()->name();
+  uint64_t reset_active = options.reset()->active_low() ? 0 : 1;
+  uint64_t reset_inactive = options.reset()->active_low() ? 1 : 0;
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> non_streaming_inputs(
+      32, {{reset_name, reset_inactive}});
+  XLS_ASSERT_OK(SetSignalsOverCycles(0, 9, {{reset_name, reset_active}},
+                                     non_streaming_inputs));
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      BlockIOResultsAsUint64 results,
+      InterpretChannelizedSequentialBlockWithUint64(
+          context.top_block(), absl::MakeSpan(sources), absl::MakeSpan(sinks),
+          non_streaming_inputs, options.reset()));
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>>& inputs =
+      results.inputs;
+  std::vector<absl::flat_hash_map<std::string, uint64_t>>& outputs =
+      results.outputs;
+
+  // Add a cycle count for easier comparison with simulation results.
+  XLS_ASSERT_OK(SetIncrementingSignalOverCycles(0, outputs.size() - 1, "cycle",
+                                                0, outputs));
+
+  VLOG(1) << "Signal Trace";
+  XLS_ASSERT_OK(VLogTestPipelinedIO(
+      std::vector<SignalSpec>{{"cycle", SignalType::kOutput},
+                              {"rst", SignalType::kInput},
+                              {"out_data", SignalType::kOutput},
+                              {"out_valid", SignalType::kOutput},
+                              {"out_ready", SignalType::kInput}},
+      /*column_width=*/10, inputs, outputs));
+
+  EXPECT_THAT(
+      sinks.at(0).GetOutputCycleSequenceAsUint64(),
+      IsOkAndHolds(Skipping(
+          10, ElementsAre(0, 5, std::nullopt, 1, 6, std::nullopt, 2, 7,
+                          std::nullopt, 3, 8, std::nullopt, 4, 9, std::nullopt,
+                          5, 10, std::nullopt, 6, 11, std::nullopt, 7))));
+}
+
+TEST_F(BlockConversionTest, SimpleMutualExclusiveRegions) {
+  auto p = CreatePackage();
+  ProcBuilder pb(TestName(), p.get());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * chan_out,
+      p->CreateStreamingChannel("chan", ChannelOps::kSendOnly,
+                                p->GetBitsType(1)));
+  auto tok = pb.Literal(Value::Token());
+  auto a = pb.StateElement("a", UBits(0, 1));
+  auto b = pb.StateElement("b", UBits(0, 1));
+  auto c = pb.StateElement("c", UBits(0, 1));
+  auto sv = pb.Or({a, b, c});
+  auto send = pb.Send(chan_out, tok, sv);
+  auto na = pb.Not(a);
+  auto nb = pb.Not(b);
+  auto nc = pb.Not(c);
+  auto nxt_a = pb.Next(a, na);
+  auto nxt_b = pb.Next(b, nb);
+  auto nxt_c = pb.Next(c, nc);
+  XLS_ASSERT_OK_AND_ASSIGN(auto proc, pb.Build());
+
+  PipelineSchedule ps(proc,
+                      {{tok.node(), 0},
+                       {a.node(), 0},
+                       {b.node(), 0},
+                       {c.node(), 0},
+                       {sv.node(), 1},
+                       {send.node(), 1},
+                       {na.node(), 2},
+                       {nb.node(), 2},
+                       {nc.node(), 2},
+                       {nxt_a.node(), 2},
+                       {nxt_b.node(), 2},
+                       {nxt_c.node(), 2}},
+                      3);
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(
+          ps, CodegenOptions().reset("foo", false, false, false), proc));
+
+  ASSERT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages.has_value());
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsMutuallyExclusive(0, 1));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsMutuallyExclusive(0, 2));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsMutuallyExclusive(1, 2));
+}
+
+TEST_F(BlockConversionTest, NodeToStageMapSimple) {
+  auto p = CreatePackage();
+  TokenlessProcBuilder pb(TestName(), "tok", p.get());
+  auto a = pb.StateElement("a", UBits(0, 2));
+  auto na = pb.Not(a, SourceInfo(), "not_a");
+  auto nxt_a = pb.Next(a, na);
+  XLS_ASSERT_OK_AND_ASSIGN(auto proc, pb.Build());
+
+  PipelineSchedule ps(proc,
+                      {{pb.InitialToken().node(), 0},
+                       {a.node(), 0},
+                       {na.node(), 1},
+                       {nxt_a.node(), 1}},  // stage 0 can activate again
+                      2);
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(
+          ps, CodegenOptions().reset("foo", false, false, false), proc));
+
+  auto has_mapping = [](auto k, auto v) {
+    return testing::Contains(testing::Pair(k, v));
+  };
+  RecordProperty("map", testing::PrintToString(
+                            context.GetMetadataForBlock(context.top_block())
+                                .streaming_io_and_pipeline.node_to_stage_map));
+  EXPECT_THAT(context.GetMetadataForBlock(context.top_block())
+                  .streaming_io_and_pipeline.node_to_stage_map,
+              has_mapping(m::RegisterRead("__a"), 0));
+  // TODO: It would be nice to identify the state register writes in the
+  // node-to-stage-map somehow. This is not really too important but having
+  // stage information scattered around in a bunch of places is annoying.
+  EXPECT_THAT(context.GetMetadataForBlock(context.top_block())
+                  .streaming_io_and_pipeline.node_to_stage_map,
+              has_mapping(m::Not(), 1));
+  RecordProperty("block", p->DumpIr());
+}
+
+TEST_F(BlockConversionTest, NodeToStageMapMulti) {
+  auto p = CreatePackage();
+  ProcBuilder pb(TestName(), p.get());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * chan_out,
+      p->CreateStreamingChannel("chan", ChannelOps::kSendOnly,
+                                p->GetBitsType(2)));
+  auto tok = pb.Literal(Value::Token());
+  auto a = pb.StateElement("a", UBits(0, 2));
+  auto b = pb.StateElement("b", UBits(0, 2));
+  auto c = pb.StateElement("c", UBits(0, 2));
+  auto na = pb.Not(a, SourceInfo(), "not_a");
+  auto nb = pb.Not(b, SourceInfo(), "not_b");
+  auto nc = pb.Not(c, SourceInfo(), "not_c");
+  auto sv = pb.Or({a, b, c}, SourceInfo(), "send_val");
+  auto nxt_a = pb.Next(a, na);
+  auto nxt_b = pb.Next(b, nb);
+  auto nxt_c = pb.Next(c, nc);
+  auto send = pb.Send(chan_out, tok, sv, SourceInfo(), "send_inst");
+  XLS_ASSERT_OK_AND_ASSIGN(auto proc, pb.Build());
+
+  PipelineSchedule ps(proc,
+                      {{tok.node(), 0},
+                       {a.node(), 0},
+                       {na.node(), 1},
+                       {nxt_a.node(), 1},  // stage 0 can activate again
+                       {b.node(), 1},
+                       {nb.node(), 2},
+                       {nxt_b.node(), 2},  // stage 1 can activate again
+                       {c.node(), 2},
+                       {nc.node(), 3},
+                       {nxt_c.node(), 3},  // stage 2 can activate again
+                       {sv.node(), 4},
+                       {send.node(), 4}},
+                      5);
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(
+          ps, CodegenOptions().reset("foo", false, false, false), proc));
+
+  auto has_mapping = [](auto k, auto v) {
+    return testing::Contains(testing::Pair(k, v));
+  };
+  // TODO: It would be nice to identify the state registers in the
+  // node-to-stage-map somehow. This is not really too important but having
+  // stage information scattered around in a bunch of places is annoying.
+  EXPECT_THAT(context.GetMetadataForBlock(context.top_block())
+                  .streaming_io_and_pipeline.node_to_stage_map,
+              has_mapping(m::RegisterRead("__a"), 0));
+  EXPECT_THAT(context.GetMetadataForBlock(context.top_block())
+                  .streaming_io_and_pipeline.node_to_stage_map,
+              has_mapping(m::RegisterRead("__b"), 1));
+  EXPECT_THAT(context.GetMetadataForBlock(context.top_block())
+                  .streaming_io_and_pipeline.node_to_stage_map,
+              has_mapping(m::RegisterRead("__c"), 2));
+  RecordProperty("block", p->DumpIr());
+  RecordProperty("map", testing::PrintToString(
+                            context.GetMetadataForBlock(context.top_block())
+                                .streaming_io_and_pipeline.node_to_stage_map));
+}
+
+TEST_F(BlockConversionTest, SimpleMutualExclusiveAndConcurrentRegions) {
+  auto p = CreatePackage();
+  ProcBuilder pb(TestName(), p.get());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * chan_out,
+      p->CreateStreamingChannel("chan", ChannelOps::kSendOnly,
+                                p->GetBitsType(1)));
+  auto tok = pb.Literal(Value::Token());
+  auto a = pb.StateElement("a", UBits(0, 1));
+  auto b = pb.StateElement("b", UBits(0, 1));
+  auto c = pb.StateElement("c", UBits(0, 1));
+  auto sv = pb.Or({a, b, c});
+  auto send = pb.Send(chan_out, tok, sv);
+  auto na = pb.Not(a);
+  auto nb = pb.Not(b);
+  auto nc = pb.Not(c);
+  auto nxt_a = pb.Next(a, na);
+  auto nxt_b = pb.Next(b, nb);
+  auto nxt_c = pb.Next(c, nc);
+  XLS_ASSERT_OK_AND_ASSIGN(auto proc, pb.Build());
+
+  PipelineSchedule ps(proc,
+                      {{tok.node(), 0},
+                       {a.node(), 0},
+                       {b.node(), 0},
+                       {c.node(), 0},
+                       {na.node(), 1},
+                       {nb.node(), 1},
+                       {nc.node(), 1},
+                       {nxt_a.node(), 1},
+                       {nxt_b.node(), 1},
+                       {nxt_c.node(), 1},
+                       {sv.node(), 2},
+                       {send.node(), 2}},
+                      3);
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(
+          ps, CodegenOptions().reset("foo", false, false, false), proc));
+
+  ASSERT_TRUE(
+      context.GetMetadataForBlock(context.top_block()).concurrent_stages);
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsMutuallyExclusive(0, 1));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(0, 2));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(1, 2));
+}
+
+TEST_F(BlockConversionTest, SimpleConcurrentRegions) {
+  auto p = CreatePackage();
+  ProcBuilder pb(TestName(), p.get());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * chan_out,
+      p->CreateStreamingChannel("chan", ChannelOps::kSendOnly,
+                                p->GetBitsType(1)));
+  auto tok = pb.Literal(Value::Token());
+  auto a = pb.StateElement("a", UBits(0, 1));
+  auto b = pb.StateElement("b", UBits(0, 1));
+  auto c = pb.StateElement("c", UBits(0, 1));
+  auto sv = pb.Or({a, b, c});
+  auto send = pb.Send(chan_out, tok, sv);
+  auto na = pb.Not(a);
+  auto nb = pb.Not(b);
+  auto nc = pb.Not(c);
+  auto nxt_a = pb.Next(a, na);
+  auto nxt_b = pb.Next(b, nb);
+  auto nxt_c = pb.Next(c, nc);
+  XLS_ASSERT_OK_AND_ASSIGN(auto proc, pb.Build());
+
+  PipelineSchedule ps(proc,
+                      {{tok.node(), 0},
+                       {a.node(), 0},
+                       {b.node(), 0},
+                       {c.node(), 0},
+                       {na.node(), 0},
+                       {nb.node(), 0},
+                       {nc.node(), 0},
+                       {nxt_a.node(), 0},
+                       {nxt_b.node(), 0},
+                       {nxt_c.node(), 0},
+                       {sv.node(), 1},
+                       {send.node(), 2}},
+                      3);
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(
+          ps, CodegenOptions().reset("foo", false, false, false), proc));
+
+  ASSERT_TRUE(
+      context.GetMetadataForBlock(context.top_block()).concurrent_stages);
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(0, 1));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(0, 2));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(1, 2));
+}
+
+TEST_F(BlockConversionTest, MultipleConcurrentRegions) {
+  auto p = CreatePackage();
+  ProcBuilder pb(TestName(), p.get());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * chan_out,
+      p->CreateStreamingChannel("chan", ChannelOps::kSendOnly,
+                                p->GetBitsType(2)));
+  auto tok = pb.Literal(Value::Token());
+  auto a = pb.StateElement("a", UBits(0, 2));
+  auto b = pb.StateElement("b", UBits(0, 2));
+  auto c = pb.StateElement("c", UBits(0, 2));
+  auto na = pb.Not(a, SourceInfo(), "not_a");
+  auto nb = pb.Not(b, SourceInfo(), "not_b");
+  auto nc = pb.Not(c, SourceInfo(), "not_c");
+  auto sv = pb.Or({a, b, c}, SourceInfo(), "send_val");
+  auto send = pb.Send(chan_out, tok, sv, SourceInfo(), "send_inst");
+  auto nxt_a = pb.Next(a, na);
+  auto nxt_b = pb.Next(b, nb);
+  auto nxt_c = pb.Next(c, nc);
+  XLS_ASSERT_OK_AND_ASSIGN(auto proc, pb.Build());
+
+  PipelineSchedule ps(proc,
+                      {{tok.node(), 0},
+                       {a.node(), 0},
+                       {na.node(), 1},
+                       {nxt_a.node(), 1},  // stage 0 can activate again
+                       {b.node(), 1},
+                       {nb.node(), 2},
+                       {nxt_b.node(), 2},  // stage 1 can activate again
+                       {c.node(), 2},
+                       {nc.node(), 3},
+                       {nxt_c.node(), 3},  // stage 2 can activate again
+                       {sv.node(), 4},
+                       {send.node(), 4}},
+                      5);
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(
+          ps, CodegenOptions().reset("foo", false, false, false), proc));
+
+  ASSERT_TRUE(
+      context.GetMetadataForBlock(context.top_block()).concurrent_stages);
+  RecordProperty("concurrency", context.GetMetadataForBlock(context.top_block())
+                                    .concurrent_stages->ToString());
+
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsMutuallyExclusive(0, 1));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(0, 2));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(0, 3));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(0, 4));
+
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsMutuallyExclusive(1, 2));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(1, 3));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(1, 4));
+
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsMutuallyExclusive(2, 3));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(2, 4));
+
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(3, 4));
+}
+
+TEST_F(BlockConversionTest, CoveringRegions) {
+  auto p = CreatePackage();
+  ProcBuilder pb(TestName(), p.get());
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * chan_out,
+      p->CreateStreamingChannel("chan", ChannelOps::kSendOnly,
+                                p->GetBitsType(2)));
+  auto tok = pb.Literal(Value::Token());
+  auto a = pb.StateElement("a", UBits(0, 2));
+  auto b = pb.StateElement("b", UBits(0, 2));
+  auto c = pb.StateElement("c", UBits(0, 2));
+  auto na = pb.Not(a, SourceInfo(), "not_a");
+  auto nb = pb.Not(b, SourceInfo(), "not_b");
+  auto nc = pb.Not(c, SourceInfo(), "not_c");
+  auto sv = pb.Or({a, b, c}, SourceInfo(), "send_val");
+  auto send = pb.Send(chan_out, tok, sv, SourceInfo(), "send_inst");
+  auto nxt_a = pb.Next(a, na);
+  auto nxt_b = pb.Next(b, nb);
+  auto nxt_c = pb.Next(c, nc);
+  XLS_ASSERT_OK_AND_ASSIGN(auto proc, pb.Build());
+
+  // One region entirely covers the others.
+  // A is live [0, 3]
+  // B is live [2, 3]
+  // C is live [1, 2]
+  PipelineSchedule ps(proc,
+                      {{tok.node(), 0},
+                       {a.node(), 0},
+                       {na.node(), 3},
+                       {nxt_a.node(), 3},
+                       {b.node(), 2},
+                       {nb.node(), 3},
+                       {nxt_b.node(), 3},
+                       {c.node(), 1},
+                       {nc.node(), 2},
+                       {nxt_c.node(), 2},
+                       {sv.node(), 4},
+                       {send.node(), 4}},
+                      5);
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(
+          ps, CodegenOptions().reset("foo", false, false, false), proc));
+
+  ASSERT_TRUE(
+      context.GetMetadataForBlock(context.top_block()).concurrent_stages);
+  RecordProperty("concurrency", context.GetMetadataForBlock(context.top_block())
+                                    .concurrent_stages->ToString());
+
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsMutuallyExclusive(0, 1));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsMutuallyExclusive(0, 2));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsMutuallyExclusive(0, 3));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(0, 4));
+
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsMutuallyExclusive(1, 2));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsMutuallyExclusive(1, 3));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(1, 4));
+
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsMutuallyExclusive(2, 3));
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(2, 4));
+
+  EXPECT_TRUE(context.GetMetadataForBlock(context.top_block())
+                  .concurrent_stages->IsConcurrent(3, 4));
+}
+
+TEST_F(BlockConversionTest, PipelineRegisterStagesKnown) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * x_out, p->CreateStreamingChannel("x_out", ChannelOps::kSendOnly,
+                                                 p->GetBitsType(2)));
+  TokenlessProcBuilder pb(TestName(), "tok", p.get());
+  auto a = pb.StateElement("a_val", UBits(0, 2));
+  auto na = pb.Not(a, SourceInfo(), "not_a");
+  auto lit_one = pb.Literal(UBits(1, 2));
+  auto na_plus_one = pb.Add(na, lit_one, SourceInfo(), "na_plus_one");
+  auto send = pb.Send(x_out, na_plus_one);
+  auto next = pb.Next(a, na);
+  XLS_ASSERT_OK_AND_ASSIGN(auto proc, pb.Build());
+  PipelineSchedule ps(proc, {{pb.InitialToken().node(), 0},
+                             {a.node(), 0},
+                             {na.node(), 1},
+                             {lit_one.node(), 2},
+                             {na_plus_one.node(), 2},
+                             {next.node(), 5},
+                             {send.node(), 6}});
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      FunctionBaseToPipelinedBlock(
+          ps, CodegenOptions().reset("foo", false, false, false), proc));
+
+  RecordProperty("blk", context.top_block()->DumpIr());
+  RecordProperty("map", testing::PrintToString(
+                            context.GetMetadataForBlock(context.top_block())
+                                .streaming_io_and_pipeline.node_to_stage_map));
+  auto read_at = [](BValue inst, int64_t stage) -> auto {
+    return testing::Contains(testing::Pair(
+        m::RegisterRead(testing::ContainsRegex(inst.GetName())), stage));
+  };
+  auto write_at = [](BValue inst, int64_t stage) -> auto {
+    return testing::Contains(testing::Pair(
+        m::RegisterWrite(testing::ContainsRegex(inst.GetName())), stage));
+  };
+  EXPECT_THAT(
+      context.GetMetadataForBlock(context.top_block())
+          .streaming_io_and_pipeline.node_to_stage_map,
+      testing::AllOf(read_at(na_plus_one, 3), read_at(na_plus_one, 4),
+                     read_at(na_plus_one, 5), read_at(na_plus_one, 6),
+                     read_at(a, 1), read_at(na, 2), read_at(na, 3),
+                     read_at(na, 4), read_at(na, 5), write_at(na_plus_one, 2),
+                     write_at(na_plus_one, 3), write_at(na_plus_one, 4),
+                     write_at(na_plus_one, 5), write_at(a, 0), write_at(na, 1),
+                     write_at(na, 2), write_at(na, 3), write_at(na, 4)));
+}
+
+TEST_F(BlockConversionTest, NonTopBlockNamedModuleName) {
+  // Block conversion creates a top block with `module_name` as the name.
+  // This tests that we get good behavior when a non-top block has the same name
+  // as `module_name`.
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * x_out, p->CreateStreamingChannel("x_out", ChannelOps::kSendOnly,
+                                                 p->GetBitsType(64)));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * y_out, p->CreateStreamingChannel("y_out", ChannelOps::kSendOnly,
+                                                 p->GetBitsType(64)));
+
+  auto make_constant_send = [&](std::string_view name, Channel* chan,
+                                int64_t value) {
+    TokenlessProcBuilder pb(name, "tok", p.get());
+    pb.Send(chan, pb.Literal(UBits(value, 64)));
+    return pb.Build();
+  };
+  XLS_ASSERT_OK_AND_ASSIGN(auto proc0,
+                           make_constant_send("A", x_out, /*value=*/24));
+  XLS_ASSERT_OK(make_constant_send("B", y_out, /*value=*/48).status());
+
+  // We set A to top, but will set module name to B.
+  XLS_ASSERT_OK(p->SetTop(proc0));
+
+  PackagePipelineSchedules schedules;
+  for (const std::unique_ptr<Proc>& proc : p->procs()) {
+    XLS_ASSERT_OK_AND_ASSIGN(
+        PipelineSchedule schedule,
+        RunPipelineSchedule(proc.get(), TestDelayEstimator(),
+                            SchedulingOptions().pipeline_stages(2)));
+    schedules.emplace(proc.get(), std::move(schedule));
+  }
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      PackageToPipelinedBlocks(
+          schedules,
+          CodegenOptions().reset("foo", false, false, false).module_name("B"),
+          p.get()));
+
+  EXPECT_THAT(context.top_block(), m::Block("B"));
+  EXPECT_THAT(context.top_block()->nodes(), Contains(m::Literal(24)));
+  EXPECT_THAT(context.top_block()->nodes(), Not(Contains(m::Literal(48))));
+
+  EXPECT_THAT(p->blocks(),
+              UnorderedElementsAre(m::Block("B"), m::Block("B__1")));
+  XLS_ASSERT_OK(p->GetBlock("B__1").status());
+  EXPECT_THAT(p->GetBlock("B__1").value()->nodes(), Contains(m::Literal(48)));
+}
+
+TEST_F(ProcConversionTestFixture, SimpleMultiProcConversion) {
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> p,
+                           CreateMultiProcPackage());
+  SchedulingOptionsFlagsProto scheduling_options;
+  scheduling_options.set_pipeline_stages(2);
+  scheduling_options.set_delay_model("unit");
+  scheduling_options.set_multi_proc(true);
+
+  CodegenFlagsProto codegen_options;
+  codegen_options.set_flop_inputs(false);
+  codegen_options.set_flop_outputs(false);
+  codegen_options.set_reset("rst");
+  codegen_options.set_streaming_channel_data_suffix("_data");
+  codegen_options.set_streaming_channel_valid_suffix("_valid");
+  codegen_options.set_streaming_channel_ready_suffix("_ready");
+  codegen_options.set_module_name("p");
+  codegen_options.set_register_merge_strategy(
+      xls::RegisterMergeStrategyProto::STRATEGY_DONT_MERGE);
+  codegen_options.set_generator(GeneratorKind::GENERATOR_KIND_PIPELINE);
+
+  std::pair<SchedulingResult, verilog::CodegenResult> result;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      result, ScheduleAndCodegen(p.get(), scheduling_options, codegen_options,
+                                 /*with_delay_model=*/true));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Block * top_block, p->GetBlock("p"));
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> inputs;
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> outputs;
+
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      0, 9, {{"rst", 1}, {"in_valid", 0}, {"in_data", 0}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      10, 15, {{"rst", 0}, {"in_valid", 0}, {"in_data", 1}, {"out_ready", 1}},
+      inputs));
+
+  // Cycle 16: Blocked on input, stage 1 has valid so still not idle
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      16, 16, {{"rst", 0}, {"in_valid", 0}, {"in_data", 2}, {"out_ready", 1}},
+      inputs));
+  // Cycle 17-18: Blocked on input, stage 1 no longer has valid so idle
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      17, 18, {{"rst", 0}, {"in_valid", 0}, {"in_data", 2}, {"out_ready", 1}},
+      inputs));
+  // Cycle 19: No longer blocked, so not idle
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      19, 19, {{"rst", 0}, {"in_valid", 1}, {"in_data", 2}, {"out_ready", 1}},
+      inputs));
+  // Cycle 20: Blocked on input, again, but not idle
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      20, 20, {{"rst", 0}, {"in_valid", 0}, {"in_data", 3}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      21, 21, {{"rst", 0}, {"in_valid", 1}, {"in_data", 3}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      22, 22, {{"rst", 0}, {"in_valid", 1}, {"in_data", 3}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      23, 23, {{"rst", 0}, {"in_valid", 0}, {"in_data", 0}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      24, 24, {{"rst", 0}, {"in_valid", 0}, {"in_data", 0}, {"out_ready", 1}},
+      inputs));
+
+  XLS_ASSERT_OK_AND_ASSIGN(outputs,
+                           InterpretSequentialBlock(top_block, inputs));
+
+  // Add a cycle count for easier comparison with simulation results.
+  XLS_ASSERT_OK(SetIncrementingSignalOverCycles(0, outputs.size() - 1, "cycle",
+                                                0, outputs));
+
+  VLOG(1) << "Signal Trace";
+  XLS_ASSERT_OK(VLogTestPipelinedIO(
+      std::vector<SignalSpec>{{"cycle", SignalType::kOutput},
+                              {"rst", SignalType::kInput},
+                              {"in_data", SignalType::kInput},
+                              {"in_valid", SignalType::kInput},
+                              {"in_ready", SignalType::kOutput},
+                              {"out_data", SignalType::kOutput},
+                              {"out_valid", SignalType::kOutput},
+                              {"out_ready", SignalType::kInput}},
+      /*column_width=*/10, inputs, outputs));
+
+  for (int64_t i = 0; i < outputs.size(); ++i) {
+    if (i < 10) {
+      EXPECT_EQ(inputs[i]["rst"], 1)
+          << absl::StrFormat("Cycle %d, expected rst==1", i);
+    } else if (i == 17 || i == 18) {
+      EXPECT_EQ(inputs[i]["rst"], 0)
+          << absl::StrFormat("Cycle %d, expected rst==0", i);
+    } else {
+      EXPECT_EQ(inputs[i]["rst"], 0)
+          << absl::StrFormat("Cycle %d, expected rst==0", i);
+    }
+  }
+}
+
+TEST_F(ProcConversionTestFixture,
+       SimpleMultiProcConversionWithFunctionsPresent) {
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> p,
+                           CreateMultiProcPackage(/*with_functions=*/true));
+  SchedulingOptionsFlagsProto scheduling_options;
+  scheduling_options.set_pipeline_stages(2);
+  scheduling_options.set_delay_model("unit");
+  scheduling_options.set_multi_proc(true);
+
+  CodegenFlagsProto codegen_options;
+  codegen_options.set_flop_inputs(false);
+  codegen_options.set_flop_outputs(false);
+  codegen_options.set_reset("rst");
+  codegen_options.set_streaming_channel_data_suffix("_data");
+  codegen_options.set_streaming_channel_valid_suffix("_valid");
+  codegen_options.set_streaming_channel_ready_suffix("_ready");
+  codegen_options.set_module_name("p");
+  codegen_options.set_register_merge_strategy(
+      xls::RegisterMergeStrategyProto::STRATEGY_DONT_MERGE);
+  codegen_options.set_generator(GeneratorKind::GENERATOR_KIND_PIPELINE);
+
+  std::pair<SchedulingResult, verilog::CodegenResult> result;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      result, ScheduleAndCodegen(p.get(), scheduling_options, codegen_options,
+                                 /*with_delay_model=*/true));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Block * top_block, p->GetBlock("p"));
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> inputs;
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> outputs;
+
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      0, 9, {{"rst", 1}, {"in_valid", 0}, {"in_data", 0}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      10, 15, {{"rst", 0}, {"in_valid", 0}, {"in_data", 1}, {"out_ready", 1}},
+      inputs));
+
+  // Cycle 16: Blocked on input, stage 1 has valid so still not idle
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      16, 16, {{"rst", 0}, {"in_valid", 0}, {"in_data", 2}, {"out_ready", 1}},
+      inputs));
+  // Cycle 17-18: Blocked on input, stage 1 no longer has valid so idle
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      17, 18, {{"rst", 0}, {"in_valid", 0}, {"in_data", 2}, {"out_ready", 1}},
+      inputs));
+  // Cycle 19: No longer blocked, so not idle
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      19, 19, {{"rst", 0}, {"in_valid", 1}, {"in_data", 2}, {"out_ready", 1}},
+      inputs));
+  // Cycle 20: Blocked on input, again, but not idle
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      20, 20, {{"rst", 0}, {"in_valid", 0}, {"in_data", 3}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      21, 21, {{"rst", 0}, {"in_valid", 1}, {"in_data", 3}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      22, 22, {{"rst", 0}, {"in_valid", 1}, {"in_data", 3}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      23, 23, {{"rst", 0}, {"in_valid", 0}, {"in_data", 0}, {"out_ready", 1}},
+      inputs));
+  XLS_ASSERT_OK(SetSignalsOverCycles(
+      24, 24, {{"rst", 0}, {"in_valid", 0}, {"in_data", 0}, {"out_ready", 1}},
+      inputs));
+
+  XLS_ASSERT_OK_AND_ASSIGN(outputs,
+                           InterpretSequentialBlock(top_block, inputs));
+
+  // Add a cycle count for easier comparison with simulation results.
+  XLS_ASSERT_OK(SetIncrementingSignalOverCycles(0, outputs.size() - 1, "cycle",
+                                                0, outputs));
+
+  VLOG(1) << "Signal Trace";
+  XLS_ASSERT_OK(VLogTestPipelinedIO(
+      std::vector<SignalSpec>{{"cycle", SignalType::kOutput},
+                              {"rst", SignalType::kInput},
+                              {"in_data", SignalType::kInput},
+                              {"in_valid", SignalType::kInput},
+                              {"in_ready", SignalType::kOutput},
+                              {"out_data", SignalType::kOutput},
+                              {"out_valid", SignalType::kOutput},
+                              {"out_ready", SignalType::kInput}},
+      /*column_width=*/10, inputs, outputs));
+
+  for (int64_t i = 0; i < outputs.size(); ++i) {
+    if (i < 10) {
+      EXPECT_EQ(inputs[i]["rst"], 1)
+          << absl::StrFormat("Cycle %d, expected rst==1", i);
+    } else if (i == 17 || i == 18) {
+      EXPECT_EQ(inputs[i]["rst"], 0)
+          << absl::StrFormat("Cycle %d, expected rst==0", i);
+    } else {
+      EXPECT_EQ(inputs[i]["rst"], 0)
+          << absl::StrFormat("Cycle %d, expected rst==0", i);
+    }
+  }
+}
+
+TEST_F(ProcConversionTestFixture, SimpleFunctionWithProcsPresent) {
+  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Package> p,
+                           CreateMultiProcPackage(/*with_functions=*/true));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f0, p->GetFunction("f0"));
+  XLS_ASSERT_OK(p->SetTop(f0));
+
+  SchedulingOptionsFlagsProto scheduling_options;
+  scheduling_options.set_pipeline_stages(1);
+  scheduling_options.set_delay_model("unit");
+  scheduling_options.set_multi_proc(true);
+
+  CodegenFlagsProto codegen_options;
+  codegen_options.set_flop_inputs(false);
+  codegen_options.set_flop_outputs(false);
+  codegen_options.set_reset("rst");
+  codegen_options.set_streaming_channel_data_suffix("_data");
+  codegen_options.set_streaming_channel_valid_suffix("_valid");
+  codegen_options.set_streaming_channel_ready_suffix("_ready");
+  codegen_options.set_module_name("p");
+  codegen_options.set_register_merge_strategy(
+      xls::RegisterMergeStrategyProto::STRATEGY_DONT_MERGE);
+  codegen_options.set_generator(GeneratorKind::GENERATOR_KIND_PIPELINE);
+
+  std::pair<SchedulingResult, verilog::CodegenResult> result;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      result, ScheduleAndCodegen(p.get(), scheduling_options, codegen_options,
+                                 /*with_delay_model=*/true));
+
+  XLS_ASSERT_OK_AND_ASSIGN(Block * top_block, p->GetBlock("p"));
+
+  EXPECT_EQ(top_block->name(), "p");
+  EXPECT_EQ(top_block->GetPorts().size(), 5);
+
+  EXPECT_THAT(
+      GetOutputPort(top_block),
+      m::OutputPort("out", m::Add(m::InputPort("x"), m::InputPort("y"))));
+}
+
+absl::StatusOr<Proc*> CreateNewStyleAccumProc(std::string_view proc_name,
+                                              Package* package) {
+  TokenlessProcBuilder pb(NewStyleProc(), proc_name, "tkn", package);
+  BValue accum = pb.StateElement("accum", Value(UBits(0, 32)));
+  XLS_ASSIGN_OR_RETURN(
+      ReceiveChannelInterface * in_channel,
+      pb.AddInputChannel("accum_in", package->GetBitsType(32)));
+  BValue input = pb.Receive(in_channel);
+  BValue next_accum = pb.Add(accum, input);
+  XLS_ASSIGN_OR_RETURN(
+      SendChannelInterface * out_channel,
+      pb.AddOutputChannel("accum_out", package->GetBitsType(32)));
+  pb.Send(out_channel, next_accum);
+  return pb.Build({next_accum});
+}
+
+TEST_F(ProcConversionTestFixture, TrivialProcHierarchyWithProcScopedChannels) {
+  // Construct a proc which instantiates one proc which accumulates its inputs.
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * leaf_proc,
+                           CreateNewStyleAccumProc("leaf_proc", p.get()));
+
+  TokenlessProcBuilder pb(NewStyleProc(), "a_top_proc", "tkn", p.get());
+  XLS_ASSERT_OK_AND_ASSIGN(ReceiveChannelInterface * in_channel,
+                           pb.AddInputChannel("in_ch", p->GetBitsType(32)));
+  XLS_ASSERT_OK_AND_ASSIGN(SendChannelInterface * out_channel,
+                           pb.AddOutputChannel("out_ch", p->GetBitsType(32)));
+
+  XLS_ASSERT_OK(pb.InstantiateProc(
+      "inst", leaf_proc,
+      std::vector<ChannelInterface*>{in_channel, out_channel}));
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * top, pb.Build({}));
+  XLS_ASSERT_OK(p->SetTop(top));
+
+  XLS_ASSERT_OK_AND_ASSIGN(ProcElaboration elab,
+                           ProcElaboration::Elaborate(top));
+
+  PackagePipelineSchedules schedules;
+  for (const std::unique_ptr<Proc>& proc : p->procs()) {
+    XLS_ASSERT_OK_AND_ASSIGN(
+        PipelineSchedule schedule,
+        RunPipelineSchedule(proc.get(), TestDelayEstimator(),
+                            SchedulingOptions().pipeline_stages(2), &elab));
+    schedules.emplace(proc.get(), std::move(schedule));
+  }
+  XLS_ASSERT_OK_AND_ASSIGN(
+      CodegenContext context,
+      PackageToPipelinedBlocks(
+          schedules, CodegenOptions().reset("rst", false, false, false),
+          p.get()));
+
+  EXPECT_EQ(p->blocks().size(), 2);
 }
 
 }  // namespace

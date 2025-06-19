@@ -15,18 +15,22 @@
 #include "xls/data_structures/binary_decision_diagram.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
-#include "xls/common/logging/logging.h"
-#include "xls/common/logging/vlog_is_on.h"
 
 namespace xls {
 
@@ -39,26 +43,41 @@ BinaryDecisionDiagram::BinaryDecisionDiagram() {
                            /*p=*/1));
 }
 
+BddNodeIndex BinaryDecisionDiagram::CreateVariableBaseNode(BddVariable var) {
+  const BddNodeIndex high = one();
+  const BddNodeIndex low = zero();
+  const int32_t paths = 2;
+  nodes_.emplace_back(var, high, low, paths);
+  return BddNodeIndex(nodes_.size() - 1);
+}
+
 BddNodeIndex BinaryDecisionDiagram::GetOrCreateNode(BddVariable var,
                                                     BddNodeIndex high,
                                                     BddNodeIndex low) {
-  NodeKey key = std::make_tuple(var, high, low);
-  auto it = node_map_.find(key);
-  if (it != node_map_.end()) {
-    return it->second;
-  }
   if (low == high) {
     return low;
   }
-  // Compute the number of paths that the new node will have to the terminal
-  // nodes 0 and 1. Use int64s to avoid overflowing and saturate at INT32_MAX.
-  int32_t paths = std::min(
-      static_cast<int64_t>(GetNode(low).path_count) + GetNode(high).path_count,
-      static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
-  nodes_.emplace_back(var, high, low, paths);
-  BddNodeIndex node_index = BddNodeIndex(nodes_.size() - 1);
-  node_map_[key] = node_index;
-  return node_index;
+
+  // If low == 0 and high == 1, then this is a variable base node and is kept
+  // in the variable_base_nodes_ vector.
+  if (low == zero() && high == one()) {
+    return variable_base_nodes_[var.value()];
+  }
+
+  // Otherwise, this is a normal node and is kept in node_map_.
+  NodeKey key = std::make_tuple(var, high, low);
+  auto it = node_map_.lazy_emplace(key, [&](const auto& ctor) {
+    // Compute the number of paths that the new node will have to the terminal
+    // nodes 0 and 1. Use int64s to avoid overflowing and saturate at INT32_MAX.
+    int32_t paths =
+        std::min(static_cast<int64_t>(GetNode(low).path_count) +
+                     GetNode(high).path_count,
+                 static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+    nodes_.emplace_back(var, high, low, paths);
+    BddNodeIndex node_index = BddNodeIndex(nodes_.size() - 1);
+    ctor(key, node_index);
+  });
+  return it->second;
 }
 
 BddNodeIndex BinaryDecisionDiagram::Restrict(BddNodeIndex expr, BddVariable var,
@@ -68,7 +87,7 @@ BddNodeIndex BinaryDecisionDiagram::Restrict(BddNodeIndex expr, BddVariable var,
   }
 
   const BddNode& node = GetNode(expr);
-  XLS_CHECK_LE(var, node.variable);
+  CHECK_LE(var, node.variable);
   if (node.variable == var) {
     return value ? node.high : node.low;
   }
@@ -132,10 +151,54 @@ BddNodeIndex BinaryDecisionDiagram::IfThenElse(BddNodeIndex cond,
   return expr;
 }
 
+template <typename T>
+void ReserveVector(int64_t new_size, std::vector<T>& vec) {
+  constexpr int64_t kGrowthFactor = 2;
+  if (new_size > vec.capacity()) {
+    vec.reserve(std::max<int64_t>(new_size, kGrowthFactor * vec.capacity()));
+  }
+}
+
 BddNodeIndex BinaryDecisionDiagram::NewVariable() {
-  BddVariable var = next_var_;
-  ++next_var_;
-  return GetOrCreateNode(var, one(), zero());
+  BddVariable var = BddVariable(variable_base_nodes_.size());
+  BddNodeIndex index = CreateVariableBaseNode(var);
+  // Simply for consistency with NewVariables, we use ReserveVector here. See
+  // comment in NewVariables for details.
+  ReserveVector(variable_base_nodes_.size() + 1, variable_base_nodes_);
+  variable_base_nodes_.push_back(index);
+  return index;
+}
+
+std::vector<BddNodeIndex> BinaryDecisionDiagram::NewVariables(int64_t count) {
+  // This is a bulk-insert API but we need to be fast for two cases:
+  //   1. Count is large.
+  //   2. Count is small (and called many times).
+  //
+  // For case 1, we would typically call std::vector::reserve(). But this would
+  // pessimize case 2 because std::vector's growth strategy never kicks in, so
+  // we would reallocate many more times than the naive push_back loop would.
+  //
+  // C++ guidance[0] is to use the std::vector::insert(begin, end) API for
+  // bulk-inserts, but that really makes the code more complicated (and is
+  // slightly less efficient for case 1).
+  //
+  // Instead we manually reserve() but to
+  //   max(count+size(), kGrowthFactor*capacity())
+  // to optimize for both cases.
+  //
+  // [0] https://en.cppreference.com/w/cpp/container/vector/reserve
+  ReserveVector(nodes_.size() + count, nodes_);
+  ReserveVector(variable_base_nodes_.size() + count, variable_base_nodes_);
+
+  std::vector<BddNodeIndex> indexes;
+  indexes.reserve(count);
+  int64_t next_var = variable_base_nodes_.size();
+  for (int64_t i = 0; i < count; ++i) {
+    BddNodeIndex index = CreateVariableBaseNode(BddVariable(next_var++));
+    variable_base_nodes_.push_back(index);
+    indexes.push_back(index);
+  }
+  return indexes;
 }
 
 BddNodeIndex BinaryDecisionDiagram::Not(BddNodeIndex expr) {
@@ -150,22 +213,26 @@ BddNodeIndex BinaryDecisionDiagram::And(BddNodeIndex a, BddNodeIndex b) {
   return IfThenElse(a, b, zero());
 }
 
+BddNodeIndex BinaryDecisionDiagram::Implies(BddNodeIndex a, BddNodeIndex b) {
+  return IfThenElse(a, b, one());
+}
+
 absl::StatusOr<bool> BinaryDecisionDiagram::Evaluate(
     BddNodeIndex expr,
     const absl::flat_hash_map<BddNodeIndex, bool>& variable_values) const {
   BddNodeIndex result = expr;
-  XLS_VLOG(2) << "Evaluating node: " << static_cast<int64_t>(expr);
-  XLS_VLOG(2) << "  expression = " << ToStringDnf(expr, /*minterm_limit=*/5);
-  if (XLS_VLOG_IS_ON(3)) {
-    XLS_VLOG(3) << "  variable values: ";
+  VLOG(2) << "Evaluating node: " << static_cast<int64_t>(expr);
+  VLOG(2) << "  expression = " << ToStringDnf(expr, /*minterm_limit=*/5);
+  if (VLOG_IS_ON(3)) {
+    VLOG(3) << "  variable values: ";
     std::vector<BddNodeIndex> variables;
     for (const auto& pair : variable_values) {
       variables.push_back(pair.first);
     }
     std::sort(variables.begin(), variables.end());
     for (BddNodeIndex node : variables) {
-      XLS_VLOG(3) << "    variable " << GetNode(node).variable << ": "
-                  << variable_values.at(node);
+      VLOG(3) << "    variable " << GetNode(node).variable << ": "
+              << variable_values.at(node);
     }
   }
   while (result != zero() && result != one()) {
@@ -178,7 +245,7 @@ absl::StatusOr<bool> BinaryDecisionDiagram::Evaluate(
     result = variable_values.at(var_node) ? GetNode(result).high
                                           : GetNode(result).low;
   }
-  XLS_VLOG(2) << "  result = " << (result == one() ? true : false);
+  VLOG(2) << "  result = " << (result == one() ? true : false);
   return result == one();
 }
 

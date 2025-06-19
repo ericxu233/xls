@@ -20,16 +20,17 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/variant.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/visitor.h"
 #include "xls/ir/function_base.h"
 #include "xls/ir/node.h"
 #include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
 #include "xls/passes/pass_base.h"
 
 namespace xls {
@@ -62,8 +63,8 @@ absl::StatusOr<bool> RecoverLabels(FunctionBase* f) {
 
   bool changed_any = false;
   for (auto& [original_label_key, nodes] : original_label_to_nodes) {
-    XLS_VLOG(10) << absl::StreamFormat("original label `%s` had %d nodes",
-                                       original_label_key, nodes.size());
+    VLOG(10) << absl::StreamFormat("original label `%s` had %d nodes",
+                                   original_label_key, nodes.size());
     // If there's only one node that had this original label, there were no
     // collisions due to inlining, and we can rename it back.
     //
@@ -91,8 +92,10 @@ absl::StatusOr<bool> RecoverLabels(FunctionBase* f) {
 
 absl::StatusOr<bool> LabelRecoveryPass::RunOnFunctionBaseInternal(
     FunctionBase* f, const OptimizationPassOptions& options,
-    PassResults* results) const {
+    PassResults* results, OptimizationContext& context) const {
   return RecoverLabels(f);
 }
+
+REGISTER_OPT_PASS(LabelRecoveryPass);
 
 }  // namespace xls

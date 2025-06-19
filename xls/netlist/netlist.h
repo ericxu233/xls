@@ -21,25 +21,26 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/strip.h"
 #include "absl/strings/substitute.h"
+#include "absl/types/span.h"
 #include "xls/common/bits_util.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/netlist/cell_library.h"
 
@@ -237,7 +238,7 @@ class AbstractModule {
     // TODO(rspringer): Improve APIs so we don't have to match array indexes
     // between these types.
     constexpr const char kDummyName[] = "__dummy__net_decl__";
-    XLS_CHECK_OK(AddNetDecl(NetDeclKind::kWire, kDummyName));
+    CHECK_OK(AddNetDecl(NetDeclKind::kWire, kDummyName));
     dummy_ = ResolveNet(kDummyName).value();
   }
 
@@ -262,15 +263,13 @@ class AbstractModule {
 
   absl::StatusOr<AbstractNetRef<EvalT>> ResolveNumber(int64_t number) const;
 
-  absl::StatusOr<AbstractNetRef<EvalT>> ResolveNet(
-      std::string_view name) const;
+  absl::StatusOr<AbstractNetRef<EvalT>> ResolveNet(std::string_view name) const;
 
   // Returns a reference to a "dummy" net - this is needed for cases where one
   // of a cell's output pins isn't actually used.
   AbstractNetRef<EvalT> GetDummyRef() const { return dummy_; }
 
-  absl::StatusOr<AbstractCell<EvalT>*> ResolveCell(
-      std::string_view name) const;
+  absl::StatusOr<AbstractCell<EvalT>*> ResolveCell(std::string_view name) const;
 
   absl::Span<const std::unique_ptr<AbstractNetDef<EvalT>>> nets() const {
     return nets_;
@@ -332,7 +331,7 @@ class AbstractModule {
                            bool is_output);
   // Returns the width of a port.
   std::optional<std::optional<Range>> GetPortRange(std::string_view name,
-                                                     bool is_assignable);
+                                                   bool is_assignable);
 
   // Declares an individual wire with its range.  For example, when encountering
   // these declarations:
@@ -441,8 +440,8 @@ class AbstractModule {
     return absl::OkStatus();
   }
 
-  const AbstractNetRef<EvalT> zero() const { return zero_; }
-  const AbstractNetRef<EvalT> one() const { return one_; }
+  AbstractNetRef<EvalT> zero() const { return zero_; }
+  AbstractNetRef<EvalT> one() const { return one_; }
 
  private:
   struct Wire {
@@ -501,7 +500,7 @@ class AbstractNetlist {
   // time.
   std::optional<const AbstractModule<EvalT>*> MaybeGetModule(
       const std::string& module_name) const;
-  const absl::Span<const std::unique_ptr<AbstractModule<EvalT>>> modules() {
+  absl::Span<const std::unique_ptr<AbstractModule<EvalT>>> modules() {
     return modules_;
   }
   absl::StatusOr<const AbstractCellLibraryEntry<EvalT>*>
@@ -698,11 +697,10 @@ std::optional<std::optional<Range>> AbstractModule<EvalT>::GetPortRange(
 }
 
 template <typename EvalT>
-int64_t AbstractModule<EvalT>::GetInputPortOffset(
-    std::string_view name) const {
+int64_t AbstractModule<EvalT>::GetInputPortOffset(std::string_view name) const {
   // The input is either a name, e.g. "a", or a name + subscript, e.g. "a[3]".
   std::vector<std::string> name_and_idx = absl::StrSplit(name, '[');
-  XLS_CHECK(name_and_idx.size() <= 2);
+  CHECK_LE(name_and_idx.size(), 2);
 
   int i;
   int off = 0;
@@ -715,12 +713,12 @@ int64_t AbstractModule<EvalT>::GetInputPortOffset(
       break;
     }
   }
-  XLS_CHECK(i < ports_.size());
+  CHECK(i < ports_.size());
 
   if (name_and_idx.size() == 2) {
     std::string_view idx = absl::StripSuffix(name_and_idx[1], "]");
     int64_t idx_out;
-    XLS_CHECK(absl::SimpleAtoi(idx, &idx_out));
+    CHECK(absl::SimpleAtoi(idx, &idx_out));
     off -= idx_out;
   }
 

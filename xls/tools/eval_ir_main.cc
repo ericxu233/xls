@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdint>
 #include <filesystem>  // NOLINT
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <random>
@@ -22,40 +24,82 @@
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
+#include "absl/base/casts.h"
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/random/bit_gen_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 #include "absl/types/span.h"
+#include "llvm/include/llvm/ADT/APInt.h"
+#include "llvm/include/llvm/ADT/StringRef.h"
+#include "llvm/include/llvm/CodeGen/CommandFlags.h"
+#include "llvm/include/llvm/ExecutionEngine/ExecutionEngine.h"
+#include "llvm/include/llvm/ExecutionEngine/GenericValue.h"
+#include "llvm/include/llvm/ExecutionEngine/Interpreter.h"  // IWYU pragma: keep
+#include "llvm/include/llvm/IR/Attributes.h"
+#include "llvm/include/llvm/IR/BasicBlock.h"
+#include "llvm/include/llvm/IR/Constant.h"
+#include "llvm/include/llvm/IR/DataLayout.h"
+#include "llvm/include/llvm/IR/DerivedTypes.h"
+#include "llvm/include/llvm/IR/Function.h"
+#include "llvm/include/llvm/IR/GlobalValue.h"
+#include "llvm/include/llvm/IR/IRBuilder.h"
+#include "llvm/include/llvm/IR/InstrTypes.h"
+#include "llvm/include/llvm/IR/Instructions.h"
+#include "llvm/include/llvm/IR/LLVMContext.h"
 #include "llvm/include/llvm/IR/Module.h"
+#include "llvm/include/llvm/IR/Type.h"
+#include "llvm/include/llvm/IR/Value.h"
+#include "llvm/include/llvm/IRReader/IRReader.h"
+#include "llvm/include/llvm/Support/CodeGen.h"
+#include "llvm/include/llvm/Support/SourceMgr.h"
 #include "llvm/include/llvm/Support/raw_ostream.h"
+#include "llvm/include/llvm/Target/TargetMachine.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/dslx/create_import_data.h"
 #include "xls/dslx/default_dslx_stdlib_path.h"
 #include "xls/dslx/import_data.h"
+#include "xls/dslx/ir_convert/conversion_info.h"
 #include "xls/dslx/ir_convert/ir_converter.h"
 #include "xls/dslx/mangle.h"
 #include "xls/dslx/parse_and_typecheck.h"
+#include "xls/dslx/virtualizable_file_system.h"
 #include "xls/dslx/warning_kind.h"
 #include "xls/interpreter/function_interpreter.h"
+#include "xls/interpreter/observer.h"
 #include "xls/interpreter/random_value.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/events.h"
+#include "xls/ir/format_preference.h"
+#include "xls/ir/function.h"
 #include "xls/ir/ir_parser.h"
+#include "xls/ir/node.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/package.h"
-#include "xls/ir/value_helpers.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
+#include "xls/ir/value_utils.h"
 #include "xls/jit/function_jit.h"
+#include "xls/jit/jit_buffer.h"
 #include "xls/jit/observer.h"
 #include "xls/passes/optimization_pass.h"
 #include "xls/passes/optimization_pass_pipeline.h"
+#include "xls/passes/pass_base.h"
+#include "xls/tests/testvector.pb.h"
+#include "xls/tools/node_coverage_utils.h"
 
-const char kUsage[] = R"(
+static constexpr std::string_view kUsage = R"(
 Evaluates an IR file with user-specified or random inputs using the IR
 interpreter. Example invocations:
 
@@ -106,6 +150,10 @@ ABSL_FLAG(std::string, top, "", "Top entity to evaluate.");
 ABSL_FLAG(std::string, input, "",
           "The input to the function as a semicolon-separated list of typed "
           "values. For example: \"bits[32]:42; (bits[7]:0, bits[20]:4)\"");
+ABSL_FLAG(std::string, testvector_textproto, "",
+          "A textproto file containing the function arguments.");
+
+// Deprecated. Soon to be removed in favor of --testvector_textproto
 ABSL_FLAG(std::string, input_file, "",
           "Inputs to interpreter, one set per line. Each line should contain a "
           "semicolon-separated set of typed values. Cannot be specified with "
@@ -144,7 +192,8 @@ ABSL_FLAG(std::string, input_validator_expr, "",
 ABSL_FLAG(std::string, input_validator_path, "",
           "Path to a file containing DSLX for an input validator as with "
           "the `--input_validator` flag.");
-ABSL_FLAG(std::string, dslx_stdlib_path, xls::kDefaultDslxStdlibPath,
+ABSL_FLAG(std::string, dslx_stdlib_path,
+          std::string(xls::kDefaultDslxStdlibPath),
           "Path to DSLX standard library");
 ABSL_FLAG(std::string, dslx_path, "",
           "Additional paths to search for modules (colon delimited).");
@@ -158,12 +207,27 @@ ABSL_FLAG(
     "force mismatches between JIT and interpreter for testing purposed.");
 // LINT.ThenChange(//xls/build_rules/xls_ir_rules.bzl)
 
-ABSL_FLAG(std::optional<std::string>, llvm_jit_ir_output, std::nullopt,
-          "Path to write the (unoptimized) LLVM IR which the JIT generates.");
-ABSL_FLAG(std::optional<std::string>, llvm_jit_opt_ir_output, std::nullopt,
-          "Path to write the (optimized) LLVM IR which the JIT generates.");
-ABSL_FLAG(std::optional<std::string>, llvm_jit_asm_output, std::nullopt,
-          "Path to write the assembly code which the JIT generates.");
+// TODO(allight): It might be nice to allow one to specify these in build files.
+// Right now if you want this report you need to run eval_ir_main on the command
+// line. Being able to use generate it with a xls_eval_ir_test target could
+// conceivably be useful.
+ABSL_FLAG(std::optional<std::string>, output_node_coverage_stats_proto,
+          std::nullopt,
+          "File to write a (binary) NodeCoverageStatsProto showing which bits "
+          "in the run were actually set for each node.");
+// TODO(allight): It might be nice to allow one to specify these in build files.
+ABSL_FLAG(std::optional<std::string>, output_node_coverage_stats_textproto,
+          std::nullopt,
+          "File to write a (text) NodeCoverageStatsProto showing which bits "
+          "in the run were actually set for each node.");
+
+// TODO(allight): It would be nice to enable doing this automatically if the
+// llvm jit code crashes or something.
+ABSL_FLAG(
+    bool, use_llvm_jit_interpreter, false,
+    "Instead of compiling jitted XLS ir code and executing it, compile it to "
+    "LLVM ir and then interpret the LLVM IR. --use_llvm_jit must be true. Use "
+    "--llvm_opt_level=0 if you want to execute the unoptimized llvm ir.");
 
 namespace xls {
 namespace {
@@ -171,7 +235,7 @@ namespace {
 // Name of the dummy package created to hold the validator function, if any.
 constexpr std::string_view kPackageName = "validator";
 
-// Excapsulates a set of arguments to pass to the function for evaluation and
+// Encapsulates a set of arguments to pass to the function for evaluation and
 // the expected result.
 struct ArgSet {
   std::vector<Value> args;
@@ -185,48 +249,126 @@ std::string ArgsToString(absl::Span<const Value> args) {
 
 class EvalIrJitObserver final : public JitObserver {
  public:
-  EvalIrJitObserver(std::optional<std::string> ir,
-                    std::optional<std::string> opt_ir,
-                    std::optional<std::string> assembly)
-      : ir_(std::move(ir)),
-        opt_ir_(std::move(opt_ir)),
-        assembly_(std::move(assembly)) {}
+  explicit EvalIrJitObserver(bool interpreter) : interpreter_(interpreter) {}
+  std::string_view saved_opt_ir() const { return saved_opt_ir_; }
   JitObserverRequests GetNotificationOptions() const final {
-    return JitObserverRequests{.unoptimized_module = ir_.has_value(),
-                               .optimized_module = opt_ir_.has_value(),
-                               .assembly_code_str = assembly_.has_value()};
+    return JitObserverRequests{.unoptimized_module = false,
+                               .optimized_module = interpreter_,
+                               .assembly_code_str = false};
   }
 
-  void UnoptimizedModule(const llvm::Module* module) final {
-    if (ir_) {
-      std::string buffer;
-      llvm::raw_string_ostream ostream(buffer);
-      module->print(ostream, nullptr);
-      ostream.flush();
-      XLS_CHECK_OK(SetFileContents(*ir_, buffer));
-    }
-  }
   void OptimizedModule(const llvm::Module* module) final {
-    if (opt_ir_) {
-      std::string buffer;
-      llvm::raw_string_ostream ostream(buffer);
+    if (interpreter_) {
+      llvm::raw_string_ostream ostream(saved_opt_ir_);
       module->print(ostream, nullptr);
       ostream.flush();
-      XLS_CHECK_OK(SetFileContents(*opt_ir_, buffer));
-    }
-  }
-  void AssemblyCodeString(const llvm::Module* module,
-                          std::string_view asm_code) final {
-    if (assembly_) {
-      XLS_CHECK_OK(SetFileContents(*assembly_, asm_code));
     }
   }
 
  private:
-  std::optional<std::filesystem::path> ir_;
-  std::optional<std::filesystem::path> opt_ir_;
-  std::optional<std::filesystem::path> assembly_;
+  bool interpreter_;
+  std::string saved_opt_ir_;
 };
+
+absl::StatusOr<InterpreterResult<Value>> RunLlvmInterpreter(
+    Function* xls_function, std::string_view llvm_ir, FunctionJit* jit,
+    absl::Span<const Value> args) {
+  llvm::SMDiagnostic diag;
+  llvm::LLVMContext ctx;
+  std::string ir_id =
+      absl::StrFormat("in-memory-data-for-%s", jit->GetJittedFunctionName());
+  std::unique_ptr<llvm::Module> mod(
+      llvm::parseIR(llvm::MemoryBufferRef(llvm_ir, ir_id), diag, ctx));
+
+  if (mod == nullptr) {
+    std::string buffer;
+    llvm::raw_string_ostream ostream(buffer);
+    diag.print("eval_ir_main___llvm_jit_interpreter", ostream,
+               /*ShowColors=*/false);
+    ostream.flush();
+    return absl::InternalError(absl::StrFormat(
+        "Failed to initialize llvm interpreter. Error was:\n%s", buffer));
+  }
+
+  std::string error;
+  llvm::EngineBuilder builder(std::move(mod));
+  // Whole point is to use an interpreter.
+  builder.setEngineKind(llvm::EngineKind::Interpreter);
+  builder.setVerifyModules(true);
+  // Don't mess with the module code we give llvm, we've already compiled it.
+  builder.setOptLevel(llvm::CodeGenOptLevel::None);
+  builder.setErrorStr(&error);
+
+  std::unique_ptr<llvm::ExecutionEngine> exec(builder.create());
+
+  XLS_RET_CHECK(exec != nullptr)
+      << "Failed to create llvm execution engine. Error was\n"
+      << error;
+
+  // Really don't compile anything!
+  exec->DisableLazyCompilation();
+
+  llvm::Function* function =
+      exec->FindFunctionNamed(jit->GetJittedFunctionName());
+  XLS_RET_CHECK(function != nullptr)
+      << "Unable to find function named \"" << jit->GetJittedFunctionName()
+      << "\" in module code\n"
+      << llvm_ir;
+
+  InterpreterEvents events;
+  // Turn values into llvm values.
+  // TODO(allight): Deduplicate with FunctionJit::Run
+  std::vector<Type*> arg_types;
+  arg_types.reserve(args.size());
+  absl::c_transform(xls_function->params(), std::back_inserter(arg_types),
+                    [](const Param* p) { return p->GetType(); });
+  JitTempBuffer temp_buffer(jit->jitted_function_base().CreateTempBuffer());
+  std::unique_ptr<JitArgumentSet> input_set(
+      jit->jitted_function_base().CreateInputBuffer());
+  std::unique_ptr<JitArgumentSet> output_set(
+      jit->jitted_function_base().CreateOutputBuffer());
+  XLS_RETURN_IF_ERROR(jit->runtime()->PackArgs(
+      args, arg_types, input_set->get_element_pointers()))
+      << "Unable to pack arguments.";
+  std::vector<llvm::GenericValue> llvm_arg_values(7);
+  // input_ptrs
+  llvm_arg_values[0].PointerVal =
+      absl::bit_cast<void*>(input_set->get_base_pointer());
+  // output_ptrs
+  llvm_arg_values[1].PointerVal =
+      absl::bit_cast<void*>(output_set->get_base_pointer());
+  // tmp_buffer
+  llvm_arg_values[2].PointerVal = temp_buffer.get_base_pointer();
+  // events
+  llvm_arg_values[3].PointerVal = &events;
+  // user_data
+  llvm_arg_values[4].PointerVal = nullptr;
+  // runtime
+  llvm_arg_values[5].PointerVal = jit->runtime();
+  // continuation. This is a function so always 0.
+  llvm_arg_values[6].IntVal =
+      llvm::APInt(/*numBits=*/64, /*val=*/0, /*isSigned=*/true);
+
+  // Run Static constructors (probably not really needed since our code doesn't
+  // have any but might as well be future proof).
+  exec->runStaticConstructorsDestructors(/*isDtors=*/false);
+  // Run the interpreter
+  // TODO(allight): It would be nice to have some better back tracing support
+  // here since the interpreter has a pretty easy to read stack structure but
+  // its private. Getting it while running this under gdb isn't that bad at
+  // least.
+  llvm::GenericValue result = exec->runFunction(function, llvm_arg_values);
+  XLS_RET_CHECK_EQ(result.IntVal.getZExtValue(), 0)
+      << "Function returned non-zero?";
+  if (exec->hasError()) {
+    return absl::InternalError(exec->getErrorMessage());
+  }
+
+  Value result_value =
+      jit->runtime()->UnpackBuffer(output_set->get_element_pointers()[0],
+                                   xls_function->GetType()->return_type());
+  return InterpreterResult<Value>{std::move(result_value), std::move(events)};
+}
 
 // Evaluates the function with the given ArgSets. Returns an error if the result
 // does not match expectations (if any). 'actual_src' and 'expected_src' are
@@ -234,17 +376,18 @@ class EvalIrJitObserver final : public JitObserver {
 // results, respectively. These strings are included in error messages.
 absl::StatusOr<std::vector<Value>> Eval(
     Function* f, absl::Span<const ArgSet> arg_sets, bool use_jit,
+    std::optional<EvaluationObserver*> eval_observer = std::nullopt,
     std::string_view actual_src = "actual",
     std::string_view expected_src = "expected") {
-  EvalIrJitObserver observer(absl::GetFlag(FLAGS_llvm_jit_ir_output),
-                             absl::GetFlag(FLAGS_llvm_jit_opt_ir_output),
-                             absl::GetFlag(FLAGS_llvm_jit_asm_output));
+  EvalIrJitObserver observer(absl::GetFlag(FLAGS_use_llvm_jit_interpreter));
   std::unique_ptr<FunctionJit> jit;
   if (use_jit) {
     // No support for procs yet.
     XLS_ASSIGN_OR_RETURN(
-        jit,
-        FunctionJit::Create(f, absl::GetFlag(FLAGS_llvm_opt_level), &observer));
+        jit, FunctionJit::Create(
+                 f, absl::GetFlag(FLAGS_llvm_opt_level),
+                 /*include_observer_callbacks=*/eval_observer.has_value(),
+                 &observer));
   }
 
   std::vector<Value> results;
@@ -252,8 +395,27 @@ absl::StatusOr<std::vector<Value>> Eval(
     Value result;
     if (use_jit) {
       if (absl::GetFlag(FLAGS_test_only_inject_jit_result).empty()) {
-        XLS_ASSIGN_OR_RETURN(result,
-                             DropInterpreterEvents(jit->Run(arg_set.args)));
+        if (absl::GetFlag(FLAGS_use_llvm_jit_interpreter)) {
+          XLS_RET_CHECK(!eval_observer)
+              << "Observer not supported with llvm interpreter.";
+          XLS_ASSIGN_OR_RETURN(result, DropInterpreterEvents(RunLlvmInterpreter(
+                                           f, observer.saved_opt_ir(),
+                                           jit.get(), arg_set.args)));
+        } else {
+          std::optional<RuntimeEvaluationObserverAdapter> adapt;
+          if (eval_observer) {
+            adapt.emplace(
+                eval_observer.value(),
+                [](int64_t v) -> Node* {
+                  return reinterpret_cast<Node*>(static_cast<intptr_t>(v));
+                },
+                jit->runtime());
+            XLS_RETURN_IF_ERROR(jit->SetRuntimeObserver(&adapt.value()));
+          }
+          XLS_ASSIGN_OR_RETURN(result,
+                               DropInterpreterEvents(jit->Run(arg_set.args)));
+          jit->ClearRuntimeObserver();
+        }
       } else {
         XLS_ASSIGN_OR_RETURN(result, Parser::ParseTypedValue(absl::GetFlag(
                                          FLAGS_test_only_inject_jit_result)));
@@ -263,10 +425,10 @@ absl::StatusOr<std::vector<Value>> Eval(
       // resulting events once the JIT fully supports events. Note: This will
       // require rethinking some of the control flow because event comparison
       // only makes sense for certain modes (optimize_ir and test_llvm_jit).
-      XLS_ASSIGN_OR_RETURN(
-          result, DropInterpreterEvents(InterpretFunction(f, arg_set.args)));
+      XLS_ASSIGN_OR_RETURN(result, DropInterpreterEvents(InterpretFunction(
+                                       f, arg_set.args, eval_observer)));
     }
-    std::cout << result.ToString(FormatPreference::kHex) << std::endl;
+    std::cout << result.ToString(FormatPreference::kHex) << '\n';
 
     if (arg_set.expected.has_value()) {
       if (result != *arg_set.expected) {
@@ -289,19 +451,22 @@ class EvalInvariantChecker : public OptimizationInvariantChecker {
   explicit EvalInvariantChecker(absl::Span<const ArgSet> arg_sets, bool use_jit)
       : arg_sets_(arg_sets.begin(), arg_sets.end()), use_jit_(use_jit) {}
   absl::Status Run(Package* package, const OptimizationPassOptions& options,
-                   PassResults* results) const override {
-    if (results->invocations.empty()) {
+                   PassResults* results,
+                   OptimizationContext& context) const override {
+    if (results->total_invocations == 0) {
       std::cerr << "// Evaluating entry function at start of pipeline.\n";
     } else {
       std::cerr << "// Evaluating entry function after pass: "
-                << results->invocations.back().pass_name << "\n";
+                << results->GetLatestInvocation().pass_name << "\n";
     }
     XLS_ASSIGN_OR_RETURN(Function * f, package->GetTopAsFunction());
-    std::string actual_src = "before optimizations";
     XLS_RETURN_IF_ERROR(Eval(f, arg_sets_, use_jit_,
-                             /*actual_src=*/results->invocations.empty()
+                             // Runs between passes don't give useful coverage
+                             // information.
+                             /*eval_observer=*/std::nullopt,
+                             /*actual_src=*/results->total_invocations == 0
                                  ? std::string("start of pipeline")
-                                 : results->invocations.back().pass_name,
+                                 : results->GetLatestInvocation().pass_name,
                              /*expected_src=*/"before optimizations")
                             .status());
     return absl::OkStatus();
@@ -317,29 +482,39 @@ class EvalInvariantChecker : public OptimizationInvariantChecker {
 // after optimizations.
 absl::Status Run(Package* package, absl::Span<const ArgSet> arg_sets_in) {
   XLS_ASSIGN_OR_RETURN(Function * f, package->GetTopAsFunction());
+  // TODO(allight): Use the specialized jit-abi coverage observer.
+  ScopedRecordNodeCoverage cov(
+      absl::GetFlag(FLAGS_output_node_coverage_stats_proto),
+      absl::GetFlag(FLAGS_output_node_coverage_stats_textproto));
   // Copy the input ArgSets because we want to write in expected values if they
   // do not exist.
   std::vector<ArgSet> arg_sets(arg_sets_in.begin(), arg_sets_in.end());
 
   if (absl::GetFlag(FLAGS_test_llvm_jit)) {
-    XLS_QCHECK(!absl::GetFlag(FLAGS_optimize_ir))
+    QCHECK(!absl::GetFlag(FLAGS_optimize_ir))
         << "Cannot specify both --test_llvm_jit and --optimize_ir";
-    XLS_ASSIGN_OR_RETURN(std::vector<Value> interpreter_results,
-                         Eval(f, arg_sets, /*use_jit=*/false));
+    XLS_ASSIGN_OR_RETURN(
+        std::vector<Value> interpreter_results,
+        Eval(f, arg_sets, /*use_jit=*/false, /*eval_observer=*/std::nullopt));
     for (int64_t i = 0; i < arg_sets.size(); ++i) {
-      XLS_QCHECK(!arg_sets[i].expected.has_value())
+      QCHECK(!arg_sets[i].expected.has_value())
           << "Cannot specify expected values when using --test_llvm_jit";
       arg_sets[i].expected = interpreter_results[i];
     }
-    return Eval(f, arg_sets, /*use_jit=*/true, "JIT", "interpreter").status();
+    XLS_RETURN_IF_ERROR(Eval(f, arg_sets, /*use_jit=*/true,
+                             /*eval_observer=*/cov.observer(), "JIT",
+                             "interpreter")
+                            .status());
+    return absl::OkStatus();
   }
 
   // Run the argsets through the IR before any optimizations. Write in the
   // results as the expected values if the expected value is not already
   // set. These expected values are used in any later evaluation after
   // optimizations.
-  XLS_ASSIGN_OR_RETURN(std::vector<Value> results,
-                       Eval(f, arg_sets, absl::GetFlag(FLAGS_use_llvm_jit)));
+  XLS_ASSIGN_OR_RETURN(
+      std::vector<Value> results,
+      Eval(f, arg_sets, absl::GetFlag(FLAGS_use_llvm_jit), cov.observer()));
   for (int64_t i = 0; i < arg_sets.size(); ++i) {
     if (!arg_sets[i].expected.has_value()) {
       arg_sets[i].expected = results[i];
@@ -357,11 +532,14 @@ absl::Status Run(Package* package, absl::Span<const ArgSet> arg_sets_in) {
           arg_sets, absl::GetFlag(FLAGS_use_llvm_jit));
     }
     PassResults results;
+    OptimizationContext context;
     XLS_RETURN_IF_ERROR(
-        pipeline->Run(package, OptimizationPassOptions(), &results).status());
+        pipeline->Run(package, OptimizationPassOptions(), &results, context)
+            .status());
 
     XLS_RETURN_IF_ERROR(Eval(f, arg_sets, absl::GetFlag(FLAGS_use_llvm_jit),
-                             "before optimizations", "after optimizations")
+                             cov.observer(), "after optimizations",
+                             "before optimizations")
                             .status());
   } else {
     XLS_RET_CHECK(!absl::GetFlag(FLAGS_eval_after_each_pass))
@@ -381,19 +559,34 @@ absl::StatusOr<ArgSet> ArgSetFromString(std::string_view args_string) {
   return arg_set;
 }
 
+absl::StatusOr<std::vector<ArgSet>> ArgSetsFromTestvector(
+    const testvector::SampleInputsProto& testvector) {
+  if (!testvector.has_function_args()) {
+    return absl::InvalidArgumentError("Expected function_args in testvector");
+  }
+  std::vector<ArgSet> arg_sets;
+  for (std::string_view arg_line : testvector.function_args().args()) {
+    XLS_ASSIGN_OR_RETURN(ArgSet arg_set, ArgSetFromString(arg_line));
+    arg_sets.push_back(arg_set);
+  }
+  return arg_sets;
+}
+
 // Converts the given DSLX validation function into IR.
 absl::StatusOr<std::unique_ptr<Package>> ConvertValidator(
     Function* f, std::string_view dslx_stdlib_path,
     absl::Span<const std::filesystem::path> dslx_paths,
     std::string_view validator_dslx) {
   dslx::ImportData import_data(dslx::CreateImportData(
-      std::string(dslx_stdlib_path), dslx_paths, dslx::kAllWarningsSet));
+      std::string(dslx_stdlib_path), dslx_paths, dslx::kDefaultWarningsSet,
+      std::make_unique<dslx::RealFilesystem>()));
   XLS_ASSIGN_OR_RETURN(dslx::TypecheckedModule module,
                        dslx::ParseAndTypecheck(validator_dslx, "fake_path",
                                                kPackageName, &import_data));
   XLS_ASSIGN_OR_RETURN(
-      std::unique_ptr<Package> package,
+      dslx::PackageConversionData data,
       dslx::ConvertModuleToPackage(module.module, &import_data, {}));
+  std::unique_ptr<Package> package = std::move(data).package;
   XLS_ASSIGN_OR_RETURN(std::string mangled_name,
                        dslx::MangleDslxName(kPackageName, kPackageName,
                                             dslx::CallingConvention::kTypical));
@@ -476,33 +669,46 @@ absl::Status RealMain(std::string_view input_path,
   XLS_ASSIGN_OR_RETURN(Function * f, package->GetTopAsFunction());
 
   std::vector<ArgSet> arg_sets;
-  if (!absl::GetFlag(FLAGS_input).empty()) {
-    XLS_QCHECK_EQ(absl::GetFlag(FLAGS_random_inputs), 0)
+  if (!absl::GetFlag(FLAGS_testvector_textproto).empty()) {
+    QCHECK_EQ(absl::GetFlag(FLAGS_random_inputs), 0)
+        << "Cannot specify both --testvector_textproto and --random_inputs";
+    QCHECK(absl::GetFlag(FLAGS_input_file).empty())
+        << "Cannot specify both --testvector_textproto and --input_file";
+    xls::testvector::SampleInputsProto data;
+    QCHECK_OK(xls::ParseTextProtoFile(absl::GetFlag(FLAGS_testvector_textproto),
+                                      &data));
+    auto arg_sets_status = ArgSetsFromTestvector(data);
+    QCHECK_OK(arg_sets_status.status())
+        << "Failed to parse testvector "
+        << absl::GetFlag(FLAGS_testvector_textproto);
+    arg_sets = arg_sets_status.value();
+  } else if (!absl::GetFlag(FLAGS_input).empty()) {
+    QCHECK_EQ(absl::GetFlag(FLAGS_random_inputs), 0)
         << "Cannot specify both --input and --random_inputs";
-    XLS_QCHECK(absl::GetFlag(FLAGS_input_file).empty())
+    QCHECK(absl::GetFlag(FLAGS_input_file).empty())
         << "Cannot specify both --input and --input_file";
     absl::StatusOr<ArgSet> arg_set_status =
         ArgSetFromString(absl::GetFlag(FLAGS_input));
-    XLS_QCHECK_OK(arg_set_status.status())
+    QCHECK_OK(arg_set_status.status())
         << "Failed to parse input: " << absl::GetFlag(FLAGS_input);
 
     arg_sets.push_back(arg_set_status.value());
   } else if (!absl::GetFlag(FLAGS_input_file).empty()) {
-    XLS_QCHECK_EQ(absl::GetFlag(FLAGS_random_inputs), 0)
+    QCHECK_EQ(absl::GetFlag(FLAGS_random_inputs), 0)
         << "Cannot specify both --input_file and --random_inputs";
     absl::StatusOr<std::string> args_input_file =
         GetFileContents(absl::GetFlag(FLAGS_input_file));
-    XLS_QCHECK_OK(args_input_file.status());
+    QCHECK_OK(args_input_file.status());
     for (const auto& arg_line : absl::StrSplit(args_input_file.value(), '\n',
                                                absl::SkipWhitespace())) {
       absl::StatusOr<ArgSet> arg_set_status = ArgSetFromString(arg_line);
-      XLS_QCHECK_OK(arg_set_status.status())
+      QCHECK_OK(arg_set_status.status())
           << absl::StreamFormat("Invalid line in input file %s: %s",
                                 absl::GetFlag(FLAGS_input_file), arg_line);
       arg_sets.push_back(arg_set_status.value());
     }
   } else {
-    XLS_QCHECK_NE(absl::GetFlag(FLAGS_random_inputs), 0)
+    QCHECK_NE(absl::GetFlag(FLAGS_random_inputs), 0)
         << "Must specify --input, --input_file, or --random_inputs.";
     arg_sets.resize(absl::GetFlag(FLAGS_random_inputs));
     std::minstd_rand rng_engine;
@@ -531,11 +737,11 @@ absl::Status RealMain(std::string_view input_path,
   }
 
   if (!absl::GetFlag(FLAGS_expected).empty()) {
-    XLS_QCHECK(absl::GetFlag(FLAGS_expected_file).empty())
+    QCHECK(absl::GetFlag(FLAGS_expected_file).empty())
         << "Cannot specify both --expected_file and --expected";
     absl::StatusOr<Value> expected_status =
         Parser::ParseTypedValue(absl::GetFlag(FLAGS_expected));
-    XLS_QCHECK_OK(expected_status.status())
+    QCHECK_OK(expected_status.status())
         << "Failed to parse expected value: " << absl::GetFlag(FLAGS_expected);
     // Set the expected value of every sample to 'expected'.
     for (ArgSet& arg_set : arg_sets) {
@@ -544,18 +750,18 @@ absl::Status RealMain(std::string_view input_path,
   } else if (!absl::GetFlag(FLAGS_expected_file).empty()) {
     absl::StatusOr<std::string> expected_file =
         GetFileContents(absl::GetFlag(FLAGS_expected_file));
-    XLS_QCHECK_OK(expected_file.status());
+    QCHECK_OK(expected_file.status());
     std::vector<Value> expecteds;
     for (const auto& expected_line :
          absl::StrSplit(expected_file.value(), '\n', absl::SkipWhitespace())) {
       absl::StatusOr<Value> expected_status =
           Parser::ParseTypedValue(expected_line);
-      XLS_QCHECK_OK(expected_status.status())
+      QCHECK_OK(expected_status.status())
           << absl::StreamFormat("Failed to parse line in expected file %s: %s",
                                 expected_line, expected_line);
       expecteds.push_back(expected_status.value());
     }
-    XLS_QCHECK_EQ(expecteds.size(), arg_sets.size())
+    QCHECK_EQ(expecteds.size(), arg_sets.size())
         << "Number of values in expected file does not match the number of "
            "inputs.";
     for (int64_t i = 0; i < arg_sets.size(); ++i) {
@@ -573,11 +779,11 @@ int main(int argc, char** argv) {
   std::vector<std::string_view> positional_arguments =
       xls::InitXls(kUsage, argc, argv);
   if (positional_arguments.empty()) {
-    XLS_LOG(QFATAL) << absl::StreamFormat("Expected invocation: %s <ir-path>",
-                                          argv[0]);
+    LOG(QFATAL) << absl::StreamFormat("Expected invocation: %s <ir-path>",
+                                      argv[0]);
   }
-  XLS_QCHECK(absl::GetFlag(FLAGS_input_validator_expr).empty() ||
-             absl::GetFlag(FLAGS_input_validator_path).empty())
+  QCHECK(absl::GetFlag(FLAGS_input_validator_expr).empty() ||
+         absl::GetFlag(FLAGS_input_validator_path).empty())
       << "At most one one of 'input_validator' or 'input_validator_path' may "
          "be specified.";
   std::string dslx_stdlib_path = absl::GetFlag(FLAGS_dslx_stdlib_path);

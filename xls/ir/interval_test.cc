@@ -23,13 +23,14 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "fuzztest/fuzztest.h"
+#include "xls/common/fuzzing/fuzztest.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/types/span.h"
 #include "xls/common/status/matchers.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
-#include "xls/ir/interval_test_helpers.h"
+#include "xls/ir/bits_test_utils.h"
+#include "xls/ir/interval_test_utils.h"
 
 using ::testing::ElementsAre;
 using ::testing::Optional;
@@ -373,24 +374,15 @@ TEST(IntervalTest, NonZeroStartingValueIsTrueWhenMaskWith) {
 
 // Test the IsTrueWhenMaskWith with an interval starting at zero.
 TEST(IntervalTest, ZeroStartingValueIsTrueWhenMaskWith) {
-  Interval interval(UBits(0, 3), UBits(4, 3));
+  Interval interval(UBits(0, 4), UBits(4, 4));
 
-  EXPECT_FALSE(interval.IsTrueWhenAndWith(UBits(0, 3)));
-  EXPECT_FALSE(interval.IsTrueWhenAndWith(UBits(1, 3)));
-  EXPECT_FALSE(interval.IsTrueWhenAndWith(UBits(2, 3)));
-  EXPECT_FALSE(interval.IsTrueWhenAndWith(UBits(3, 3)));
-  EXPECT_TRUE(interval.IsTrueWhenAndWith(UBits(4, 3)));
-  EXPECT_TRUE(interval.IsTrueWhenAndWith(UBits(5, 3)));
-  EXPECT_TRUE(interval.IsTrueWhenAndWith(UBits(6, 3)));
-  EXPECT_TRUE(interval.IsTrueWhenAndWith(UBits(7, 3)));
-}
-
-// Test the IsTrueWhenMaskWith with an interval that does not overlap.
-TEST(IntervalTest, NoOverlappingIntervalIsTrueWhenMaskWith) {
-  Interval interval(UBits(4, 3), UBits(0, 3));
-
-  for (int64_t value = 0; value < 8; ++value) {
-    EXPECT_FALSE(interval.IsTrueWhenAndWith(UBits(value, 3)));
+  EXPECT_FALSE(interval.IsTrueWhenAndWith(UBits(0, 4)));
+  for (int64_t value = 1; value < 7; ++value) {
+    EXPECT_TRUE(interval.IsTrueWhenAndWith(UBits(value, 4)));
+  }
+  EXPECT_FALSE(interval.IsTrueWhenAndWith(UBits(8, 4)));
+  for (int64_t value = 9; value < 16; ++value) {
+    EXPECT_TRUE(interval.IsTrueWhenAndWith(UBits(value, 4)));
   }
 }
 
@@ -404,6 +396,27 @@ TEST(IntervalTest, OverlappingBitsIsTrueWhenMaskWith) {
     EXPECT_TRUE(interval.IsTrueWhenAndWith(UBits(value, 3)));
   }
 }
+
+// Test the IsTrueWhenMaskWith with an interval containing overlapping bits, but
+// not overlapping for every bit at the ends of the interval.
+TEST(IntervalTest, OverlappingBitsIsTrueWhenMaskWith2) {
+  Interval interval(UBits(2, 3), UBits(6, 3));
+
+  EXPECT_FALSE(interval.IsTrueWhenAndWith(UBits(0, 3)));
+  for (int64_t value = 1; value < 8; ++value) {
+    EXPECT_TRUE(interval.IsTrueWhenAndWith(UBits(value, 3)))
+        << "didn't match with value: " << value;
+  }
+}
+
+void IsTrueWhenAndWith(const Interval& interval, const Bits& value) {
+  EXPECT_EQ(interval.IsTrueWhenAndWith(value),
+            interval.ForEachElement([&](const Bits& bits) -> bool {
+              return bits_ops::OrReduce(bits_ops::And(bits, value)).IsAllOnes();
+            }));
+}
+FUZZ_TEST(IntervalFuzzTest, IsTrueWhenAndWith)
+    .WithDomains(ProperInterval(12), ArbitraryBits(12));
 
 TEST(IntervalTest, Covers) {
   Bits thirty_two = Bits::PowerOfTwo(5, 12);
@@ -468,6 +481,17 @@ TEST(IntervalTest, ZeroExtend) {
   EXPECT_EQ(original.ToString(), "[4, 16]");
   EXPECT_EQ(extended.ToString(), "[4, 16]");
   EXPECT_EQ(extended.BitCount(), 30);
+}
+
+TEST(IntervalTest, IterMaximalImproper) {
+  Interval interval(UBits(2, 2), UBits(1, 2));
+  EXPECT_THAT(interval.Elements(),
+              ElementsAre(UBits(2, 2), UBits(3, 2), UBits(0, 2), UBits(1, 2)));
+}
+
+TEST(IntervalTest, IterSingleElement) {
+  Interval interval(UBits(2, 20), UBits(2, 20));
+  EXPECT_THAT(interval.Elements(), ElementsAre(UBits(2, 20)));
 }
 
 }  // namespace

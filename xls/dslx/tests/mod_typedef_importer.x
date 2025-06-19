@@ -12,20 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import xls.dslx.tests.mod_imported_aliases
+import xls.dslx.tests.mod_imported_aliases;
 
 type MyEnum = mod_imported_aliases::MyEnumAlias;
 type MyStruct = mod_imported_aliases::MyStructAlias;
 type MyTuple = mod_imported_aliases::MyTupleAlias;
 
 fn main(x: u8) -> MyTuple {
-  let me: MyEnum = x as MyEnum;
-  (MyStruct { me: me }, MyEnum::FOO)
+    let me: MyEnum = x as MyEnum;
+    (MyStruct { me }, MyEnum::FOO)
 }
 
 #[test]
 fn main_test() {
-  let (ms, me): (MyStruct, MyEnum) = main(u8:64);
-  assert_eq(MyEnum::BAR, ms.me);
-  assert_eq(MyEnum::FOO, me)
+    let (ms, me): (MyStruct, MyEnum) = main(u8:64);
+    assert_eq(MyEnum::BAR, ms.me);
+    assert_eq(MyEnum::FOO, me)
 }

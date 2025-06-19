@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_IR_VISUALIZATION_IR_TO_JSON_H_
-#define XLS_IR_VISUALIZATION_IR_TO_JSON_H_
+#ifndef XLS_VISUALIZATION_IR_VIZ_IR_TO_JSON_H_
+#define XLS_VISUALIZATION_IR_VIZ_IR_TO_JSON_H_
 
 #include <optional>
 #include <string>
 #include <string_view>
 
 #include "absl/status/statusor.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
+#include "xls/ir/package.h"
 #include "xls/scheduling/pipeline_schedule.h"
 
 namespace xls {
@@ -32,11 +34,6 @@ absl::StatusOr<std::string> IrToJson(
     const PipelineSchedule* schedule = nullptr,
     std::optional<std::string_view> entry_name = std::nullopt);
 
-// Return the IR text of the given package with HTML mark up. Various IR
-// constructs are wrapped in spans. This function is exposed only for testing as
-// the marked up IR is generally available in the JSON produced by IrToJson.
-absl::StatusOr<std::string> MarkUpIrText(Package* package);
-
 }  // namespace xls
 
-#endif  // XLS_IR_VISUALIZATION_IR_TO_JSON_H_
+#endif  // XLS_VISUALIZATION_IR_VIZ_IR_TO_JSON_H_

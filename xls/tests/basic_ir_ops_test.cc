@@ -13,30 +13,31 @@
 // limitations under the License.
 
 #include <bitset>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/log/log.h"
 #include "absl/strings/substitute.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
-#include "xls/ir/function.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_test_base.h"
 #include "xls/ir/package.h"
+#include "xls/ir/value.h"
+#include "xls/simulation/sim_test_base.h"
 
 namespace xls {
 namespace {
 
 // Simple tests of arithmetic, logical, and bit twiddling IR operations which
 // operate on Bits types.
-class BasicOpsTest : public IrTestBase {};
+class BasicOpsTest : public SimTestBase {};
 
 TEST_F(BasicOpsTest, LogicalNot) {
   std::string text = R"(
@@ -275,8 +276,8 @@ top fn main(x: bits[3]) -> bits[4] {
       {0b111, 0b0100},
   };
   for (auto example : examples) {
-    XLS_LOG(INFO) << "Example: " << example.input << " = "
-                  << std::bitset<32>(example.input);
+    LOG(INFO) << "Example: " << example.input << " = "
+              << std::bitset<32>(example.input);
     RunAndExpectEq({{"x", example.input}}, example.output, text);
   }
 }
@@ -363,7 +364,7 @@ TEST_F(BasicOpsTest, Clz) {
       {0b011, 1},
   };
   for (auto example : examples) {
-    XLS_LOG(INFO) << "Example: " << example.input;
+    LOG(INFO) << "Example: " << example.input;
     RunAndExpectEq({{"x", example.input}}, example.output, text);
   }
 }
@@ -394,8 +395,8 @@ top fn main(x: bits[8]) -> bits[27] {
 
   RunAndExpectEq({{"x", 0}}, 1, text);
   RunAndExpectEq({{"x", 1}}, 2, text);
-  RunAndExpectEq({{"x", 17}}, (1LL << 17), text);
-  RunAndExpectEq({{"x", 26}}, (1LL << 26), text);
+  RunAndExpectEq({{"x", 17}}, (int64_t{1} << 17), text);
+  RunAndExpectEq({{"x", 26}}, (int64_t{1} << 26), text);
   RunAndExpectEq({{"x", 27}}, 0, text);
   RunAndExpectEq({{"x", 123}}, 0, text);
   RunAndExpectEq({{"x", 255}}, 0, text);

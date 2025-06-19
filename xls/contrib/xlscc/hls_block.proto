@@ -16,11 +16,13 @@ syntax = "proto3";
 
 package xlscc;
 
+import "xls/ir/channel.proto";
+
 enum ChannelType {
-  INVALID = 0;
-  DIRECT_IN = 1;
-  FIFO = 2;
-  MEMORY = 3;
+  CHANNEL_TYPE_UNSPECIFIED = 0;
+  CHANNEL_TYPE_DIRECT_IN = 1;
+  CHANNEL_TYPE_FIFO = 2;
+  CHANNEL_TYPE_MEMORY = 3;
 }
 
 message HLSChannel {
@@ -29,6 +31,7 @@ message HLSChannel {
   optional ChannelType type = 3;
   optional int32 width_in_bits = 4;
   optional int32 depth = 5;  // For memories
+  optional xls.FlopKindProto flop_kind = 6;
 }
 
 message HLSBlock {

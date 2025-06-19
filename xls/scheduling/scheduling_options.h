@@ -23,9 +23,14 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/ir/node.h"
+#include "xls/ir/package.h"
+#include "xls/passes/optimization_pass.h"
+#include "xls/tools/scheduling_options_flags.pb.h"
 
 namespace xls {
 
@@ -177,10 +182,64 @@ class SendThenRecvConstraint {
   int64_t minimum_latency_;
 };
 
+// When this is present, whenever we have a dependency between two operations on
+// the same channel, the dependent operation will always be scheduled at least
+// `MinimumLatency()` cycles later. This ensures that we don't try to execute
+// two operations on the same channel at the same time.
+class SameChannelConstraint {
+ public:
+  explicit SameChannelConstraint(int64_t minimum_latency)
+      : minimum_latency_(minimum_latency) {}
+
+  int64_t MinimumLatency() const { return minimum_latency_; }
+
+ private:
+  int64_t minimum_latency_;
+};
+
 using SchedulingConstraint =
     std::variant<IOConstraint, NodeInCycleConstraint, DifferenceConstraint,
                  RecvsFirstSendsLastConstraint, BackedgeConstraint,
-                 SendThenRecvConstraint>;
+                 SendThenRecvConstraint, SameChannelConstraint>;
+
+// Options for what the scheduler should do if scheduling fails.
+struct SchedulingFailureBehavior {
+  static SchedulingFailureBehavior FromProto(
+      const SchedulingFailureBehaviorProto& proto) {
+    SchedulingFailureBehavior failure_behavior;
+    failure_behavior.explain_infeasibility = proto.explain_infeasibility();
+    if (proto.has_infeasible_per_state_backedge_slack_pool()) {
+      failure_behavior.infeasible_per_state_backedge_slack_pool =
+          proto.infeasible_per_state_backedge_slack_pool();
+    }
+    return failure_behavior;
+  }
+  SchedulingFailureBehaviorProto ToProto() const {
+    SchedulingFailureBehaviorProto proto;
+    proto.set_explain_infeasibility(explain_infeasibility);
+    if (infeasible_per_state_backedge_slack_pool.has_value()) {
+      proto.set_infeasible_per_state_backedge_slack_pool(
+          *infeasible_per_state_backedge_slack_pool);
+    }
+    return proto;
+  }
+
+  // If scheduling fails, re-run scheduling with extra slack variables in an
+  // attempt to explain why scheduling failed.
+  bool explain_infeasibility = true;
+
+  // If specified, the specified value must be > 0. Setting this configures how
+  // the scheduling problem is reformulated in the case that it fails. If
+  // specified, this value will cause the reformulated problem to include
+  // per-state backedge slack variables, which increases the complexity. This
+  // value scales the objective such that adding slack to the per-state backedge
+  // is preferred up until total slack reaches the pool size, after which adding
+  // slack to the shared backedge slack variable is preferred. Increasing this
+  // value should give more specific information about how much slack each
+  // failing backedge needs at the cost of less actionable and harder to
+  // understand output.
+  std::optional<double> infeasible_per_state_backedge_slack_pool;
+};
 
 // Options to use when generating a pipeline schedule. At least a clock period
 // or a pipeline length (or both) must be specified. See
@@ -190,20 +249,33 @@ class SchedulingOptions {
   explicit SchedulingOptions(
       SchedulingStrategy strategy = SchedulingStrategy::SDC)
       : strategy_(strategy),
+        opt_level_(kMaxOptLevel),
         minimize_clock_on_failure_(true),
-        constraints_({BackedgeConstraint(),
-                      SendThenRecvConstraint(/*minimum_latency=*/1)}),
+        recover_after_minimizing_clock_(false),
+        minimize_worst_case_throughput_(false),
+        constraints_({
+            BackedgeConstraint(),
+            SendThenRecvConstraint(/*minimum_latency=*/1),
+            SameChannelConstraint(/*minimum_latency=*/1),
+        }),
         use_fdo_(false),
         fdo_iteration_number_(5),
         fdo_delay_driven_path_number_(1),
         fdo_fanout_driven_path_number_(0),
         fdo_refinement_stochastic_ratio_(1.0),
         fdo_path_evaluate_strategy_(PathEvaluateStrategy::WINDOW),
-        fdo_synthesizer_name_("yosys")
-        {}
+        fdo_synthesizer_name_("yosys"),
+        schedule_all_procs_(false) {}
 
   // Returns the scheduling strategy.
   SchedulingStrategy strategy() const { return strategy_; }
+
+  // Sets/gets the target delay model
+  SchedulingOptions& opt_level(int64_t value) {
+    opt_level_ = value;
+    return *this;
+  }
+  int64_t opt_level() const { return opt_level_; }
 
   // Sets/gets the target delay model
   SchedulingOptions& delay_model(std::string& value) {
@@ -258,6 +330,26 @@ class SchedulingOptions {
     return minimize_clock_on_failure_;
   }
 
+  // Sets/gets whether to fall back to the fastest feasible clock if scheduling
+  // is infeasible at the user's specified clock.
+  SchedulingOptions& recover_after_minimizing_clock(bool value) {
+    recover_after_minimizing_clock_ = value;
+    return *this;
+  }
+  std::optional<bool> recover_after_minimizing_clock() const {
+    return recover_after_minimizing_clock_;
+  }
+
+  // Sets/gets whether to find the fastest feasible worst-case throughput if the
+  // user has not specified a worst-case throughput bound.
+  SchedulingOptions& minimize_worst_case_throughput(bool value) {
+    minimize_worst_case_throughput_ = value;
+    return *this;
+  }
+  std::optional<bool> minimize_worst_case_throughput() const {
+    return minimize_worst_case_throughput_;
+  }
+
   // Sets/gets the worst-case throughput bound to use when scheduling; for
   // procs, controls the length of state backedges allowed in scheduling.
   SchedulingOptions& worst_case_throughput(int64_t value) {
@@ -268,7 +360,19 @@ class SchedulingOptions {
     return worst_case_throughput_;
   }
 
-  // Sets/gets the additional delay added to each receive node.
+  // Sets/gets the weight of the dynamic throughput objective for the SDC
+  // scheduler. Only relevant if worst-case throughput is set to a value != 1.
+  // std::nullopt disables the dynamic throughput objective.
+  SchedulingOptions& dynamic_throughput_objective_weight(
+      std::optional<double> value) {
+    dynamic_throughput_objective_weight_ = value;
+    return *this;
+  }
+  std::optional<double> dynamic_throughput_objective_weight() const {
+    return dynamic_throughput_objective_weight_;
+  }
+
+  // Sets/gets the additional delay added to each input.
   //
   // TODO(tedhong): 2022-02-11, Update so that this sets/gets the
   // additional delay added to each input path.
@@ -278,6 +382,15 @@ class SchedulingOptions {
   }
   std::optional<int64_t> additional_input_delay_ps() const {
     return additional_input_delay_ps_;
+  }
+
+  // Sets/gets the additional delay added to each output.
+  SchedulingOptions& additional_output_delay_ps(int64_t value) {
+    additional_output_delay_ps_ = value;
+    return *this;
+  }
+  std::optional<int64_t> additional_output_delay_ps() const {
+    return additional_output_delay_ps_;
   }
 
   // Set fallback estimation for ffi calls used in absence of more information.
@@ -316,6 +429,26 @@ class SchedulingOptions {
   }
   std::optional<int64_t> mutual_exclusion_z3_rlimit() const {
     return mutual_exclusion_z3_rlimit_;
+  }
+
+  // The rlimit used for default next-value omission optimization.
+  SchedulingOptions& default_next_value_z3_rlimit(int64_t value) {
+    default_next_value_z3_rlimit_ = value;
+    return *this;
+  }
+  std::optional<int64_t> default_next_value_z3_rlimit() const {
+    return default_next_value_z3_rlimit_;
+  }
+
+  // Struct that configures what should be done when scheduling fails. The
+  // scheduling problem can be reformulated to give actionable feedback on how
+  // to get a feasible schedule.
+  SchedulingOptions& failure_behavior(SchedulingFailureBehavior value) {
+    failure_behavior_ = value;
+    return *this;
+  }
+  SchedulingFailureBehavior failure_behavior() const {
+    return failure_behavior_;
   }
 
   // Enable FDO
@@ -368,8 +501,7 @@ class SchedulingOptions {
     } else if (value == "cone") {
       fdo_path_evaluate_strategy_ = PathEvaluateStrategy::CONE;
     } else {
-      XLS_CHECK_EQ(value, "window")
-          << "Unknown path evaluate strategy: " << value;
+      CHECK_EQ(value, "window") << "Unknown path evaluate strategy: " << value;
       fdo_path_evaluate_strategy_ = PathEvaluateStrategy::WINDOW;
     }
     return *this;
@@ -408,21 +540,49 @@ class SchedulingOptions {
     return fdo_synthesis_libraries_;
   }
 
+  // Cell to assume is driving primary inputs
+  SchedulingOptions& fdo_default_driver_cell(std::string_view value) {
+    fdo_default_driver_cell_ = value;
+    return *this;
+  }
+  std::string fdo_default_driver_cell() const {
+    return fdo_default_driver_cell_;
+  }
+
+  // Cell to assume is being driven by primary outputs
+  SchedulingOptions& fdo_default_load(std::string_view value) {
+    fdo_default_load_ = value;
+    return *this;
+  }
+  std::string fdo_default_load() const { return fdo_default_load_; }
+
+  SchedulingOptions& schedule_all_procs(bool value) {
+    schedule_all_procs_ = value;
+    return *this;
+  }
+  bool schedule_all_procs() const { return schedule_all_procs_; }
 
  private:
   SchedulingStrategy strategy_;
+  int64_t opt_level_;
   std::optional<int64_t> clock_period_ps_;
   std::optional<std::string> delay_model_;
   std::optional<int64_t> pipeline_stages_;
   std::optional<int64_t> clock_margin_percent_;
   std::optional<int64_t> period_relaxation_percent_;
   bool minimize_clock_on_failure_;
+  bool recover_after_minimizing_clock_;
+  bool minimize_worst_case_throughput_;
   std::optional<int64_t> worst_case_throughput_;
+  std::optional<double> dynamic_throughput_objective_weight_;
   std::optional<int64_t> additional_input_delay_ps_;
+  std::optional<int64_t> additional_output_delay_ps_;
   std::optional<int64_t> ffi_fallback_delay_ps_;
   std::vector<SchedulingConstraint> constraints_;
   std::optional<int32_t> seed_;
   std::optional<int64_t> mutual_exclusion_z3_rlimit_;
+  std::optional<int64_t> default_next_value_z3_rlimit_;
+  SchedulingFailureBehavior failure_behavior_;
   bool use_fdo_;
   int64_t fdo_iteration_number_;
   int64_t fdo_delay_driven_path_number_;
@@ -433,10 +593,21 @@ class SchedulingOptions {
   std::string fdo_yosys_path_;
   std::string fdo_sta_path_;
   std::string fdo_synthesis_libraries_;
+  std::string fdo_default_driver_cell_;
+  std::string fdo_default_load_;
+  bool schedule_all_procs_;
 };
 
 // A map from node to cycle as a bare-bones representation of a schedule.
 using ScheduleCycleMap = absl::flat_hash_map<Node*, int64_t>;
+
+absl::StatusOr<SchedulingOptions> SetUpSchedulingOptions(
+    const SchedulingOptionsFlagsProto& flags, Package* p);
+
+absl::StatusOr<DelayEstimator*> SetUpDelayEstimator(
+    const SchedulingOptionsFlagsProto& flags);
+absl::StatusOr<bool> IsDelayModelSpecifiedViaFlag(
+    const SchedulingOptionsFlagsProto& flags);
 
 }  // namespace xls
 

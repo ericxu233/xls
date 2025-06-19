@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Paramterized fixed and floating point fir filter
+// Parameterized fixed and floating point fir filter
 // implementations.  A fir filter, used in signal
 // processing, is essentially a convolution of a
 // filter of a series of samples.
 
-import std
-import float32
+import float32;
 
 type F32 = float32::F32;
 
@@ -29,16 +28,14 @@ pub fn fir_filter_fixed<NUM_TAPS:u32, NUM_SAMPLES:u32,
   -> s32[NUM_OUTPUTS] {
 
   // Convolve filter coefficients over sample array.
-  for(out_idx, fir_output): (u32, s32[NUM_OUTPUTS])
-    in range(u32:0, NUM_OUTPUTS) {
+  for(out_idx, fir_output): (u32, s32[NUM_OUTPUTS]) in u32:0..NUM_OUTPUTS {
 
     // Compute a single output datapoint.
     // There's probably a way to reuse dot-product here
     // (flatten sample array, bitslice, reverse, repack as array,
     // then pass to dot product?), but it seems like more
     // trouble than it's worth.
-    let point_output = for(tap_idx, acc): (u32, s32)
-      in range(u32:0, NUM_TAPS) {
+    let point_output = for(tap_idx, acc): (u32, s32) in u32:0..NUM_TAPS {
 
       let sample_idx = out_idx + NUM_TAPS - tap_idx - u32:1;
       let product = coefficients[tap_idx] * samples[sample_idx];
@@ -57,12 +54,10 @@ pub fn fir_filter_float32<NUM_TAPS:u32, NUM_SAMPLES:u32,
   -> F32[NUM_OUTPUTS] {
 
   // Convolve filter coefficients over sample array.
-  for(out_idx, fir_output): (u32, F32[NUM_OUTPUTS])
-    in range(u32:0, NUM_OUTPUTS) {
+  for(out_idx, fir_output): (u32, F32[NUM_OUTPUTS]) in u32:0..NUM_OUTPUTS {
 
     // Compute a single output datapoint.
-    let point_output = for(tap_idx, acc): (u32, F32)
-      in range(u32:0, NUM_TAPS) {
+    let point_output = for(tap_idx, acc): (u32, F32) in u32:0..NUM_TAPS {
 
       let sample_idx = out_idx + NUM_TAPS - tap_idx - u32:1;
       let product = float32::mul(coefficients[tap_idx],

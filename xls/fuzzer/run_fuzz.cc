@@ -22,8 +22,12 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include "absl/flags/declare.h"
+#include "absl/flags/flag.h"
+#include "absl/log/log.h"
 #include "absl/random/bit_gen_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -38,16 +42,19 @@
 #include "google/protobuf/text_format.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/get_runfile_path.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/stopwatch.h"
 #include "xls/common/subprocess.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/fuzzer/ast_generator.h"
 #include "xls/fuzzer/cpp_run_fuzz.h"
 #include "xls/fuzzer/sample.h"
 #include "xls/fuzzer/sample_generator.h"
 #include "xls/fuzzer/sample_runner.h"
 #include "xls/fuzzer/sample_summary.pb.h"
+
+ABSL_DECLARE_FLAG(int32_t, v);
+ABSL_DECLARE_FLAG(std::string, vmodule);
 
 namespace xls {
 
@@ -105,7 +112,7 @@ absl::Status WriteIrSummaries(const std::filesystem::path& run_dir,
                        GetXlsRunfilePath(kSummarizeIrMainPath));
   std::string timing_str;
   if (!google::protobuf::TextFormat::PrintToString(timing, &timing_str)) {
-    XLS_LOG(ERROR) << "Failed to serialize timing: " << timing.DebugString();
+    LOG(ERROR) << "Failed to serialize timing: " << timing.DebugString();
   }
   std::vector<std::string> argv = {
       summarize_ir_main_path,
@@ -133,7 +140,7 @@ absl::Status WriteIrSummaries(const std::filesystem::path& run_dir,
   absl::StatusOr<SubprocessResult> result =
       SubprocessErrorAsStatus(InvokeSubprocess(argv, /*cwd=*/run_dir));
   if (!result.ok()) {
-    XLS_LOG(ERROR) << "Failed to write IR summaries: " << result.status();
+    LOG(ERROR) << "Failed to write IR summaries: " << result.status();
   }
   return absl::OkStatus();
 }
@@ -150,7 +157,7 @@ absl::StatusOr<std::filesystem::path> SaveCrasher(
   std::string hex_digest = absl::BytesToHexString({digest.data(), 4});
 
   std::filesystem::path sample_crasher_dir = crasher_dir / hex_digest;
-  XLS_LOG(INFO) << "Saving crasher to " << sample_crasher_dir;
+  LOG(INFO) << "Saving crasher to " << sample_crasher_dir;
   // TODO(epastor): 2023-09-28 - Make sure this preserves permissions.
   std::filesystem::copy(run_dir, sample_crasher_dir,
                         std::filesystem::copy_options::recursive);
@@ -170,9 +177,10 @@ absl::StatusOr<std::filesystem::path> SaveCrasher(
 
 }  // namespace
 
-absl::Status RunSample(const Sample& smp, const std::filesystem::path& run_dir,
-                       const std::optional<std::filesystem::path>& summary_file,
-                       std::optional<absl::Duration> generate_sample_elapsed) {
+absl::StatusOr<CompletedSampleKind> RunSample(
+    const Sample& smp, const std::filesystem::path& run_dir,
+    const std::optional<std::filesystem::path>& summary_file,
+    std::optional<absl::Duration> generate_sample_elapsed) {
   XLS_ASSIGN_OR_RETURN(std::filesystem::path sample_runner_main_path,
                        GetXlsRunfilePath(kSampleRunnerMainPath));
 
@@ -182,50 +190,47 @@ absl::Status RunSample(const Sample& smp, const std::filesystem::path& run_dir,
       "--logtostderr",
   };
 
+  // Pass on verbosity flags if available.
+  if (int64_t verbosity = absl::GetFlag(FLAGS_v); verbosity > 0) {
+    argv.push_back(absl::StrCat("--v=", verbosity));
+  }
+  if (std::string vmodule = absl::GetFlag(FLAGS_vmodule); !vmodule.empty()) {
+    argv.push_back(absl::StrCat("--vmodule=", absl::GetFlag(FLAGS_vmodule)));
+  }
+
   std::filesystem::path sample_file_name = run_dir / "sample.x";
-  XLS_RETURN_IF_ERROR(
-      SetFileContents(run_dir / sample_file_name, smp.input_text()));
+  XLS_RETURN_IF_ERROR(SetFileContents(sample_file_name, smp.input_text()));
   argv.push_back("--input_file=sample.x");
 
   std::filesystem::path options_file_name = run_dir / "options.pbtxt";
   XLS_RETURN_IF_ERROR(
-      SetFileContents(run_dir / options_file_name, smp.options().ToPbtxt()));
+      SetTextProtoFile(options_file_name, smp.options().proto()));
   argv.push_back("--options_file=options.pbtxt");
 
-  std::filesystem::path args_file_name = run_dir / "args.txt";
-  XLS_RETURN_IF_ERROR(SetFileContents(run_dir / args_file_name,
-                                      ArgsBatchToText(smp.args_batch())));
-  argv.push_back("--args_file=args.txt");
+  std::filesystem::path testvector_path = run_dir / "testvector.pbtxt";
+  XLS_RETURN_IF_ERROR(SetTextProtoFile(testvector_path, smp.testvector()));
+  argv.push_back("--testvector_textproto=testvector.pbtxt");
 
-  std::optional<std::filesystem::path> ir_channel_names_file_name =
-      std::nullopt;
-  if (!smp.ir_channel_names().empty()) {
-    ir_channel_names_file_name = run_dir / "ir_channel_names.txt";
-    XLS_RETURN_IF_ERROR(
-        SetFileContents(run_dir / *ir_channel_names_file_name,
-                        IrChannelNamesToText(smp.ir_channel_names())));
-    argv.push_back("--ir_channel_names_file=ir_channel_names.txt");
-  }
-
-  argv.push_back(run_dir.string());
+  argv.push_back("\"$RUNDIR\"");
 
   std::filesystem::path run_script_path = run_dir / "run.sh";
   XLS_RETURN_IF_ERROR(
-      SetFileContents(run_script_path, absl::StrFormat(R"(#!/bin/sh
-
-{ %s }
-)",
+      SetFileContents(run_script_path, absl::StrFormat(R"""(#!/bin/sh
+RUNDIR=`dirname $0`
+cd "$RUNDIR"
+%s "$@"
+)""",
                                                        ArgvToCmdline(argv))));
   std::filesystem::permissions(run_script_path,
                                std::filesystem::perms::owner_exec,
                                std::filesystem::perm_options::add);
 
-  XLS_VLOG(1) << "Starting to run sample";
-  XLS_VLOG(2) << smp.input_text();
+  VLOG(1) << "Starting to run sample";
+  VLOG(2) << smp.input_text();
   SampleRunner runner(run_dir);
-  XLS_RETURN_IF_ERROR(runner.RunFromFiles(sample_file_name, options_file_name,
-                                          args_file_name,
-                                          ir_channel_names_file_name));
+  XLS_ASSIGN_OR_RETURN(auto fuzz_result,
+                       runner.RunFromFiles(sample_file_name, options_file_name,
+                                           testvector_path));
 
   fuzzer::SampleTimingProto timing = runner.timing();
 
@@ -240,41 +245,43 @@ absl::Status RunSample(const Sample& smp, const std::filesystem::path& run_dir,
   }
   timing.set_total_ns(absl::ToInt64Nanoseconds(total_elapsed));
 
-  XLS_VLOG(1) << "Completed running sample, elapsed: " << total_elapsed;
+  VLOG(1) << "Completed running sample, elapsed: " << total_elapsed;
 
   if (summary_file.has_value()) {
     XLS_RETURN_IF_ERROR(WriteIrSummaries(run_dir, timing, *summary_file));
   }
-  return absl::OkStatus();
+  return fuzz_result;
 }
 
-absl::StatusOr<Sample> GenerateSampleAndRun(
-    absl::BitGenRef bit_gen,
+absl::StatusOr<std::pair<Sample, CompletedSampleKind>> GenerateSampleAndRun(
+    dslx::FileTable& file_table, absl::BitGenRef bit_gen,
     const dslx::AstGeneratorOptions& ast_generator_options,
     const SampleOptions& sample_options, const std::filesystem::path& run_dir,
     const std::optional<std::filesystem::path>& crasher_dir,
     const std::optional<std::filesystem::path>& summary_file,
     bool force_failure) {
   Stopwatch stopwatch;
-  XLS_ASSIGN_OR_RETURN(Sample smp, GenerateSample(ast_generator_options,
-                                                  sample_options, bit_gen));
+  XLS_ASSIGN_OR_RETURN(
+      Sample smp, GenerateSample(ast_generator_options, sample_options, bit_gen,
+                                 file_table));
   absl::Duration generate_sample_elapsed = stopwatch.GetElapsedTime();
 
-  absl::Status status =
+  absl::StatusOr<CompletedSampleKind> status =
       RunSample(smp, run_dir, summary_file, generate_sample_elapsed);
   if (force_failure) {
     status = absl::InternalError("Forced sample failure.");
   }
   if (status.ok()) {
-    return smp;
+    return std::pair(smp, status.value());
   }
 
-  XLS_LOG(ERROR) << "Sample failed: " << status;
+  LOG(ERROR) << "Sample failed: " << status.status();
   if (crasher_dir.has_value()) {
-    XLS_ASSIGN_OR_RETURN(std::filesystem::path sample_crasher_dir,
-                         SaveCrasher(run_dir, smp, status, *crasher_dir));
-    if (!absl::IsDeadlineExceeded(status)) {
-      XLS_LOG(INFO) << "Attempting to minimize IR...";
+    XLS_ASSIGN_OR_RETURN(
+        std::filesystem::path sample_crasher_dir,
+        SaveCrasher(run_dir, smp, status.status(), *crasher_dir));
+    if (!absl::IsDeadlineExceeded(status.status())) {
+      LOG(INFO) << "Attempting to minimize IR...";
       std::optional<absl::Duration> timeout =
           sample_options.timeout_seconds().has_value()
               ? std::optional<absl::Duration>(
@@ -285,15 +292,15 @@ absl::StatusOr<Sample> GenerateSampleAndRun(
           MinimizeIr(smp, run_dir, /*inject_jit_result=*/std::nullopt,
                      timeout));
       if (minimized_path.has_value()) {
-        XLS_LOG(INFO) << "...minimization successful; output at "
-                      << *minimized_path;
+        LOG(INFO) << "...minimization successful; output at "
+                  << *minimized_path;
         std::filesystem::copy(*minimized_path, sample_crasher_dir);
       } else {
-        XLS_LOG(INFO) << "...minimization failed.";
+        LOG(INFO) << "...minimization failed.";
       }
     }
   }
-  return status;
+  return status.status();
 }
 
 }  // namespace xls

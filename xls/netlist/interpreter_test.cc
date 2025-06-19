@@ -14,14 +14,18 @@
 #include "xls/netlist/interpreter.h"
 
 #include <atomic>
+#include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "gtest/gtest.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "xls/common/status/matchers.h"
@@ -30,6 +34,7 @@
 #include "xls/netlist/function_extractor.h"
 #include "xls/netlist/lib_parser.h"
 #include "xls/netlist/netlist.h"
+#include "xls/netlist/netlist.pb.h"
 #include "xls/netlist/netlist_parser.h"
 
 namespace xls {
@@ -467,7 +472,7 @@ TEST(NetlistParserTest, XorUsingCellFunctions) {
 
 class OpaqueBoolValue {
  public:
-  OpaqueBoolValue(const OpaqueBoolValue& rhs)  = default;
+  OpaqueBoolValue(const OpaqueBoolValue& rhs) = default;
   OpaqueBoolValue& operator=(const OpaqueBoolValue& rhs) = default;
   OpaqueBoolValue(OpaqueBoolValue&& rhs) { value_ = rhs.value_; }
   OpaqueBoolValue& operator=(OpaqueBoolValue&& rhs) {
@@ -527,7 +532,7 @@ struct EvalOpCallCounter {
   int sleep_ms = 0;
 #define IMPL1(cell, OP)                                                   \
   absl::StatusOr<ValueT> EvalOp_##cell(const std::vector<ValueT>& args) { \
-    XLS_CHECK(args.size() == 1);                                          \
+    CHECK_EQ(args.size(), 1);                                             \
     absl::SleepFor(absl::Milliseconds(sleep_ms));                         \
     ValueT result = OP(args[0]);                                          \
     num_eval_calls++;                                                     \
@@ -536,7 +541,7 @@ struct EvalOpCallCounter {
 
 #define IMPL2(cell, OP)                                                   \
   absl::StatusOr<ValueT> EvalOp_##cell(const std::vector<ValueT>& args) { \
-    XLS_CHECK(args.size() == 2);                                          \
+    CHECK_EQ(args.size(), 2);                                             \
     absl::SleepFor(absl::Milliseconds(sleep_ms));                         \
     ValueT result = OP(args[0], args[1]);                                 \
     num_eval_calls++;                                                     \
@@ -553,7 +558,7 @@ struct EvalOpCallCounter {
 
 #define OP(ValueT, counter, name)                                            \
   {                                                                          \
-#name, {                                                                 \
+    #name, {                                                                 \
       {                                                                      \
         "Y",                                                                 \
             [&counter](                                                      \

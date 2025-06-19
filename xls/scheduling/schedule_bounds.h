@@ -17,19 +17,16 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
-#include "xls/common/status/ret_check.h"
-#include "xls/delay_model/delay_estimator.h"
-#include "xls/ir/function.h"
+#include "absl/strings/str_format.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/ir/node.h"
 
 namespace xls {
@@ -121,8 +118,13 @@ class ScheduleBounds {
   absl::Status PropagateUpperBounds();
 
  private:
+  absl::StatusOr<int64_t> GetDelay(Node* node) const;
+
   // A topological sort of the nodes in the function.
   std::vector<Node*> topo_sort_;
+
+  // The set of nodes that can't affect anything that will be synthesized.
+  absl::flat_hash_set<Node*> dead_after_synthesis_;
 
   int64_t clock_period_ps_;
   const DelayEstimator* delay_estimator_;

@@ -14,11 +14,15 @@
 
 #include "xls/ir/channel_ops.h"
 
+#include <cstdint>
 #include <ostream>
 #include <string>
 #include <string_view>
 
-#include "xls/common/logging/logging.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 
 namespace xls {
 
@@ -31,15 +35,17 @@ std::string ChannelOpsToString(ChannelOps ops) {
     case ChannelOps::kSendReceive:
       return "send_receive";
   }
-  XLS_LOG(FATAL) << "Invalid channel kind: " << static_cast<int64_t>(ops);
+  LOG(FATAL) << "Invalid channel kind: " << static_cast<int64_t>(ops);
 }
 
 absl::StatusOr<ChannelOps> StringToChannelOps(std::string_view str) {
   if (str == "send_only") {
     return ChannelOps::kSendOnly;
-  } else if (str == "receive_only") {
+  }
+  if (str == "receive_only") {
     return ChannelOps::kReceiveOnly;
-  } else if (str == "send_receive") {
+  }
+  if (str == "send_receive") {
     return ChannelOps::kSendReceive;
   }
   return absl::InvalidArgumentError(

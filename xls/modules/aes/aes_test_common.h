@@ -11,14 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 #ifndef XLS_MODULES_AES_AES_TEST_COMMON_H_
 #define XLS_MODULES_AES_AES_TEST_COMMON_H_
 
 // Utilities common to AES module testing.
 // These will likely be expanded/modified once tests exist for other key sizes.
-#include <arpa/inet.h>
 
 #include <array>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <vector>

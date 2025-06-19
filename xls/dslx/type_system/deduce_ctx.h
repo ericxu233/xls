@@ -16,6 +16,7 @@
 #define XLS_DSLX_TYPE_SYSTEM_DEDUCE_CTX_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -23,19 +24,25 @@
 #include <utility>
 #include <vector>
 
-#include "absl/container/flat_hash_map.h"
+#include "absl/base/no_destructor.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/import_data.h"
 #include "xls/dslx/import_routines.h"
-#include "xls/dslx/type_system/concrete_type.h"
+#include "xls/dslx/type_system/ast_env.h"
+#include "xls/dslx/type_system/parametric_env.h"
+#include "xls/dslx/type_system/parametric_expression.h"
+#include "xls/dslx/type_system/type.h"
 #include "xls/dslx/type_system/type_and_parametric_env.h"
+#include "xls/dslx/type_system/type_info.h"
 #include "xls/dslx/type_system/type_mismatch_error_data.h"
 #include "xls/dslx/warning_collector.h"
 
 namespace xls::dslx {
 
-enum class WithinProc {
+enum class WithinProc : uint8_t {
   kNo,
   kYes,
 };
@@ -43,26 +50,26 @@ enum class WithinProc {
 // An entry on the "stack of functions/procs currently being deduced".
 class FnStackEntry {
  public:
-  // Creates an entry for type inference of function 'f' with the given symbolic
-  // bindings.
-  static FnStackEntry Make(Function* f, ParametricEnv parametric_env,
+  // Creates an entry for type inference of function 'f' with the given
+  // parametric env.
+  static FnStackEntry Make(Function& f, ParametricEnv parametric_env,
                            WithinProc within_proc) {
-    return FnStackEntry(f, f->identifier(), f->owner(),
-                        std::move(parametric_env), std::nullopt, within_proc);
+    return FnStackEntry(f, f.identifier(), f.owner(), std::move(parametric_env),
+                        std::nullopt, within_proc);
   }
 
-  static FnStackEntry Make(Function* f, ParametricEnv parametric_env,
+  static FnStackEntry Make(Function& f, ParametricEnv parametric_env,
                            const Invocation* invocation,
                            WithinProc within_proc) {
-    return FnStackEntry(f, f->identifier(), f->owner(),
-                        std::move(parametric_env), invocation, within_proc);
+    return FnStackEntry(f, f.identifier(), f.owner(), std::move(parametric_env),
+                        invocation, within_proc);
   }
 
   // Creates an entry for type inference of the top level of module 'module'.
   static FnStackEntry MakeTop(Module* module) { return FnStackEntry(module); }
 
   // Represents a "representation" string for use in debugging, as in Python.
-  std::string ToReprString() const;
+  std::string ToReprString(const FileTable& file_table) const;
 
   const std::string& name() const { return name_; }
 
@@ -78,11 +85,11 @@ class FnStackEntry {
   bool operator!=(std::nullptr_t) const { return f_ != nullptr; }
 
  private:
-  FnStackEntry(Function* f, std::string name, Module* module,
+  FnStackEntry(Function& f, std::string name, Module* module,
                ParametricEnv parametric_env,
                std::optional<const Invocation*> invocation,
                WithinProc within_proc)
-      : f_(f),
+      : f_(&f),
         name_(std::move(name)),
         module_(module),
         parametric_env_(std::move(parametric_env)),
@@ -96,7 +103,9 @@ class FnStackEntry {
         module_(module),
         within_proc_(WithinProc::kNo) {}
 
+  // Note: can be nullptr when the entry represents the "top level" of a module.
   Function* f_;
+
   std::string name_;
   const Module* module_;
   ParametricEnv parametric_env_;
@@ -107,19 +116,17 @@ class FnStackEntry {
 class DeduceCtx;  // Forward decl.
 
 // Callback signature for the "top level" of the node type-deduction process.
-using DeduceFn = std::function<absl::StatusOr<std::unique_ptr<ConcreteType>>(
+using DeduceFn = std::function<absl::StatusOr<std::unique_ptr<Type>>(
     const AstNode*, DeduceCtx*)>;
 
 // Signature used for typechecking a single function within a module (this is
 // generally used for typechecking parametric instantiations).
-using TypecheckFunctionFn = std::function<absl::Status(Function*, DeduceCtx*)>;
+using TypecheckFunctionFn = std::function<absl::Status(Function&, DeduceCtx*)>;
 
 // Similar to TypecheckFunctionFn, but for a [parametric] invocation.
 using TypecheckInvocationFn =
     std::function<absl::StatusOr<TypeAndParametricEnv>(
-        DeduceCtx* ctx, const Invocation*,
-        const absl::flat_hash_map<std::variant<const Param*, const ProcMember*>,
-                                  InterpValue>&)>;
+        DeduceCtx* ctx, const Invocation*, const AstEnv&)>;
 
 // A single object that contains all the state/callbacks used in the
 // typechecking process.
@@ -138,9 +145,17 @@ class DeduceCtx {
   std::unique_ptr<DeduceCtx> MakeCtx(TypeInfo* new_type_info,
                                      Module* new_module);
 
+  // Creates a new DeduceCtx reflecting the given type info and module.
+  // Uses the same callbacks as this current context.
+  //
+  // Note that the resulting DeduceCtx has the same fn_stack as this current
+  // context.
+  std::unique_ptr<DeduceCtx> MakeCtxWithSameFnStack(TypeInfo* new_type_info,
+                                                    Module* new_module);
+
   // Helper that calls back to the top-level deduce procedure for the given
   // node.
-  absl::StatusOr<std::unique_ptr<ConcreteType>> Deduce(const AstNode* node);
+  absl::StatusOr<std::unique_ptr<Type>> Deduce(const AstNode* node);
 
   // To report structured information on typechecking mismatches we record
   // metadata on the DeduceCtx object.
@@ -158,12 +173,16 @@ class DeduceCtx {
   //    represents -- note this may end up supplemented by diagnostic
   //    information for display.
   absl::Status TypeMismatchError(Span mismatch_span, const AstNode* lhs_node,
-                                 const ConcreteType& lhs,
-                                 const AstNode* rhs_node,
-                                 const ConcreteType& rhs, std::string message);
+                                 const Type& lhs, const AstNode* rhs_node,
+                                 const Type& rhs, std::string message);
 
   bool WithinProc() const {
     return fn_stack().back().within_proc() == WithinProc::kYes;
+  }
+
+  const ParametricEnv& GetCurrentParametricEnv() const {
+    static const absl::NoDestructor<ParametricEnv> empty_env;
+    return fn_stack().empty() ? *empty_env : fn_stack().back().parametric_env();
   }
 
   std::vector<FnStackEntry>& fn_stack() { return fn_stack_; }
@@ -176,21 +195,44 @@ class DeduceCtx {
   TypeInfo* type_info() const { return type_info_; }
 
   // Creates a new TypeInfo that has the current type_info_ as its parent.
-  void AddDerivedTypeInfo();
+  //
+  // Returns the new (derived) type info object. This can later be passed to
+  // "PopDerivedTypeInfo()" to check soundness of our type info stack.
+  TypeInfo* AddDerivedTypeInfo();
 
   // Puts the given TypeInfo on top of the current stack.
   absl::Status PushTypeInfo(TypeInfo* ti);
 
   // Pops the current type_info_ and sets the type_info_ to be the popped
   // value's parent (conceptually an inverse of AddDerivedTypeInfo()).
-  absl::Status PopDerivedTypeInfo();
+  absl::Status PopDerivedTypeInfo(TypeInfo* expect_popped);
 
   // Adds an entry to the stack of functions currently being deduced.
   void AddFnStackEntry(FnStackEntry entry);
 
+  // Gets the current function stack as a string suitable for debugging.
+  //
+  // E.g. XLS_VLOG_LINES(3, ctx->GetFnStackDebugString());
+  std::string GetFnStackDebugString() const;
+
   // Pops an entry from the stack of functions currently being deduced and
   // returns it, conceptually the inverse of AddFnStackEntry().
   std::optional<FnStackEntry> PopFnStackEntry();
+
+  // Resolves "type" via provided symbolic bindings.
+  //
+  // Uses the symbolic bindings of the function we're currently inside of to
+  // resolve parametric types.
+  //
+  // Args:
+  //  type: Type to resolve any contained dims for.
+  //
+  // Returns:
+  //  "type" with dimensions resolved according to the current bindings.
+  absl::StatusOr<std::unique_ptr<Type>> Resolve(const Type& type) const;
+
+  // Sequences Deduce, then Resolve.
+  absl::StatusOr<std::unique_ptr<Type>> DeduceAndResolve(const AstNode* node);
 
   const TypecheckModuleFn& typecheck_module() const {
     return typecheck_module_;
@@ -203,6 +245,10 @@ class DeduceCtx {
   }
 
   ImportData* import_data() const { return import_data_; }
+
+  FileTable& file_table() { return import_data()->file_table(); }
+  const FileTable& file_table() const { return import_data()->file_table(); }
+
   TypeInfoOwner& type_info_owner() const {
     return import_data_->type_info_owner();
   }
@@ -248,16 +294,18 @@ class DeduceCtx {
 
   // -- Metadata
 
-  // Keeps track of the function we're currently typechecking and the symbolic
-  // bindings that deduction is running on.
+  // Keeps track of the function we're currently typechecking and the parametric
+  // env that deduction is running on.
   std::vector<FnStackEntry> fn_stack_;
 
   // Keeps track of any type mismatch error that is currently active.
   std::optional<TypeMismatchErrorData> type_mismatch_error_data_;
 };
 
-// Helper that converts the symbolic bindings to a parametric expression
-// environment (for parametric evaluation).
+// Helper that converts the parametric env to a "parametric expression
+// environment" (for parametric evaluation).
+//
+// TODO(leary): 2024-04-01 These should be consolidated in the future.
 ParametricExpression::Env ToParametricEnv(const ParametricEnv& parametric_env);
 
 }  // namespace xls::dslx

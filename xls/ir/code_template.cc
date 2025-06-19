@@ -19,10 +19,10 @@
 #include <string>
 #include <string_view>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 #include "re2/re2.h"
 
@@ -39,7 +39,7 @@ static absl::Status TemplateParseError(int64_t col, std::string_view message) {
   return absl::InvalidArgumentError(absl::StrFormat("%d: %s", col, message));
 }
 
-/*static*/ int64_t CodeTemplate::ExtractErrorColumn(const absl::Status& s) {
+/* static */ int64_t CodeTemplate::ExtractErrorColumn(const absl::Status& s) {
   static const RE2 sColExtractRE("^([0-9]+):");
   int64_t result = 0;  // Fallback if there is no column.
   RE2::PartialMatch(s.message(), sColExtractRE, &result);

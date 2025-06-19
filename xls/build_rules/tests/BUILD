@@ -32,8 +32,10 @@ load(
     "xls_ir_opt_ir",
     "xls_ir_verilog",
 )
+load("//xls/build_rules:xls_internal_aot_rules.bzl", "xls_aot_generate")
 load(
     "//xls/build_rules:xls_rules_build_defs.bzl",
+    "FUNCTION_WRAPPER_TYPE",
     "xls_ir_jit_wrapper_macro",
     xls_dslx_ir_native_rule = "xls_dslx_ir",
     xls_dslx_opt_ir_native_rule = "xls_dslx_opt_ir",
@@ -51,6 +53,10 @@ load(
 package(
     default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -141,7 +147,7 @@ xls_dslx_verilog(
 check_sha256sum_test(
     name = "add_one_pipeline_rtl_v_sha256sum_test",
     src = ":add_one_pipeline_rtl.sv",
-    sha256sum = "5a9a4ff3f5254915afb92d7a30447db53a524b649d6a4c1290b539a651ee3434",
+    sha256sum = "7230178ff270fa174805ff808bbe927c19a13961fc4e957e59aa434569e36caf",
 )
 
 # Build a frozen file generated with a build rule.
@@ -149,14 +155,14 @@ check_sha256sum_frozen(
     name = "add_one_pipeline_rtl_v_sha256sum_frozen",
     src = ":add_one_pipeline_rtl.sv",
     frozen_file = ":add_one_pipeline_rtl.frozen.v",
-    sha256sum = "5a9a4ff3f5254915afb92d7a30447db53a524b649d6a4c1290b539a651ee3434",
+    sha256sum = "7230178ff270fa174805ff808bbe927c19a13961fc4e957e59aa434569e36caf",
 )
 
 # Test with a frozen checksum file generated with a check_sha256sum_frozen rule.
 check_sha256sum_test(
     name = "add_one_pipeline_rtl_frozen_v_sha256sum_test",
     src = ":add_one_pipeline_rtl.frozen.v",
-    sha256sum = "5a9a4ff3f5254915afb92d7a30447db53a524b649d6a4c1290b539a651ee3434",
+    sha256sum = "7230178ff270fa174805ff808bbe927c19a13961fc4e957e59aa434569e36caf",
 )
 
 sh_test(
@@ -201,6 +207,7 @@ sh_test(
 xls_dslx_test(
     name = "generated_file_as_input_test",
     srcs = ["generated.x"],
+    dslx_test_args = {"compare": "jit"},
 )
 
 # Encapsulate the generated file as a library.
@@ -220,6 +227,7 @@ xls_dslx_library(
 # Reference the library with the generated file inside of a xls_dslx_test rule.
 xls_dslx_test(
     name = "dependent_on_library_with_generated_file_test",
+    dslx_test_args = {"compare": "jit"},
     library = ":importer_dslx",
 )
 
@@ -254,6 +262,7 @@ xls_dslx_library(
 # xls_dslx_test on a xls_dslx_library with a transitive dependency.
 xls_dslx_test(
     name = "d_dslx_test",
+    dslx_test_args = {"compare": "jit"},
     library = ":d_dslx",
 )
 
@@ -270,6 +279,7 @@ xls_dslx_library(
 # xls_dslx_test on a xls_dslx_library with a transitive dependency.
 xls_dslx_test(
     name = "e_dslx_test",
+    dslx_test_args = {"compare": "jit"},
     library = ":e_dslx",
 )
 
@@ -354,6 +364,7 @@ xls_dslx_verilog(
 xls_dslx_test(
     name = "chaining_example_test",
     srcs = ["chaining_example.x"],
+    dslx_test_args = {"compare": "jit"},
 )
 
 xls_dslx_ir(
@@ -364,13 +375,13 @@ xls_dslx_ir(
 
 xls_ir_opt_ir(
     name = "chaining_example_opt_ir",
-    src = ":chaining_example_ir.ir",
+    src = ":chaining_example_ir",
     opt_ir_file = "chaining_example_opt_ir.opt.ir",
 )
 
 xls_ir_verilog(
     name = "chaining_example_verilog",
-    src = ":chaining_example_opt_ir.opt.ir",
+    src = ":chaining_example_opt_ir",
     codegen_args = {
         "pipeline_stages": "1",
     },
@@ -379,18 +390,18 @@ xls_ir_verilog(
 
 xls_eval_ir_test(
     name = "chaining_example_eval_ir_test",
-    src = ":chaining_example_ir.ir",
+    src = ":chaining_example_ir",
 )
 
 xls_ir_equivalence_test(
     name = "chaining_example_ir_equivalence_test",
-    src_0 = ":chaining_example_ir.ir",
-    src_1 = ":chaining_example_opt_ir.opt.ir",
+    src_0 = ":chaining_example_ir",
+    src_1 = ":chaining_example_opt_ir",
 )
 
 xls_benchmark_ir(
     name = "chaining_example_benchmark_ir",
-    src = ":chaining_example_opt_ir.opt.ir",
+    src = ":chaining_example_opt_ir",
 )
 
 ################################################################################
@@ -477,7 +488,7 @@ xls_benchmark_ir(
 
 cc_xls_ir_jit_wrapper(
     name = "chaining_example_opt_ir_jit_wrapper_main_cc",
-    src = ":chaining_example_opt_ir.opt.ir",
+    src = ":chaining_example_opt_ir",
     jit_wrapper_args = {
         "namespace": "not_xls::test",
     },
@@ -485,16 +496,16 @@ cc_xls_ir_jit_wrapper(
 
 xls_ir_opt_ir(
     name = "chaining_example_double_opt_ir",
-    src = ":chaining_example_ir.ir",
+    src = ":chaining_example_ir",
     opt_ir_file = "chaining_example_double_opt_ir.opt.ir",
     top = get_mangled_ir_symbol("chaining_example", "double"),
 )
 
 cc_xls_ir_jit_wrapper(
     name = "chaining_example_opt_ir_jit_wrapper_double_cc",
-    src = ":chaining_example_double_opt_ir.opt.ir",
+    src = ":chaining_example_double_opt_ir",
     jit_wrapper_args = {
-        "class_name": "chaining_example",
+        "class_name": "ChainingExample",
         "function": get_mangled_ir_symbol("chaining_example", "double"),
         "namespace": "not_xls::test",
     },
@@ -502,9 +513,9 @@ cc_xls_ir_jit_wrapper(
 
 xls_ir_opt_ir(
     name = "chaining_example_triple_run_only_opt_ir",
-    src = ":chaining_example_ir.ir",
+    src = ":chaining_example_ir",
     opt_ir_args = {
-        "run_only_passes": "arith_simp",
+        "passes": "arith_simp",
     },
     opt_ir_file = "chaining_example_triple_run_only_opt_ir.opt.ir",
     top = get_mangled_ir_symbol("chaining_example", "triple"),
@@ -512,7 +523,7 @@ xls_ir_opt_ir(
 
 xls_ir_opt_ir(
     name = "chaining_example_triple_skip_passes_opt_ir",
-    src = ":chaining_example_triple_run_only_opt_ir.opt.ir",
+    src = ":chaining_example_triple_run_only_opt_ir",
     opt_ir_args = {
         "skip_passes": "arith_simp",
     },
@@ -522,8 +533,8 @@ xls_ir_opt_ir(
 
 xls_ir_equivalence_test(
     name = "chaining_example_triple_ir_equivalence_test",
-    src_0 = ":chaining_example_triple_run_only_opt_ir.opt.ir",
-    src_1 = ":chaining_example_triple_skip_passes_opt_ir.opt.ir",
+    src_0 = ":chaining_example_triple_run_only_opt_ir",
+    src_1 = ":chaining_example_triple_skip_passes_opt_ir",
     top = get_mangled_ir_symbol("chaining_example", "triple"),
 )
 
@@ -558,6 +569,7 @@ xls_dslx_library(
 # Execute the DSLX interpreter.
 xls_dslx_test(
     name = "simple_example_4_test",
+    dslx_test_args = {"compare": "jit"},
     library = ":simple_example_4_dslx",
 )
 
@@ -577,17 +589,26 @@ xls_dslx_verilog(
     deps = [":simple_example_4_dslx"],
 )
 
+xls_aot_generate(
+    name = "simple_example_5_one_stage_jit_wrapper_aot_gen",
+    src = ":simple_example_5_one_stage.opt.ir",
+    with_msan = False,
+)
+
 # The xls_ir_jit_wrapper rule using an optimized IR file as input.
 # The header and source files are outputs of the rule, they can be referenced
 # by other rules.
 xls_ir_jit_wrapper_macro(
     name = "simple_example_5_one_stage_jit_wrapper",
     src = ":simple_example_5_one_stage.opt.ir",
+    aot_info = ":simple_example_5_one_stage_jit_wrapper_aot_gen",
     header_file = "simple_example_5_one_stage_jit_wrapper.h",
     jit_wrapper_args = {
         "namespace": "not_xls::test",
     },
     source_file = "simple_example_5_one_stage_jit_wrapper.cc",
+    top = "main",
+    wrapper_type = FUNCTION_WRAPPER_TYPE,
 )
 
 # cc_xls_ir_jit_wrapper macro with a cc_library target with name
@@ -654,14 +675,14 @@ xls_dslx_ir_native_rule(
 # The target is the native rule form of the 'chaining_example_opt_ir' target.
 xls_ir_opt_ir_native_rule(
     name = "chaining_example_opt_ir_native_rule",
-    src = ":chaining_example_ir.ir",
+    src = ":chaining_example_ir",
     top = get_mangled_ir_symbol("chaining_example", "main"),
 )
 
 # The target is the native rule form of the 'chaining_example_verilog' target.
 xls_ir_verilog_native_rule(
     name = "chaining_example_verilog_native_rule",
-    src = ":chaining_example_opt_ir.opt.ir",
+    src = ":chaining_example_opt_ir",
     codegen_args = {
         "pipeline_stages": "1",
     },
@@ -692,11 +713,13 @@ xls_dslx_verilog_native_rule(
 xls_ir_jit_wrapper_native_rule(
     name = "simple_example_5_one_stage_jit_wrapper_native_rule",
     src = ":simple_example_5_one_stage.opt.ir",
+    aot_info = ":simple_example_5_one_stage_jit_wrapper_aot_gen",
     header_file = "simple_example_5_one_stage_jit_wrapper_native_rule.h",
     jit_wrapper_args = {
         "namespace": "not_xls::test",
     },
     source_file = "simple_example_5_one_stage_jit_wrapper_native_rule.cc",
+    wrapper_type = FUNCTION_WRAPPER_TYPE,
 )
 
 ################################################################################
@@ -715,6 +738,12 @@ xls_ir_opt_ir(
     opt_ir_file = "xls_ir_opt_ir.opt.ir",
 )
 
+xls_ir_opt_ir(
+    name = "user_defined_output_filename_std_target_opt_ir",
+    src = ":user_defined_output_filename_ir",
+    opt_ir_file = "xls_ir_opt_ir_std_target.opt.ir",
+)
+
 xls_ir_verilog(
     name = "user_defined_output_filename_verilog",
     src = ":xls_ir_opt_ir.opt.ir",
@@ -724,6 +753,17 @@ xls_ir_verilog(
     module_sig_file = "xls_ir_verilog.sig.textproto",
     schedule_file = "xls_ir_verilog.schedule.textproto",
     verilog_file = "xls_ir_verilog.sv",
+)
+
+xls_ir_verilog(
+    name = "user_defined_output_filename_std_target_verilog",
+    src = ":user_defined_output_filename_std_target_opt_ir",
+    codegen_args = {
+        "pipeline_stages": "1",
+    },
+    module_sig_file = "xls_ir_verilog_std_target.sig.textproto",
+    schedule_file = "xls_ir_verilog_std_target.schedule.textproto",
+    verilog_file = "xls_ir_verilog_std_target.sv",
 )
 
 xls_dslx_ir_native_rule(
@@ -772,24 +812,35 @@ xls_dslx_verilog_native_rule(
     verilog_file = "xls_dslx_verilog_native_rule.sv",
 )
 
+xls_aot_generate(
+    name = "user_defined_output_filename_jit_wrapper_aot_gen",
+    src = ":xls_ir_opt_ir.opt.ir",
+    with_msan = False,
+)
+
 xls_ir_jit_wrapper_macro(
     name = "user_defined_output_filename_jit_wrapper",
     src = ":xls_ir_opt_ir.opt.ir",
+    aot_info = ":user_defined_output_filename_jit_wrapper_aot_gen",
     header_file = "xls_ir_jit_wrapper.h",
     jit_wrapper_args = {
         "namespace": "not_xls::test",
     },
     source_file = "xls_ir_jit_wrapper.cc",
+    top = "main",
+    wrapper_type = FUNCTION_WRAPPER_TYPE,
 )
 
 xls_ir_jit_wrapper_native_rule(
     name = "user_defined_output_filename_native_rule_jit_wrapper",
     src = ":xls_ir_opt_ir.opt.ir",
+    aot_info = ":user_defined_output_filename_jit_wrapper_aot_gen",
     header_file = "xls_ir_jit_wrapper_native_rule.h",
     jit_wrapper_args = {
         "namespace": "not_xls::test",
     },
     source_file = "xls_ir_jit_wrapper_native_rule.cc",
+    wrapper_type = FUNCTION_WRAPPER_TYPE,
 )
 
 ################################################################################
@@ -864,5 +915,5 @@ xls_dslx_cpp_type_library(
 ################################################################################
 xls_ir_cc_library(
     name = "die_if_odd_cc",
-    src = ":die_if_odd.opt.ir",
+    src = ":die_if_odd",
 )

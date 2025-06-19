@@ -14,6 +14,7 @@
 
 #include "xls/passes/optimization_pass_pipeline.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -26,11 +27,15 @@
 #include "xls/common/status/matchers.h"
 #include "xls/examples/sample_packages.h"
 #include "xls/ir/bits.h"
+#include "xls/ir/channel.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/op.h"
 #include "xls/ir/package.h"
+#include "xls/ir/value.h"
 #include "xls/passes/optimization_pass.h"
 
 namespace m = ::xls::op_matchers;
@@ -38,7 +43,7 @@ namespace m = ::xls::op_matchers;
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 
 class OptimizationPipelineTest : public IrTestBase {
  protected:
@@ -271,6 +276,54 @@ TEST_F(OptimizationPipelineTest, LogicCombining) {
                                                        p.get()));
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
   EXPECT_THAT(f->return_value(), m::Param("x"));
+}
+
+TEST_F(OptimizationPipelineTest, ProcScopedChannels) {
+  auto p = CreatePackage();
+
+  // Create leaf proc which adds one to its input.
+  Proc* leaf;
+  {
+    TokenlessProcBuilder pb(NewStyleProc(), "myleaf", "tkn", p.get());
+    XLS_ASSERT_OK_AND_ASSIGN(ReceiveChannelInterface * in,
+                             pb.AddInputChannel("in", p->GetBitsType(32)));
+    XLS_ASSERT_OK_AND_ASSIGN(SendChannelInterface * out,
+                             pb.AddOutputChannel("out", p->GetBitsType(32)));
+
+    // Create an optimization opportunity (constant folding).
+    BValue one = pb.Add(pb.Literal(UBits(0, 32)), pb.Literal(UBits(1, 32)));
+
+    pb.Send(out, pb.Add(pb.Receive(in), one));
+    XLS_ASSERT_OK_AND_ASSIGN(leaf, pb.Build());
+  }
+
+  // Create a top proc which instantiates two leaf procs and sends an input
+  // value through the chain, accumulates it and then sends to the output.
+  Proc* top;
+  {
+    TokenlessProcBuilder pb(NewStyleProc(), "myproc", "tkn", p.get());
+    XLS_ASSERT_OK_AND_ASSIGN(ReceiveChannelInterface * in,
+                             pb.AddInputChannel("in", p->GetBitsType(32)));
+    XLS_ASSERT_OK_AND_ASSIGN(SendChannelInterface * out,
+                             pb.AddOutputChannel("out", p->GetBitsType(32)));
+
+    XLS_ASSERT_OK_AND_ASSIGN(ChannelWithInterfaces tmp0_ch,
+                             pb.AddChannel("tmp0", p->GetBitsType(32)));
+    XLS_ASSERT_OK_AND_ASSIGN(ChannelWithInterfaces tmp1_ch,
+                             pb.AddChannel("tmp1", p->GetBitsType(32)));
+
+    BValue accum = pb.StateElement("accum", Value(UBits(0, 32)));
+    XLS_ASSERT_OK(
+        pb.InstantiateProc("inst0", leaf, {in, tmp0_ch.send_interface}));
+    XLS_ASSERT_OK(pb.InstantiateProc(
+        "inst1", leaf, {tmp0_ch.receive_interface, tmp1_ch.send_interface}));
+    BValue next_accum = pb.Add(pb.Receive(tmp1_ch.receive_interface), accum);
+    pb.Send(out, next_accum);
+    XLS_ASSERT_OK(pb.SetAsTop());
+    XLS_ASSERT_OK_AND_ASSIGN(top, pb.Build({next_accum}));
+  }
+
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
 }
 
 }  // namespace

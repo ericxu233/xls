@@ -15,6 +15,7 @@
 #include "xls/ir/block.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -26,22 +27,63 @@
 #include <variant>
 #include <vector>
 
+#include "absl/base/casts.h"
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "absl/types/span.h"
 #include "absl/types/variant.h"
+#include "google/protobuf/text_format.h"
 #include "xls/common/casts.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/visitor.h"
+#include "xls/ir/channel.h"
 #include "xls/ir/instantiation.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/register.h"
+#include "xls/ir/source_location.h"
+#include "xls/ir/topo_sort.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
+#include "xls/ir/value_utils.h"
 
 namespace xls {
+
+namespace {
+
+std::string BoolToString(bool b) { return b ? "true" : "false"; };
+
+}  // namespace
+
+std::string ChannelPortMetadata::ToString() const {
+  std::string result =
+      absl::StrFormat("channel_ports(name=%s, type=%s, direction=%s, kind=%s",
+                      channel_name, type->ToString(),
+                      direction == ChannelDirection::kSend ? "send" : "receive",
+                      ChannelKindToString(channel_kind));
+  if (flop_kind != FlopKind::kNone) {
+    absl::StrAppendFormat(&result, ", flop=%s", FlopKindToString(flop_kind));
+  }
+  if (data_port.has_value()) {
+    absl::StrAppendFormat(&result, ", data_port=%s", *data_port);
+  }
+  if (ready_port.has_value()) {
+    absl::StrAppendFormat(&result, ", ready_port=%s", *ready_port);
+  }
+  if (valid_port.has_value()) {
+    absl::StrAppendFormat(&result, ", valid_port=%s", *valid_port);
+  }
+  return result + ")";
+}
 
 // For each node in the block, compute the fewest number of registers
 // (RegisterWrite/RegisterRead pair) in a path from the node to a user-less node
@@ -101,8 +143,7 @@ static int64_t GetPortPosition(Node* n, const Block* block) {
     }
     i++;
   }
-  XLS_LOG(FATAL) << absl::StreamFormat("Node %s is not a port node",
-                                       n->GetName());
+  LOG(FATAL) << absl::StreamFormat("Node %s is not a port node", n->ToString());
 }
 
 // Return the priority of a node for the purposes of dump order. Nodes with
@@ -157,10 +198,10 @@ std::vector<Node*> Block::DumpOrder() const {
   absl::flat_hash_map<Node*, int64_t> reg_depth =
       ComputeRegisterDepthToLeaves(this, register_writes_);
 
-  XLS_VLOG(4) << "Node dump order priorities:";
+  VLOG(4) << "Node dump order priorities:";
   for (Node* node : nodes()) {
     priorities[node] = DumpOrderPriority(node, this, reg_depth);
-    XLS_VLOG(4) << absl::StreamFormat(
+    VLOG(4) << absl::StreamFormat(
         "%s: (%d, %d, %d)", node->GetName(), std::get<0>(priorities.at(node)),
         std::get<1>(priorities.at(node)), std::get<2>(priorities.at(node)));
   }
@@ -205,11 +246,20 @@ std::vector<Node*> Block::DumpOrder() const {
     place_node(node);
   }
 
-  XLS_CHECK_EQ(order.size(), node_count());
+  CHECK_EQ(order.size(), node_count());
   return order;
 }
 
 std::string Block::DumpIr() const {
+  std::string res;
+
+  if (GetSignature().has_value()) {
+    std::string textproto;
+    google::protobuf::TextFormat::Printer printer;
+    printer.SetSingleLineMode(true);
+    printer.PrintToString(*GetSignature(), &textproto);
+    absl::StrAppend(&res, "#[signature(\"\"\"", textproto, "\"\"\"]\n");
+  }
   std::vector<std::string> port_strings;
   for (const Port& port : GetPorts()) {
     if (std::holds_alternative<ClockPort*>(port)) {
@@ -225,9 +275,25 @@ std::string Block::DumpIr() const {
           std::get<OutputPort*>(port)->operand(0)->GetType()->ToString()));
     }
   }
-  std::string res = absl::StrFormat("block %s(%s) {\n", name(),
-                                    absl::StrJoin(port_strings, ", "));
+  absl::StrAppendFormat(&res, "block %s(%s) {\n", name(),
+                        absl::StrJoin(port_strings, ", "));
 
+  if (provenance_.has_value()) {
+    absl::StrAppendFormat(&res, "  #![%v]\n", *provenance_);
+  }
+  if (reset_behavior_.has_value()) {
+    absl::StrAppendFormat(
+        &res, "  #![reset(port=\"%s\", asynchronous=%s, active_low=%s)]\n",
+        reset_port_.value()->name(),
+        BoolToString(reset_behavior_->asynchronous),
+        BoolToString(reset_behavior_->active_low));
+  }
+  for (const std::pair<std::string, ChannelDirection>& channel_direction :
+       GetChannelsWithMappedPorts()) {
+    absl::StrAppendFormat(
+        &res, "  #![%s]\n",
+        channel_port_metadata_.at(channel_direction).ToString());
+  }
   for (Instantiation* instantiation : GetInstantiations()) {
     absl::StrAppendFormat(&res, "  %s\n", instantiation->ToString());
   }
@@ -262,16 +328,25 @@ absl::Status Block::SetPortNameExactly(std::string_view name, Node* node) {
                             name));
       }
       // Pick a new name for n.
-      n->name_ = UniquifyNodeName(name);
+      n->SetNameDirectly(UniquifyNodeName(name));
       XLS_RET_CHECK_NE(n->GetName(), name);
-      node->name_ = name;
+      node->SetNameDirectly(name);
       return absl::OkStatus();
     }
   }
   // Ensure the name is known by the uniquer.
   UniquifyNodeName(name);
-  node->name_ = name;
+  node->SetNameDirectly(name);
   return absl::OkStatus();
+}
+
+bool Block::HasInputPort(std::string_view name) const {
+  return ports_by_name_.contains(name) &&
+         std::holds_alternative<InputPort*>(ports_by_name_.at(name));
+}
+bool Block::HasOutputPort(std::string_view name) const {
+  return ports_by_name_.contains(name) &&
+         std::holds_alternative<OutputPort*>(ports_by_name_.at(name));
 }
 
 absl::StatusOr<InputPort*> Block::GetInputPort(std::string_view name) const {
@@ -351,26 +426,35 @@ absl::StatusOr<OutputPort*> Block::AddOutputPort(std::string_view name,
   return port;
 }
 
-absl::StatusOr<Register*> Block::AddRegister(std::string_view name, Type* type,
-                                             std::optional<Reset> reset) {
-  if (registers_.contains(name)) {
-    return absl::InvalidArgumentError(
-        absl::StrFormat("Register already exists with name %s", name));
+absl::StatusOr<Register*> Block::AddRegister(std::string_view requested_name,
+                                             Type* type,
+                                             std::optional<Value> reset_value) {
+  std::string name =
+      register_name_uniquer_.GetSanitizedUniqueName(requested_name);
+  if (name != requested_name) {
+    VLOG(2) << "Multiple registers with name `" << requested_name
+            << "` requested. Using name `" << name << "`.";
   }
-  if (reset.has_value()) {
-    if (type != package()->GetTypeForValue(reset.value().reset_value)) {
+  if (reset_value.has_value()) {
+    if (type != package()->GetTypeForValue(*reset_value)) {
       return absl::InvalidArgumentError(absl::StrFormat(
-          "Reset value %s for register %s is not of type %s",
-          reset.value().reset_value.ToString(), name, type->ToString()));
+          "Reset value `%s` for register `%s` is not of type `%s`",
+          reset_value->ToString(), name, type->ToString()));
     }
   }
-  registers_[name] = std::make_unique<Register>(std::string(name), type, reset);
+  registers_[name] =
+      std::make_unique<Register>(std::string(name), type, reset_value);
   register_vec_.push_back(registers_[name].get());
   Register* reg = register_vec_.back();
   register_reads_[reg] = {};
   register_writes_[reg] = {};
 
   return register_vec_.back();
+}
+
+absl::StatusOr<Register*> Block::AddRegisterWithZeroResetValue(
+    std::string_view requested_name, Type* type) {
+  return AddRegister(requested_name, type, ZeroOfType(type));
 }
 
 absl::Status Block::RemoveRegister(Register* reg) {
@@ -415,13 +499,44 @@ absl::Status Block::AddClockPort(std::string_view name) {
   return absl::OkStatus();
 }
 
-absl::StatusOr<InputPort*> Block::AddResetPort(std::string_view name) {
+absl::StatusOr<InputPort*> Block::AddResetPort(std::string_view port_name,
+                                               ResetBehavior behavior) {
   if (reset_port_.has_value()) {
-    return absl::InternalError("Block already has reset.");
+    return absl::InvalidArgumentError(
+        absl::StrFormat("Block `%s` already has a reset port", name()));
   }
-  XLS_ASSIGN_OR_RETURN(reset_port_,
-                       AddInputPort(name, package()->GetBitsType(1)));
-  return *reset_port_;
+  XLS_ASSIGN_OR_RETURN(InputPort * port,
+                       AddInputPort(port_name, package()->GetBitsType(1)));
+  XLS_RETURN_IF_ERROR(SetResetPort(port, behavior));
+  return port;
+}
+
+absl::Status Block::SetResetPort(InputPort* input_port,
+                                 ResetBehavior behavior) {
+  XLS_RET_CHECK(input_port->function_base() == this);
+  if (reset_port_.has_value()) {
+    return absl::InvalidArgumentError(
+        absl::StrFormat("Block `%s` already has a reset port", name()));
+  }
+  if (input_port->GetType() != package()->GetBitsType(1)) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Reset port must be single bit type, port `%s` type is %s",
+        input_port->name(), input_port->port_type()->ToString()));
+  }
+  reset_port_ = input_port;
+  reset_behavior_ = behavior;
+  return absl::OkStatus();
+}
+
+absl::Status Block::OverrideResetBehavior(ResetBehavior behavior) {
+  if (!reset_port_.has_value()) {
+    return absl::InvalidArgumentError(
+        absl::StrFormat("Cannot override reset behavior of block `%s`. Block "
+                        "does not have a reset port set",
+                        name()));
+  }
+  reset_behavior_ = behavior;
+  return absl::OkStatus();
 }
 
 // Removes the element `node` from the vector element in the given map at the
@@ -454,11 +569,11 @@ static absl::Status AddToMapOfNodeVectors(
 Node* Block::AddNodeInternal(std::unique_ptr<Node> node) {
   Node* ptr = FunctionBase::AddNodeInternal(std::move(node));
   if (RegisterRead* reg_read = dynamic_cast<RegisterRead*>(ptr)) {
-    XLS_CHECK_OK(AddToMapOfNodeVectors(reg_read->GetRegister(), reg_read,
-                                       &register_reads_));
+    CHECK_OK(AddToMapOfNodeVectors(reg_read->GetRegister(), reg_read,
+                                   &register_reads_));
   } else if (RegisterWrite* reg_write = dynamic_cast<RegisterWrite*>(ptr)) {
-    XLS_CHECK_OK(AddToMapOfNodeVectors(reg_write->GetRegister(), reg_write,
-                                       &register_writes_));
+    CHECK_OK(AddToMapOfNodeVectors(reg_write->GetRegister(), reg_write,
+                                   &register_writes_));
   } else if (InstantiationInput* inst_input =
                  dynamic_cast<InstantiationInput*>(ptr)) {
     instantiation_inputs_[inst_input->instantiation()].push_back(inst_input);
@@ -471,7 +586,7 @@ Node* Block::AddNodeInternal(std::unique_ptr<Node> node) {
 }
 
 absl::Status Block::RemoveNode(Node* n) {
-  // Simliar to parameters in xls::Functions, input and output ports are also
+  // Similar to parameters in xls::Functions, input and output ports are also
   // also stored separately as vectors for easy access and to indicate ordering.
   // Fix up these vectors prior to removing the node.
   if (n->Is<InputPort>() || n->Is<OutputPort>()) {
@@ -493,11 +608,46 @@ absl::Status Block::RemoveNode(Node* n) {
           n->GetName());
       output_ports_.erase(it);
     }
-    ports_by_name_.erase(n->GetName());
+    std::string port_name = n->GetName();
+    auto ports_by_name_it = ports_by_name_.find(port_name);
+    XLS_RET_CHECK(ports_by_name_it != ports_by_name_.end());
+    ports_by_name_.erase(ports_by_name_it);
     auto port_it = std::find(ports_.begin(), ports_.end(), port);
     XLS_RET_CHECK(port_it != ports_.end()) << absl::StrFormat(
-        "port node %s is not in the vector of ports", n->GetName());
+        "port node %s is not in the vector of ports", port_name);
     ports_.erase(port_it);
+
+    if (GetResetPort().has_value() && n == GetResetPort().value()) {
+      reset_port_ = std::nullopt;
+      reset_behavior_ = std::nullopt;
+    }
+
+    // If the port appears in the channel metadata mapping, remove it. This can
+    // occur, for example, when removing zero-width ports (e.g., from empty
+    // tuple typed channels).
+    for (auto& [channel_name, metadata] : channel_port_metadata_) {
+      if (metadata.data_port.has_value() && port_name == *metadata.data_port) {
+        VLOG(3) << absl::StreamFormat(
+            "Data port for channel `%s` in block `%s` removed: %s",
+            metadata.channel_name, name(), metadata.data_port.value());
+        metadata.data_port = std::nullopt;
+        break;
+      } else if (metadata.ready_port.has_value() &&
+                 port_name == *metadata.ready_port) {
+        VLOG(3) << absl::StreamFormat(
+            "Ready port for channel `%s` in block `%s` removed: %s",
+            metadata.channel_name, name(), metadata.ready_port.value());
+        metadata.ready_port = std::nullopt;
+        break;
+      } else if (metadata.valid_port.has_value() &&
+                 port_name == *metadata.valid_port) {
+        VLOG(3) << absl::StreamFormat(
+            "Valid port for channel `%s` in block `%s` removed: %s",
+            metadata.channel_name, name(), metadata.valid_port.value());
+        metadata.valid_port = std::nullopt;
+        break;
+      }
+    }
   } else if (RegisterRead* reg_read = dynamic_cast<RegisterRead*>(n)) {
     XLS_RETURN_IF_ERROR(RemoveFromMapOfNodeVectors(reg_read->GetRegister(),
                                                    reg_read, &register_reads_));
@@ -533,7 +683,8 @@ absl::StatusOr<RegisterRead*> Block::GetRegisterRead(Register* reg) const {
                       name(), reg->name()));
 }
 
-absl::StatusOr<RegisterWrite*> Block::GetRegisterWrite(Register* reg) const {
+absl::StatusOr<RegisterWrite*> Block::GetUniqueRegisterWrite(
+    Register* reg) const {
   XLS_RET_CHECK(register_writes_.contains(reg)) << absl::StreamFormat(
       "Block %s does not have register %s (%p)", name(), reg->name(), reg);
   const std::vector<RegisterWrite*>& writes = register_writes_.at(reg);
@@ -548,6 +699,13 @@ absl::StatusOr<RegisterWrite*> Block::GetRegisterWrite(Register* reg) const {
   return absl::InvalidArgumentError(
       absl::StrFormat("Block %s has multiple write operation for register %s",
                       name(), reg->name()));
+}
+
+absl::StatusOr<absl::Span<RegisterWrite* const>> Block::GetRegisterWrites(
+    Register* reg) const {
+  XLS_RET_CHECK(register_writes_.contains(reg)) << absl::StreamFormat(
+      "Block %s does not have register %s (%p)", name(), reg->name(), reg);
+  return register_writes_.at(reg);
 }
 
 absl::Status Block::ReorderPorts(absl::Span<const std::string> port_names) {
@@ -569,7 +727,7 @@ absl::Status Block::ReorderPorts(absl::Span<const std::string> port_names) {
   return absl::OkStatus();
 }
 
-/*static*/ std::string Block::PortName(const Port& port) {
+/* static */ std::string Block::PortName(const Port& port) {
   return absl::visit(Visitor{
                          [](ClockPort* p) { return p->name; },
                          [](InputPort* p) { return p->GetName(); },
@@ -587,6 +745,18 @@ absl::StatusOr<BlockInstantiation*> Block::AddBlockInstantiation(
   return down_cast<BlockInstantiation*>(instantiation.value());
 }
 
+absl::StatusOr<FifoInstantiation*> Block::AddFifoInstantiation(
+    std::string_view name, FifoConfig fifo_config, Type* data_type,
+    std::optional<std::string_view> channel) {
+  XLS_RET_CHECK(package()->IsOwnedType(data_type));
+  XLS_ASSIGN_OR_RETURN(
+      absl::StatusOr<Instantiation*> instantiation,
+      AddInstantiation(name,
+                       std::make_unique<FifoInstantiation>(
+                           name, fifo_config, data_type, channel, package())));
+  return down_cast<FifoInstantiation*>(instantiation.value());
+}
+
 absl::StatusOr<Instantiation*> Block::AddInstantiation(
     std::string_view name, std::unique_ptr<Instantiation> instantiation) {
   if (instantiations_.contains(name)) {
@@ -602,6 +772,83 @@ absl::StatusOr<Instantiation*> Block::AddInstantiation(
   instantiation_outputs_[instantiation_ptr] = {};
 
   return instantiation_ptr;
+}
+
+absl::Status Block::ReplaceInstantiationWith(
+    Instantiation* old_inst, Instantiation* new_inst,
+    absl::flat_hash_map<std::string, std::string> port_renaming) {
+  XLS_RET_CHECK(IsOwned(old_inst));
+  XLS_RET_CHECK(IsOwned(new_inst)) << "must add instantiation to this block "
+                                      "before replacing uses of another.";
+  std::vector<InstantiationInput*> inps(instantiation_inputs_.at(old_inst));
+  std::vector<InstantiationOutput*> outs(instantiation_outputs_.at(old_inst));
+
+  XLS_ASSIGN_OR_RETURN(InstantiationType old_type_orig, old_inst->type());
+  XLS_ASSIGN_OR_RETURN(InstantiationType new_type, new_inst->type());
+
+  // Validate renaming scheme:
+  for (auto& [orig_port_name, new_port_name] : port_renaming) {
+    XLS_RET_CHECK(old_type_orig.input_types().contains(orig_port_name) ||
+                  old_type_orig.output_types().contains(orig_port_name))
+        << "attempting to rename port that does not exists";
+
+    // Note: It would be possible to rename a port to the name of an
+    // already existing port, if that port is also getting renamed. This,
+    // however, makes analysis significantly more complex, particularly
+    // because it would have to deal with "rename loops":
+    //
+    // port_renaming = { {"a", "b"}, {"b", "a"} }; // !!
+    //
+    // For now, we simply don't allow it:
+    XLS_RET_CHECK((!old_type_orig.input_types().contains(new_port_name)) &&
+                  (!old_type_orig.output_types().contains(new_port_name)))
+        << "new port name already exists";
+  }
+
+  // Construct old type with renamed ports:
+  auto input_types = old_type_orig.input_types();
+  auto output_types = old_type_orig.output_types();
+  for (auto& [orig_port_name, new_port_name] : port_renaming) {
+    if (input_types.contains(orig_port_name)) {
+      auto node = input_types.extract(orig_port_name);
+      node.key() = new_port_name;
+      input_types.insert(std::move(node));
+    }
+    if (output_types.contains(orig_port_name)) {
+      auto node = output_types.extract(orig_port_name);
+      node.key() = new_port_name;
+      output_types.insert(std::move(node));
+    }
+  }
+  InstantiationType old_type_renamed =
+      InstantiationType(input_types, output_types);
+
+  // Validate that signature matches after renaming:
+  XLS_RET_CHECK(old_type_renamed == new_type)
+      << "Type mismatch of instantiations";
+
+  // Replace instantiation:
+  for (InstantiationInput* inp : inps) {
+    auto renaming_rule = port_renaming.find(inp->port_name());
+    auto new_name = renaming_rule == port_renaming.end()
+                        ? inp->port_name()
+                        : renaming_rule->second;
+    XLS_RETURN_IF_ERROR(inp->ReplaceUsesWithNew<InstantiationInput>(
+                               inp->data(), new_inst, new_name)
+                            .status());
+    XLS_RETURN_IF_ERROR(RemoveNode(inp));
+  }
+  for (InstantiationOutput* out : outs) {
+    auto renaming_rule = port_renaming.find(out->port_name());
+    auto new_name = renaming_rule == port_renaming.end()
+                        ? out->port_name()
+                        : renaming_rule->second;
+    XLS_RETURN_IF_ERROR(
+        out->ReplaceUsesWithNew<InstantiationOutput>(new_inst, new_name)
+            .status());
+    XLS_RETURN_IF_ERROR(RemoveNode(out));
+  }
+  return RemoveInstantiation(old_inst);
 }
 
 absl::Status Block::RemoveInstantiation(Instantiation* instantiation) {
@@ -637,7 +884,7 @@ absl::StatusOr<Instantiation*> Block::GetInstantiation(
 
 absl::Span<InstantiationInput* const> Block::GetInstantiationInputs(
     Instantiation* instantiation) const {
-  XLS_CHECK(IsOwned(instantiation))
+  CHECK(IsOwned(instantiation))
       << absl::StreamFormat("Block %s does not have instantiation %s (%p)",
                             name(), instantiation->name(), instantiation);
   return instantiation_inputs_.at(instantiation);
@@ -645,14 +892,17 @@ absl::Span<InstantiationInput* const> Block::GetInstantiationInputs(
 
 absl::Span<InstantiationOutput* const> Block::GetInstantiationOutputs(
     Instantiation* instantiation) const {
-  XLS_CHECK(IsOwned(instantiation))
+  CHECK(IsOwned(instantiation))
       << absl::StreamFormat("Block %s does not have instantiation %s (%p)",
                             name(), instantiation->name(), instantiation);
   return instantiation_outputs_.at(instantiation);
 }
 
-absl::StatusOr<Block*> Block::Clone(std::string_view new_name,
-                                    Package* target_package) const {
+absl::StatusOr<Block*> Block::Clone(
+    std::string_view new_name, Package* target_package,
+    const absl::flat_hash_map<std::string, std::string>& reg_name_map,
+    const absl::flat_hash_map<const Block*, Block*>& block_instantiation_map)
+    const {
   absl::flat_hash_map<Node*, Node*> original_to_clone;
   absl::flat_hash_map<Register*, Register*> register_map;
   absl::flat_hash_map<Instantiation*, Instantiation*> instantiation_map;
@@ -664,31 +914,68 @@ absl::StatusOr<Block*> Block::Clone(std::string_view new_name,
   Block* cloned_block = target_package->AddBlock(
       std::make_unique<Block>(new_name, target_package));
 
+  std::optional<std::string> clk_port_name;
   for (const Port& port : GetPorts()) {
     if (std::holds_alternative<ClockPort*>(port)) {
-      XLS_RETURN_IF_ERROR(
-          cloned_block->AddClockPort(std::get<ClockPort*>(port)->name));
+      auto old_name = std::get<ClockPort*>(port)->name;
+      clk_port_name = reg_name_map.contains(old_name)
+                          ? reg_name_map.at(old_name)
+                          : old_name;
+      XLS_RETURN_IF_ERROR(cloned_block->AddClockPort(*clk_port_name));
     }
   }
-
+  auto to_new_name = [&](Register* r) {
+    auto it = reg_name_map.find(r->name());
+    if (it == reg_name_map.end()) {
+      return r->name();
+    }
+    return it->second;
+  };
   for (Register* reg : GetRegisters()) {
     XLS_ASSIGN_OR_RETURN(Type * mapped_type,
                          target_package->MapTypeFromOtherPackage(reg->type()));
-    XLS_ASSIGN_OR_RETURN(
-        register_map[reg],
-        cloned_block->AddRegister(reg->name(), mapped_type, reg->reset()));
+    XLS_ASSIGN_OR_RETURN(register_map[reg], cloned_block->AddRegister(
+                                                to_new_name(reg), mapped_type,
+                                                reg->reset_value()));
   }
 
   for (Instantiation* inst : GetInstantiations()) {
     if (inst->kind() == InstantiationKind::kBlock) {
-      auto block_inst = dynamic_cast<BlockInstantiation*>(inst);
-      XLS_CHECK(block_inst != nullptr);
+      XLS_ASSIGN_OR_RETURN(BlockInstantiation * block_inst,
+                           inst->AsBlockInstantiation());
+      Block* new_inst;
+      if (!block_instantiation_map.contains(block_inst->instantiated_block())) {
+        XLS_RET_CHECK_EQ(target_package, package())
+            << "No definition of block " << block_inst->name() << "("
+            << block_inst->instantiated_block()->name() << ") provided.";
+        new_inst = block_inst->instantiated_block();
+      } else {
+        new_inst = block_instantiation_map.at(block_inst->instantiated_block());
+      }
       XLS_ASSIGN_OR_RETURN(
           instantiation_map[inst],
-          cloned_block->AddBlockInstantiation(
-              block_inst->name(), block_inst->instantiated_block()));
+          cloned_block->AddBlockInstantiation(block_inst->name(), new_inst));
+    } else if (inst->kind() == InstantiationKind::kExtern) {
+      XLS_ASSIGN_OR_RETURN(ExternInstantiation * extern_inst,
+                           inst->AsExternInstantiation());
+      XLS_ASSIGN_OR_RETURN(
+          instantiation_map[inst],
+          cloned_block->AddInstantiation(
+              inst->name(), std::make_unique<ExternInstantiation>(
+                                inst->name(), extern_inst->function())));
     } else {
-      XLS_LOG(FATAL) << "InstantiationKind not yet supported: " << inst->kind();
+      XLS_RET_CHECK_EQ(inst->kind(), InstantiationKind::kFifo)
+          << "Unknown instantiation kind";
+      XLS_ASSIGN_OR_RETURN(FifoInstantiation * fifo_inst,
+                           inst->AsFifoInstantiation());
+      XLS_ASSIGN_OR_RETURN(
+          Type * data_type,
+          target_package->MapTypeFromOtherPackage(fifo_inst->data_type()));
+      XLS_ASSIGN_OR_RETURN(
+          FifoInstantiation * cloned_inst,
+          cloned_block->AddFifoInstantiation(
+              inst->name(), fifo_inst->fifo_config(), data_type));
+      instantiation_map[inst] = cloned_inst;
     }
   }
 
@@ -752,6 +1039,14 @@ absl::StatusOr<Block*> Block::Clone(std::string_view new_name,
     }
   }
 
+  // Copy over reset and channel port metadata.
+  if (GetResetPort().has_value()) {
+    XLS_RETURN_IF_ERROR(cloned_block->SetResetPort(
+        original_to_clone[*GetResetPort()]->As<InputPort>(),
+        *GetResetBehavior()));
+  }
+  cloned_block->channel_port_metadata_ = channel_port_metadata_;
+
   {
     std::vector<std::string> correct_ordering;
     for (const Port& port : GetPorts()) {
@@ -762,13 +1057,253 @@ absl::StatusOr<Block*> Block::Clone(std::string_view new_name,
         std::string_view view = std::get<OutputPort*>(port)->name();
         correct_ordering.push_back(std::string(view.begin(), view.end()));
       } else if (std::holds_alternative<ClockPort*>(port)) {
-        correct_ordering.push_back(std::get<ClockPort*>(port)->name);
+        correct_ordering.push_back(*clk_port_name);
       }
     }
     XLS_RETURN_IF_ERROR(cloned_block->ReorderPorts(correct_ordering));
   }
 
   return cloned_block;
+}
+
+absl::Status Block::AddChannelPortMetadata(ChannelPortMetadata metadata) {
+  // Verify that the specified ports exist.
+  if (metadata.direction == ChannelDirection::kReceive) {
+    if (metadata.data_port.has_value()) {
+      XLS_RET_CHECK(HasInputPort(metadata.data_port.value()))
+          << absl::StrFormat(
+                 "No input port `%s` on block `%s` (data port for channel "
+                 "`%s`)",
+                 metadata.data_port.value(), name(), metadata.channel_name);
+    }
+    if (metadata.valid_port.has_value()) {
+      XLS_RET_CHECK(HasInputPort(metadata.valid_port.value()))
+          << absl::StrFormat(
+                 "No input port `%s` on block `%s` (valid port for channel "
+                 "`%s`)",
+                 metadata.valid_port.value(), name(), metadata.channel_name);
+    }
+    if (metadata.ready_port.has_value()) {
+      XLS_RET_CHECK(HasOutputPort(metadata.ready_port.value()))
+          << absl::StrFormat(
+                 "No output port `%s` on block `%s` (ready port for channel "
+                 "`%s`)",
+                 metadata.ready_port.value(), name(), metadata.channel_name);
+    }
+  } else {
+    CHECK_EQ(metadata.direction, ChannelDirection::kSend);
+    if (metadata.data_port.has_value()) {
+      XLS_RET_CHECK(HasOutputPort(metadata.data_port.value()))
+          << absl::StrFormat(
+                 "No output port `%s` on block `%s` (data port for channel "
+                 "`%s`)",
+                 metadata.data_port.value(), name(), metadata.channel_name);
+    }
+    if (metadata.valid_port.has_value()) {
+      XLS_RET_CHECK(HasOutputPort(metadata.valid_port.value()))
+          << absl::StrFormat(
+                 "No output port `%s` on block `%s` (valid port for channel "
+                 "`%s`)",
+                 metadata.data_port.value(), name(), metadata.channel_name);
+    }
+    if (metadata.ready_port.has_value()) {
+      XLS_RET_CHECK(HasInputPort(metadata.ready_port.value()))
+          << absl::StrFormat(
+                 "No input port `%s` on block `%s` (ready port for channel "
+                 "`%s`)",
+                 metadata.data_port.value(), name(), metadata.channel_name);
+    }
+  }
+  VLOG(3) << "AddChannelPortMetadata for block `" << name()
+          << "`: " << metadata.ToString();
+  channel_port_metadata_[{metadata.channel_name, metadata.direction}] =
+      std::move(metadata);
+  return absl::OkStatus();
+}
+
+absl::Status Block::AddChannelPortMetadata(
+    ChannelRef channel, ChannelDirection direction,
+    std::optional<std::string> data_port, std::optional<std::string> valid_port,
+    std::optional<std::string> ready_port) {
+  FlopKind flop_kind;
+  if (std::holds_alternative<Channel*>(channel)) {
+    if (StreamingChannel* streaming_channel =
+            dynamic_cast<StreamingChannel*>(std::get<Channel*>(channel));
+        streaming_channel != nullptr) {
+      flop_kind =
+          direction == ChannelDirection::kReceive
+              ? streaming_channel->channel_config().input_flop_kind().value_or(
+                    FlopKind::kNone)
+              : streaming_channel->channel_config().output_flop_kind().value_or(
+                    FlopKind::kNone);
+    } else {
+      flop_kind = FlopKind::kNone;
+    }
+  } else {
+    flop_kind = std::get<ChannelInterface*>(channel)->flop_kind();
+  }
+  return AddChannelPortMetadata(
+      ChannelPortMetadata{.channel_name = std::string{ChannelRefName(channel)},
+                          .type = ChannelRefType(channel),
+                          .direction = direction,
+                          .channel_kind = ChannelRefKind(channel),
+                          .flop_kind = flop_kind,
+                          .data_port = data_port,
+                          .valid_port = valid_port,
+                          .ready_port = ready_port});
+}
+
+absl::StatusOr<ChannelPortMetadata> Block::GetChannelPortMetadata(
+    std::string_view channel_name, ChannelDirection direction) const {
+  XLS_ASSIGN_OR_RETURN(const ChannelPortMetadata* metadata,
+                       GetChannelPortMetadataInternal(channel_name, direction));
+  return *metadata;
+}
+
+absl::StatusOr<const ChannelPortMetadata*>
+Block::GetChannelPortMetadataInternal(std::string_view channel_name,
+                                      ChannelDirection direction) const {
+  auto it =
+      channel_port_metadata_.find(std::pair<std::string, ChannelDirection>(
+          std::string{channel_name}, direction));
+  if (it == channel_port_metadata_.end()) {
+    return absl::NotFoundError(absl::StrFormat(
+        "Block `%s` has no port metadata for channel `%s` in the %s direction",
+        name(), channel_name,
+        direction == ChannelDirection::kSend ? "send" : "receive"));
+  }
+  return &it->second;
+}
+
+absl::StatusOr<PortNode*> Block::GetPortNode(std::string_view name) const {
+  auto it = ports_by_name_.find(name);
+  if (it == ports_by_name_.end()) {
+    return absl::NotFoundError(absl::StrFormat(
+        "Block `%s` has no port node named  `%s`", this->name(), name));
+  }
+  Port port = it->second;
+  if (std::holds_alternative<InputPort*>(port)) {
+    return absl::implicit_cast<PortNode*>(std::get<InputPort*>(port));
+  }
+  if (std::holds_alternative<OutputPort*>(port)) {
+    return absl::implicit_cast<PortNode*>(std::get<OutputPort*>(port));
+  }
+  return absl::InvalidArgumentError("Cannot call GetPortNode on clock port");
+}
+
+absl::StatusOr<std::optional<PortNode*>> Block::GetReadyPortForChannel(
+    std::string_view channel_name, ChannelDirection direction) const {
+  XLS_ASSIGN_OR_RETURN(const ChannelPortMetadata* metadata,
+                       GetChannelPortMetadataInternal(channel_name, direction));
+  if (!metadata->ready_port.has_value()) {
+    return std::nullopt;
+  }
+  return GetPortNode(*metadata->ready_port);
+}
+
+absl::StatusOr<std::optional<PortNode*>> Block::GetValidPortForChannel(
+    std::string_view channel_name, ChannelDirection direction) const {
+  XLS_ASSIGN_OR_RETURN(const ChannelPortMetadata* metadata,
+                       GetChannelPortMetadataInternal(channel_name, direction));
+  if (!metadata->valid_port.has_value()) {
+    return std::nullopt;
+  }
+  return GetPortNode(*metadata->valid_port);
+}
+
+absl::StatusOr<std::optional<PortNode*>> Block::GetDataPortForChannel(
+    std::string_view channel_name, ChannelDirection direction) const {
+  XLS_ASSIGN_OR_RETURN(const ChannelPortMetadata* metadata,
+                       GetChannelPortMetadataInternal(channel_name, direction));
+  if (!metadata->data_port.has_value()) {
+    return std::nullopt;
+  }
+  return GetPortNode(*metadata->data_port);
+}
+
+absl::StatusOr<FifoInstantiation*> Block::GetFifoInstantiationForChannel(
+    std::string_view channel_name) const {
+  for (Instantiation* inst : GetInstantiations()) {
+    if (inst->kind() == InstantiationKind::kFifo) {
+      XLS_ASSIGN_OR_RETURN(FifoInstantiation * fifo_inst,
+                           inst->AsFifoInstantiation());
+      if (fifo_inst->channel_name().has_value() &&
+          *fifo_inst->channel_name() == channel_name) {
+        return fifo_inst;
+      }
+    }
+  }
+  return absl::NotFoundError(
+      absl::StrFormat("No fifo instantation for channel `%s` in block `%s`",
+                      channel_name, name()));
+}
+
+namespace {
+
+absl::StatusOr<std::optional<InstantiationConnection*>>
+GetInstantiationConnectionByName(const Block* block, Instantiation* inst,
+                                 std::string_view port_name) {
+  for (InstantiationInput* input : block->GetInstantiationInputs(inst)) {
+    if (input->port_name() == port_name) {
+      return input;
+    }
+  }
+  for (InstantiationOutput* output : block->GetInstantiationOutputs(inst)) {
+    if (output->port_name() == port_name) {
+      return output;
+    }
+  }
+  return absl::NotFoundError(absl::StrFormat(
+      "No connection for port `%s` of instantiation `%s` found in block `%s`",
+      port_name, inst->name(), block->name()));
+}
+
+}  // namespace
+
+absl::StatusOr<std::optional<InstantiationConnection*>>
+Block::GetReadyInstantiationConnectionForChannel(
+    std::string_view channel_name, ChannelDirection direction) const {
+  XLS_ASSIGN_OR_RETURN(FifoInstantiation * inst,
+                       GetFifoInstantiationForChannel(channel_name));
+  return GetInstantiationConnectionByName(
+      this, inst,
+      direction == ChannelDirection::kSend
+          ? FifoInstantiation::kPushReadyPortName
+          : FifoInstantiation::kPopReadyPortName);
+}
+
+absl::StatusOr<std::optional<InstantiationConnection*>>
+Block::GetValidInstantiationConnectionForChannel(
+    std::string_view channel_name, ChannelDirection direction) const {
+  XLS_ASSIGN_OR_RETURN(FifoInstantiation * inst,
+                       GetFifoInstantiationForChannel(channel_name));
+  return GetInstantiationConnectionByName(
+      this, inst,
+      direction == ChannelDirection::kSend
+          ? FifoInstantiation::kPushValidPortName
+          : FifoInstantiation::kPopValidPortName);
+}
+
+absl::StatusOr<std::optional<InstantiationConnection*>>
+Block::GetDataInstantiationConnectionForChannel(
+    std::string_view channel_name, ChannelDirection direction) const {
+  XLS_ASSIGN_OR_RETURN(FifoInstantiation * inst,
+                       GetFifoInstantiationForChannel(channel_name));
+  return GetInstantiationConnectionByName(
+      this, inst,
+      direction == ChannelDirection::kSend
+          ? FifoInstantiation::kPushDataPortName
+          : FifoInstantiation::kPopDataPortName);
+}
+
+std::vector<std::pair<std::string, ChannelDirection>>
+Block::GetChannelsWithMappedPorts() const {
+  std::vector<std::pair<std::string, ChannelDirection>> result;
+  for (const auto& [key, _] : channel_port_metadata_) {
+    result.push_back(key);
+  }
+  std::sort(result.begin(), result.end());
+  return result;
 }
 
 }  // namespace xls

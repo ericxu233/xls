@@ -21,6 +21,10 @@ load("@xls_pip_deps//:requirements.bzl", "requirement")
 package(
     default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -29,9 +33,16 @@ exports_files(
     visibility = ["//xls:xls_internal"],
 )
 
+# All files that have a ```dslx ... in them.
 filegroup(
-    name = "dslx_reference",
-    srcs = ["dslx_reference.md"],
+    name = "dslx_documentation_files",
+    srcs = [
+        "dslx_ffi.md",
+        "dslx_reference.md",
+        "dslx_std.md",
+        "dslx_type_system.md",
+        "floating_point.md",
+    ],
 )
 
 filegroup(
@@ -49,13 +60,9 @@ py_test(
         ":all_markdown",
         "//:mkdocs.yml",
     ],
-    python_version = "PY3",
-    srcs_version = "PY3",
     deps = [
         requirement("pyyaml"),
         "//xls/common:runfiles",
-        "@com_google_absl_py//absl:app",
-        "@com_google_absl_py//absl/flags",
-        "@com_google_absl_py//absl/logging",
+        "@abseil-py//absl:app",
     ],
 )

@@ -12,21 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <limits>
+#include <cstdint>
 #include <string>
 #include <vector>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "xls/ir/function.h"
-#include "xls/ir/ir_test_base.h"
-#include "xls/ir/package.h"
+#include "absl/types/span.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/value.h"
+#include "xls/simulation/sim_test_base.h"
 
 namespace xls {
 namespace {
 
 // Tests of non-trivial IR types.
-class IrTypeTests : public IrTestBase {
+class IrTypeTests : public SimTestBase {
  protected:
   // Creates a one-dimensional array of Bits values of the given width.
   Value Array1D(absl::Span<const int64_t> values, int64_t width) {

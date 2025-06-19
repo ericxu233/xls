@@ -14,12 +14,21 @@
 
 #include "xls/noc/simulation/indexer.h"
 
+#include <cstdint>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
+#include "absl/types/span.h"
+#include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/noc/simulation/common.h"
+#include "xls/noc/simulation/parameters.h"
 
 namespace xls {
 namespace noc {

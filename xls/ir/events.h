@@ -15,18 +15,44 @@
 #ifndef XLS_IR_EVENTS_H_
 #define XLS_IR_EVENTS_H_
 
+#include <compare>
+#include <cstdint>
 #include <string>
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
 
 namespace xls {
+
+// A trace message is a string and a verbosity associated with the message.
+struct TraceMessage {
+  std::string message;
+  int64_t verbosity;
+
+  bool operator==(const TraceMessage& other) const {
+    return message == other.message && verbosity == other.verbosity;
+  }
+  bool operator!=(const TraceMessage& other) const { return !(*this == other); }
+  std::strong_ordering operator<=>(const TraceMessage& other) const {
+    auto verbosity_cmp = verbosity <=> other.verbosity;
+    if (verbosity_cmp != std::strong_ordering::equal) {
+      return verbosity_cmp;
+    }
+    return message <=> other.message;
+  }
+
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink, const TraceMessage& t) {
+    absl::Format(&sink, "%s [verbosity: %d]", t.message, t.verbosity);
+  }
+};
 
 // Common structure capturing events that can be produced by any XLS interpreter
 // (DSLX, IR, JIT, etc.)
 struct InterpreterEvents {
-  std::vector<std::string> trace_msgs;
+  std::vector<TraceMessage> trace_msgs;
   std::vector<std::string> assert_msgs;
 
   void Clear() {
@@ -54,7 +80,7 @@ struct InterpreterResult {
 // any assertion has failed.
 template <typename ValueT>
 absl::StatusOr<ValueT> InterpreterResultToStatusOrValue(
-    InterpreterResult<ValueT> result) {
+    const InterpreterResult<ValueT>& result) {
   absl::Status status = InterpreterEventsToStatus(result.events);
 
   if (!status.ok()) {
@@ -68,7 +94,7 @@ absl::StatusOr<ValueT> InterpreterResultToStatusOrValue(
 // interpreter events and including assertion failures as errors.
 template <typename ValueT>
 absl::StatusOr<ValueT> DropInterpreterEvents(
-    absl::StatusOr<InterpreterResult<ValueT>> result) {
+    const absl::StatusOr<InterpreterResult<ValueT>>& result) {
   if (!result.ok()) {
     return result.status();
   }
@@ -78,4 +104,4 @@ absl::StatusOr<ValueT> DropInterpreterEvents(
 
 }  // namespace xls
 
-#endif  // XLS_IR_EVENTS_H
+#endif  // XLS_IR_EVENTS_H_

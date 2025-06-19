@@ -22,15 +22,18 @@
 
 #include "gtest/gtest.h"
 #include "absl/flags/flag.h"
+#include "absl/log/log.h"
+#include "absl/random/distributions.h"
+#include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/time/time.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/temp_directory.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/stopwatch.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/fuzzer/ast_generator.h"
 #include "xls/fuzzer/run_fuzz.h"
 #include "xls/fuzzer/sample.h"
@@ -65,6 +68,8 @@ ABSL_FLAG(
     std::optional<absl::Duration>, sample_timeout, std::nullopt,
     "Maximum time to run each sample before timing out. Examples: 10s, 2m, 1h");
 ABSL_FLAG(bool, generate_proc, false, "Generate a proc sample.");
+ABSL_FLAG(bool, with_valid_holdoff, false,
+          "If true, emit valid random holdoffs on proc input channels.");
 
 // The maximum number of failures before the test aborts.
 constexpr int64_t kMaxFailures = 10;
@@ -92,13 +97,13 @@ TEST(FuzzIntegrationTest, Fuzzing) {
                            GetCrasherDir());
   uint64_t seed = absl::GetFlag(FLAGS_seed);
   if (absl::GetFlag(FLAGS_use_nondeterministic_seed)) {
-    std::random_device rd;
-    seed = (static_cast<uint64_t>(rd()) << 32) | static_cast<uint64_t>(rd());
-    XLS_LOG(INFO) << "Random seed (generated nondeterministically): " << seed;
+    seed = absl::Uniform<uint64_t>(absl::BitGen());
+    LOG(INFO) << "Random seed (generated nondeterministically): " << seed;
   } else {
-    XLS_LOG(INFO) << "Random seed specified via flag: " << seed;
+    LOG(INFO) << "Random seed specified via flag: " << seed;
   }
   std::mt19937_64 rng{seed};
+  dslx::FileTable file_table;
 
   dslx::AstGeneratorOptions ast_generator_options{
       .max_width_bits_types = absl::GetFlag(FLAGS_max_width_bits_types),
@@ -130,6 +135,8 @@ TEST(FuzzIntegrationTest, Fuzzing) {
     sample_options.set_timeout_seconds(
         absl::ToInt64Seconds(*absl::GetFlag(FLAGS_sample_timeout)));
   }
+  sample_options.set_with_valid_holdoff(
+      absl::GetFlag(FLAGS_with_valid_holdoff));
 
   int64_t crasher_count = 0;
   int64_t sample_count = 0;
@@ -141,13 +148,13 @@ TEST(FuzzIntegrationTest, Fuzzing) {
                      &run_time, &sample_count]() -> bool {
     if (target_duration.has_value()) {
       if (run_time.GetElapsedTime() >= *target_duration) {
-        XLS_LOG(INFO) << "Ran for target duration of " << *target_duration
-                      << ". Exiting.";
+        LOG(INFO) << "Ran for target duration of " << *target_duration
+                  << ". Exiting.";
         return false;
       }
     } else {
       if (sample_count >= target_sample_count) {
-        XLS_LOG(INFO) << "Generated target number of samples. Exiting.";
+        LOG(INFO) << "Generated target number of samples. Exiting.";
         return false;
       }
     }
@@ -155,16 +162,16 @@ TEST(FuzzIntegrationTest, Fuzzing) {
   };
 
   while (keep_going()) {
-    XLS_LOG(INFO) << "Running sample " << sample_count++;
+    LOG(INFO) << "Running sample " << sample_count++;
     XLS_ASSERT_OK_AND_ASSIGN(TempDirectory run_dir, TempDirectory::Create());
     absl::Status status =
-        GenerateSampleAndRun(rng, ast_generator_options, sample_options,
-                             run_dir.path(), crasher_dir,
+        GenerateSampleAndRun(file_table, rng, ast_generator_options,
+                             sample_options, run_dir.path(), crasher_dir,
                              /*summary_file=*/std::nullopt,
                              absl::GetFlag(FLAGS_force_failure))
             .status();
     if (!status.ok()) {
-      XLS_LOG(ERROR) << "Sample failed: " << status;
+      LOG(ERROR) << "Sample failed: " << status;
       crasher_count += 1;
     }
 

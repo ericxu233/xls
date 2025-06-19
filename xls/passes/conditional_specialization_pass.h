@@ -15,9 +15,13 @@
 #ifndef XLS_PASSES_CONDITIONAL_SPECIALIZATION_PASS_H_
 #define XLS_PASSES_CONDITIONAL_SPECIALIZATION_PASS_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
 #include "xls/ir/function_base.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
+#include "xls/passes/pass_pipeline.pb.h"
 
 namespace xls {
 
@@ -25,18 +29,21 @@ namespace xls {
 // value.
 class ConditionalSpecializationPass : public OptimizationFunctionBasePass {
  public:
+  static constexpr std::string_view kName = "cond_spec";
   // If `use_bdd` is true, then binary decision diagrams (BDDs) are used for
   // stronger analysis at the cost of slower transformation.
   explicit ConditionalSpecializationPass(bool use_bdd)
-      : OptimizationFunctionBasePass("cond_spec", "Conditional specialization"),
+      : OptimizationFunctionBasePass(kName, "Conditional specialization"),
         use_bdd_(use_bdd) {}
   ~ConditionalSpecializationPass() override = default;
+
+  absl::StatusOr<PassPipelineProto::Element> ToProto() const override;
 
  protected:
   bool use_bdd_;
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
 };
 
 }  // namespace xls

@@ -15,18 +15,15 @@
 #ifndef XLS_NOC_SIMULATION_TRAFFIC_MODELS_H_
 #define XLS_NOC_SIMULATION_TRAFFIC_MODELS_H_
 
-#include <algorithm>
+#include <cstdint>
 #include <memory>
-#include <queue>
+#include <type_traits>
 #include <vector>
 
 #include "absl/status/statusor.h"
-#include "absl/strings/str_format.h"
-#include "xls/common/status/status_macros.h"
-#include "xls/noc/simulation/common.h"
+#include "absl/types/span.h"
 #include "xls/noc/simulation/packetizer.h"
 #include "xls/noc/simulation/random_number_interface.h"
-#include "xls/noc/simulation/units.h"
 
 // This file contains classes used to model traffic of a NOC.
 

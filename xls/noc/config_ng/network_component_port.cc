@@ -14,14 +14,15 @@
 
 #include "xls/noc/config_ng/network_component_port.h"
 
-#include "xls/common/logging/logging.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/die_if_null.h"
 
 namespace xls::noc {
 
 NetworkComponentPort::NetworkComponentPort(NetworkComponent* network_component,
                                            const PortType port_type,
                                            const PortDirection direction)
-    : component_(*XLS_DIE_IF_NULL(network_component)),
+    : component_(*ABSL_DIE_IF_NULL(network_component)),
       type_(port_type),
       direction_(direction) {}
 

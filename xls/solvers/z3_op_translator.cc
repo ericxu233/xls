@@ -16,15 +16,42 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
 #include "absl/base/macros.h"
-#include "xls/common/logging/logging.h"
-#include "../z3/src/api/z3.h"  // IWYU pragma: keep
-#include "../z3/src/api/z3_api.h"
+#include "absl/log/check.h"
+#include "z3/src/api/z3.h"  // IWYU pragma: keep
+#include "z3/src/api/z3_api.h"
 
 namespace xls::solvers::z3 {
+
+Z3_ast Z3OpTranslator::Shll(Z3_ast l, Z3_ast r) {
+  int64_t l_bit_count = GetBvBitCount(l);
+  int64_t r_bit_count = GetBvBitCount(r);
+
+  if (r_bit_count == 0) {
+    return l;
+  }
+  if (l_bit_count == r_bit_count) {
+    return Z3_mk_bvshl(z3_ctx_, l, r);
+  }
+  if (l_bit_count > r_bit_count) {
+    // Easy case. Extend right side and return.
+    return Shll(l, ZeroExt(r, l_bit_count));
+  }
+  // Extend l then truncate it back.
+  Z3_ast ext_l = ZeroExt(l, r_bit_count);
+  Z3_ast ext_shift = Shll(ext_l, r);
+  return Z3_mk_extract(z3_ctx_, l_bit_count - 1, 0, ext_shift);
+}
+
+Z3_ast Z3OpTranslator::ZeroExt(Z3_ast bits, int64_t new_bit_count) {
+  int64_t cur_bit_count = GetBvBitCount(bits);
+  CHECK_GT(new_bit_count, cur_bit_count);
+  return Z3_mk_zero_ext(z3_ctx_, new_bit_count - cur_bit_count, bits);
+}
 
 Z3_ast Z3OpTranslator::OrBool(Z3_ast lhs, Z3_ast rhs) {
   Z3_ast args[] = {lhs, rhs};
@@ -48,22 +75,22 @@ std::vector<Z3_ast> Z3OpTranslator::ExplodeBits(Z3_ast arg) {
 
 Z3_ast Z3OpTranslator::SignExt(Z3_ast arg, int64_t new_bit_count) {
   int64_t input_bit_count = GetBvBitCount(arg);
-  XLS_CHECK_GE(new_bit_count, input_bit_count);
-  XLS_CHECK_GE(input_bit_count, 0);
-  XLS_CHECK_GE(new_bit_count, 0);
+  CHECK_GE(new_bit_count, input_bit_count);
+  CHECK_GE(input_bit_count, 0);
+  CHECK_GE(new_bit_count, 0);
   return Z3_mk_sign_ext(
       z3_ctx_, static_cast<unsigned int>(new_bit_count - input_bit_count), arg);
 }
 
 Z3_ast Z3OpTranslator::Extract(Z3_ast arg, int64_t bitno) {
   unsigned int unsigned_bitno = static_cast<unsigned int>(bitno);
-  XLS_CHECK_EQ(unsigned_bitno, bitno);
+  CHECK_EQ(unsigned_bitno, bitno);
   return Z3_mk_extract(z3_ctx_, unsigned_bitno, unsigned_bitno, arg);
 }
 
 Z3_ast Z3OpTranslator::Fill(bool value, int64_t bit_count) {
   unsigned int ubit_count = static_cast<unsigned int>(bit_count);
-  XLS_CHECK_EQ(bit_count, ubit_count);
+  CHECK_EQ(bit_count, ubit_count);
   std::unique_ptr<bool[]> bits(new bool[ubit_count]);
   for (int64_t i = 0; i < bit_count; ++i) {
     bits[i] = value;

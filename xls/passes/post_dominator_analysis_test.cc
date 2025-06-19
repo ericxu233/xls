@@ -14,11 +14,15 @@
 
 #include "xls/passes/post_dominator_analysis.h"
 
+#include <memory>
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "xls/common/status/matchers.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/value.h"
 
 namespace xls {
 namespace {
@@ -222,20 +226,22 @@ TEST_F(PostDominatorAnalysisTest, DisconnectedNode) {
 
 TEST_F(PostDominatorAnalysisTest, MultipleOutputs) {
   auto p = CreatePackage();
-  ProcBuilder pb("p", "tkn", p.get());
+  ProcBuilder pb("p", p.get());
   BValue x = pb.StateElement("x", Value(UBits(0, 1)));
   BValue y = pb.StateElement("y", Value(UBits(0, 1)));
   BValue z = pb.And(x, y);
-  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build(pb.GetTokenParam(), {x, z}));
+  pb.Next(x, x);
+  BValue next_y = pb.Next(y, z);
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build());
   XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PostDominatorAnalysis> analysis,
                            PostDominatorAnalysis::Run(proc));
 
   EXPECT_THAT(analysis->GetPostDominatorsOfNode(x.node()),
               ElementsAre(x.node()));
   EXPECT_THAT(analysis->GetPostDominatorsOfNode(y.node()),
-              ElementsAre(y.node(), z.node()));
+              ElementsAre(y.node(), z.node(), next_y.node()));
   EXPECT_THAT(analysis->GetPostDominatorsOfNode(z.node()),
-              ElementsAre(z.node()));
+              ElementsAre(z.node(), next_y.node()));
 
   EXPECT_THAT(analysis->GetNodesPostDominatedByNode(x.node()),
               ElementsAre(x.node()));

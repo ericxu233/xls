@@ -15,6 +15,7 @@
 #ifndef XLS_SIMULATION_MODULE_SIMULATOR_H_
 #define XLS_SIMULATION_MODULE_SIMULATOR_H_
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -23,10 +24,15 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "xls/codegen/module_signature.h"
-#include "xls/codegen/vast.h"
+#include "xls/codegen/vast/vast.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/value.h"
 #include "xls/simulation/module_testbench.h"
+#include "xls/simulation/module_testbench_thread.h"
+#include "xls/simulation/testbench_signal_capture.h"
+#include "xls/simulation/verilog_include.h"
 #include "xls/simulation/verilog_simulator.h"
 
 namespace xls {
@@ -137,8 +143,8 @@ class ModuleSimulator {
       std::optional<ReadyValidHoldoffs> holdoffs = std::nullopt) const;
 
  private:
-  // Returns a map of the signal name to its deasserted value.
-  absl::flat_hash_map<std::string, Bits> DeassertControlSignals() const;
+  // Returns the control input ports and their deasserted values.
+  std::vector<DutInput> DeassertControlSignals() const;
 
   struct ProcTestbench {
     std::unique_ptr<ModuleTestbench> testbench;

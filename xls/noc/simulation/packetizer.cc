@@ -14,7 +14,18 @@
 
 #include "xls/noc/simulation/packetizer.h"
 
+#include <cstdint>
 #include <vector>
+
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/bits_ops.h"
+#include "xls/ir/format_preference.h"
+#include "xls/noc/simulation/flit.h"
 
 namespace xls::noc {
 
@@ -66,7 +77,7 @@ absl::Status Packetizer::AcceptNewFlit(DataFlit flit) {
 
     BitsRope received_data(packet_bit_count);
     for (Bits& b : *partial_packet_store) {
-      XLS_VLOG(1) << absl::StreamFormat(
+      VLOG(1) << absl::StreamFormat(
           "... packetizer concat %s",
           BitsToString(b, FormatPreference::kBinary, true));
       received_data.push_back(b);

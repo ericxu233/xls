@@ -14,6 +14,7 @@
 
 #include "xls/common/status/status_macros.h"
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -22,7 +23,6 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "xls/common/status/status_builder.h"
@@ -30,6 +30,7 @@
 namespace {
 
 using ::testing::AllOf;
+using ::testing::ContainsRegex;
 using ::testing::Eq;
 using ::testing::HasSubstr;
 
@@ -84,8 +85,6 @@ TEST(AssignOrReturn, Works) {
   EXPECT_THAT(func().message(), Eq("EXPECTED"));
 }
 
-// Note: GCC (as of 9.2.1) doesn't seem to support this trick.
-#ifdef __clang__
 TEST(AssignOrReturn, WorksWithCommasInType) {
   auto func = []() -> absl::Status {
     XLS_ASSIGN_OR_RETURN((std::tuple<int, int> t1),
@@ -121,7 +120,6 @@ TEST(AssignOrReturn, WorksWithStructureBindings) {
 
   EXPECT_THAT(func().message(), Eq("EXPECTED"));
 }
-#endif
 
 TEST(AssignOrReturn, WorksWithParenthesesAndDereference) {
   auto func = []() -> absl::Status {
@@ -185,8 +183,6 @@ TEST(AssignOrReturn, WorksWithAdaptorFunc) {
               AllOf(HasSubstr("EXPECTED A"), HasSubstr("EXPECTED B")));
 }
 
-// Note: GCC (as of 9.2.1) doesn't seem to support this trick.
-#ifdef __clang__
 TEST(AssignOrReturn, WorksWithThirdArgumentAndCommas) {
   auto fail_test_if_called = [](xabsl::StatusBuilder builder) {
     ADD_FAILURE();
@@ -215,7 +211,6 @@ TEST(AssignOrReturn, WorksWithThirdArgumentAndCommas) {
   EXPECT_THAT(func().message(),
               AllOf(HasSubstr("EXPECTED A"), HasSubstr("EXPECTED B")));
 }
-#endif
 
 TEST(AssignOrReturn, WorksWithAppendIncludingLocals) {
   auto func = [&](const std::string& str) -> absl::Status {
@@ -265,6 +260,60 @@ TEST(AssignOrReturn, UniquePtrWorksForExistingVariable) {
   };
 
   EXPECT_THAT(func().message(), Eq("EXPECTED"));
+}
+
+namespace assign_or_return {
+absl::Status CallThree() { return absl::InternalError("foobar"); }
+absl::StatusOr<int> CallTwo() {
+  XLS_RETURN_IF_ERROR(CallThree());
+  return 1;
+}
+absl::Status CallOne() {
+  XLS_ASSIGN_OR_RETURN(auto abc, CallTwo());
+  (void)abc;
+  return absl::OkStatus();
+}
+}  // namespace assign_or_return
+TEST(AssignOrReturn, KeepsBackTrace) {
+#ifndef XLS_USE_ABSL_SOURCE_LOCATION
+  GTEST_SKIP() << "Back trace not recorded";
+#endif
+  auto result = assign_or_return::CallOne();
+  RecordProperty("result", testing::PrintToString(result));
+  EXPECT_THAT(result.message(), Eq("foobar"));
+  // Expect 3 lines in the stack trace with status_macros_test.cc in them for
+  // the three deep call stack.
+  EXPECT_THAT(
+      result.ToString(absl::StatusToStringMode::kWithEverything),
+      ContainsRegex(
+          "(.*xls/common/status/status_macros_test.cc:[0-9]+.*\n?){3}"));
+}
+
+namespace assign_or_return_with_message {
+absl::Status CallThree() { return absl::InternalError("Clap"); }
+absl::StatusOr<int> CallTwo() {
+  XLS_RETURN_IF_ERROR(CallThree()) << "Your";
+  return 1;
+}
+absl::Status CallOne() {
+  XLS_ASSIGN_OR_RETURN(auto abc, CallTwo(), _ << "Hands");
+  (void)abc;
+  return absl::OkStatus();
+}
+}  // namespace assign_or_return_with_message
+TEST(AssignOrReturn, KeepsBackTraceWithMessage) {
+#ifndef XLS_USE_ABSL_SOURCE_LOCATION
+  GTEST_SKIP() << "Back trace not recorded";
+#endif
+  auto result = assign_or_return_with_message::CallOne();
+  RecordProperty("result", testing::PrintToString(result));
+  EXPECT_THAT(result.message(), Eq("Clap; Your; Hands"));
+  // Expect 3 lines in the stack trace with status_macros_test.cc in them for
+  // the three deep call stack.
+  EXPECT_THAT(
+      result.ToString(absl::StatusToStringMode::kWithEverything),
+      ContainsRegex(
+          "(.*xls/common/status/status_macros_test.cc:[0-9]+.*\n?){3}"));
 }
 
 TEST(ReturnIfError, Works) {
@@ -331,6 +380,60 @@ TEST(ReturnIfError, WorksWithVoidReturnAdaptor) {
   EXPECT_EQ(code, 2);
 }
 
+namespace return_if_error {
+absl::Status CallThree() { return absl::InternalError("foobar"); }
+absl::Status CallTwo() {
+  XLS_RETURN_IF_ERROR(CallThree());
+  return absl::OkStatus();
+}
+absl::Status CallOne() {
+  XLS_RETURN_IF_ERROR(CallTwo());
+  return absl::OkStatus();
+}
+}  // namespace return_if_error
+
+TEST(ReturnIfError, KeepsBackTrace) {
+#ifndef XLS_USE_ABSL_SOURCE_LOCATION
+  GTEST_SKIP() << "Back trace not recorded";
+#endif
+  auto result = return_if_error::CallOne();
+  RecordProperty("result", testing::PrintToString(result));
+  EXPECT_THAT(result.message(), Eq("foobar"));
+  // Expect 3 lines in the stack trace with status_macros_test.cc in them for
+  // the three deep call stack.
+  EXPECT_THAT(
+      result.ToString(absl::StatusToStringMode::kWithEverything),
+      ContainsRegex(
+          "(.*xls/common/status/status_macros_test.cc:[0-9]+.*\n?){3}"));
+}
+
+namespace return_if_error_with_message {
+absl::Status CallThree() { return absl::InternalError("Clap"); }
+absl::Status CallTwo() {
+  XLS_RETURN_IF_ERROR(CallThree()) << "Your";
+  return absl::OkStatus();
+}
+absl::Status CallOne() {
+  XLS_RETURN_IF_ERROR(CallTwo()) << "Hands";
+  return absl::OkStatus();
+}
+}  // namespace return_if_error_with_message
+
+TEST(ReturnIfError, KeepsBackTraceWithMessage) {
+#ifndef XLS_USE_ABSL_SOURCE_LOCATION
+  GTEST_SKIP() << "Back trace not recorded";
+#endif
+  auto result = return_if_error_with_message::CallOne();
+  RecordProperty("result", testing::PrintToString(result));
+  EXPECT_THAT(result.message(), Eq("Clap; Your; Hands"));
+  // Expect 3 lines in the stack trace with status_macros_test.cc in them for
+  // the three deep call stack.
+  EXPECT_THAT(
+      result.ToString(absl::StatusToStringMode::kWithEverything),
+      ContainsRegex(
+          "(.*xls/common/status/status_macros_test.cc:[0-9]+.*\n?){3}"));
+}
+
 // Basis for XLS_RETURN_IF_ERROR and XLS_ASSIGN_OR_RETURN benchmarks.  Derived
 // classes override LoopAgain() with the macro invocation(s).
 template <class T>
@@ -351,7 +454,7 @@ class ReturnLoop {
     return LoopAgain(ops);
   }
 
-  const ReturnType return_value() { return value_; }
+  ReturnType return_value() { return value_; }
 
  private:
   virtual ReturnType LoopAgain(size_t* ops) = 0;

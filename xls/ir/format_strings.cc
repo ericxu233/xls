@@ -15,15 +15,21 @@
 #include "xls/ir/format_strings.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_replace.h"
+#include "absl/types/span.h"
+#include "xls/ir/format_preference.h"
 
 namespace xls {
 
@@ -79,6 +85,11 @@ absl::StatusOr<std::vector<FormatStep>> ParseFormatString(
       steps.push_back(FormatPreference::kPlainHex);
       continue;
     }
+    if (consume_substr("{:0x}")) {
+      push_fragment();
+      steps.push_back(FormatPreference::kZeroPaddedHex);
+      continue;
+    }
     if (consume_substr("{:#x}")) {
       push_fragment();
       steps.push_back(FormatPreference::kHex);
@@ -87,6 +98,11 @@ absl::StatusOr<std::vector<FormatStep>> ParseFormatString(
     if (consume_substr("{:b}")) {
       push_fragment();
       steps.push_back(FormatPreference::kPlainBinary);
+      continue;
+    }
+    if (consume_substr("{:0b}")) {
+      push_fragment();
+      steps.push_back(FormatPreference::kZeroPaddedBinary);
       continue;
     }
     if (consume_substr("{:#b}")) {
@@ -101,11 +117,10 @@ absl::StatusOr<std::vector<FormatStep>> ParseFormatString(
             "Invalid or unsupported format specifier \"%s\" in format string "
             "\"%s\"",
             format_string.substr(i, close_pos - i + 1), format_string));
-      } else {
-        return absl::InvalidArgumentError(absl::StrFormat(
-            "{ without matching } at position %d in format string \"%s\"", i,
-            format_string));
       }
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "{ without matching } at position %d in format string \"%s\"", i,
+          format_string));
     }
     if (format_string[i] == '}') {
       return absl::InvalidArgumentError(absl::StrFormat(

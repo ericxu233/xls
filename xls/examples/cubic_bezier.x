@@ -1,3 +1,5 @@
+#![feature(type_inference_v2)]
+
 // Copyright 2020 The XLS Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +17,7 @@
 // Sample a cubic polynomial f(x) with coefficients a, b, c with no constant.
 // f(x) = a * x + b * x ** 2 + c * x ** 3
 
-import std
+import std;
 
 // The function parameters are represented as fixed point rational numbers.
 // The parameters are passed with the following precisions:
@@ -40,13 +42,13 @@ fn main(x: sN[17], a: sN[23], b: sN[23], c: sN[23]) ->sN[74] {
     // left to match the fractional point. This is 50 - (16 + 2) = 32
     let p1: sN[40] = std::smul(a, x);
     let p1: sN[74] = p1 as sN[74];
-    let p1: sN[74] = p1 << sN[74]: 32;
+    let p1: sN[74] = p1 << 32;
 
     // The fractional part is positioned at 2 + 32 = 34 index.
     // The shift is then 50 - (32 + 2) = 14;
     let p2: sN[57] = std::smul(b, x2);
     let p2: sN[74] = p2 as sN[74];
-    let p2: sN[74] = p2 << sN[74]: 16;
+    let p2: sN[74] = p2 << 16;
 
     // This doesn't need any shift.
     let p3: sN[74] = std::smul(c, x3);

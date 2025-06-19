@@ -15,29 +15,30 @@
 # Delay models.
 
 # pytype binary only
-load("//xls/delay_model:build_defs.bzl", "delay_model")
+load("//xls/estimators/delay_model:build_defs.bzl", "delay_model")
 
 package(
     default_applicable_licenses = ["//:license"],
-    default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
 py_binary(
     name = "area_characterization_client_main",
     srcs = ["area_characterization_client_main.py"],
-    python_version = "PY3",
-    srcs_version = "PY3",
     deps = [
-        "@com_google_absl_py//absl:app",
-        "@com_google_absl_py//absl/flags",
-        "@com_google_absl_py//absl/logging",
-        "//xls/delay_model",
-        "//xls/delay_model:delay_model_py_pb2",
-        "//xls/delay_model:op_module_generator",
+        "//xls/estimators:estimator_model",
+        "//xls/estimators:estimator_model_py_pb2",
+        "//xls/estimators:op_module_generator",
         "//xls/synthesis:client_credentials",
         "//xls/synthesis:synthesis_py_pb2",
         "//xls/synthesis:synthesis_service_py_pb2_grpc",
+        "@abseil-py//absl:app",
+        "@abseil-py//absl/flags",
+        "@abseil-py//absl/logging",
     ],
 )
 
@@ -47,9 +48,10 @@ cc_library(
     hdrs = ["area_estimator.h"],
     deps = [
         ":models",
-        "@com_google_absl//absl/status:statusor",
-        "//xls/delay_model:delay_estimator",
+        "//xls/common/status:status_macros",
+        "//xls/estimators/delay_model:delay_estimator",
         "//xls/ir",
+        "@com_google_absl//absl/status:statusor",
     ],
 )
 
@@ -58,24 +60,25 @@ cc_test(
     srcs = ["area_estimators_test.cc"],
     deps = [
         ":area_estimator",
-        "//xls/common:xls_gunit",
         "//xls/common:xls_gunit_main",
         "//xls/common/status:matchers",
         "//xls/ir",
         "//xls/ir:function_builder",
         "//xls/ir:ir_test_base",
         "//xls/ir:source_location",
+        "@com_google_absl//absl/status:status_matchers",
+        "@googletest//:gtest",
     ],
 )
 
-# A srcs-less library which gathers together the models into a single
-# dependency.
+# A srcs-less library which gathers together the alwaylink=1 models into a
+# single library.
 cc_library(
     name = "models",
     srcs = [],
     deps = [
-        "area_model_ice40_lut4",  # build_cleaner: keep
-        "area_model_testing_2_point_5_mux_per_node",  # build_cleaner: keep
+        ":area_model_ice40_lut4",  # build_cleaner: keep
+        ":area_model_testing_2_point_5_mux_per_node",  # build_cleaner: keep
     ],
 )
 

@@ -15,29 +15,28 @@
 #ifndef XLS_PASSES_ARITH_SIMPLIFICATION_PASS_H_
 #define XLS_PASSES_ARITH_SIMPLIFICATION_PASS_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
-// class ArithSimplificationPass analyzes the IR and finds some
-// simple patterns it can simplify, e.g., things like mul by 1,
-// add of 0, etc.
+// This pass performes various arithmetic optimizations such as replacement of
+// divide by a constant with non-divide operations.
 class ArithSimplificationPass : public OptimizationFunctionBasePass {
  public:
-  explicit ArithSimplificationPass(int64_t opt_level = kMaxOptLevel)
-      : OptimizationFunctionBasePass("arith_simp",
-                                     "Arithmetic Simplifications"),
-        opt_level_(opt_level) {}
+  static constexpr std::string_view kName = "arith_simp";
+  explicit ArithSimplificationPass()
+      : OptimizationFunctionBasePass(kName, "Arithmetic Simplifications") {}
   ~ArithSimplificationPass() override = default;
 
  protected:
-  int64_t opt_level_;
-
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
 };
 
 }  // namespace xls

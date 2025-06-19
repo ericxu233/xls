@@ -25,14 +25,14 @@
 #include <utility>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
-#include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/dslx/bytecode/bytecode.h"
@@ -41,88 +41,19 @@
 #include "xls/dslx/bytecode/interpreter_stack.h"
 #include "xls/dslx/errors.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/proc_id.h"
 #include "xls/dslx/interp_value.h"
-#include "xls/dslx/interp_value_helpers.h"
-#include "xls/dslx/type_system/concrete_type.h"
+#include "xls/dslx/interp_value_utils.h"
+#include "xls/dslx/make_value_format_descriptor.h"
+#include "xls/dslx/type_system/type.h"
 #include "xls/dslx/type_system/type_info.h"
+#include "xls/dslx/value_format_descriptor.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
 #include "xls/ir/format_preference.h"
 
 namespace xls::dslx {
 namespace {
-
-absl::StatusOr<std::string> PrettyPrintValue(const InterpValue& value,
-                                             const ConcreteType* type,
-                                             FormatPreference format_preference,
-                                             int64_t indent = 0) {
-  std::string indent_str(static_cast<size_t>(indent * 4), ' ');
-  if (const auto* array_type = dynamic_cast<const ArrayType*>(type);
-      array_type != nullptr) {
-    const ConcreteType* element_type = &array_type->element_type();
-    std::vector<std::string> elements;
-    for (const auto& element_value : value.GetValuesOrDie()) {
-      XLS_ASSIGN_OR_RETURN(std::string element,
-                           PrettyPrintValue(element_value, element_type,
-                                            format_preference, indent + 1));
-      elements.push_back(element);
-    }
-
-    std::string element_type_name = element_type->ToString();
-    std::string value_prefix;
-    std::string separator = ", ";
-    std::string value_suffix;
-    if (const auto* struct_type = dynamic_cast<const StructType*>(element_type);
-        struct_type != nullptr) {
-      element_type_name = struct_type->nominal_type().identifier();
-      std::string next_indent(static_cast<size_t>(indent + 1) * 4, ' ');
-      value_prefix = absl::StrCat("\n", next_indent);
-      separator = absl::StrCat(",", value_prefix);
-      value_suffix = absl::StrCat("\n", indent_str);
-    }
-
-    return absl::StrFormat("%s[%d]:[%s%s%s]", element_type_name,
-                           value.GetValuesOrDie().size(), value_prefix,
-                           absl::StrJoin(elements, separator), value_suffix);
-  }
-
-  if (const auto* struct_type = dynamic_cast<const StructType*>(type);
-      struct_type != nullptr) {
-    std::vector<std::string> members;
-    members.reserve(struct_type->size());
-    for (int64_t i = 0; i < struct_type->size(); i++) {
-      std::string sub_indent_str(static_cast<size_t>(indent + 1) * 4, ' ');
-      const ConcreteType& member_type = struct_type->GetMemberType(i);
-      XLS_ASSIGN_OR_RETURN(
-          std::string member_value,
-          PrettyPrintValue(value.GetValuesOrDie()[i], &member_type,
-                           format_preference, indent + 1));
-      members.push_back(absl::StrFormat("%s%s: %s", sub_indent_str,
-                                        struct_type->GetMemberName(i),
-                                        member_value));
-    }
-
-    return absl::StrFormat("%s {\n%s\n%s}",
-                           struct_type->nominal_type().identifier(),
-                           absl::StrJoin(members, "\n"), indent_str);
-  }
-  if (const auto* enum_type = dynamic_cast<const EnumType*>(type);
-      enum_type != nullptr) {
-    const EnumDef& enum_def = enum_type->nominal_type();
-    int64_t member_index = 0;
-    for (const InterpValue& member : enum_type->members()) {
-      if (member == value) {
-        return absl::StrFormat("%s::%s (%s)", enum_def.identifier(),
-                               enum_def.GetMemberName(member_index),
-                               member.ToString());
-      }
-      ++member_index;
-    }
-    XLS_RET_CHECK_FAIL() << "Unexpected value " << value.ToString()
-                         << " as enum " << enum_def.identifier();
-  }
-  return value.ToString(/*humanize=*/false, format_preference);
-}
 
 absl::Status RunBinaryBuiltin(
     const std::function<absl::StatusOr<InterpValue>(const InterpValue& a,
@@ -151,11 +82,12 @@ absl::Status RunTernaryBuiltin(
 
 }  // namespace
 
-absl::Status RunBuiltinSlice(const Bytecode& bytecode,
-                             InterpreterStack& stack) {
+absl::Status RunBuiltinArraySlice(const Bytecode& bytecode,
+                                  InterpreterStack& stack) {
   return RunTernaryBuiltin(
       [](const InterpValue& basis, const InterpValue& start,
-         const InterpValue& type_value) {
+         const InterpValue& type_value) -> absl::StatusOr<InterpValue> {
+        XLS_RET_CHECK(basis.IsArray());
         return basis.Slice(start, type_value);
       },
       stack);
@@ -173,7 +105,7 @@ absl::Status RunBuiltinUpdate(const Bytecode& bytecode,
 
 absl::Status RunBuiltinBitSlice(const Bytecode& bytecode,
                                 InterpreterStack& stack) {
-  XLS_VLOG(3) << "Executing builtin BitSlice.";
+  VLOG(3) << "Executing builtin BitSlice.";
   return RunTernaryBuiltin(
       [](const InterpValue& subject, const InterpValue& start,
          const InterpValue& width) -> absl::StatusOr<InterpValue> {
@@ -193,7 +125,7 @@ absl::Status RunBuiltinBitSlice(const Bytecode& bytecode,
 
 absl::Status RunBuiltinBitSliceUpdate(const Bytecode& bytecode,
                                       InterpreterStack& stack) {
-  XLS_VLOG(3) << "Executing builtin BitSliceUpdate.";
+  VLOG(3) << "Executing builtin BitSliceUpdate.";
 
   return RunTernaryBuiltin(
       [](const InterpValue& subject, const InterpValue& start,
@@ -258,6 +190,18 @@ absl::Status RunBuiltinGate(const Bytecode& bytecode, InterpreterStack& stack) {
       stack);
 }
 
+absl::Status RunBuiltinEncode(const Bytecode& bytecode,
+                              InterpreterStack& stack) {
+  VLOG(3) << "Executing builtin encode.";
+  XLS_RET_CHECK(!stack.empty());
+
+  XLS_ASSIGN_OR_RETURN(InterpValue input, stack.Pop());
+  XLS_ASSIGN_OR_RETURN(InterpValue output, input.Encode());
+  stack.Push(std::move(output));
+
+  return absl::OkStatus();
+}
+
 absl::Status RunBuiltinOneHot(const Bytecode& bytecode,
                               InterpreterStack& stack) {
   return RunBinaryBuiltin(
@@ -299,9 +243,9 @@ absl::Status RunBuiltinOneHotSel(const Bytecode& bytecode,
 
 absl::Status RunBuiltinPrioritySel(const Bytecode& bytecode,
                                    InterpreterStack& stack) {
-  return RunBinaryBuiltin(
-      [](const InterpValue& selector,
-         const InterpValue& cases_array) -> absl::StatusOr<InterpValue> {
+  return RunTernaryBuiltin(
+      [](const InterpValue& selector, const InterpValue& cases_array,
+         const InterpValue& default_value) -> absl::StatusOr<InterpValue> {
         XLS_ASSIGN_OR_RETURN(Bits selector_bits, selector.GetBits());
         XLS_ASSIGN_OR_RETURN(const std::vector<InterpValue>* cases,
                              cases_array.GetValues());
@@ -309,8 +253,6 @@ absl::Status RunBuiltinPrioritySel(const Bytecode& bytecode,
           return absl::InternalError(
               "At least one case must be specified for priority_sel.");
         }
-        XLS_ASSIGN_OR_RETURN(int64_t result_bit_count,
-                             cases->at(0).GetBitCount());
         for (int64_t i = 0; i < cases->size(); i++) {
           if (selector_bits.Get(i)) {
             XLS_ASSIGN_OR_RETURN(Bits case_bits, cases->at(i).GetBits());
@@ -318,8 +260,8 @@ absl::Status RunBuiltinPrioritySel(const Bytecode& bytecode,
           }
         }
 
-        Bits empty_result(result_bit_count);
-        return InterpValue::MakeBits(cases->at(0).tag(), empty_result);
+        XLS_ASSIGN_OR_RETURN(Bits default_bits, default_value.GetBits());
+        return InterpValue::MakeBits(cases->at(0).tag(), default_bits);
       },
       stack);
 }
@@ -350,7 +292,7 @@ absl::Status RunBuiltinSMulp(const Bytecode& bytecode,
          const InterpValue& rhs) -> absl::StatusOr<InterpValue> {
         XLS_ASSIGN_OR_RETURN(int64_t lhs_bitwidth, lhs.GetBitCount());
         XLS_ASSIGN_OR_RETURN(int64_t rhs_bitwidth, lhs.GetBitCount());
-        XLS_CHECK_EQ(lhs_bitwidth, rhs_bitwidth);
+        CHECK_EQ(lhs_bitwidth, rhs_bitwidth);
         int64_t product_bitwidth = lhs_bitwidth;
         std::vector<InterpValue> outputs;
         InterpValue offset = InterpValue::MakeUnsigned(
@@ -375,7 +317,7 @@ absl::Status RunBuiltinUMulp(const Bytecode& bytecode,
          const InterpValue& rhs) -> absl::StatusOr<InterpValue> {
         XLS_ASSIGN_OR_RETURN(int64_t lhs_bitwidth, lhs.GetBitCount());
         XLS_ASSIGN_OR_RETURN(int64_t rhs_bitwidth, lhs.GetBitCount());
-        XLS_CHECK_EQ(lhs_bitwidth, rhs_bitwidth);
+        CHECK_EQ(lhs_bitwidth, rhs_bitwidth);
         int64_t product_bitwidth = lhs_bitwidth;
         std::vector<InterpValue> outputs;
         InterpValue offset = InterpValue::MakeUnsigned(
@@ -390,20 +332,9 @@ absl::Status RunBuiltinUMulp(const Bytecode& bytecode,
       stack);
 }
 
-absl::Status RunBuiltinAddWithCarry(const Bytecode& bytecode,
-                                    InterpreterStack& stack) {
-  XLS_VLOG(3) << "Executing builtin AddWithCarry.";
-  XLS_RET_CHECK_GE(stack.size(), 2);
-  XLS_ASSIGN_OR_RETURN(InterpValue lhs, stack.Pop());
-  XLS_ASSIGN_OR_RETURN(InterpValue rhs, stack.Pop());
-  XLS_ASSIGN_OR_RETURN(InterpValue result, lhs.AddWithCarry(rhs));
-  stack.Push(result);
-  return absl::OkStatus();
-}
-
 absl::Status RunBuiltinAndReduce(const Bytecode& bytecode,
                                  InterpreterStack& stack) {
-  XLS_VLOG(3) << "Executing builtin AndReduce.";
+  VLOG(3) << "Executing builtin AndReduce.";
   XLS_RET_CHECK(!stack.empty());
   XLS_ASSIGN_OR_RETURN(InterpValue value, stack.Pop());
   XLS_ASSIGN_OR_RETURN(Bits bits, value.GetBits());
@@ -412,39 +343,78 @@ absl::Status RunBuiltinAndReduce(const Bytecode& bytecode,
   return absl::OkStatus();
 }
 
+// Returns appropriately formatted lhs and rhs values for use within an
+// assert_eq (lt, etc) message. Assert failure messages preserve the value
+// formatting (hex, binary) of literal numbers which appear in the assert
+// call. For example, in `assert_eq(x, u32:0b10101)`, values will appear in
+// binary format in the failure message.
+static absl::StatusOr<std::pair<std::string, std::string>>
+GetAssertFormattedStrings(const InterpreterStack::FormattedInterpValue& lhs,
+                          const InterpreterStack::FormattedInterpValue& rhs,
+                          const Bytecode& bytecode, const Frame& frame,
+                          const BytecodeInterpreterOptions& options) {
+  auto formatted_pair = [&](const ValueFormatDescriptor& fmt)
+      -> absl::StatusOr<std::pair<std::string, std::string>> {
+    XLS_ASSIGN_OR_RETURN(
+        std::string lhs_string,
+        lhs.value.ToFormattedString(fmt, /*include_type_prefix=*/true));
+    XLS_ASSIGN_OR_RETURN(
+        std::string rhs_string,
+        rhs.value.ToFormattedString(fmt, /*include_type_prefix=*/true));
+    return std::make_pair(lhs_string, rhs_string);
+  };
+
+  if (options.format_preference() == FormatPreference::kDefault &&
+      (lhs.format_descriptor.has_value() ||
+       rhs.format_descriptor.has_value())) {
+    return formatted_pair(lhs.format_descriptor.has_value()
+                              ? *lhs.format_descriptor
+                              : *rhs.format_descriptor);
+  }
+  const TypeInfo* type_info = frame.type_info();
+  XLS_ASSIGN_OR_RETURN(Bytecode::InvocationData invocation_data,
+                       bytecode.invocation_data());
+  XLS_ASSIGN_OR_RETURN(
+      Type * lhs_type,
+      type_info->GetItemOrError(invocation_data.invocation()->args()[0]));
+  XLS_ASSIGN_OR_RETURN(
+      Type * rhs_type,
+      type_info->GetItemOrError(invocation_data.invocation()->args()[1]));
+  XLS_RET_CHECK_EQ(*lhs_type, *rhs_type) << absl::StreamFormat(
+      "Assert arguments are not the same type: `%s` vs `%s`",
+      lhs_type->ToString(), rhs_type->ToString());
+  XLS_ASSIGN_OR_RETURN(
+      ValueFormatDescriptor fmt,
+      MakeValueFormatDescriptor(*lhs_type, options.format_preference()));
+  return formatted_pair(fmt);
+}
+
 absl::Status RunBuiltinAssertEq(const Bytecode& bytecode,
                                 InterpreterStack& stack, const Frame& frame,
-                                const BytecodeInterpreterOptions& options) {
-  XLS_VLOG(3) << "Executing builtin AssertEq.";
+                                const BytecodeInterpreterOptions& options,
+                                const std::optional<ProcId>& caller_proc_id) {
+  VLOG(3) << "Executing builtin AssertEq.";
   XLS_RET_CHECK_GE(stack.size(), 2);
 
-  XLS_ASSIGN_OR_RETURN(InterpValue rhs, stack.Pop());
-  XLS_ASSIGN_OR_RETURN(InterpValue lhs, stack.Pop());
+  XLS_ASSIGN_OR_RETURN(InterpreterStack::FormattedInterpValue formatted_rhs,
+                       stack.PopFormattedValue());
+  XLS_ASSIGN_OR_RETURN(InterpreterStack::FormattedInterpValue formatted_lhs,
+                       stack.PopFormattedValue());
+  const InterpValue& lhs = formatted_lhs.value;
+  const InterpValue& rhs = formatted_rhs.value;
   stack.Push(InterpValue::MakeUnit());
   bool eq = lhs.Eq(rhs);
   if (!eq) {
-    const TypeInfo* type_info = frame.type_info();
-    XLS_ASSIGN_OR_RETURN(Bytecode::InvocationData invocation_data,
-                         bytecode.invocation_data());
-    XLS_ASSIGN_OR_RETURN(
-        ConcreteType * lhs_type,
-        type_info->GetItemOrError(invocation_data.invocation->args()[0]));
-    XLS_ASSIGN_OR_RETURN(
-        ConcreteType * rhs_type,
-        type_info->GetItemOrError(invocation_data.invocation->args()[1]));
-    XLS_ASSIGN_OR_RETURN(
-        std::string pretty_lhs,
-        PrettyPrintValue(lhs, lhs_type, options.format_preference()));
-    XLS_ASSIGN_OR_RETURN(
-        std::string pretty_rhs,
-        PrettyPrintValue(rhs, rhs_type, options.format_preference()));
+    XLS_ASSIGN_OR_RETURN((const auto& [lhs_string, rhs_string]),
+                         GetAssertFormattedStrings(formatted_lhs, formatted_rhs,
+                                                   bytecode, frame, options));
     std::string message =
-        absl::StrContains(pretty_lhs, '\n')
+        absl::StrContains(lhs_string, '\n')
             ? absl::StrCat(
                   "\n  lhs and rhs were not equal:\n",
-                  HighlightLineByLineDifferences(pretty_lhs, pretty_rhs))
+                  HighlightLineByLineDifferences(lhs_string, rhs_string))
             : absl::StrFormat("\n  lhs: %s\n  rhs: %s\n  were not equal",
-                              pretty_lhs, pretty_rhs);
+                              lhs_string, rhs_string);
     if (lhs.IsArray() && rhs.IsArray()) {
       XLS_ASSIGN_OR_RETURN(
           std::optional<int64_t> i,
@@ -456,7 +426,12 @@ absl::Status RunBuiltinAssertEq(const Bytecode& bytecode,
                                  lhs_values[*i].ToHumanString(),
                                  rhs_values[*i].ToHumanString());
     }
-    return FailureErrorStatus(bytecode.source_span(), message);
+    if (caller_proc_id.has_value()) {
+      message += absl::StrFormat(" (called from %s)",
+                                 caller_proc_id.value().ToString());
+    }
+    return FailureErrorStatus(bytecode.source_span(), message,
+                              stack.file_table());
   }
 
   return absl::OkStatus();
@@ -464,41 +439,51 @@ absl::Status RunBuiltinAssertEq(const Bytecode& bytecode,
 
 absl::Status RunBuiltinAssertLt(const Bytecode& bytecode,
                                 InterpreterStack& stack, const Frame& frame,
-                                const BytecodeInterpreterOptions& options) {
-  XLS_VLOG(3) << "Executing builtin AssertLt.";
+                                const BytecodeInterpreterOptions& options,
+                                const std::optional<ProcId>& caller_proc_id) {
+  VLOG(3) << "Executing builtin AssertLt.";
   XLS_RET_CHECK_GE(stack.size(), 2);
 
-  XLS_ASSIGN_OR_RETURN(InterpValue rhs, stack.Pop());
-  XLS_ASSIGN_OR_RETURN(InterpValue lhs, stack.Pop());
+  XLS_ASSIGN_OR_RETURN(InterpreterStack::FormattedInterpValue formatted_rhs,
+                       stack.PopFormattedValue());
+  XLS_ASSIGN_OR_RETURN(InterpreterStack::FormattedInterpValue formatted_lhs,
+                       stack.PopFormattedValue());
+  const InterpValue& lhs = formatted_lhs.value;
+  const InterpValue& rhs = formatted_rhs.value;
   stack.Push(InterpValue::MakeUnit());
   XLS_ASSIGN_OR_RETURN(InterpValue lt_value, lhs.Lt(rhs));
   bool lt = lt_value.IsTrue();
   if (!lt) {
-    const TypeInfo* type_info = frame.type_info();
-    XLS_ASSIGN_OR_RETURN(Bytecode::InvocationData invocation_data,
-                         bytecode.invocation_data());
-    XLS_ASSIGN_OR_RETURN(
-        ConcreteType * lhs_type,
-        type_info->GetItemOrError(invocation_data.invocation->args()[0]));
-    XLS_ASSIGN_OR_RETURN(
-        ConcreteType * rhs_type,
-        type_info->GetItemOrError(invocation_data.invocation->args()[1]));
-    XLS_ASSIGN_OR_RETURN(
-        std::string pretty_lhs,
-        PrettyPrintValue(lhs, lhs_type, options.format_preference()));
-    XLS_ASSIGN_OR_RETURN(
-        std::string pretty_rhs,
-        PrettyPrintValue(rhs, rhs_type, options.format_preference()));
+    XLS_ASSIGN_OR_RETURN((const auto& [lhs_string, rhs_string]),
+                         GetAssertFormattedStrings(formatted_lhs, formatted_rhs,
+                                                   bytecode, frame, options));
     std::string message = absl::StrFormat(
-        "\n  lhs: %s\n was not less than rhs: %s", pretty_lhs, pretty_rhs);
-    return FailureErrorStatus(bytecode.source_span(), message);
+        "\n  lhs: %s\n was not less than rhs: %s", lhs_string, rhs_string);
+    if (caller_proc_id.has_value()) {
+      message += absl::StrFormat(" (called from %s)",
+                                 caller_proc_id.value().ToString());
+    }
+    return FailureErrorStatus(bytecode.source_span(), message,
+                              stack.file_table());
   }
 
   return absl::OkStatus();
 }
 
+absl::Status RunBuiltinCeilLog2(const Bytecode& bytecode,
+                                InterpreterStack& stack) {
+  VLOG(3) << "Executing builtin ceillog2.";
+  XLS_RET_CHECK(!stack.empty());
+
+  XLS_ASSIGN_OR_RETURN(InterpValue input, stack.Pop());
+  XLS_ASSIGN_OR_RETURN(InterpValue result, input.CeilOfLog2());
+  stack.Push(result);
+
+  return absl::OkStatus();
+}
+
 absl::Status RunBuiltinClz(const Bytecode& bytecode, InterpreterStack& stack) {
-  XLS_VLOG(3) << "Executing builtin clz.";
+  VLOG(3) << "Executing builtin clz.";
   XLS_RET_CHECK(!stack.empty());
 
   XLS_ASSIGN_OR_RETURN(InterpValue input, stack.Pop());
@@ -511,7 +496,7 @@ absl::Status RunBuiltinClz(const Bytecode& bytecode, InterpreterStack& stack) {
 
 absl::Status RunBuiltinCover(const Bytecode& bytecode,
                              InterpreterStack& stack) {
-  XLS_VLOG(3) << "Executing builtin `cover!`";
+  VLOG(3) << "Executing builtin `cover!`";
   XLS_RET_CHECK_GE(stack.size(), 2);
 
   XLS_ASSIGN_OR_RETURN(InterpValue string, stack.Pop());
@@ -522,7 +507,7 @@ absl::Status RunBuiltinCover(const Bytecode& bytecode,
 }
 
 absl::Status RunBuiltinCtz(const Bytecode& bytecode, InterpreterStack& stack) {
-  XLS_VLOG(3) << "Executing builtin ctz.";
+  VLOG(3) << "Executing builtin ctz.";
   XLS_RET_CHECK(!stack.empty());
 
   XLS_ASSIGN_OR_RETURN(InterpValue input, stack.Pop());
@@ -553,7 +538,7 @@ absl::Status RunBuiltinEnumerate(const Bytecode& bytecode,
 
 absl::Status RunBuiltinOrReduce(const Bytecode& bytecode,
                                 InterpreterStack& stack) {
-  XLS_VLOG(3) << "Executing builtin OrReduce.";
+  VLOG(3) << "Executing builtin OrReduce.";
   XLS_RET_CHECK(!stack.empty());
   XLS_ASSIGN_OR_RETURN(InterpValue value, stack.Pop());
   XLS_ASSIGN_OR_RETURN(Bits bits, value.GetBits());
@@ -610,9 +595,34 @@ absl::Status RunBuiltinRev(const Bytecode& bytecode, InterpreterStack& stack) {
   return absl::OkStatus();
 }
 
+absl::Status RunBuiltinZip(const Bytecode& bytecode, InterpreterStack& stack) {
+  return RunBinaryBuiltin(
+      [](const InterpValue& lhs,
+         const InterpValue& rhs) -> absl::StatusOr<InterpValue> {
+        // Should have been checked by type inference.
+        XLS_RET_CHECK(lhs.IsArray() && rhs.IsArray());
+
+        XLS_ASSIGN_OR_RETURN(size_t lhs_length, lhs.GetLength());
+        XLS_ASSIGN_OR_RETURN(size_t rhs_length, rhs.GetLength());
+
+        // Should have been checked by type inference.
+        XLS_RET_CHECK_EQ(rhs_length, rhs_length);
+
+        std::vector<InterpValue> zipped;
+        zipped.reserve(lhs_length);
+        for (size_t i = 0; i < lhs_length; ++i) {
+          zipped.push_back(InterpValue::MakeTuple(
+              {lhs.GetValuesOrDie()[i], rhs.GetValuesOrDie()[i]}));
+        }
+
+        return InterpValue::MakeArray(std::move(zipped));
+      },
+      stack);
+}
+
 absl::Status RunBuiltinXorReduce(const Bytecode& bytecode,
                                  InterpreterStack& stack) {
-  XLS_VLOG(3) << "Executing builtin XorReduce.";
+  VLOG(3) << "Executing builtin XorReduce.";
   XLS_RET_CHECK(!stack.empty());
   XLS_ASSIGN_OR_RETURN(InterpValue value, stack.Pop());
   XLS_ASSIGN_OR_RETURN(Bits bits, value.GetBits());

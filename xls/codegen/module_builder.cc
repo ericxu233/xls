@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <iterator>
 #include <optional>
 #include <string>
@@ -26,10 +27,14 @@
 #include <variant>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/strip.h"
 #include "absl/types/span.h"
 #include "xls/codegen/codegen_options.h"
 #include "xls/codegen/flattening.h"
@@ -37,12 +42,12 @@
 #include "xls/codegen/module_signature.pb.h"
 #include "xls/codegen/node_expressions.h"
 #include "xls/codegen/node_representation.h"
-#include "xls/codegen/vast.h"
-#include "xls/common/logging/logging.h"
+#include "xls/codegen/vast/vast.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
+#include "xls/ir/format_preference.h"
 #include "xls/ir/format_strings.h"
 #include "xls/ir/node.h"
 #include "xls/ir/nodes.h"
@@ -51,13 +56,23 @@
 #include "xls/ir/source_location.h"
 #include "xls/ir/type.h"
 #include "xls/ir/value.h"
-#include "xls/passes/bdd_function.h"
 #include "xls/passes/bdd_query_engine.h"
 
 namespace xls {
 namespace verilog {
 
 namespace {
+
+// Returns the name and polarity (ifdef/ifndef) of the macro used to guard
+// simulation-only constructs.
+std::pair<std::string, ConditionalDirectiveKind> MacroNameAndPolarity(
+    std::string_view macro_name) {
+  if (absl::StartsWith(macro_name, "!")) {
+    return {std::string{absl::StripPrefix(macro_name, "!")},
+            ConditionalDirectiveKind::kIfndef};
+  }
+  return {std::string{macro_name}, ConditionalDirectiveKind::kIfdef};
+}
 
 // Returns the bounds of the potentially-nested array type as a vector of
 // int64_t. Ordering of the vector is outer-most bound to inner-most. For
@@ -110,6 +125,13 @@ absl::StatusOr<Expression*> FlattenValueToExpression(const Value& value,
       elements.push_back(element_expr);
     }
   }
+  if (elements.empty()) {
+    return absl::InvalidArgumentError(
+        absl::StrFormat("Empty expression for value %s.", value.ToString()));
+  }
+  if (elements.size() == 1) {
+    return elements[0];
+  }
   return file->Concat(elements, SourceInfo());
 }
 
@@ -137,6 +159,84 @@ absl::StatusOr<ArrayAssignmentPattern*> ValueToArrayAssignmentPattern(
     pieces.push_back(element_expr);
   }
   return file->Make<ArrayAssignmentPattern>(SourceInfo(), pieces);
+}
+
+// Defines and returns a function which implements the given PrioritySelect
+// node.
+absl::StatusOr<VerilogFunction*> DefinePrioritySelectFunction(
+    Node* selector, Type* tpe, int64_t num_cases, const SourceInfo& loc,
+    std::string_view function_name, ModuleSection* section,
+    const CodegenOptions& options) {
+  VerilogFile* file = section->file();
+
+  VerilogFunction* func = section->Add<VerilogFunction>(
+      loc, function_name, file->BitVectorType(tpe->GetFlatBitCount(), loc));
+  Expression* selector_expression = func->AddArgument(
+      "sel", file->BitVectorType(selector->BitCountOrDie(), loc), loc);
+
+  std::vector<Expression*> cases;
+  cases.reserve(num_cases);
+  for (size_t i = 0; i < num_cases; ++i) {
+    cases.push_back(func->AddArgument(
+        absl::StrCat("case", i),
+        file->BitVectorType(tpe->GetFlatBitCount(), loc), loc));
+  }
+
+  Expression* default_value = func->AddArgument(
+      "default_value", file->BitVectorType(tpe->GetFlatBitCount(), loc), loc);
+
+  CaseType case_type(selector->BitCountOrDie() > 1 ? CaseKeyword::kCasez
+                                                   : CaseKeyword::kCase);
+  const FourValueBit case_label_top_bits = FourValueBit::kHighZ;
+  FourValueBit case_label_bottom_bits = FourValueBit::kZero;
+  if (options.use_system_verilog()) {
+    // If using system verilog, always use the "unique" keyword.
+    case_type.modifier = CaseModifier::kUnique;
+  }
+
+  Case* case_statement =
+      func->AddStatement<Case>(loc, selector_expression, case_type);
+  // Make a ternary vector that looks like ???...?1000...0.
+  // Each label will be a sliding window into this larger vector.
+  // If the selector is known to be one hot, the window will look like
+  // 000...01000...0 instead and the "unique" keyword will be used instead.
+  std::vector<FourValueBit> ternary_vector;
+  ternary_vector.reserve((cases.size() * 2) - 1);
+  std::fill_n(std::back_inserter(ternary_vector), cases.size() - 1,
+              case_label_top_bits);
+  ternary_vector.push_back(FourValueBit::kOne);
+  std::fill_n(std::back_inserter(ternary_vector), cases.size() - 1,
+              case_label_bottom_bits);
+  absl::Span<FourValueBit const> ternary_span = ternary_vector;
+
+  for (size_t i = 0; i < cases.size(); ++i) {
+    absl::StatusOr<Expression*> label_expression =
+        file->Make<FourValueBinaryLiteral>(
+            loc, ternary_span.subspan(i, cases.size()));
+    CHECK_OK(label_expression.status());
+    StatementBlock* block =
+        case_statement->AddCaseArm(label_expression.value());
+    block->Add<BlockingAssignment>(loc, func->return_value_ref(), cases[i]);
+  }
+  Expression* zero_label = file->Literal(0, selector->BitCountOrDie(), loc,
+                                         FormatPreference::kBinary);
+  Expression* x_literal;
+  if (options.use_system_verilog()) {
+    // Use 'X when generating SystemVerilog.
+    x_literal = file->Make<XLiteral>(loc);
+  } else {
+    // Verilog doesn't support 'X, so use the less desirable 16'dxxxx format.
+    x_literal = file->Make<XSentinel>(loc, tpe->GetFlatBitCount());
+  }
+  case_statement->AddCaseArm(zero_label)
+      ->Add<BlockingAssignment>(loc, func->return_value_ref(), default_value);
+
+  // Add a default case that propagates X.
+  StatementBlock* case_block = case_statement->AddCaseArm(DefaultSentinel());
+  case_block->Add<Comment>(loc, "Propagate X");
+  case_block->Add<BlockingAssignment>(loc, func->return_value_ref(), x_literal);
+
+  return func;
 }
 
 }  // namespace
@@ -206,11 +306,12 @@ ModuleBuilder::ModuleBuilder(std::string_view name, VerilogFile* file,
                              CodegenOptions options,
                              std::optional<std::string_view> clk_name,
                              std::optional<ResetProto> rst_proto)
-    : module_name_(SanitizeIdentifier(name)),
+    : module_name_(SanitizeVerilogIdentifier(name)),
       file_(file),
       package_("__ModuleBuilder_type_generator"),
       options_(std::move(options)),
-      query_engine_(std::nullopt) {
+      query_engine_(BddQueryEngine::kDefaultPathLimit),
+      name_uniquer_(/*separator=*/"__") {
   module_ = file_->AddModule(module_name_, SourceInfo());
   functions_section_ = module_->Add<ModuleSection>(SourceInfo());
   constants_section_ = module_->Add<ModuleSection>(SourceInfo());
@@ -218,20 +319,24 @@ ModuleBuilder::ModuleBuilder(std::string_view name, VerilogFile* file,
   declaration_and_assignment_section_ =
       module_->Add<ModuleSection>(SourceInfo());
   instantiation_section_ = module_->Add<ModuleSection>(SourceInfo());
-  assert_section_ = module_->Add<ModuleSection>(SourceInfo());
+  assert_section_ = std::nullopt;
+
   cover_section_ = module_->Add<ModuleSection>(SourceInfo());
   output_section_ = module_->Add<ModuleSection>(SourceInfo());
   trace_section_ = module_->Add<ModuleSection>(SourceInfo());
 
   NewDeclarationAndAssignmentSections();
 
+  // Add the module's name to the name uniquer.
+  name_uniquer_.GetSanitizedUniqueName(module_name_);
+
   if (clk_name.has_value()) {
-    clk_ = AddInputPort(clk_name.value(), /*bit_count=*/1);
+    clk_ = AddInputPort(clk_name.value(), /*bit_count=*/1).value();
   }
 
   if (rst_proto.has_value()) {
     rst_ = Reset();
-    rst_->signal = AddInputPort(rst_proto->name(), /*bit_count=*/1);
+    rst_->signal = AddInputPort(rst_proto->name(), /*bit_count=*/1).value();
     rst_->asynchronous = rst_proto->asynchronous();
     rst_->active_low = rst_proto->active_low();
   }
@@ -242,6 +347,22 @@ void ModuleBuilder::NewDeclarationAndAssignmentSections() {
       declaration_and_assignment_section_->Add<ModuleSection>(SourceInfo()));
   assignment_subsections_.push_back(
       declaration_and_assignment_section_->Add<ModuleSection>(SourceInfo()));
+}
+
+ModuleSection* ModuleBuilder::assert_section() const {
+  if (!assert_section_.has_value()) {
+    assert_section_ = module_->Add<ModuleSection>(SourceInfo());
+    for (std::string_view macro_name_and_polarity :
+         options_.assertion_macro_names()) {
+      auto [macro_name, polarity] =
+          MacroNameAndPolarity(macro_name_and_polarity);
+      assert_section_ = (*assert_section_)
+                            ->Add<ModuleConditionalDirective>(
+                                SourceInfo(), polarity, macro_name)
+                            ->consequent();
+    }
+  }
+  return *assert_section_;
 }
 
 absl::Status ModuleBuilder::AssignFromSlice(
@@ -265,21 +386,32 @@ absl::Status ModuleBuilder::AssignFromSlice(
   return absl::OkStatus();
 }
 
-absl::StatusOr<LogicRef*> ModuleBuilder::AddInputPort(std::string_view name,
-                                                      Type* type) {
-  LogicRef* port =
-      AddInputPort(SanitizeIdentifier(name), type->GetFlatBitCount());
+absl::StatusOr<LogicRef*> ModuleBuilder::AddInputPort(
+    std::string_view name, Type* type,
+    std::optional<std::string_view> sv_type) {
+  if (sv_type && options_.emit_sv_types() && type->IsArray()) {
+    return absl::UnimplementedError(
+        "Codegen packs arrays at port boundaries, see "
+        "https://github.com/google/xls/issues/1637.");
+  }
+  XLS_ASSIGN_OR_RETURN(LogicRef * port,
+                       AddInputPort(name, type->GetFlatBitCount(), sv_type));
   if (!type->IsArray()) {
     return port;
   }
+
+  std::string unflattened_name =
+      SanitizeAndUniquifyName(absl::StrCat(name, "_unflattened"));
   // All inputs are flattened so unflatten arrays with a sequence of
   // assignments.
   ArrayType* array_type = type->AsArrayOrDie();
-  LogicRef* ar = module_->AddWire(
-      absl::StrCat(SanitizeIdentifier(name), "_unflattened"),
-      file_->UnpackedArrayType(NestedElementWidth(array_type),
-                               NestedArrayBounds(array_type), SourceInfo()),
-      SourceInfo(), input_section());
+  XLS_ASSIGN_OR_RETURN(
+      LogicRef * ar,
+      module_->AddWire(
+          unflattened_name,
+          file_->UnpackedArrayType(NestedElementWidth(array_type),
+                                   NestedArrayBounds(array_type), SourceInfo()),
+          SourceInfo(), input_section()));
   XLS_RETURN_IF_ERROR(AssignFromSlice(
       ar, port, type->AsArrayOrDie(), 0, [&](Expression* lhs, Expression* rhs) {
         input_section()->Add<ContinuousAssignment>(SourceInfo(), lhs, rhs);
@@ -287,19 +419,73 @@ absl::StatusOr<LogicRef*> ModuleBuilder::AddInputPort(std::string_view name,
   return ar;
 }
 
-LogicRef* ModuleBuilder::AddInputPort(std::string_view name,
-                                      int64_t bit_count) {
-  return module_->AddInput(SanitizeIdentifier(name),
-                           file_->BitVectorType(bit_count, SourceInfo()),
-                           SourceInfo());
+absl::StatusOr<LogicRef*> ModuleBuilder::AddInputPort(
+    std::string_view name, int64_t bit_count,
+    std::optional<std::string_view> sv_type) {
+  std::string sanitized_unique_name = SanitizeAndUniquifyName(name);
+  if (sanitized_unique_name != name) {
+    return absl::InvalidArgumentError(
+        absl::StrFormat("Unable to name input port `%s` on module `%s` because "
+                        "it is an invalid identifier, is a verilog keyword, or "
+                        "collides with another identifier in the module",
+                        name, module_name_));
+  }
+  auto* raw_bits_type = file_->BitVectorType(bit_count, SourceInfo());
+  if (sv_type && options_.emit_sv_types()) {
+    XLS_ASSIGN_OR_RETURN(
+        LogicRef * port,
+        module_->AddInput(
+            name, file_->ExternType(raw_bits_type, *sv_type, SourceInfo()),
+            SourceInfo()));
+    if (!sv_type.has_value()) {
+      return port;
+    }
+    // If a SystemVerilog type is specified then create a flattened copy of the
+    // value for use inside the module because bit indexing into structs can
+    // cause lint warnings.
+    std::string flattened_name =
+        SanitizeAndUniquifyName(absl::StrCat(name, "_flattened"));
+    XLS_ASSIGN_OR_RETURN(
+        LogicRef * wire,
+        module_->AddWire(flattened_name,
+                         file_->BitVectorType(bit_count, SourceInfo()),
+                         SourceInfo(), input_section()));
+    input_section()->Add<ContinuousAssignment>(SourceInfo(), wire, port);
+    return wire;
+  }
+  return module_->AddInput(name, raw_bits_type, SourceInfo());
 }
 
-absl::Status ModuleBuilder::AddOutputPort(std::string_view name, Type* type,
-                                          Expression* value) {
-  LogicRef* output_port = module_->AddOutput(
-      SanitizeIdentifier(name),
-      file_->BitVectorType(type->GetFlatBitCount(), SourceInfo()),
-      SourceInfo());
+absl::Status ModuleBuilder::AddOutputPort(
+    std::string_view name, Type* type, Expression* value,
+    std::optional<std::string_view> sv_type) {
+  std::string sanitized_unique_name = SanitizeAndUniquifyName(name);
+  if (sanitized_unique_name != name) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Unable to name output port `%s` on module `%s` because "
+        "it is an invalid identifier, is a verilog keyword, or "
+        "collides with another identifier in the module",
+        name, module_name_));
+  }
+
+  LogicRef* output_port;
+  DataType* bits_type =
+      file_->BitVectorType(type->GetFlatBitCount(), SourceInfo());
+  if (sv_type && options_.emit_sv_types()) {
+    if (type->IsArray()) {
+      return absl::UnimplementedError(
+          "Codegen packs arrays at port boundaries, see "
+          "https://github.com/google/xls/issues/1637.");
+    }
+    XLS_ASSIGN_OR_RETURN(
+        output_port,
+        module_->AddOutput(name,
+                           file_->ExternType(bits_type, *sv_type, SourceInfo()),
+                           SourceInfo()));
+  } else {
+    XLS_ASSIGN_OR_RETURN(output_port,
+                         module_->AddOutput(name, bits_type, SourceInfo()));
+  }
 
   if (type->IsArray()) {
     // The output is flattened so flatten arrays with a sequence of assignments.
@@ -315,12 +501,30 @@ absl::Status ModuleBuilder::AddOutputPort(std::string_view name, Type* type,
   return absl::OkStatus();
 }
 
-absl::Status ModuleBuilder::AddOutputPort(std::string_view name,
-                                          int64_t bit_count,
-                                          Expression* value) {
-  LogicRef* output_port = module_->AddOutput(
-      SanitizeIdentifier(name), file_->BitVectorType(bit_count, SourceInfo()),
-      SourceInfo());
+absl::Status ModuleBuilder::AddOutputPort(
+    std::string_view name, int64_t bit_count, Expression* value,
+    std::optional<std::string_view> sv_type) {
+  std::string sanitized_unique_name = SanitizeAndUniquifyName(name);
+  if (sanitized_unique_name != name) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Unable to name output port `%s` on module `%s` because "
+        "it is an invalid identifier, is a verilog keyword, or "
+        "collides with another identifier in the module",
+        name, module_name_));
+  }
+
+  LogicRef* output_port;
+  DataType* bits_type = file_->BitVectorType(bit_count, SourceInfo());
+  if (sv_type && options_.emit_sv_types()) {
+    XLS_ASSIGN_OR_RETURN(
+        output_port,
+        module_->AddOutput(name,
+                           file_->ExternType(bits_type, *sv_type, SourceInfo()),
+                           SourceInfo()));
+  } else {
+    XLS_ASSIGN_OR_RETURN(output_port,
+                         module_->AddOutput(name, bits_type, SourceInfo()));
+  }
   output_section()->Add<ContinuousAssignment>(SourceInfo(), output_port, value);
   return absl::OkStatus();
 }
@@ -328,28 +532,6 @@ absl::Status ModuleBuilder::AddOutputPort(std::string_view name,
 absl::StatusOr<LogicRef*> ModuleBuilder::DeclareModuleConstant(
     std::string_view name, const Value& value) {
   Type* type = package_.GetTypeForValue(value);
-  LogicRef* ref;
-  if (type->IsArray()) {
-    ArrayType* array_type = type->AsArrayOrDie();
-    ref = module_->AddWire(
-        SanitizeIdentifier(name),
-        file_->UnpackedArrayType(NestedElementWidth(array_type),
-                                 NestedArrayBounds(array_type), SourceInfo()),
-        SourceInfo(), constants_section());
-  } else {
-    ref = module_->AddWire(
-        SanitizeIdentifier(name),
-        file_->BitVectorType(type->GetFlatBitCount(), SourceInfo()),
-        SourceInfo(), constants_section());
-  }
-  XLS_RETURN_IF_ERROR(
-      AddAssignmentFromValue(ref, value, [&](Expression* lhs, Expression* rhs) {
-        constants_section()->Add<ContinuousAssignment>(SourceInfo(), lhs, rhs);
-      }));
-  return ref;
-}
-
-LogicRef* ModuleBuilder::DeclareVariable(std::string_view name, Type* type) {
   DataType* data_type;
   if (type->IsArray()) {
     ArrayType* array_type = type->AsArrayOrDie();
@@ -359,19 +541,48 @@ LogicRef* ModuleBuilder::DeclareVariable(std::string_view name, Type* type) {
   } else {
     data_type = file_->BitVectorType(type->GetFlatBitCount(), SourceInfo());
   }
-  return module_->AddWire(SanitizeIdentifier(name), data_type, SourceInfo(),
-                          declaration_section());
+  // Verilator does not like declaration of arrays and assignments in the same
+  // line so declare and assign separately.
+  if (!value.IsArray()) {
+    XLS_ASSIGN_OR_RETURN(Expression * rhs,
+                         FlattenValueToExpression(value, file_));
+    // Add wire with init.
+    return module_->AddWire(SanitizeAndUniquifyName(name), data_type, rhs,
+                            SourceInfo(), constants_section());
+  }
+  XLS_ASSIGN_OR_RETURN(
+      LogicRef * ref, module_->AddWire(SanitizeAndUniquifyName(name), data_type,
+                                       SourceInfo(), constants_section()));
+  XLS_RETURN_IF_ERROR(
+      AddAssignmentFromValue(ref, value, [&](Expression* lhs, Expression* rhs) {
+        constants_section()->Add<ContinuousAssignment>(SourceInfo(), lhs, rhs);
+      }));
+  return ref;
 }
 
-LogicRef* ModuleBuilder::DeclareVariable(std::string_view name,
-                                         int64_t bit_count) {
-  return module_->AddWire(SanitizeIdentifier(name),
+absl::StatusOr<LogicRef*> ModuleBuilder::DeclareVariable(std::string_view name,
+                                                         Type* type) {
+  DataType* data_type;
+  if (type->IsArray()) {
+    ArrayType* array_type = type->AsArrayOrDie();
+    data_type =
+        file_->UnpackedArrayType(NestedElementWidth(array_type),
+                                 NestedArrayBounds(array_type), SourceInfo());
+  } else {
+    data_type = file_->BitVectorType(type->GetFlatBitCount(), SourceInfo());
+  }
+  return module_->AddWire(SanitizeAndUniquifyName(name), data_type,
+                          SourceInfo(), declaration_section());
+}
+
+absl::StatusOr<LogicRef*> ModuleBuilder::DeclareVariable(std::string_view name,
+                                                         int64_t bit_count) {
+  return module_->AddWire(SanitizeAndUniquifyName(name),
                           file_->BitVectorType(bit_count, SourceInfo()),
                           SourceInfo(), declaration_section());
 }
 
-bool ModuleBuilder::CanEmitAsInlineExpression(
-    Node* node, std::optional<absl::Span<Node* const>> users_of_expression) {
+bool ModuleBuilder::CanEmitAsInlineExpression(Node* node) {
   if (node->GetType()->IsArray()) {
     // TODO(meheff): With system verilog we can do array assignment.
     return false;
@@ -383,16 +594,16 @@ bool ModuleBuilder::CanEmitAsInlineExpression(
     return false;
   }
 
-  std::vector<Node*> users_vec;
-  absl::Span<Node* const> users;
-  if (users_of_expression.has_value()) {
-    users = *users_of_expression;
-  } else {
-    users_vec.insert(users_vec.begin(), node->users().begin(),
-                     node->users().end());
-    users = users_vec;
-  }
-  for (Node* user : users) {
+  for (Node* user : node->users()) {
+    // Assert predicates are either:
+    //   (1) emitted as a format string
+    //   (2) emitted multiple times by the default assertion format
+    //
+    // In both cases, we don't want to emit the predicate as a large inline
+    // expression.
+    if (user->Is<Assert>() && CanEmitAsserts()) {
+      return false;
+    }
     for (int64_t i = 0; i < user->operand_count(); ++i) {
       if (user->operand(i) == node && OperandMustBeNamedReference(user, i)) {
         return false;
@@ -425,6 +636,40 @@ absl::StatusOr<Expression*> ModuleBuilder::EmitAsInlineExpression(
     return file_->Make<VerilogFunctionCall>(node->loc(), func, inputs);
   }
   return NodeToExpression(node, inputs, file_, options_);
+}
+
+absl::Status ModuleBuilder::EmitArrayCopyAndUpdateViaGenerate1D(
+    std::string_view op_name, IndexableExpression* lhs,
+    IndexableExpression* rhs, Expression* update_value, IndexType index_type,
+    Type* xls_type) {
+  ArrayType* array_type = xls_type->AsArrayOrDie();
+
+  // Create names derived from the unique operation name to ensure the derived
+  // names are unique. We namespace via double underscore in an attempt to
+  // reserve the suffixes and avoid collisions.
+  std::string genvar_name =
+      SanitizeAndUniquifyName(absl::StrCat(op_name, "__index"));
+  std::string generate_loop_name =
+      SanitizeAndUniquifyName(absl::StrCat(op_name, "__gen"));
+
+  XLS_ASSIGN_OR_RETURN(auto* genvar,
+                       module_->AddGenvar(genvar_name, SourceInfo()));
+
+  GenerateLoop* generate_loop = module_->Add<GenerateLoop>(
+      SourceInfo(), genvar, file_->PlainLiteral(0, SourceInfo()),
+      file_->PlainLiteral(array_type->size(), SourceInfo()),
+      generate_loop_name);
+
+  // In the body there is a conditional where we choose to either assign the rhs
+  // index directly or the updated value.
+  Expression* index_is_match =
+      file_->Equals(index_type.expression, genvar, SourceInfo());
+  Expression* rhs_at_index = file_->Index(rhs, genvar, SourceInfo());
+  generate_loop->AddBodyNode(file_->Make<ContinuousAssignment>(
+      SourceInfo(), file_->Make<Index>(SourceInfo(), lhs, genvar),
+      file_->Ternary(index_is_match, update_value, rhs_at_index,
+                     SourceInfo())));
+  return absl::OkStatus();
 }
 
 // Emits a copy and update of an array as a sequence of assignments.
@@ -522,28 +767,27 @@ absl::Status ModuleBuilder::EmitArrayCopyAndUpdate(
             assignment_section()->Add<ContinuousAssignment>(SourceInfo(), lhs,
                                                             rhs);
           });
-    } else {
-      // Indices may or may not match the subarray/element being replaced with
-      // update value. Use a ternary expression to pick from rhs or update
-      // value. E.g:
-      //   assign lhs[i][j] = (i == idx) ? update_value[j] : rhs[j]
-      auto gen_ternary = [&](absl::Span<Expression* const> inputs) {
-        return file_->Ternary(std::get<Expression*>(index_match), inputs[0],
-                              inputs[1], SourceInfo());
-      };
-
-      // Emit a continuous assignment with a ternary select. The ternary
-      // operation supports array types in SystemVerilog so sv_array_expr is
-      // true.
-      return AddAssignmentToGeneratedExpression(
-          xls_type, lhs, /*inputs=*/{update_value, rhs}, gen_ternary,
-          /*add_assignment=*/
-          [&](Expression* lhs, Expression* rhs) {
-            assignment_section()->Add<ContinuousAssignment>(SourceInfo(), lhs,
-                                                            rhs);
-          },
-          /*sv_array_expr=*/true);
     }
+    // Indices may or may not match the subarray/element being replaced with
+    // update value. Use a ternary expression to pick from rhs or update
+    // value. E.g:
+    //   assign lhs[i][j] = (i == idx) ? update_value[j] : rhs[j]
+    auto gen_ternary = [&](absl::Span<Expression* const> inputs) {
+      return file_->Ternary(std::get<Expression*>(index_match), inputs[0],
+                            inputs[1], SourceInfo());
+    };
+
+    // Emit a continuous assignment with a ternary select. The ternary
+    // operation supports array types in SystemVerilog so sv_array_expr is
+    // true.
+    return AddAssignmentToGeneratedExpression(
+        xls_type, lhs, /*inputs=*/{update_value, rhs}, gen_ternary,
+        /*add_assignment=*/
+        [&](Expression* lhs, Expression* rhs) {
+          assignment_section()->Add<ContinuousAssignment>(SourceInfo(), lhs,
+                                                          rhs);
+        },
+        /*sv_array_expr=*/true);
   }
 
   // Iterate through array elements and recurse.
@@ -577,9 +821,27 @@ absl::Status ModuleBuilder::EmitArrayCopyAndUpdate(
   return absl::OkStatus();
 }
 
+// We emit asserts if at least one of the following is true:
+//   (1) We are targeting SystemVerilog. In this case, we have a default
+//   assertion format.
+//   (2) We have an op-override for assertions. In this case, we use the
+//   assertion format specified by the op-override, so it doesn't matter that we
+//   don't have a default way of writing assertions in Verilog.
+bool ModuleBuilder::CanEmitAsserts() const {
+  return options_.use_system_verilog() ||
+         options_.GetOpOverride(Op::kAssert).has_value();
+}
+
+std::string ModuleBuilder::SanitizeAndUniquifyName(std::string_view name) {
+  std::string n =
+      SanitizeVerilogIdentifier(name_uniquer_.GetSanitizedUniqueName(name),
+                                options_.use_system_verilog());
+  return n;
+}
+
 absl::StatusOr<LogicRef*> ModuleBuilder::EmitAsAssignment(
     std::string_view name, Node* node, absl::Span<Expression* const> inputs) {
-  LogicRef* ref = DeclareVariable(name, node->GetType());
+  XLS_ASSIGN_OR_RETURN(LogicRef * ref, DeclareVariable(name, node->GetType()));
 
   // TODO(meheff): Arrays should not be special cased here. Instead each op
   // should be expressed using a generator which takes an span of input
@@ -695,13 +957,27 @@ absl::StatusOr<LogicRef*> ModuleBuilder::EmitAsAssignment(
           index_types.push_back(
               IndexType{inputs[i], node->operand(i)->GetType()->AsBitsOrDie()});
         }
-        XLS_RETURN_IF_ERROR(EmitArrayCopyAndUpdate(
-            /*lhs=*/ref,
-            /*rhs=*/inputs[0]->AsIndexableExpressionOrDie(),
-            /*update_value=*/inputs[1],
-            /*indices=*/index_types,
-            /*index_match=*/true,
-            /*xls_type=*/array_type));
+
+        // We use a generate loop in the simple case where the array is 1D and
+        // the element type is bits.
+        if (index_types.size() == 1 &&
+            node->GetType()->AsArrayOrDie()->element_type()->IsBits()) {
+          XLS_RETURN_IF_ERROR(EmitArrayCopyAndUpdateViaGenerate1D(
+              /*op_name=*/node->GetName(),
+              /*lhs=*/ref,
+              /*rhs=*/inputs[0]->AsIndexableExpressionOrDie(),
+              /*update_value=*/inputs[1],
+              /*index_type=*/index_types[0],
+              /*xls_type=*/array_type));
+        } else {
+          XLS_RETURN_IF_ERROR(EmitArrayCopyAndUpdate(
+              /*lhs=*/ref,
+              /*rhs=*/inputs[0]->AsIndexableExpressionOrDie(),
+              /*update_value=*/inputs[1],
+              /*indices=*/index_types,
+              /*index_match=*/true,
+              /*xls_type=*/array_type));
+        }
         break;
       }
       case Op::kArrayConcat: {
@@ -843,6 +1119,74 @@ absl::StatusOr<LogicRef*> ModuleBuilder::EmitAsAssignment(
             /*sv_array_expr=*/false));
         break;
       }
+      case Op::kPrioritySel: {
+        Expression* selector_expression = inputs[0];
+        // Determine the element type of the potentially-multidimensional
+        // array. This is the type of the inputs passed into the expression
+        // generator ohs_element.
+        Type* element_type = array_type->element_type();
+        while (element_type->IsArray()) {
+          element_type = element_type->AsArrayOrDie()->element_type();
+        }
+        absl::Span<Expression* const> cases_and_default = inputs.subspan(1);
+        if (cases_and_default.size() == 2) {
+          // Selects an element from the set of cases 'inputs' according to the
+          // semantics of the select instruction. 'inputs' is the set of all
+          // cases including the optional default case which appears last.
+          auto priority_sel_element =
+              [&](absl::Span<Expression* const> inputs) {
+                Expression* selected_expr = inputs[0];
+                Expression* default_expr = inputs[1];
+                return file_->Ternary(selector_expression, selected_expr,
+                                      default_expr, node->loc());
+              };
+          XLS_RETURN_IF_ERROR(AddAssignmentToGeneratedExpression(
+              array_type, /*lhs=*/ref, /*inputs=*/cases_and_default,
+              /*gen_rhs_expr=*/priority_sel_element,
+              /*add_assignment=*/
+              [&](Expression* lhs, Expression* rhs) {
+                assignment_section()->Add<ContinuousAssignment>(node->loc(),
+                                                                lhs, rhs);
+              },
+              /*sv_array_expr=*/true));
+          break;
+        }
+        XLS_ASSIGN_OR_RETURN(std::string function_name,
+                             VerilogFunctionName(node));
+        absl::StrAppend(&function_name, "_element",
+                        element_type->GetFlatBitCount());
+        VerilogFunction* func;
+        if (node_functions_.contains(function_name)) {
+          func = node_functions_.at(function_name);
+        } else {
+          XLS_ASSIGN_OR_RETURN(
+              func,
+              DefinePrioritySelectFunction(
+                  node->As<PrioritySelect>()->selector(), /*tpe=*/element_type,
+                  /*num_cases=*/node->As<PrioritySelect>()->cases().size(),
+                  /*loc=*/node->loc(), function_name, functions_section_,
+                  options_));
+          node_functions_[function_name] = func;
+        }
+        auto priority_sel_element = [&](absl::Span<Expression* const> inputs) {
+          std::vector<Expression*> selector_and_inputs{selector_expression};
+          selector_and_inputs.insert(selector_and_inputs.end(), inputs.begin(),
+                                     inputs.end());
+          // We emit priority selects as function invocations.
+          return file_->Make<VerilogFunctionCall>(node->loc(), func,
+                                                  selector_and_inputs);
+        };
+        XLS_RETURN_IF_ERROR(AddAssignmentToGeneratedExpression(
+            array_type, /*lhs=*/ref, /*inputs=*/cases_and_default,
+            priority_sel_element,
+            /*add_assignment=*/
+            [&](Expression* lhs, Expression* rhs) {
+              assignment_section()->Add<ContinuousAssignment>(node->loc(), lhs,
+                                                              rhs);
+            },
+            /*sv_array_expr=*/false));
+        break;
+      }
       default:
         return absl::UnimplementedError(
             absl::StrCat("Unsupported array-shaped op: ", node->ToString()));
@@ -857,33 +1201,51 @@ absl::StatusOr<LogicRef*> ModuleBuilder::EmitAsAssignment(
 
 absl::StatusOr<NodeRepresentation> ModuleBuilder::EmitAssert(
     xls::Assert* asrt, Expression* condition) {
-  if (!options_.use_system_verilog()) {
-    // Asserts are a SystemVerilog only feature.
+  if (!CanEmitAsserts()) {
     // TODO(meheff): 2021/02/27 We should raise an error here or possibly emit a
     // construct like: if (!condition) $display("Assert failed ...");
-    XLS_LOG(WARNING) << "Asserts are only supported in SystemVerilog.";
+    LOG(WARNING) << "Asserts are only supported in SystemVerilog.";
     return UnrepresentedSentinel();
   }
-  if (clock() == nullptr) {
-    // TODO(meheff): Add support for assertions without a clock using deferred
-    // assertions (SystemVerilog LRM 16.4).
-    return absl::InvalidArgumentError(
-        "Emitting an assert in SystemVerilog requires a clock.");
+
+  if (asrt->label().has_value()) {
+    if (asrt->label().value() !=
+        SanitizeAndUniquifyName(asrt->label().value())) {
+      return absl::InvalidArgumentError(
+          "Assert label must be a valid SystemVerilog identifier.");
+    }
   }
-  Expression* disable_iff;
+
+  // Since XLS provides no guarantees RE: X-propagation, disable the assert if
+  // the signal is unknown. This avoids triggering the assert when the circuit
+  // is in an invalid state.
+  Expression* disable_iff = file_->Make<SystemFunctionCall>(
+      asrt->loc(), "isunknown", std::vector<Expression*>({condition}));
   if (reset().has_value()) {
-    // Disable the assert when in reset.
-    disable_iff = reset()->active_low
-                      ? static_cast<Expression*>(
-                            file_->LogicalNot(reset()->signal, asrt->loc()))
-                      : static_cast<Expression*>(reset()->signal);
-  } else {
-    // As a backup if no reset is available, disable the assert if the signal is
-    // unknown. This is not great but avoids unconditionally triggering the
-    // assert at the start of simulation.
-    disable_iff = file_->Make<SystemFunctionCall>(
-        asrt->loc(), "isunknown", std::vector<Expression*>({condition}));
+    // Disable the assert when in reset or when the reset signal is undefined.
+    Expression* reset_not_active_value =
+        file_->Literal1(reset()->active_low, asrt->loc());
+    Expression* reset_not_active = file_->CaseNotEquals(
+        reset()->signal, reset_not_active_value, asrt->loc());
+
+    disable_iff = file_->LogicalOr(reset_not_active, disable_iff, asrt->loc());
   }
+
+  if (clock() == nullptr) {
+    return assert_section()->Add<DeferredImmediateAssertion>(
+        asrt->loc(), condition, disable_iff,
+        asrt->label().has_value() ? asrt->label().value() : "",
+        asrt->message());
+  }
+
+  // Sample the disable_iff signal under the following conditions
+  //  1. reset exists and is synchronous.
+  //  2. reset does not exist and a clock exists.
+  if (!reset().has_value() || !reset()->asynchronous) {
+    disable_iff = file_->Make<SystemFunctionCall>(
+        asrt->loc(), "sampled", std::vector<Expression*>({disable_iff}));
+  }
+
   return assert_section()->Add<ConcurrentAssertion>(
       asrt->loc(), condition,
       /*clocking_event=*/file_->Make<PosEdge>(asrt->loc(), clock()),
@@ -894,25 +1256,41 @@ absl::StatusOr<NodeRepresentation> ModuleBuilder::EmitAssert(
 absl::StatusOr<Display*> ModuleBuilder::EmitTrace(
     xls::Trace* trace, Expression* condition,
     absl::Span<Expression* const> trace_args) {
+  auto [macro_name, polarity] =
+      MacroNameAndPolarity(options_.simulation_macro_name());
+  ModuleConditionalDirective* directive =
+      trace_section_->Add<ModuleConditionalDirective>(SourceInfo(), polarity,
+                                                      macro_name);
+
   StructuredProcedure* trace_always;
-  if (clk_ == nullptr) {
-    // Make a fresh always_comb or always @* block for combinational traces
-    // so that each trace only fires when its own inputs change.
-    if (options_.use_system_verilog()) {
-      trace_always = trace_section_->Add<AlwaysComb>(trace->loc());
+  std::vector<SensitivityListElement> sensitivity_list;
+  if (options_.use_system_verilog()) {
+    if (clk_ != nullptr) {
+      // Even though this is purely behavioral and not synthesizable, use
+      // always_ff as a stylistic choice.
+      trace_always = directive->consequent()->Add<AlwaysFf>(
+          trace->loc(), std::initializer_list<SensitivityListElement>{
+                            file_->Make<PosEdge>(trace->loc(), clk_)});
+
     } else {
-      std::vector<SensitivityListElement> sensitivity_list = {
-          ImplicitEventExpression{}};
-      trace_always =
-          trace_section_->Add<Always>(trace->loc(), sensitivity_list);
+      // When targeting SystemVerilog with no clock, we use `always_comb` and
+      // have no need for a sensitivity list.
+      trace_always = directive->consequent()->Add<AlwaysComb>(trace->loc());
     }
   } else {
-    // Trigger the trace at every clock if we have one.
-    std::vector<SensitivityListElement> sensitivity_list = {
-        file_->Make<PosEdge>(trace->loc(), clk_)};
-    // Use an ordinary always block instead of always_ff when targeting
-    // SystemVerilog because this is behavioral (not synthesizable) code.
-    trace_always = trace_section_->Add<Always>(trace->loc(), sensitivity_list);
+    if (clk_ != nullptr) {
+      // When targeting Verilog with a clock, we use `always` triggered on the
+      // posedge.
+      trace_always = directive->consequent()->Add<Always>(
+          trace->loc(), std::initializer_list<SensitivityListElement>{
+                            file_->Make<PosEdge>(trace->loc(), clk_)});
+    } else {
+      // When targeting Verilog with no clock, we use `always` and need to
+      // populate the sensitivity list with the implicit event expression.
+      trace_always = directive->consequent()->Add<Always>(
+          trace->loc(), std::initializer_list<SensitivityListElement>{
+                            ImplicitEventExpression{}});
+    }
   }
 
   Conditional* trace_if =
@@ -940,7 +1318,8 @@ absl::StatusOr<IndexableExpression*> ModuleBuilder::EmitGate(
         gate->GetType()->ToString()));
   }
 
-  LogicRef* ref = DeclareVariable(gate->GetName(), gate->GetType());
+  XLS_ASSIGN_OR_RETURN(LogicRef * ref,
+                       DeclareVariable(gate->GetName(), gate->GetType()));
 
   // Emit the gate as an AND of the (potentially replicated) condition and the
   // data. For example:
@@ -968,7 +1347,7 @@ absl::StatusOr<NodeRepresentation> ModuleBuilder::EmitCover(
     xls::Cover* cover, Expression* condition) {
   if (!options_.use_system_verilog()) {
     // Coverpoints are a SystemVerilog only feature.
-    XLS_LOG(WARNING) << "Coverpoints are only supported in SystemVerilog.";
+    LOG(WARNING) << "Coverpoints are only supported in SystemVerilog.";
     return UnrepresentedSentinel();
   }
   if (clk_ == nullptr) {
@@ -1003,17 +1382,19 @@ absl::StatusOr<ModuleBuilder::Register> ModuleBuilder::DeclareRegister(
     // Currently, an array register requires SystemVerilog because there is an
     // array assignment in the always flop block.
     ArrayType* array_type = type->AsArrayOrDie();
-    reg = module_->AddReg(
-        SanitizeIdentifier(name),
-        file_->UnpackedArrayType(NestedElementWidth(array_type),
+    XLS_ASSIGN_OR_RETURN(
+        reg, module_->AddReg(SanitizeAndUniquifyName(name),
+                             file_->UnpackedArrayType(
+                                 NestedElementWidth(array_type),
                                  NestedArrayBounds(array_type), SourceInfo()),
-        SourceInfo(),
-        /*init=*/nullptr, declaration_section());
+                             SourceInfo(),
+                             /*init=*/nullptr, declaration_section()));
   } else {
-    reg = module_->AddReg(
-        SanitizeIdentifier(name),
-        file_->BitVectorType(type->GetFlatBitCount(), SourceInfo()),
-        SourceInfo(), /*init=*/nullptr, declaration_section());
+    XLS_ASSIGN_OR_RETURN(
+        reg, module_->AddReg(
+                 SanitizeAndUniquifyName(name),
+                 file_->BitVectorType(type->GetFlatBitCount(), SourceInfo()),
+                 SourceInfo(), /*init=*/nullptr, declaration_section()));
   }
   return Register{.ref = reg,
                   .next = next,
@@ -1033,10 +1414,12 @@ absl::StatusOr<ModuleBuilder::Register> ModuleBuilder::DeclareRegister(
         "Block has no reset signal, but register has reset value.");
   }
 
-  return Register{.ref = module_->AddReg(
-                      SanitizeIdentifier(name),
+  XLS_ASSIGN_OR_RETURN(
+      LogicRef * ref,
+      module_->AddReg(SanitizeAndUniquifyName(name),
                       file_->BitVectorType(bit_count, SourceInfo()),
-                      SourceInfo(), /*init=*/nullptr, declaration_section()),
+                      SourceInfo(), /*init=*/nullptr, declaration_section()));
+  return Register{.ref = ref,
                   .next = next,
                   .reset_value = reset_value,
                   .load_enable = nullptr,
@@ -1057,7 +1440,7 @@ absl::Status ModuleBuilder::AssignRegisters(
   // logic input. For example (`a` is a register with a reset, `b` uses the
   // reset signal as a logic input):
   //
-  // always_ff @(psoedge clk) begin
+  // always_ff @(posedge clk) begin
   //   if (rst) begin
   //     a <= ...;
   //   end else begin
@@ -1156,16 +1539,18 @@ bool ModuleBuilder::MustEmitAsFunction(Node* node) {
     case Op::kUMulp:
     case Op::kDynamicBitSlice:
     case Op::kBitSliceUpdate:
-    case Op::kPrioritySel:
     case Op::kSDiv:
     case Op::kUDiv:
+    case Op::kShra:
       return true;
+    case Op::kPrioritySel:
+      return node->As<PrioritySelect>()->cases().size() > 1;
     default:
       return false;
   }
 }
 
-std::string ModuleBuilder::VerilogFunctionName(Node* node) {
+absl::StatusOr<std::string> ModuleBuilder::VerilogFunctionName(Node* node) {
   switch (node->op()) {
     case Op::kSMul:
     case Op::kUMul:
@@ -1188,18 +1573,24 @@ std::string ModuleBuilder::VerilogFunctionName(Node* node) {
       return absl::StrFormat(
           "%s_w%d_%db_%db", OpToString(node->op()), node->BitCountOrDie(),
           node->operand(1)->BitCountOrDie(), node->operand(2)->BitCountOrDie());
-    case Op::kPrioritySel:
+    case Op::kPrioritySel: {
       return absl::StrFormat("%s_%db_%dway", OpToString(node->op()),
                              node->GetType()->GetFlatBitCount(),
                              node->operand(0)->BitCountOrDie());
+    }
     case Op::kSDiv:
     case Op::kUDiv:
-      XLS_CHECK_EQ(node->BitCountOrDie(), node->operand(0)->BitCountOrDie());
-      XLS_CHECK_EQ(node->BitCountOrDie(), node->operand(1)->BitCountOrDie());
+      CHECK_EQ(node->BitCountOrDie(), node->operand(0)->BitCountOrDie());
+      CHECK_EQ(node->BitCountOrDie(), node->operand(1)->BitCountOrDie());
       return absl::StrFormat("%s_%db", OpToString(node->op()),
                              node->BitCountOrDie());
+    case Op::kShra:
+      CHECK_EQ(node->BitCountOrDie(), node->operand(0)->BitCountOrDie());
+      return absl::StrFormat("%s_%db_by_%db", OpToString(node->op()),
+                             node->BitCountOrDie(),
+                             node->operand(1)->BitCountOrDie());
     default:
-      XLS_LOG(FATAL) << "Cannot emit node as function: " << node->ToString();
+      LOG(FATAL) << "Cannot emit node as function: " << node->ToString();
   }
 }
 
@@ -1224,8 +1615,8 @@ VerilogFunction* DefineDynamicBitSliceFunction(DynamicBitSlice* slice,
       slice->loc());
   int64_t width = slice->width();
 
-  LogicRef* zexted_operand = func->AddRegDef(
-      slice->loc(), "zexted_operand",
+  LogicRef* extended_operand = func->AddRegDef(
+      slice->loc(), "extended_operand",
       file->BitVectorType(slice->to_slice()->BitCountOrDie() + width,
                           slice->loc()),
       /*init=*/nullptr);
@@ -1241,10 +1632,10 @@ VerilogFunction* DefineDynamicBitSliceFunction(DynamicBitSlice* slice,
       file->GreaterThanEquals(start, op_width, slice->loc());
   // Pad with width zeros
   func->AddStatement<BlockingAssignment>(
-      slice->loc(), zexted_operand,
+      slice->loc(), extended_operand,
       file->Concat({zeros, operand}, slice->loc()));
   Expression* sliced_operand =
-      file->PartSelect(zexted_operand, start, width, slice->loc());
+      file->PartSelect(extended_operand, start, width, slice->loc());
   func->AddStatement<BlockingAssignment>(
       slice->loc(), func->return_value_ref(),
       file->Ternary(out_of_bounds, zeros, sliced_operand, slice->loc()));
@@ -1342,7 +1733,7 @@ VerilogFunction* DefineBitSliceUpdateFunction(BitSliceUpdate* update,
 // Defines and returns a function which implements the given SMul node.
 VerilogFunction* DefineSmulFunction(Node* node, std::string_view function_name,
                                     ModuleSection* section) {
-  XLS_CHECK_EQ(node->op(), Op::kSMul);
+  CHECK_EQ(node->op(), Op::kSMul);
   VerilogFile* file = section->file();
 
   ScopedLintDisable lint_disable(section, {Lint::kSignedType, Lint::kMultiply});
@@ -1350,7 +1741,7 @@ VerilogFunction* DefineSmulFunction(Node* node, std::string_view function_name,
   VerilogFunction* func = section->Add<VerilogFunction>(
       node->loc(), function_name,
       file->BitVectorType(node->BitCountOrDie(), node->loc()));
-  XLS_CHECK_EQ(node->operand_count(), 2);
+  CHECK_EQ(node->operand_count(), 2);
   Expression* lhs = func->AddArgument(
       "lhs",
       file->BitVectorType(node->operand(0)->BitCountOrDie(), node->loc()),
@@ -1395,7 +1786,7 @@ VerilogFunction* DefineSmulFunction(Node* node, std::string_view function_name,
 // Defines and returns a function which implements the given UMul node.
 VerilogFunction* DefineUmulFunction(Node* node, std::string_view function_name,
                                     ModuleSection* section) {
-  XLS_CHECK_EQ(node->op(), Op::kUMul);
+  CHECK_EQ(node->op(), Op::kUMul);
   VerilogFile* file = section->file();
 
   ScopedLintDisable lint_disable(section, {Lint::kMultiply});
@@ -1403,7 +1794,7 @@ VerilogFunction* DefineUmulFunction(Node* node, std::string_view function_name,
   VerilogFunction* func = section->Add<VerilogFunction>(
       node->loc(), function_name,
       file->BitVectorType(node->BitCountOrDie(), node->loc()));
-  XLS_CHECK_EQ(node->operand_count(), 2);
+  CHECK_EQ(node->operand_count(), 2);
   Expression* lhs = func->AddArgument(
       "lhs",
       file->BitVectorType(node->operand(0)->BitCountOrDie(), node->loc()),
@@ -1421,13 +1812,13 @@ VerilogFunction* DefineUmulFunction(Node* node, std::string_view function_name,
 // Defines and returns a function which implements the given SMulp node.
 absl::StatusOr<VerilogFunction*> DefineSmulpFunction(
     Node* node, std::string_view function_name, ModuleSection* section) {
-  XLS_CHECK_EQ(node->op(), Op::kSMulp);
-  XLS_CHECK_EQ(node->operand_count(), 2);
+  CHECK_EQ(node->op(), Op::kSMulp);
+  CHECK_EQ(node->operand_count(), 2);
   int64_t width = node->As<PartialProductOp>()->width();
 
   VerilogFile* file = section->file();
 
-  ScopedLintDisable lint_disable(section, {Lint::kMultiply});
+  ScopedLintDisable lint_disable(section, {Lint::kSignedType, Lint::kMultiply});
 
   VerilogFunction* func = section->Add<VerilogFunction>(
       node->loc(), function_name, file->BitVectorType(width * 2, node->loc()));
@@ -1469,16 +1860,32 @@ absl::StatusOr<VerilogFunction*> DefineSmulpFunction(
       node->loc(), signed_result,
       file->Mul(signed_lhs, signed_rhs, node->loc()));
 
+  LogicRef* unsigned_result =
+      func->AddRegDef(node->loc(), "unsigned_result",
+                      file->BitVectorType(width, node->loc(),
+                                          /*is_signed=*/false),
+                      /*init=*/nullptr);
+  func->AddStatement<BlockingAssignment>(
+      node->loc(), unsigned_result,
+      file->Make<UnsignedCast>(node->loc(), signed_result));
+
   Bits offset_bits = MulpOffsetForSimulation(
       node->GetType()->AsTupleOrDie()->element_type(0)->GetFlatBitCount(),
       /*shift_size=*/4);
   Literal* offset = file->Literal(offset_bits, node->loc());
+
+  LogicRef* offset_result =
+      func->AddRegDef(node->loc(), "offset_result",
+                      file->BitVectorType(width, node->loc(),
+                                          /*is_signed=*/false),
+                      /*init=*/nullptr);
+  func->AddStatement<BlockingAssignment>(
+      node->loc(), offset_result,
+      file->Sub(unsigned_result, offset, node->loc()));
+
   func->AddStatement<BlockingAssignment>(
       node->loc(), func->return_value_ref(),
-      file->Concat({offset, file->Sub(file->Make<UnsignedCast>(node->loc(),
-                                                               signed_result),
-                                      offset, node->loc())},
-                   node->loc()));
+      file->Concat({offset, offset_result}, node->loc()));
 
   return func;
 }
@@ -1486,8 +1893,8 @@ absl::StatusOr<VerilogFunction*> DefineSmulpFunction(
 // Defines and returns a function which implements the given UMulp node.
 absl::StatusOr<VerilogFunction*> DefineUmulpFunction(
     Node* node, std::string_view function_name, ModuleSection* section) {
-  XLS_CHECK_EQ(node->op(), Op::kUMulp);
-  XLS_CHECK_EQ(node->operand_count(), 2);
+  CHECK_EQ(node->op(), Op::kUMulp);
+  CHECK_EQ(node->operand_count(), 2);
   int64_t width = node->As<PartialProductOp>()->width();
 
   VerilogFile* file = section->file();
@@ -1527,13 +1934,13 @@ absl::StatusOr<VerilogFunction*> DefineUmulpFunction(
 // Defines and returns a function which implements the given Udiv node.
 VerilogFunction* DefineUDivFunction(Node* node, std::string_view function_name,
                                     ModuleSection* section) {
-  XLS_CHECK_EQ(node->op(), Op::kUDiv);
+  CHECK_EQ(node->op(), Op::kUDiv);
   VerilogFile* file = section->file();
 
   VerilogFunction* func = section->Add<VerilogFunction>(
       node->loc(), function_name,
       file->BitVectorType(node->BitCountOrDie(), node->loc()));
-  XLS_CHECK_EQ(node->operand_count(), 2);
+  CHECK_EQ(node->operand_count(), 2);
   Expression* lhs = func->AddArgument(
       "lhs",
       file->BitVectorType(node->operand(0)->BitCountOrDie(), node->loc()),
@@ -1558,13 +1965,13 @@ VerilogFunction* DefineUDivFunction(Node* node, std::string_view function_name,
 // Defines and returns a function which implements the given SDiv node.
 VerilogFunction* DefineSDivFunction(Node* node, std::string_view function_name,
                                     ModuleSection* section) {
-  XLS_CHECK_EQ(node->op(), Op::kSDiv);
+  CHECK_EQ(node->op(), Op::kSDiv);
   VerilogFile* file = section->file();
 
   VerilogFunction* func = section->Add<VerilogFunction>(
       node->loc(), function_name,
       file->BitVectorType(node->BitCountOrDie(), node->loc()));
-  XLS_CHECK_EQ(node->operand_count(), 2);
+  CHECK_EQ(node->operand_count(), 2);
   IndexableExpression* lhs = func->AddArgument(
       "lhs",
       file->BitVectorType(node->operand(0)->BitCountOrDie(), node->loc()),
@@ -1617,81 +2024,64 @@ VerilogFunction* DefineSDivFunction(Node* node, std::string_view function_name,
   return func;
 }
 
-// Defines and returns a function which implements the given UMul node.
-VerilogFunction* DefinePrioritySelectFunction(
-    PrioritySelect* sel, std::string_view function_name,
-    ModuleSection* section, const std::optional<BddQueryEngine>& query_engine,
-    bool use_system_verilog) {
+VerilogFunction* DefineShraFunction(Node* node, std::string_view function_name,
+                                    ModuleSection* section) {
+  CHECK_EQ(node->op(), Op::kShra);
   VerilogFile* file = section->file();
 
+  // Disable lint for the signed_result reg, which is declared signed to catch
+  // the output of `$signed(to_shift) >> amount`.
+  ScopedLintDisable lint_disable(section, {Lint::kSignedType});
+
   VerilogFunction* func = section->Add<VerilogFunction>(
-      sel->loc(), function_name,
-      file->BitVectorType(sel->GetType()->GetFlatBitCount(), sel->loc()));
-  Expression* selector = func->AddArgument(
-      "sel", file->BitVectorType(sel->operand(0)->BitCountOrDie(), sel->loc()),
-      sel->loc());
+      node->loc(), function_name,
+      file->BitVectorType(node->BitCountOrDie(), node->loc()));
+  CHECK_EQ(node->operand_count(), 2);
 
-  std::vector<Expression*> cases;
-  cases.reserve(sel->cases().size());
-  for (size_t i = 0; i < sel->cases().size(); ++i) {
-    Node* const node = sel->get_case(i);
-    cases.push_back(func->AddArgument(
-        absl::StrCat("case", i),
-        file->BitVectorType(node->GetType()->GetFlatBitCount(), sel->loc()),
-        sel->loc()));
-  }
+  IndexableExpression* to_shift = func->AddArgument(
+      "to_shift",
+      file->BitVectorType(node->operand(0)->BitCountOrDie(), node->loc()),
+      node->loc());
+  IndexableExpression* shift_amount = func->AddArgument(
+      "shift_amount",
+      file->BitVectorType(node->operand(1)->BitCountOrDie(), node->loc()),
+      node->loc());
 
-  XLS_CHECK(sel->selector()->GetType()->IsBits());
-  bool one_hot = false;
-  bool never_zero = false;
-  if (query_engine.has_value()) {
-    one_hot = query_engine->AtMostOneBitTrue(sel->selector());
-    never_zero = query_engine->AtLeastOneBitTrue(sel->selector());
-  }
+  LogicRef* signed_result =
+      func->AddRegDef(node->loc(), "signed_result",
+                      file->BitVectorType(node->BitCountOrDie(), node->loc(),
+                                          /*is_signed=*/true),
+                      /*init=*/nullptr);
 
-  CaseType case_type(CaseKeyword::kCasez);
-  FourValueBit case_label_top_bits = FourValueBit::kHighZ;
-  if (one_hot) {
-    case_type.keyword = CaseKeyword::kCase;
-    case_label_top_bits = FourValueBit::kZero;
-  }
-  if ((one_hot || never_zero) && use_system_verilog) {
-    case_type.modifier = CaseModifier::kUnique;
-  }
+  // To perform an arithmetic shift right the left operand must be cast to a
+  // signed value, ie:
+  //
+  //   signed_result := $signed(x) >>> y
+  //
+  // We bind the intermediate result to a variable to prevent the signed
+  // result from having a self-determined width. Self-determined widths of
+  // signed values is normally suspicious because it can result in accidentally
+  // dropping sign-extended bits. In our case, it should be safe because we'll
+  // immediately cast to unsigned, but linters can still flag this. When we bind
+  // the signed result to a variable, the width is no longer self-determined.
+  //
+  // Ultimately, we cast the expression with $unsigned and return the value as
+  // an unsigned type to prevent usages from leaking the signed property.
+  //
+  //   $unsigned(signed_result)
+  //
+  // Without the unsigned, the '>>>' expression would be treated as a signed
+  // value potentially affecting the evaluation of 'op'.  This unsigned cast
+  // is also necessary for correctness of the shift evaluation when the shift
+  // appears in a ternary expression because of Verilog type rules.
+  func->AddStatement<BlockingAssignment>(
+      node->loc(), signed_result,
+      file->Shra(file->Make<SignedCast>(node->loc(), to_shift), shift_amount,
+                 node->loc()));
 
-  Case* case_statement =
-      func->AddStatement<Case>(sel->loc(), selector, case_type);
-  // Make a ternary vector that looks like ???...?1000...0.
-  // Each label will be a sliding window into this larger vector.
-  // If the selector is known to be one hot, the window will look like
-  // 000...01000...0 instead and the "unique" keyword will be used instead.
-  std::vector<FourValueBit> ternary_vector;
-  ternary_vector.reserve(cases.size() * 2 - 1);
-  std::fill_n(std::back_inserter(ternary_vector), cases.size() - 1,
-              case_label_top_bits);
-  ternary_vector.push_back(FourValueBit::kOne);
-  std::fill_n(std::back_inserter(ternary_vector), cases.size() - 1,
-              FourValueBit::kZero);
-  absl::Span<FourValueBit const> ternary_span = ternary_vector;
-
-  for (size_t i = 0; i < cases.size(); ++i) {
-    absl::StatusOr<Expression*> label_expression =
-        file->Make<FourValueBinaryLiteral>(
-            sel->loc(), ternary_span.subspan(i, cases.size()));
-    XLS_CHECK_OK(label_expression.status());
-    StatementBlock* block =
-        case_statement->AddCaseArm(label_expression.value());
-    block->Add<BlockingAssignment>(sel->loc(), func->return_value_ref(),
-                                   cases[i]);
-  }
-
-  // Add default case that returns zero
-  if (!never_zero) {
-    Expression* zero = file->Literal(
-        0, sel->operand(1)->GetType()->GetFlatBitCount(), sel->loc());
-    case_statement->AddCaseArm(DefaultSentinel())
-        ->Add<BlockingAssignment>(sel->loc(), func->return_value_ref(), zero);
-  }
+  func->AddStatement<BlockingAssignment>(
+      node->loc(), func->return_value_ref(),
+      file->Make<UnsignedCast>(node->loc(), signed_result));
 
   return func;
 }
@@ -1699,7 +2089,7 @@ VerilogFunction* DefinePrioritySelectFunction(
 }  // namespace
 
 absl::StatusOr<VerilogFunction*> ModuleBuilder::DefineFunction(Node* node) {
-  std::string function_name = VerilogFunctionName(node);
+  XLS_ASSIGN_OR_RETURN(std::string function_name, VerilogFunctionName(node));
   if (node_functions_.contains(function_name)) {
     return node_functions_.at(function_name);
   }
@@ -1729,24 +2119,27 @@ absl::StatusOr<VerilogFunction*> ModuleBuilder::DefineFunction(Node* node) {
       func = DefineBitSliceUpdateFunction(node->As<BitSliceUpdate>(),
                                           function_name, functions_section_);
       break;
-    case Op::kPrioritySel:
-      if (!query_engine_.has_value() && options_.use_system_verilog()) {
-        query_engine_ = BddQueryEngine(BddFunction::kDefaultPathLimit);
-        XLS_RETURN_IF_ERROR(
-            query_engine_->Populate(node->function_base()).status());
-      }
-      func = DefinePrioritySelectFunction(
-          node->As<PrioritySelect>(), function_name, functions_section_,
-          query_engine_, options_.use_system_verilog());
+    case Op::kPrioritySel: {
+      XLS_ASSIGN_OR_RETURN(
+          func,
+          DefinePrioritySelectFunction(
+              node->As<PrioritySelect>()->selector(), /*tpe=*/node->GetType(),
+              /*num_cases=*/node->As<PrioritySelect>()->cases().size(),
+              /*loc=*/node->loc(), function_name, functions_section_,
+              options_));
       break;
+    }
     case Op::kUDiv:
       func = DefineUDivFunction(node, function_name, functions_section_);
       break;
     case Op::kSDiv:
       func = DefineSDivFunction(node, function_name, functions_section_);
       break;
+    case Op::kShra:
+      func = DefineShraFunction(node, function_name, functions_section_);
+      break;
     default:
-      XLS_LOG(FATAL) << "Cannot define node as function: " << node->ToString();
+      LOG(FATAL) << "Cannot define node as function: " << node->ToString();
   }
   node_functions_[function_name] = func;
   return func;

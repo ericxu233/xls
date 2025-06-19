@@ -14,6 +14,7 @@
 
 #include "xls/dslx/type_system/type_info_to_proto.h"
 
+#include <filesystem>  // NOLINT
 #include <optional>
 #include <string>
 #include <string_view>
@@ -21,11 +22,15 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
 #include "xls/common/golden_files.h"
 #include "xls/common/status/matchers.h"
 #include "xls/dslx/create_import_data.h"
 #include "xls/dslx/import_data.h"
 #include "xls/dslx/parse_and_typecheck.h"
+#include "xls/dslx/type_system/type_info.pb.h"
 
 namespace xls::dslx {
 namespace {
@@ -51,7 +56,9 @@ void DoRun(std::string_view program, const std::string& test_name,
   std::string nodes_text = absl::StrJoin(
       tip.nodes(), "\n",
       [&](std::string* out, const AstNodeTypeInfoProto& node) {
-        absl::StrAppend(out, ToHumanString(node, *import_data).value());
+        absl::StrAppend(
+            out, ToHumanString(node, *import_data, import_data->file_table())
+                     .value());
       });
 
   std::filesystem::path golden_file_path = absl::StrFormat(
@@ -128,12 +135,31 @@ pub enum Foo : u32 {
   (void)tm;
 
   std::string program = R"(
-import my_imported_module
+import my_imported_module;
 
 type MyFoo = my_imported_module::Foo;
 )";
   DoRun(program, TestName(), /*proto_out=*/nullptr,
         /*import_data=*/&import_data);
+}
+
+TEST(TypeInfoToProtoTest, ProcWithImpl) {
+  std::string program = R"(
+proc Foo { a: u32 }
+)";
+  DoRun(program, TestName());
+}
+
+TEST(TypeInfoToProtoTest, BitsConstructorTypeProto) {
+  std::string program = R"(
+fn distinct<COUNT: u32, N: u32, S: bool>(items: xN[S][N][COUNT], valid: bool[COUNT]) -> bool { fail!("unimplemented", zero!<bool>()) }
+
+#[test]
+fn test_simple_nondistinct() {
+    assert_eq(distinct(u2[2]:[1, 1], bool[2]:[true, true]), false)
+}
+)";
+  DoRun(program, TestName());
 }
 
 }  // namespace

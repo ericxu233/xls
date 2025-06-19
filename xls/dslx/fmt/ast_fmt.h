@@ -18,61 +18,107 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <utility>
-#include <vector>
+#include <string_view>
 
-#include "absl/container/flat_hash_map.h"
+#include "absl/status/statusor.h"
 #include "absl/types/span.h"
+#include "xls/dslx/fmt/comments.h"
 #include "xls/dslx/fmt/pretty_print.h"
 #include "xls/dslx/frontend/ast.h"
-#include "xls/dslx/frontend/comment_data.h"
-#include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/frontend/module.h"
+#include "xls/dslx/frontend/token.h"
+#include "xls/dslx/virtualizable_file_system.h"
 
 namespace xls::dslx {
 
-// API convenience wrapper around comment data that the scanner produces -- this
-// allows us to look up "what comments an AST node is responsible for" via
-// `GetComments()` providing the AST node span.
-class Comments {
+// TODO: davidplass - Move this class to its own file after all the
+// Expr-descendants are migrated to it.
+class Formatter {
  public:
-  static Comments Create(absl::Span<const CommentData> comments);
+  Formatter(Comments& comments, DocArena& arena)
+      : comments_(comments), arena_(arena) {}
 
-  // Returns all the comments contained within the given `node_span`.
-  //
-  // This is a convenient way for nodes to query for all their related comments.
-  std::vector<const CommentData*> GetComments(const Span& node_span) const;
-
-  // Returns whether there are any comments contained in the given span.
-  bool HasComments(const Span& in_span) const;
-
-  const std::optional<Pos>& last_data_limit() const { return last_data_limit_; }
+  // keep-sorted start
+  // Each `Format` method creates a pretty-printable document from the given AST
+  // node `n`.
+  DocRef Format(const Function& n);
+  DocRef Format(const Expr& n);
+  DocRef Format(const Let& n, bool trailing_semi);
+  absl::StatusOr<DocRef> Format(const Module& n);
+  // If `trailing_semi` is true, then a trailing semicolon will also be emitted.
+  DocRef Format(const Statement& n, bool trailing_semi);
+  DocRef Format(const VerbatimNode& n);
+  // keep-sorted end
 
  private:
-  Comments(absl::flat_hash_map<int64_t, CommentData> line_to_comment,
-           std::optional<Pos> last_data_limit)
-      : line_to_comment_(std::move(line_to_comment)),
-        last_data_limit_(std::move(last_data_limit)) {}
+  // keep-sorted start
+  DocRef Format(const ConstAssert& n);
+  DocRef Format(const ConstantDef& n);
+  DocRef Format(const EnumDef& n);
+  DocRef Format(const EnumMember& n);
+  DocRef Format(const Impl& n);
+  DocRef Format(const ImplMember& n);
+  DocRef Format(const Import& n);
+  DocRef Format(const Use& n);
+  DocRef Format(const ModuleMember& n);
+  DocRef Format(const ParametricBinding& n);
+  DocRef Format(const ParametricBinding* n);
+  DocRef Format(const Proc& n);
+  DocRef Format(const ProcDef& n);
+  DocRef Format(const ProcMember& n);
+  DocRef Format(const QuickCheck& n);
+  DocRef Format(const StructDef& n);
+  DocRef Format(const TestFunction& n);
+  DocRef Format(const TestProc& n);
+  DocRef Format(const TypeAlias& n);
+  DocRef FormatParams(absl::Span<const Param* const> params);
+  DocRef FormatStructDefBase(
+      const StructDefBase& n, Keyword keyword,
+      const std::optional<std::string>& extern_type_name);
+  // keep-sorted end
 
-  absl::flat_hash_map<int64_t, CommentData> line_to_comment_;
-  std::optional<Pos> last_data_limit_;
+  Comments& comments_;
+  DocArena& arena_;
 };
 
-// Functions with this signature create a pretty printable document from the AST
-// node "n".
+inline constexpr int64_t kDslxDefaultTextWidth = 100;
 
-DocRef Fmt(const Expr& n, const Comments& comments, DocArena& arena);
-
-DocRef Fmt(const Statement& n, const Comments& comments, DocArena& arena);
-
-DocRef Fmt(const Function& n, const Comments& comments, DocArena& arena);
-
-DocRef Fmt(const Module& n, const Comments& comments, DocArena& arena);
-
-// Auto-formatting entry point.
+// Auto-formatting entry points.
 //
-// Performs a reflow-capable formatting of module "m" with standard line width.
-std::string AutoFmt(const Module& m, const Comments& comments,
-                    int64_t text_width = 100);
+// Performs a reflow-capable formatting of module `m` with standard line width,
+// but with the ability to disable formatting for specific ranges of text.
+absl::StatusOr<std::string> AutoFmt(VirtualizableFilesystem& vfs,
+                                    const Module& m, Comments& comments,
+                                    int64_t text_width = kDslxDefaultTextWidth);
+
+// Performs a reflow-capable formatting of module `m` with standard line width,
+// for the actual `content` but with the ability to disable formatting for
+// specific ranges of text.
+absl::StatusOr<std::string> AutoFmt(VirtualizableFilesystem& vfs,
+                                    const Module& m, Comments& comments,
+                                    std::string contents,
+                                    int64_t text_width = kDslxDefaultTextWidth);
+
+// If we fail the postcondition we return back the data we used to detect that
+// the postcondition was violated.
+struct AutoFmtPostconditionViolation {
+  std::string original_transformed;
+  std::string autofmt_transformed;
+};
+
+// Checks whether the auto-formatting process looks "opportunistically sound" --
+// that is, this will not hold true for all examples, but it'll hold true for a
+// bunch of them, and so can be a useful debugging tool.
+//
+// It's difficult to come up with a /simple/ postcondition for the
+// auto-formatter because it does some cleanup transformations based on the
+// grammar, and we want this to be a simple linear / regexp style check on the
+// flattened text, so we can't account for all the transforms that the
+// autoformatter may perform. Still, it's useful in testing or debugging
+// scenarios where we know none of those constructs / situations are present.
+std::optional<AutoFmtPostconditionViolation>
+ObeysAutoFmtOpportunisticPostcondition(std::string_view original,
+                                       std::string_view autofmt);
 
 }  // namespace xls::dslx
 

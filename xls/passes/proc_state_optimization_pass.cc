@@ -16,31 +16,48 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
+#include "cppitertools/zip.hpp"
 #include "xls/common/math_util.h"
+#include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/data_structures/inline_bitmap.h"
-#include "xls/data_structures/union_find.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/data_structures/leaf_type_tree.h"
+#include "xls/data_structures/transitive_closure.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/ir/proc.h"
+#include "xls/ir/source_location.h"
+#include "xls/ir/state_element.h"
 #include "xls/ir/type.h"
-#include "xls/ir/value_helpers.h"
+#include "xls/ir/value.h"
+#include "xls/ir/value_utils.h"
 #include "xls/passes/dataflow_visitor.h"
+#include "xls/passes/lazy_ternary_query_engine.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
 #include "xls/passes/pass_base.h"
+#include "xls/passes/query_engine.h"
+#include "xls/passes/stateless_query_engine.h"
+#include "xls/passes/union_query_engine.h"
 
 namespace xls {
 namespace {
@@ -48,7 +65,8 @@ namespace {
 absl::StatusOr<bool> RemoveZeroWidthStateElements(Proc* proc) {
   std::vector<int64_t> to_remove;
   for (int64_t i = proc->GetStateElementCount() - 1; i >= 0; --i) {
-    if (proc->GetStateElementType(i)->GetFlatBitCount() == 0) {
+    if (proc->GetStateElementType(i)->GetFlatBitCount() == 0 &&
+        !TypeHasToken(proc->GetStateElementType(i))) {
       to_remove.push_back(i);
     }
   }
@@ -56,12 +74,66 @@ absl::StatusOr<bool> RemoveZeroWidthStateElements(Proc* proc) {
     return false;
   }
   for (int64_t i : to_remove) {
-    XLS_VLOG(2) << "Removing zero-width state element: "
-                << proc->GetStateParam(i)->GetName();
-    XLS_RETURN_IF_ERROR(proc->GetStateParam(i)
-                            ->ReplaceUsesWithNew<Literal>(
-                                ZeroOfType(proc->GetStateElementType(i)))
-                            .status());
+    StateElement* state_element = proc->GetStateElement(i);
+    VLOG(2) << "Removing zero-width state element: "
+            << proc->GetStateElement(i)->name();
+    StateRead* state_read = proc->GetStateRead(state_element);
+    std::vector<Next*> next_values(proc->next_values(state_read).begin(),
+                                   proc->next_values(state_read).end());
+    for (Next* next : next_values) {
+      XLS_RETURN_IF_ERROR(
+          next->ReplaceUsesWithNew<Literal>(Value::Tuple({})).status());
+      XLS_RETURN_IF_ERROR(proc->RemoveNode(next));
+    }
+    XLS_RETURN_IF_ERROR(
+        state_read->ReplaceUsesWithNew<Literal>(state_element->initial_value())
+            .status());
+    XLS_RETURN_IF_ERROR(proc->RemoveStateElement(i));
+  }
+  return true;
+}
+
+absl::StatusOr<bool> RemoveConstantStateElements(Proc* proc,
+                                                 QueryEngine& query_engine) {
+  std::vector<int64_t> to_remove;
+  for (int64_t i = proc->GetStateElementCount() - 1; i >= 0; --i) {
+    StateElement* state_element = proc->GetStateElement(i);
+    StateRead* state_read = proc->GetStateRead(state_element);
+    const Value& initial_value = state_element->initial_value();
+
+    bool never_changes = true;
+    for (Next* next : proc->next_values(state_read)) {
+      if (next->value() == state_read) {
+        continue;
+      }
+      std::optional<Value> next_value = query_engine.KnownValue(next->value());
+      if (!next_value.has_value() || *next_value != initial_value) {
+        never_changes = false;
+        break;
+      }
+    }
+    if (never_changes) {
+      to_remove.push_back(i);
+    }
+  }
+  if (to_remove.empty()) {
+    return false;
+  }
+  for (int64_t i : to_remove) {
+    StateElement* state_element = proc->GetStateElement(i);
+    Value value = state_element->initial_value();
+    VLOG(2) << "Removing constant state element: " << state_element->name()
+            << " (value: " << value.ToString() << ")";
+    StateRead* state_read = proc->GetStateRead(state_element);
+    std::vector<Next*> next_values(proc->next_values(state_read).begin(),
+                                   proc->next_values(state_read).end());
+    for (Next* next : next_values) {
+      XLS_RETURN_IF_ERROR(
+          next->ReplaceUsesWithNew<Literal>(Value::Tuple({})).status());
+      XLS_RETURN_IF_ERROR(proc->RemoveNode(next));
+    }
+    XLS_RETURN_IF_ERROR(
+        state_read->ReplaceUsesWithNew<Literal>(value).status());
     XLS_RETURN_IF_ERROR(proc->RemoveStateElement(i));
   }
   return true;
@@ -70,9 +142,9 @@ absl::StatusOr<bool> RemoveZeroWidthStateElements(Proc* proc) {
 // A visitor which computes which state elements each node is dependent
 // upon. Dependence is represented using an N-bit bit-vector where the i-th bit
 // set indicates that the corresponding node is dependent upon the i-th state
-// parameter. Dependence is tracked an a per leaf element basis using
+// element. Dependence is tracked an a per leaf element basis using
 // LeafTypeTrees.
-class StateDependencyVisitor : public DataFlowVisitor<InlineBitmap> {
+class StateDependencyVisitor : public DataflowVisitor<InlineBitmap> {
  public:
   explicit StateDependencyVisitor(Proc* proc) : proc_(proc) {}
 
@@ -84,16 +156,14 @@ class StateDependencyVisitor : public DataFlowVisitor<InlineBitmap> {
                               node->GetType(), FlattenOperandBitmaps(node)));
   }
 
-  absl::Status HandleParam(Param* param) override {
-    if (param == proc_->TokenParam()) {
-      return DefaultHandler(param);
-    }
-    // A state parameter is only dependent upon itself.
-    XLS_ASSIGN_OR_RETURN(int64_t index, proc_->GetStateParamIndex(param));
+  absl::Status HandleStateRead(StateRead* state_read) override {
+    // A state read is only dependent upon itself.
+    XLS_ASSIGN_OR_RETURN(int64_t index, proc_->GetStateElementIndex(
+                                            state_read->state_element()));
     InlineBitmap bitmap(proc_->GetStateElementCount());
     bitmap.Set(index, true);
-    return SetValue(param,
-                    LeafTypeTree<InlineBitmap>(param->GetType(), bitmap));
+    return SetValue(state_read,
+                    LeafTypeTree<InlineBitmap>(state_read->GetType(), bitmap));
   }
 
   // Returns the union of all of the bitmaps in the LeafTypeTree for all of the
@@ -117,7 +187,26 @@ class StateDependencyVisitor : public DataFlowVisitor<InlineBitmap> {
     return result;
   }
 
- private:
+ protected:
+  // We are interested in tracking the dependencies of the state elements so
+  // union together all inputs (data and control sources) which represent which
+  // state elements this node depends on.
+  absl::StatusOr<InlineBitmap> JoinElements(
+      Type* element_type, absl::Span<const InlineBitmap* const> data_sources,
+      absl::Span<const LeafTypeTreeView<InlineBitmap>> control_sources,
+      Node* node, absl::Span<const int64_t> index) override {
+    InlineBitmap element = *data_sources.front();
+    for (const InlineBitmap* data_source : data_sources.subspan(1)) {
+      element.Union(*data_source);
+    }
+    for (const LeafTypeTreeView<InlineBitmap>& control_source :
+         control_sources) {
+      XLS_RET_CHECK(IsLeafType(control_source.type()));
+      element.Union(control_source.elements().front());
+    }
+    return std::move(element);
+  }
+
   Proc* proc_;
 };
 
@@ -126,25 +215,25 @@ class StateDependencyVisitor : public DataFlowVisitor<InlineBitmap> {
 // Dependencies are only computed in a single forward pass so dependencies
 // through the proc back edge are not considered.
 absl::StatusOr<absl::flat_hash_map<Node*, InlineBitmap>>
-ComputeStateDependencies(Proc* proc) {
+ComputeStateDependencies(Proc* proc, OptimizationContext& context) {
   StateDependencyVisitor visitor(proc);
   XLS_RETURN_IF_ERROR(proc->Accept(&visitor));
   absl::flat_hash_map<Node*, InlineBitmap> state_dependencies;
   for (Node* node : proc->nodes()) {
     state_dependencies.insert({node, visitor.FlattenNodeBitmaps(node)});
   }
-  if (XLS_VLOG_IS_ON(3)) {
-    XLS_VLOG(3) << "State dependencies (** side-effecting operation):";
-    for (Node* node : TopoSort(proc)) {
+  if (VLOG_IS_ON(5)) {
+    VLOG(5) << "State dependencies (** side-effecting operation):";
+    for (Node* node : context.TopoSort(proc)) {
       std::vector<std::string> dependent_elements;
       for (int64_t i = 0; i < proc->GetStateElementCount(); ++i) {
         if (state_dependencies.at(node).Get(i)) {
-          dependent_elements.push_back(proc->GetStateParam(i)->GetName());
+          dependent_elements.push_back(proc->GetStateRead(i)->GetName());
         }
       }
-      XLS_VLOG(3) << absl::StrFormat("  %s : {%s}%s", node->GetName(),
-                                     absl::StrJoin(dependent_elements, ", "),
-                                     OpIsSideEffecting(node->op()) ? "**" : "");
+      VLOG(5) << absl::StrFormat("  %s : {%s}%s", node->GetName(),
+                                 absl::StrJoin(dependent_elements, ", "),
+                                 OpIsSideEffecting(node->op()) ? "**" : "");
     }
   }
   return std::move(state_dependencies);
@@ -153,148 +242,130 @@ ComputeStateDependencies(Proc* proc) {
 // Removes unobservable state elements. A state element X is observable if:
 //   (1) a side-effecting operation depends on X, OR
 //   (2) the next-state value of an observable state element depends on X.
-absl::StatusOr<bool> RemoveUnobservableStateElements(Proc* proc) {
+absl::StatusOr<bool> RemoveUnobservableStateElements(
+    Proc* proc, OptimizationContext& context) {
+  if (proc->GetStateElementCount() == 0) {
+    return false;
+  }
   absl::flat_hash_map<Node*, InlineBitmap> state_dependencies;
-  XLS_ASSIGN_OR_RETURN(state_dependencies, ComputeStateDependencies(proc));
+  XLS_ASSIGN_OR_RETURN(state_dependencies,
+                       ComputeStateDependencies(proc, context));
 
-  // Map from node to the state element indices for which the node is the
-  // next-state value.
-  absl::flat_hash_map<Node*, std::vector<int64_t>> next_state_indices;
-  for (int64_t i = 0; i < proc->GetStateElementCount(); ++i) {
-    next_state_indices[proc->GetNextStateElement(i)].push_back(i);
+  // Compute an adjacency matrix for which state elements affect each other.
+  //
+  // The last element is the side-effecting nodes (all merged together).
+  std::vector<InlineBitmap> state_dependencies_matrix(
+      proc->GetStateElementCount() + 1,
+      InlineBitmap(proc->GetStateElementCount()));
+  for (auto [elem, adj] :
+       iter::zip(proc->StateElements(), state_dependencies_matrix)) {
+    for (Next* next : proc->next_values(proc->GetStateRead(elem))) {
+      adj.Union(state_dependencies.at(next->value()));
+      if (next->predicate().has_value()) {
+        adj.Union(state_dependencies.at(*next->predicate()));
+      }
+    }
+    // Avoid a copy of each state element's bitmap by extending after doing all
+    // the unions.
+    adj = std::move(adj).WithSize(proc->GetStateElementCount() + 1);
   }
 
-  // The equivalence classes of state element indices. State element X is in the
-  // same class as Y if the next-state value of X depends on Y or vice versa.
-  UnionFind<int64_t> state_components;
-  for (int64_t i = 0; i < proc->GetStateElementCount(); ++i) {
-    state_components.Insert(i);
-  }
-
-  // At the end, the union-find data structure will have one equivalence class
-  // corresponding to the set of all observable state indices. This value is
-  // always either `std::nullopt` or an element of that equivalence class. We
-  // won't have a way to represent the equivalence class until it contains at
-  // least one value, so we use `std::optional`.
-  std::optional<int64_t> observable_state_index;
-
-  // Merge state elements which depend on each other and identify observable
-  // state indices.
+  // Add all the side-effecting nodes as additional edges which depend on their
+  // living state elements.
   for (Node* node : proc->nodes()) {
-    if (OpIsSideEffecting(node->op()) && !node->Is<Param>()) {
-      // `node` is side-effecting. All state elements that `node` is dependent
-      // on are observable.
-      for (int64_t i = 0; i < proc->GetStateElementCount(); ++i) {
-        if (state_dependencies.at(node).Get(i)) {
-          XLS_VLOG(4) << absl::StreamFormat(
-              "State element `%s` (%d) is observable because side-effecting "
-              "node `%s` depends on it",
-              proc->GetStateParam(i)->GetName(), i, node->GetName());
-          if (!observable_state_index.has_value()) {
-            observable_state_index = i;
-          } else {
-            state_components.Union(i, observable_state_index.value());
-          }
-        }
-      }
+    if (!OpIsSideEffecting(node->op()) ||
+        node->OpIn({Op::kStateRead, Op::kNext, Op::kGate})) {
+      continue;
     }
-    if (next_state_indices.contains(node)) {
-      for (int64_t next_state_index : next_state_indices.at(node)) {
-        // `node` is the next state node for state element with index
-        // `next_state_index`. Union `next_state_index` with each state index
-        // that `node` is dependent on.
-        for (int64_t i = 0; i < proc->GetStateElementCount(); ++i) {
-          if (state_dependencies.at(node).Get(i)) {
-            XLS_VLOG(4) << absl::StreamFormat(
-                "Unioning state elements `%s` (%d) and `%s` (%d) because next "
-                "state of `%s` (node `%s`) depends on `%s`",
-                proc->GetStateParam(next_state_index)->GetName(),
-                next_state_index, proc->GetStateParam(i)->GetName(), i,
-                proc->GetStateParam(next_state_index)->GetName(),
-                node->GetName(), proc->GetStateParam(i)->GetName());
-            state_components.Union(i, next_state_index);
-          }
-        }
-      }
-    }
+    state_dependencies_matrix.back().Union(state_dependencies.at(node));
   }
-  if (observable_state_index.has_value()) {
-    // Set to the representative value of the union-find data structure.
-    observable_state_index =
-        state_components.Find(observable_state_index.value());
-  }
+  state_dependencies_matrix.back() =
+      std::move(state_dependencies_matrix.back())
+          .WithSize(proc->GetStateElementCount() + 1);
 
+  // Set of state elements which each state element affects.
+  state_dependencies_matrix =
+      TransitiveClosure(std::move(state_dependencies_matrix));
+
+  // Figure out which state elements are observable.
+  const InlineBitmap& observed = state_dependencies_matrix.back();
   // Gather unobservable state element indices into `to_remove`.
   std::vector<int64_t> to_remove;
   to_remove.reserve(proc->GetStateElementCount());
-  XLS_VLOG(3) << "Observability of state elements:";
+
+  VLOG(3) << "Observability of state elements:";
   for (int64_t i = proc->GetStateElementCount() - 1; i >= 0; --i) {
-    if (!observable_state_index.has_value() ||
-        state_components.Find(i) != observable_state_index.value()) {
+    if (!observed.Get(i)) {
       to_remove.push_back(i);
-      XLS_VLOG(3) << absl::StrFormat("  %s (%d) : NOT observable",
-                                     proc->GetStateParam(i)->GetName(), i);
+      VLOG(3) << absl::StrFormat("  %s (%d) : NOT observable",
+                                 proc->GetStateElement(i)->name(), i);
     } else {
-      XLS_VLOG(3) << absl::StrFormat("  %s (%d) : observable",
-                                     proc->GetStateParam(i)->GetName(), i);
+      VLOG(3) << absl::StrFormat("  %s (%d) : observable",
+                                 proc->GetStateElement(i)->name(), i);
     }
   }
   if (to_remove.empty()) {
     return false;
   }
 
-  // Replace uses of to-be-removed state parameters with a zero-valued literal.
+  // Replace uses of to-be-removed state elements with a zero-valued literal,
+  // and remove their next_value nodes.
   for (int64_t i : to_remove) {
-    Param* state_param = proc->GetStateParam(i);
-    if (!state_param->IsDead()) {
+    StateRead* state_read = proc->GetStateRead(i);
+    absl::btree_set<Next*, Node::NodeIdLessThan> next_values =
+        proc->next_values(state_read);
+    for (Next* next : next_values) {
       XLS_RETURN_IF_ERROR(
-          state_param
-              ->ReplaceUsesWithNew<Literal>(ZeroOfType(state_param->GetType()))
+          next->ReplaceUsesWithNew<Literal>(Value::Tuple({})).status());
+      XLS_RETURN_IF_ERROR(proc->RemoveNode(next));
+    }
+    if (!state_read->IsDead()) {
+      XLS_RETURN_IF_ERROR(
+          state_read
+              ->ReplaceUsesWithNew<Literal>(ZeroOfType(state_read->GetType()))
               .status());
     }
   }
 
   for (int64_t i : to_remove) {
-    XLS_VLOG(2) << absl::StreamFormat(
-        "Removing dead state element %s of type %s",
-        proc->GetStateParam(i)->GetName(),
-        proc->GetStateParam(i)->GetType()->ToString());
+    VLOG(2) << absl::StreamFormat("Removing dead state element %s of type %s",
+                                  proc->GetStateElement(i)->name(),
+                                  proc->GetStateElement(i)->type()->ToString());
     XLS_RETURN_IF_ERROR(proc->RemoveStateElement(i));
   }
   return true;
 }
 
 // If there's a sequence of state elements `c` with length `k` such that
-//     next[c[i + 1]] ≡ param[c[i]] and next[c[0]] is a literal
+//     next[c[i + 1]] ≡ state_read[c[i]] and next[c[0]] is a constant
 // where `≡` denotes semantic equivalence, then this function will convert all
 // of those state elements into a single state element of size ⌈log₂(k)⌉ bits,
-// unless the literal value is equal to init_value[c[0]], in which case the
+// unless the constant value is equal to init_value[c[0]], in which case the
 // state will be eliminated entirely.
 //
 // The reason this takes a chain as input rather than a single state element
-// with literal input (and then run to fixed point) is because the latter would
+// with constant input (and then run to fixed point) is because the latter would
 // result in a one-hot encoding of the state rather than binary.
 //
 // TODO: 2022-08-31 this could be modified to handle arbitrary DAGs where each
 // included next function doesn't have any receives (i.e.: a DAG consisting of
-// arithmetic/logic operations, literals, and registers).
-absl::Status LiteralChainToStateMachine(Proc* proc,
-                                        absl::Span<const int64_t> chain) {
-  XLS_CHECK(!chain.empty());
+// arithmetic/logic operations, constants, and registers).
+absl::Status ConstantChainToStateMachine(Proc* proc,
+                                         absl::Span<const int64_t> chain,
+                                         const QueryEngine& query_engine) {
+  CHECK(!chain.empty());
 
   std::string state_machine_name = "state_machine";
-  for (int64_t param_index : chain) {
+  for (int64_t state_index : chain) {
     absl::StrAppend(&state_machine_name, "_",
-                    proc->GetStateParam(param_index)->GetName());
+                    proc->GetStateElement(state_index)->name());
   }
 
   int64_t state_machine_width = CeilOfLog2(chain.size()) + 1;
   Type* state_machine_type = proc->package()->GetBitsType(state_machine_width);
-  XLS_ASSIGN_OR_RETURN(Param * state_machine_param,
+  XLS_ASSIGN_OR_RETURN(StateRead * state_machine_read,
                        proc->AppendStateElement(
                            state_machine_name, ZeroOfType(state_machine_type)));
-  XLS_ASSIGN_OR_RETURN(int64_t state_machine_index,
-                       proc->GetStateParamIndex(state_machine_param));
 
   {
     XLS_ASSIGN_OR_RETURN(
@@ -304,60 +375,98 @@ absl::Status LiteralChainToStateMachine(Proc* proc,
         Node * max,
         proc->MakeNode<Literal>(
             SourceInfo(), Value(UBits(chain.size() - 1, state_machine_width))));
-    XLS_ASSIGN_OR_RETURN(Node * machine_plus_one,
-                         proc->MakeNode<BinOp>(
-                             SourceInfo(), state_machine_param, one, Op::kAdd));
+    XLS_ASSIGN_OR_RETURN(
+        Node * machine_plus_one,
+        proc->MakeNode<BinOp>(SourceInfo(), state_machine_read, one, Op::kAdd));
     XLS_ASSIGN_OR_RETURN(Node * machine_too_large,
                          proc->MakeNode<CompareOp>(
-                             SourceInfo(), state_machine_param, max, Op::kUGt));
+                             SourceInfo(), state_machine_read, max, Op::kUGt));
     XLS_ASSIGN_OR_RETURN(
         Node * sel,
         proc->MakeNode<Select>(
             SourceInfo(), machine_too_large,
-            std::vector<Node*>({machine_plus_one, state_machine_param}),
+            std::vector<Node*>({machine_plus_one, state_machine_read}),
             std::nullopt));
-    XLS_RETURN_IF_ERROR(proc->SetNextStateElement(state_machine_index, sel));
+    XLS_RETURN_IF_ERROR(
+        proc->MakeNode<Next>(SourceInfo(), /*state_read=*/state_machine_read,
+                             /*value=*/sel, /*predicate=*/std::nullopt)
+            .status());
   }
 
   std::vector<Node*> initial_state_literals;
   initial_state_literals.reserve(chain.size());
-  for (int64_t param_index : chain) {
+  for (int64_t state_index : chain) {
     XLS_ASSIGN_OR_RETURN(
-        Node * init, proc->MakeNode<Literal>(
-                         SourceInfo(), proc->GetInitValueElement(param_index)));
+        Node * init,
+        proc->MakeNode<Literal>(
+            SourceInfo(), proc->GetStateElement(state_index)->initial_value()));
     initial_state_literals.push_back(init);
   }
 
-  Node* chain_literal = proc->GetNextStateElement(chain.at(0));
-  XLS_CHECK(chain_literal->Is<Literal>());
+  CHECK_EQ(proc->next_values(proc->GetStateRead(chain.front())).size(), 1);
+  Next* next_value =
+      *proc->next_values(proc->GetStateRead(chain.front())).begin();
+  CHECK(next_value->predicate() == std::nullopt &&
+        query_engine.IsFullyKnown(next_value->value()));
+  Node* chain_constant = next_value->value();
+  CHECK(chain_constant != nullptr && query_engine.IsFullyKnown(chain_constant));
+  XLS_ASSIGN_OR_RETURN(
+      Literal * chain_literal,
+      proc->MakeNode<Literal>(chain_constant->loc(),
+                              *query_engine.KnownValue(chain_constant)));
 
+  absl::btree_set<int64_t, std::greater<int64_t>> indices_to_remove;
   for (int64_t chain_index = 0; chain_index < chain.size(); ++chain_index) {
-    int64_t param_index = chain.at(chain_index);
+    int64_t state_index = chain.at(chain_index);
     std::vector<Node*> cases = initial_state_literals;
-    XLS_CHECK_GE(cases.size(), chain_index);
+    CHECK_GE(cases.size(), chain_index);
     cases.resize(chain_index + 1);
     std::reverse(cases.begin(), cases.end());
-    XLS_RETURN_IF_ERROR(proc->GetStateParam(param_index)
-                            ->ReplaceUsesWithNew<Select>(state_machine_param,
+    absl::btree_set<Next*, Node::NodeIdLessThan> next_values =
+        proc->next_values(proc->GetStateRead(state_index));
+    for (Next* next : next_values) {
+      XLS_RETURN_IF_ERROR(
+          next->ReplaceUsesWithNew<Literal>(Value::Tuple({})).status());
+      XLS_RETURN_IF_ERROR(proc->RemoveNode(next));
+    }
+    XLS_RETURN_IF_ERROR(proc->GetStateRead(state_index)
+                            ->ReplaceUsesWithNew<Select>(state_machine_read,
                                                          cases, chain_literal)
                             .status());
+    indices_to_remove.insert(state_index);
+  }
+  for (int64_t state_index : indices_to_remove) {
+    XLS_RETURN_IF_ERROR(proc->RemoveStateElement(state_index));
   }
 
   return absl::OkStatus();
 }
 
 // Convert all chains in the state element graph (as described in the docs for
-// `LiteralChainToStateMachine`) into state machines with `⌈log₂(k)⌉` bits of
+// `ConstantChainToStateMachine`) into state machines with `⌈log₂(k)⌉` bits of
 // state where `k` is the length of the chain.
 //
 // TODO: 2022-08-31 this currently only handles chains of length 1 with
 // syntactic equivalence
-absl::StatusOr<bool> ConvertLiteralChainsToStateMachines(Proc* proc) {
+absl::StatusOr<bool> ConvertConstantChainsToStateMachines(
+    Proc* proc, QueryEngine& query_engine) {
   bool changed = false;
   for (int64_t i = 0; i < proc->GetStateElementCount(); ++i) {
-    if (proc->GetNextStateElement(i)->Is<Literal>()) {
-      XLS_RETURN_IF_ERROR(LiteralChainToStateMachine(proc, {i}));
+    const absl::btree_set<Next*, Node::NodeIdLessThan>& next_values =
+        proc->next_values(proc->GetStateRead(i));
+    if (next_values.size() != 1) {
+      continue;
+    }
+    Next* next_value = *next_values.begin();
+    if (next_value->predicate() == std::nullopt &&
+        query_engine.IsFullyKnown(next_value->value())) {
+      XLS_RETURN_IF_ERROR(ConstantChainToStateMachine(proc, {i}, query_engine));
       changed = true;
+
+      // Repopulate the query engine in case we need to use it again.
+      XLS_RETURN_IF_ERROR(query_engine.Populate(proc).status());
+
+      continue;
     }
   }
   return changed;
@@ -366,23 +475,41 @@ absl::StatusOr<bool> ConvertLiteralChainsToStateMachines(Proc* proc) {
 }  // namespace
 
 absl::StatusOr<bool> ProcStateOptimizationPass::RunOnProcInternal(
-    Proc* proc, const OptimizationPassOptions& options,
-    PassResults* results) const {
+    Proc* proc, const OptimizationPassOptions& options, PassResults* results,
+    OptimizationContext& context) const {
   bool changed = false;
 
   XLS_ASSIGN_OR_RETURN(bool zero_width_changed,
                        RemoveZeroWidthStateElements(proc));
   changed = changed || zero_width_changed;
 
-  XLS_ASSIGN_OR_RETURN(bool literal_chains_changed,
-                       ConvertLiteralChainsToStateMachines(proc));
-  changed = changed || literal_chains_changed;
+  auto query_engine = UnionQueryEngine::Of(
+      StatelessQueryEngine(),
+      GetSharedQueryEngine<LazyTernaryQueryEngine>(context, proc));
+
+  // Run constant state-element removal to fixed point; should usually take just
+  // one additional pass to verify, except for chains like next_s1 := s1,
+  // next_s2 := f(s1), next_s3 := g(s1, s2), ..., etc., where the results all
+  // match the state elements' initial values.
+  bool constant_changed = false;
+  do {
+    XLS_ASSIGN_OR_RETURN(constant_changed,
+                         RemoveConstantStateElements(proc, query_engine));
+    changed = changed || constant_changed;
+  } while (constant_changed);
+
+  XLS_ASSIGN_OR_RETURN(
+      bool constant_chains_changed,
+      ConvertConstantChainsToStateMachines(proc, query_engine));
+  changed = changed || constant_chains_changed;
 
   XLS_ASSIGN_OR_RETURN(bool unobservable_changed,
-                       RemoveUnobservableStateElements(proc));
+                       RemoveUnobservableStateElements(proc, context));
   changed = changed || unobservable_changed;
 
   return changed;
 }
+
+REGISTER_OPT_PASS(ProcStateOptimizationPass);
 
 }  // namespace xls

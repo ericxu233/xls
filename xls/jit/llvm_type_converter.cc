@@ -15,14 +15,33 @@
 #include "xls/jit/llvm_type_converter.h"
 
 #include <algorithm>
+#include <climits>
+#include <cstdint>
 #include <optional>
 #include <vector>
 
+#include "absl/base/casts.h"
+#include "absl/container/fixed_array.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "llvm/include/llvm/ADT/ArrayRef.h"
+#include "llvm/include/llvm/IR/Constant.h"
+#include "llvm/include/llvm/IR/Constants.h"
+#include "llvm/include/llvm/IR/DataLayout.h"
 #include "llvm/include/llvm/IR/DerivedTypes.h"
+#include "llvm/include/llvm/IR/IRBuilder.h"
+#include "llvm/include/llvm/IR/Type.h"
 #include "llvm/include/llvm/Support/Alignment.h"
-#include "xls/common/logging/logging.h"
+#include "llvm/include/llvm/Support/Casting.h"
+#include "xls/common/math_util.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
+#include "xls/jit/type_buffer_metadata.h"
+#include "xls/jit/type_layout.h"
 
 namespace xls {
 
@@ -31,12 +50,9 @@ LlvmTypeConverter::LlvmTypeConverter(llvm::LLVMContext* context,
     : context_(*context), data_layout_(data_layout) {}
 
 int64_t LlvmTypeConverter::GetLlvmBitCount(int64_t xls_bit_count) const {
-  // LLVM does not accept 0-bit types, and we want to be able to JIT-compile
-  // unoptimized IR, so for the time being we make a dummy 1-bit value.
-  // See https://github.com/google/xls/issues/76
-  if (xls_bit_count <= 1) {
-    return 1;
-  }
+  // LLVM does not accept 0-bit types and < 8 bit types often have issues, and
+  // we want to be able to JIT-compile unoptimized IR, so for the time being we
+  // make a dummy 8-bit value.  See https://github.com/google/xls/issues/76
   if (xls_bit_count <= 8) {
     return 8;
   }
@@ -49,15 +65,16 @@ llvm::Type* LlvmTypeConverter::ConvertToLlvmType(const Type* xls_type) const {
     llvm_type = llvm::IntegerType::get(
         context_, GetLlvmBitCount(xls_type->AsBitsOrDie()));
   } else if (xls_type->IsTuple()) {
-    std::vector<llvm::Type*> tuple_types;
-
     const TupleType* tuple_type = xls_type->AsTupleOrDie();
+    absl::FixedArray<llvm::Type*> tuple_types(
+        tuple_type->element_types().size());
+    auto output_it = tuple_types.begin();
     for (Type* tuple_elem_type : tuple_type->element_types()) {
-      llvm::Type* llvm_type = ConvertToLlvmType(tuple_elem_type);
-      tuple_types.push_back(llvm_type);
+      *output_it++ = ConvertToLlvmType(tuple_elem_type);
     }
 
-    llvm_type = llvm::StructType::get(context_, tuple_types);
+    llvm_type = llvm::StructType::get(
+        context_, llvm::ArrayRef(tuple_types.begin(), tuple_types.size()));
   } else if (xls_type->IsArray()) {
     const ArrayType* array_type = xls_type->AsArrayOrDie();
     llvm::Type* element_type = ConvertToLlvmType(array_type->element_type());
@@ -68,8 +85,8 @@ llvm::Type* LlvmTypeConverter::ConvertToLlvmType(const Type* xls_type) const {
     // like a normal data-type.
     llvm_type = GetTokenType();
   } else {
-    XLS_LOG(FATAL) << absl::StrCat("Type not supported for LLVM conversion: %s",
-                                   xls_type->ToString());
+    LOG(FATAL) << absl::StrCat("Type not supported for LLVM conversion: %s",
+                               xls_type->ToString());
   }
   return llvm_type;
 }
@@ -98,12 +115,12 @@ absl::StatusOr<llvm::Constant*> LlvmTypeConverter::ToLlvmConstant(
     return ToIntegralConstant(type, value);
   }
   if (type->isStructTy()) {
-    std::vector<llvm::Constant*> llvm_elements;
+    std::vector<llvm::Constant*> llvm_elements(type->getStructNumElements());
     for (int i = 0; i < type->getStructNumElements(); ++i) {
       XLS_ASSIGN_OR_RETURN(
           llvm::Constant * llvm_element,
           ToLlvmConstant(type->getStructElementType(i), value.element(i)));
-      llvm_elements.push_back(llvm_element);
+      llvm_elements[i] = llvm_element;
     }
 
     return llvm::ConstantStruct::get(llvm::cast<llvm::StructType>(type),
@@ -122,7 +139,7 @@ absl::StatusOr<llvm::Constant*> LlvmTypeConverter::ToLlvmConstant(
         llvm::ArrayType::get(element_type, type->getArrayNumElements()),
         elements);
   }
-  XLS_LOG(FATAL) << "Unknown value kind: " << value.kind();
+  LOG(FATAL) << "Unknown value kind: " << value.kind();
 }
 
 llvm::Constant* LlvmTypeConverter::ZeroOfType(llvm::Type* type) {
@@ -148,7 +165,7 @@ llvm::Constant* LlvmTypeConverter::ZeroOfType(llvm::Type* type) {
 
 absl::StatusOr<llvm::Constant*> LlvmTypeConverter::ToIntegralConstant(
     llvm::Type* type, const Value& value) const {
-  Bits xls_bits = value.bits();
+  const Bits& xls_bits = value.bits();
 
   if (xls_bits.bit_count() > 64) {
     std::vector<uint8_t> bytes = xls_bits.ToBytes();
@@ -169,13 +186,26 @@ int64_t LlvmTypeConverter::GetTypeByteSize(const Type* type) const {
   return data_layout_.getTypeAllocSize(ConvertToLlvmType(type)).getFixedValue();
 }
 
+int64_t LlvmTypeConverter::GetTypeAbiAlignment(const Type* type) const {
+  return data_layout_.getABITypeAlign(ConvertToLlvmType(type)).value();
+}
+int64_t LlvmTypeConverter::GetTypePreferredAlignment(const Type* type) const {
+  return data_layout_.getPrefTypeAlign(ConvertToLlvmType(type)).value();
+}
+
+TypeBufferMetadata LlvmTypeConverter::GetTypeBufferMetadata(
+    const Type* type) const {
+  return TypeBufferMetadata{
+      .size = GetTypeByteSize(type),
+      .preferred_alignment = GetTypePreferredAlignment(type),
+      .abi_alignment = GetTypeAbiAlignment(type),
+      .packed_size = GetPackedTypeByteSize(type)};
+}
+
 int64_t LlvmTypeConverter::AlignFor(const Type* type, int64_t offset) const {
   llvm::Align alignment =
       data_layout_.getPrefTypeAlign(ConvertToLlvmType(type));
-  if (data_layout_.exceedsNaturalStackAlignment(alignment)) {
-    return llvm::alignTo(offset, alignment);
-  }
-  return llvm::alignTo(offset, data_layout_.getStackAlignment());
+  return llvm::alignTo(offset, alignment);
 }
 
 llvm::Type* LlvmTypeConverter::GetTokenType() const {
@@ -191,11 +221,16 @@ llvm::Value* LlvmTypeConverter::GetToken() const {
 llvm::Value* LlvmTypeConverter::AsSignedValue(
     llvm::Value* value, Type* xls_type, llvm::IRBuilder<>& builder,
     std::optional<llvm::Type*> dest_type) const {
-  XLS_CHECK(xls_type->IsBits());
+  CHECK(xls_type->IsBits());
   int64_t xls_bit_count = xls_type->AsBitsOrDie()->bit_count();
+  int64_t llvm_bit_count = GetLlvmBitCount(xls_bit_count);
   llvm::Value* signed_value;
-  if (xls_bit_count <= 1) {
+  if (llvm_bit_count == xls_bit_count || xls_bit_count == 0) {
     signed_value = value;
+  } else if (xls_bit_count == 1) {
+    // Just for this one case we don't need to do a shift.
+    signed_value = builder.CreateICmpNE(
+        value, llvm::ConstantInt::get(value->getType(), 0));
   } else {
     llvm::Value* sign_bit = builder.CreateTrunc(
         builder.CreateLShr(
@@ -205,14 +240,14 @@ llvm::Value* LlvmTypeConverter::AsSignedValue(
         sign_bit,
         builder.CreateOr(InvertedPaddingMask(xls_type, builder), value), value);
   }
-  return dest_type.has_value()
+  return dest_type.has_value() && dest_type.value() != signed_value->getType()
              ? builder.CreateSExt(signed_value, dest_type.value())
              : signed_value;
 }
 
 llvm::Value* LlvmTypeConverter::PaddingMask(Type* xls_type,
                                             llvm::IRBuilder<>& builder) const {
-  XLS_CHECK(xls_type->IsBits());
+  CHECK(xls_type->IsBits());
   int64_t xls_bit_count = xls_type->AsBitsOrDie()->bit_count();
   int64_t llvm_bit_count = GetLlvmBitCount(xls_type->AsBitsOrDie());
   if (xls_bit_count == 0) {
@@ -269,7 +304,7 @@ void LlvmTypeConverter::ComputeElementLayouts(
     }
     return;
   }
-  XLS_CHECK(xls_type->IsTuple());
+  CHECK(xls_type->IsTuple());
   TupleType* tuple_type = xls_type->AsTupleOrDie();
   llvm::Type* llvm_type = ConvertToLlvmType(tuple_type);
   const llvm::StructLayout* layout =

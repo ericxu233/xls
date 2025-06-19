@@ -15,23 +15,30 @@
 #define XLS_NETLIST_INTERPRETER_H_
 
 #include <atomic>
+#include <cstddef>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "absl/synchronization/mutex.h"
-#include "absl/synchronization/notification.h"
-#include "xls/common/logging/logging.h"
+#include "absl/types/span.h"
+#include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/thread.h"
-#include "xls/ir/type.h"
-#include "xls/ir/value.h"
+#include "xls/netlist/cell_library.h"
 #include "xls/netlist/function_parser.h"
 #include "xls/netlist/netlist.h"
 
@@ -40,7 +47,7 @@ namespace netlist {
 
 template <typename EvalT>
 using AbstractNetRef2Value =
-    absl::flat_hash_map<const rtl::AbstractNetRef<EvalT>, EvalT>;
+    absl::flat_hash_map<rtl::AbstractNetRef<EvalT>, EvalT>;
 
 using NetRef2Value = AbstractNetRef2Value<bool>;
 
@@ -57,8 +64,8 @@ class AbstractInterpreter {
         num_available_threads_(0),
         threads_should_exit_(false) {
     for (int c = 0; c < num_threads; ++c) {
-      threads_.push_back(std::move(std::make_unique<xls::Thread>(
-          [this]() { XLS_CHECK_OK(ThreadBody()); })));
+      threads_.push_back(std::move(
+          std::make_unique<xls::Thread>([this]() { CHECK_OK(ThreadBody()); })));
     }
   }
 
@@ -207,21 +214,21 @@ void AbstractInterpreter<EvalT>::UpdateProcessedState(
   }
 
   if (dump_cell_set.contains(cell->name())) {
-    XLS_LOG(INFO) << "Cell " << cell->name() << " inputs:";
+    LOG(INFO) << "Cell " << cell->name() << " inputs:";
     if constexpr (std::is_convertible<EvalT, int>()) {
       for (const auto& input : cell->inputs()) {
-        XLS_LOG(INFO) << "   " << input.netref->name() << " : "
-                      << static_cast<int>(
-                             processed_cells.at(cell)->inputs.at(input.netref));
+        LOG(INFO) << "   " << input.netref->name() << " : "
+                  << static_cast<int>(
+                         processed_cells.at(cell)->inputs.at(input.netref));
       }
 
-      XLS_LOG(INFO) << "Cell " << cell->name() << " outputs:";
+      LOG(INFO) << "Cell " << cell->name() << " outputs:";
       for (const auto& output : cell->outputs()) {
-        XLS_LOG(INFO) << "   " << output.netref->name() << " : "
-                      << static_cast<int>(wires[output.netref]);
+        LOG(INFO) << "   " << output.netref->name() << " : "
+                  << static_cast<int>(wires[output.netref]);
       }
     } else {
-      XLS_LOG(INFO) << "Cell " << cell->name() << " inputs are not printable.";
+      LOG(INFO) << "Cell " << cell->name() << " inputs are not printable.";
     }
   }
 }
@@ -274,12 +281,12 @@ AbstractInterpreter<EvalT>::InterpretModule(
   for (const auto& input : inputs) {
     rtl::AbstractNetRef<EvalT> wire = input.first;
     for (const auto cell : wire->connected_cells()) {
-      XLS_CHECK(processed_cells.contains(cell));
+      CHECK(processed_cells.contains(cell));
       processed_cells[cell]->inputs.insert({wire, std::move(input.second)});
     }
     if constexpr (std::is_convertible<EvalT, int>()) {
-      XLS_VLOG(2) << "Input : " << input.first->name() << " : "
-                  << static_cast<int>(input.second);
+      VLOG(2) << "Input : " << input.first->name() << " : "
+              << static_cast<int>(input.second);
     }
   }
 
@@ -310,11 +317,11 @@ AbstractInterpreter<EvalT>::InterpretModule(
 
     rtl::AbstractNetRef<EvalT> wire = active_wires.front();
     active_wires.pop_front();
-    XLS_VLOG(2) << "Processing wire: " << wire->name();
+    VLOG(2) << "Processing wire: " << wire->name();
 
     for (const auto cell : wire->connected_input_cells()) {
       auto processed_cell_state = processed_cells[cell].get();
-      XLS_CHECK_GT(processed_cell_state->missing_wires, 0);
+      CHECK_GT(processed_cell_state->missing_wires, 0);
       processed_cell_state->missing_wires--;
       if (processed_cell_state->missing_wires == 0) {
         // TODO: Only fall back to this thread if no available threads and next
@@ -334,9 +341,9 @@ AbstractInterpreter<EvalT>::InterpretModule(
           num_available_threads_--;
           num_pending_outputs++;
           input_queue_guard_.Unlock();
-          XLS_VLOG(2) << "Dispatched cell: " << cell->name();
+          VLOG(2) << "Dispatched cell: " << cell->name();
         } else {
-          XLS_VLOG(2) << "Processing locally cell: " << cell->name();
+          VLOG(2) << "Processing locally cell: " << cell->name();
           XLS_ASSIGN_OR_RETURN(
               auto results, InterpretCell(cell, processed_cell_state->inputs));
           UpdateProcessedState(processed_cells, active_wires, outputs, module,

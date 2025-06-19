@@ -25,18 +25,20 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/algorithm/container.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_split.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/temp_directory.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/dslx/interp_value.h"
-#include "xls/dslx/interp_value_helpers.h"
+#include "xls/dslx/interp_value_utils.h"
 #include "xls/fuzzer/cpp_sample_runner.h"
 #include "xls/fuzzer/sample.h"
 #include "xls/fuzzer/sample.pb.h"
@@ -44,13 +46,13 @@
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/value.h"
 #include "xls/simulation/check_simulator.h"
-#include "xls/tools/eval_helpers.h"
+#include "xls/tools/eval_utils.h"
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::AllOf;
 using ::testing::ElementsAre;
 using ::testing::HasSubstr;
@@ -71,7 +73,8 @@ proc main {
     (operand_0, operand_1, result)
   }
 
-  next(tok: token, state: ()) {
+  next(state: ()) {
+    let tok = join();
     let (tok_operand_0_val, operand_0_val) = recv(tok, operand_0);
     let (tok_operand_1_val, operand_1_val) = recv(tok, operand_1);
     let tok_recv = join(tok_operand_0_val, tok_operand_1_val);
@@ -97,8 +100,8 @@ proc main {
     (enable_counter, result)
   }
 
-  next(tok: token, counter_value: u32) {
-    let (tok_enable_counter, enable_counter_val) = recv(tok, enable_counter);
+  next(counter_value: u32) {
+    let (tok_enable_counter, enable_counter_val) = recv(join(), enable_counter);
 
     let result_val = if enable_counter_val == true {counter_value + u32:1}
       else {counter_value};
@@ -190,7 +193,7 @@ class SampleRunnerTest : public ::testing::Test {
     if (test_info == nullptr) {
       return;
     }
-    XLS_CHECK(test_info->name() != nullptr);
+    CHECK(test_info->name() != nullptr);
 
     std::filesystem::path test_outputs_path =
         undeclared_outputs_dir / test_info->name();
@@ -200,7 +203,7 @@ class SampleRunnerTest : public ::testing::Test {
     if (test_info->value_param() != nullptr) {
       test_outputs_path /= test_info->value_param();
     }
-    XLS_CHECK(std::filesystem::create_directories(test_outputs_path));
+    CHECK(std::filesystem::create_directories(test_outputs_path));
     std::filesystem::copy(temp_dir.path(), test_outputs_path,
                           std::filesystem::copy_options::recursive);
   }
@@ -268,7 +271,8 @@ TEST_F(SampleRunnerTest, DSLXToIR) {
   options.set_input_is_dslx(true);
   options.set_ir_converter_args({"--top=main"});
   options.set_optimize_ir(false);
-  XLS_ASSERT_OK(runner.Run(Sample(std::string(dslx_text), options, {})));
+  ArgsBatch no_args;
+  XLS_ASSERT_OK(runner.Run(Sample(std::string(dslx_text), options, no_args)));
   EXPECT_THAT(GetFileContents(GetTempPath() / "sample.ir"),
               IsOkAndHolds(HasSubstr("package sample")));
 }
@@ -578,6 +582,7 @@ TEST_F(SampleRunnerTest, CodegenCombinational) {
   options.set_input_is_dslx(true);
   options.set_ir_converter_args({"--top=main"});
   options.set_codegen(true);
+  options.set_codegen_ng(true);
   options.set_codegen_args({"--generator=combinational"});
   options.set_use_system_verilog(false);
   options.set_simulate(true);
@@ -600,6 +605,14 @@ TEST_F(SampleRunnerTest, CodegenCombinational) {
                            GetFileContents(GetTempPath() / "sample.v.results"));
   EXPECT_THAT(absl::StrSplit(absl::StripAsciiWhitespace(verilog_results), "\n",
                              absl::SkipEmpty()),
+              ElementsAre("bits[8]:0x8e"));
+
+  // Codegen NG results should match.
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::string verilog_ng_results,
+      GetFileContents(GetTempPath() / "sample.ng.v.results"));
+  EXPECT_THAT(absl::StrSplit(absl::StripAsciiWhitespace(verilog_ng_results),
+                             "\n", absl::SkipEmpty()),
               ElementsAre("bits[8]:0x8e"));
 }
 
@@ -719,7 +732,8 @@ TEST_F(SampleRunnerTest, BadIRInput) {
   EXPECT_THAT(runner.Run(Sample(std::string(ir_text), options, args_batch)),
               StatusIs(absl::StatusCode::kInternal,
                        AllOf(HasSubstr("eval_ir_main"),
-                             HasSubstr("returned non-zero exit status"))));
+                             HasSubstr("returned a non-zero exit status"),
+                             HasSubstr("Expected 'package' keyword"))));
   EXPECT_THAT(GetFileContents(GetTempPath() / "eval_ir_main.stderr"),
               IsOkAndHolds(HasSubstr("Expected 'package' keyword")));
 }
@@ -783,6 +797,7 @@ TEST_F(SampleRunnerTest, CodegenPipelineProcWithState) {
   options.set_input_is_dslx(true);
   options.set_ir_converter_args({"--top=main"});
   options.set_codegen(true);
+  options.set_codegen_ng(true);
   options.set_codegen_args({
       "--generator=pipeline",
       "--pipeline_stages=2",
@@ -814,6 +829,8 @@ TEST_F(SampleRunnerTest, CodegenPipelineProcWithState) {
               IsOkAndHolds(HasSubstr(expected_result)));
   EXPECT_THAT(GetFileContents(GetTempPath() / "sample.sv.results"),
               IsOkAndHolds(HasSubstr(expected_result)));
+  EXPECT_THAT(GetFileContents(GetTempPath() / "sample.ng.sv.results"),
+              IsOkAndHolds(HasSubstr(expected_result)));
 }
 
 TEST_F(SampleRunnerTest, MiscompareNumberOfChannels) {
@@ -823,7 +840,8 @@ TEST_F(SampleRunnerTest, MiscompareNumberOfChannels) {
            [](const std::vector<std::string>&, const std::filesystem::path&,
               const SampleOptions&) -> absl::StatusOr<std::string> {
         return ChannelValuesToString(
-            {{"sample__result", {}}, {"extra_channel_name", {}}});
+            absl::flat_hash_map<std::string, std::vector<Value>>(
+                {{"sample__result", {}}, {"extra_channel_name", {}}}));
       }});
   SampleOptions options;
   options.set_ir_converter_args({"--top=main"});
@@ -851,7 +869,9 @@ TEST_F(SampleRunnerTest, MiscompareChannelNames) {
       {.eval_proc_main =
            [](const std::vector<std::string>&, const std::filesystem::path&,
               const SampleOptions&) -> absl::StatusOr<std::string> {
-        return ChannelValuesToString({{"sample__enable_counter", {}}});
+        return ChannelValuesToString(
+            absl::flat_hash_map<std::string, std::vector<Value>>(
+                {{"sample__enable_counter", {}}}));
       }});
   SampleOptions options;
   options.set_ir_converter_args({"--top=main"});
@@ -881,7 +901,8 @@ TEST_F(SampleRunnerTest, MiscompareMissingChannel) {
       {.eval_proc_main =
            [](const std::vector<std::string>&, const std::filesystem::path&,
               const SampleOptions&) -> absl::StatusOr<std::string> {
-        return ChannelValuesToString({});
+        return ChannelValuesToString(
+            absl::flat_hash_map<std::string, std::vector<Value>>({}));
       }});
   SampleOptions options;
   options.set_ir_converter_args({"--top=main"});
@@ -918,7 +939,9 @@ TEST_F(SampleRunnerTest, MiscompareNumberOfChannelValues) {
            [value](const std::vector<std::string>&,
                    const std::filesystem::path&,
                    const SampleOptions&) -> absl::StatusOr<std::string> {
-        return ChannelValuesToString({{"sample__result", {value}}});
+        return ChannelValuesToString(
+            absl::flat_hash_map<std::string, std::vector<Value>>(
+                {{"sample__result", {value}}}));
       }});
   SampleOptions options;
   options.set_ir_converter_args({"--top=main"});
@@ -957,7 +980,8 @@ TEST_F(SampleRunnerTest, MiscompareChannelValues) {
                const std::vector<std::string>&, const std::filesystem::path&,
                const SampleOptions&) -> absl::StatusOr<std::string> {
         return ChannelValuesToString(
-            {{"sample__result", {correct_value, incorrect_value}}});
+            absl::flat_hash_map<std::string, std::vector<Value>>(
+                {{"sample__result", {correct_value, incorrect_value}}}));
       }});
   SampleOptions options;
   options.set_ir_converter_args({"--top=main"});

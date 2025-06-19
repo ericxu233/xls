@@ -15,22 +15,27 @@
 #include "xls/passes/sparsify_select_pass.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <optional>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/bits_ops.h"
-#include "xls/ir/dfs_visitor.h"
+#include "xls/ir/function_base.h"
 #include "xls/ir/interval.h"
 #include "xls/ir/interval_set.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
-#include "xls/ir/type.h"
+#include "xls/ir/value.h"
+#include "xls/ir/value_utils.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
+#include "xls/passes/partial_info_query_engine.h"
 #include "xls/passes/pass_base.h"
-#include "xls/passes/range_query_engine.h"
+#include "xls/passes/query_engine.h"
 
 namespace xls {
 
@@ -76,17 +81,11 @@ static absl::Status SparsifySelect(FunctionBase* f, Select* select,
     {
       absl::Status failure = absl::OkStatus();
       interval.ForEachElement([&](const Bits& bits) -> bool {
-        absl::StatusOr<uint64_t> value = bits.ToUint64();
-        if (!value.ok()) {
-          // This won't ever happen because of the way SparsifySelect
-          // gets called in this pass (we check for it before calling the
-          // function).
-          failure = value.status();
-          return true;
-        }
-        uint64_t index = *value;
-        if (index < select->cases().size()) {
-          cases_in_range.push_back(select->cases()[*value]);
+        std::optional<uint64_t> index =
+            bits.FitsInUint64() ? std::make_optional(*bits.ToUint64())
+                                : std::nullopt;
+        if (index.has_value() && *index < select->cases().size()) {
+          cases_in_range.push_back(select->cases()[*index]);
         } else if (select->default_value().has_value()) {
           cases_in_range.push_back(select->default_value().value());
         } else {
@@ -112,8 +111,7 @@ static absl::Status SparsifySelect(FunctionBase* f, Select* select,
     // TODO(taktoa): would be good to use assume(false) here instead of 0
     XLS_ASSIGN_OR_RETURN(
         Node * zero,
-        f->MakeNode<Literal>(
-            select->loc(), Value(Bits(select->GetType()->GetFlatBitCount()))));
+        f->MakeNode<Literal>(select->loc(), ZeroOfType(select->GetType())));
 
     XLS_ASSIGN_OR_RETURN(
         Node * if_in_range,
@@ -155,16 +153,17 @@ static absl::Status SparsifySelect(FunctionBase* f, Select* select,
 
 absl::StatusOr<bool> SparsifySelectPass::RunOnFunctionBaseInternal(
     FunctionBase* f, const OptimizationPassOptions& options,
-    PassResults* results) const {
-  RangeQueryEngine engine;
-  XLS_RETURN_IF_ERROR(engine.Populate(f).status());
+    PassResults* results, OptimizationContext& context) const {
+  PartialInfoQueryEngine* engine =
+      context.SharedQueryEngine<PartialInfoQueryEngine>(f);
+  XLS_RETURN_IF_ERROR(engine->Populate(f).status());
 
   bool changed = false;
-  for (Node* node : TopoSort(f)) {
+  for (Node* node : context.TopoSort(f)) {
     if (node->Is<Select>()) {
       Select* select = node->As<Select>();
       Node* selector = select->selector();
-      IntervalSetTree selector_ist = engine.GetIntervalSetTree(selector);
+      IntervalSetTree selector_ist = engine->GetIntervals(selector);
       IntervalSet selector_intervals = selector_ist.Get({});
       if (std::optional<int64_t> size = selector_intervals.Size()) {
         if (size >= select->cases().size()) {
@@ -181,5 +180,7 @@ absl::StatusOr<bool> SparsifySelectPass::RunOnFunctionBaseInternal(
 
   return changed;
 }
+
+REGISTER_OPT_PASS(SparsifySelectPass);
 
 }  // namespace xls

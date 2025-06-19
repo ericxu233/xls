@@ -15,23 +15,46 @@
 #ifndef XLS_PASSES_OPTIMIZATION_PASS_H_
 #define XLS_PASSES_OPTIMIZATION_PASS_H_
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <type_traits>
+#include <typeindex>
+#include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/ir/change_listener.h"
+#include "xls/ir/function.h"
 #include "xls/ir/function_base.h"
+#include "xls/ir/node.h"
 #include "xls/ir/package.h"
 #include "xls/ir/proc.h"
 #include "xls/ir/ram_rewrite.pb.h"
+#include "xls/ir/value.h"
 #include "xls/passes/pass_base.h"
+#include "xls/passes/pass_pipeline.pb.h"
+#include "xls/passes/pass_registry.h"
+#include "xls/passes/pipeline_generator.h"
+#include "xls/passes/query_engine.h"
+#include "xls/passes/query_engine_helpers.h"
 
 namespace xls {
+
+inline constexpr int64_t kMaxOptLevel = 3;
 
 // Metadata for RAMs.
 // TODO(google/xls#873): Ideally this metadata should live in the IR.
@@ -66,13 +89,6 @@ struct RamConfig {
   static absl::StatusOr<RamConfig> FromProto(const RamConfigProto& proto);
 };
 
-struct RamModelBuilderResult {
-  std::unique_ptr<Package> package;
-  absl::flat_hash_map<std::string, int64_t> channel_logical_name_to_physical_id;
-};
-
-using ram_model_builder_t = std::function<RamModelBuilderResult(RamConfig)>;
-
 // A configuration describing a desired RAM rewrite.
 struct RamRewrite {
   // Configuration of RAM we start with.
@@ -85,9 +101,10 @@ struct RamRewrite {
   RamConfig to_config;
   // Name prefix for the new ram model
   std::string to_name_prefix;
-  // If populated, also add a RAM model of kind "to_kind" driving the new
-  // channels using the builder function.
-  std::optional<ram_model_builder_t> model_builder;
+
+  // For proc-scoped channels only, this specifies which proc the channels are
+  // defined in.
+  std::optional<std::string> proc_name;
 
   static absl::StatusOr<RamRewrite> FromProto(const RamRewriteProto& proto);
 };
@@ -104,12 +121,27 @@ struct OptimizationPassOptions : public PassOptionsBase {
   explicit OptimizationPassOptions(const PassOptionsBase& options_base)
       : PassOptionsBase(options_base) {}
 
-  // Whether to inline all procs by calling the proc inlining pass.
-  // TODO(meheff): 2022/2/13 Devise a better mechanism for deciding whether or
-  // not to inline procs including figuring out which procs to inline. At the
-  // minimum, there should be a specialization of OptimizationPassOptions for
-  // the optimization pass pipeline which holds this value.
-  bool inline_procs = false;
+  // What opt-level was requested for this pass. This might not be the top-level
+  // --opt_level flag value as compound-passes might lower this for some of
+  // their segments.
+  int64_t opt_level = kMaxOptLevel;
+
+  OptimizationPassOptions WithOptLevel(int64_t opt_level) const& {
+    OptimizationPassOptions opt = *this;
+    opt.opt_level = opt_level;
+    return opt;
+  }
+
+  OptimizationPassOptions&& WithOptLevel(int64_t opt_level) && {
+    this->opt_level = opt_level;
+    return std::move(*this);
+  }
+
+  // Whether narrowing is enabled in this config.
+  bool narrowing_enabled() const;
+
+  // Whether splits is enabled in this config.
+  bool splits_enabled() const;
 
   // If this is not `std::nullopt`, convert array indexes with fewer than or
   // equal to the given number of possible indices (by range analysis) into
@@ -117,62 +149,416 @@ struct OptimizationPassOptions : public PassOptionsBase {
   // sometimes reduce output quality.
   std::optional<int64_t> convert_array_index_to_select = std::nullopt;
 
+  // If this is not `std::nullopt`, split `next_value`s that assign `sel`s to
+  // state params if they have fewer than the given number of cases. Otherwise,
+  // this optimization is skipped, since it can sometimes reduce output quality.
+  std::optional<int64_t> split_next_value_selects = std::nullopt;
+
   // List of RAM rewrites, generally lowering abstract RAMs into concrete
   // variants.
-  std::vector<RamRewrite> ram_rewrites;
+  absl::Span<RamRewrite const> ram_rewrites = {};
 
   // Use select context during narrowing range analysis.
   bool use_context_narrowing_analysis = false;
+
+  // Whether to eliminate no-op Next nodes; this should be disabled after
+  // proc-state legalization.
+  bool eliminate_noop_next = true;
+
+  OptimizationPassOptions WithEliminateNoopNext(
+      bool eliminate_noop_next) const& {
+    OptimizationPassOptions opt = *this;
+    opt.eliminate_noop_next = eliminate_noop_next;
+    return opt;
+  }
+
+  OptimizationPassOptions&& WithEliminateNoopNext(bool eliminate_noop_next) && {
+    this->eliminate_noop_next = eliminate_noop_next;
+    return std::move(*this);
+  }
+
+  // Optimize for best case throughput, even at the cost of area.
+  bool optimize_for_best_case_throughput = false;
+
+  // Enable resource sharing to reduce area
+  bool enable_resource_sharing = false;
+
+  // Force resource sharing to apply the transformation when is legal
+  bool force_resource_sharing = false;
+
+  // Area model to use
+  std::string area_model = "asap7";
 };
+
+class OptimizationContext {
+ public:
+  template <typename QueryEngineT>
+    requires(std::is_base_of_v<QueryEngine, QueryEngineT>)
+  QueryEngineT* SharedQueryEngine(FunctionBase* f) {
+    absl::flat_hash_map<std::type_index, std::shared_ptr<QueryEngine>>&
+        f_query_engines = shared_query_engines_[f];
+    auto it = f_query_engines.find(typeid(QueryEngineT));
+    if (it == f_query_engines.end()) {
+      bool inserted = false;
+      if constexpr (requires { QueryEngineT::MakeDefault(); }) {
+        std::tie(it, inserted) = f_query_engines.emplace(
+            typeid(QueryEngineT), QueryEngineT::MakeDefault());
+      } else {
+        std::tie(it, inserted) = f_query_engines.emplace(
+            typeid(QueryEngineT), std::make_unique<QueryEngineT>());
+      }
+      CHECK(inserted);
+      CHECK_OK(it->second->Populate(f).status());
+    }
+    return dynamic_cast<QueryEngineT*>(it->second.get());
+  }
+
+  template <typename QueryEngineT>
+    requires(std::is_base_of_v<QueryEngine, QueryEngineT>)
+  MaybeOwnedForwardingQueryEngine<QueryEngineT> GetForwardingQueryEngine(
+      FunctionBase* f) {
+    return MaybeOwnedForwardingQueryEngine<QueryEngineT>(
+        SharedQueryEngine<QueryEngineT>(f));
+  }
+
+  std::vector<QueryEngine*> ListQueryEngines() {
+    std::vector<QueryEngine*> query_engines;
+    for (auto& [f, f_query_engines] : shared_query_engines_) {
+      query_engines.reserve(query_engines.size() + f_query_engines.size());
+      for (auto& [type_index, query_engine] : f_query_engines) {
+        query_engines.push_back(query_engine.get());
+      }
+    }
+    return query_engines;
+  }
+
+  void Abandon(FunctionBase* f) {
+    shared_query_engines_.erase(f);
+    reverse_topo_sort_.erase(f);
+  }
+
+  std::vector<Node*> ReverseTopoSort(FunctionBase* f);
+  std::vector<Node*> TopoSort(FunctionBase* f);
+
+ private:
+  const std::vector<Node*>& ReverseTopoSortReference(FunctionBase* f);
+
+  class InvalidatingVector : public ChangeListener {
+   public:
+    explicit InvalidatingVector(FunctionBase* f, std::vector<Node*> value = {})
+        : f_(f), storage_(std::move(value)) {
+      f_->RegisterChangeListener(this);
+    }
+    ~InvalidatingVector() override { f_->UnregisterChangeListener(this); }
+
+    InvalidatingVector(const InvalidatingVector&) = delete;
+    InvalidatingVector& operator=(const InvalidatingVector&) = delete;
+
+    InvalidatingVector(InvalidatingVector&& other)
+        : f_(other.f_), storage_(std::move(other.storage_)) {
+      f_->RegisterChangeListener(this);
+    }
+    InvalidatingVector& operator=(InvalidatingVector&& other) {
+      if (f_ != nullptr) {
+        f_->UnregisterChangeListener(this);
+      }
+      f_ = other.f_;
+      storage_ = std::move(other.storage_);
+      if (f_ != nullptr) {
+        f_->RegisterChangeListener(this);
+      }
+      return *this;
+    }
+
+    std::vector<Node*>& operator*() { return storage_; }
+    const std::vector<Node*>& operator*() const { return storage_; }
+
+    std::vector<Node*>* operator->() { return &storage_; }
+    const std::vector<Node*>* operator->() const { return &storage_; }
+
+    void NodeAdded(Node*) override { storage_.clear(); }
+    void NodeDeleted(Node*) override { storage_.clear(); }
+    void OperandChanged(Node*, Node*, absl::Span<const int64_t>) override {
+      storage_.clear();
+    }
+    void OperandRemoved(Node*, Node*) override { storage_.clear(); }
+    void OperandAdded(Node*) override { storage_.clear(); }
+    void ReturnValueChanged(Function*, Node*) override { storage_.clear(); }
+    void NextStateElementChanged(Proc*, int64_t, Node*) override {
+      storage_.clear();
+    }
+
+   private:
+    FunctionBase* f_;
+    std::vector<Node*> storage_;
+  };
+  absl::flat_hash_map<FunctionBase*, InvalidatingVector> reverse_topo_sort_;
+
+  absl::flat_hash_map<
+      FunctionBase*,
+      absl::flat_hash_map<std::type_index, std::shared_ptr<QueryEngine>>>
+      shared_query_engines_;
+};
+
+// Construct a query engine that forwards to the shared implementation from
+// 'ctx' on 'f' if the context is not null and otherwise creates a new engine
+// using the given args.
+//
+// TODO(allight): It might be nice to put this in OptimizationContext and force
+// there to always be a value there.
+template <typename QueryEngineT, typename... Args>
+  requires(std::is_base_of_v<QueryEngine, QueryEngineT>)
+MaybeOwnedForwardingQueryEngine<QueryEngineT> GetSharedQueryEngine(
+    OptimizationContext& ctx, FunctionBase* ABSL_NONNULL f, Args... args) {
+  return MaybeOwnedForwardingQueryEngine<QueryEngineT>(
+      ctx.SharedQueryEngine<QueryEngineT>(f));
+}
 
 // An object containing information about the invocation of a pass (single call
 // to PassBase::Run).
 // Defines the pass types for optimizations which operate strictly on XLS IR
 // (i.e., xls::Package).
-// TODO(meheff): Rename to OptimizationPass, etc.
-using OptimizationPass = PassBase<Package, OptimizationPassOptions>;
+using OptimizationPass = PassBase<OptimizationPassOptions, OptimizationContext>;
 using OptimizationCompoundPass =
-    CompoundPassBase<Package, OptimizationPassOptions>;
+    CompoundPassBase<OptimizationPassOptions, OptimizationContext>;
 using OptimizationFixedPointCompoundPass =
-    FixedPointCompoundPassBase<Package, OptimizationPassOptions>;
+    FixedPointCompoundPassBase<OptimizationPassOptions, OptimizationContext>;
 using OptimizationInvariantChecker = OptimizationCompoundPass::InvariantChecker;
+using OptimizationPipelineGenerator =
+    PipelineGeneratorBase<OptimizationPassOptions, OptimizationContext>;
+using OptimizationWrapperPass =
+    WrapperPassBase<OptimizationPassOptions, OptimizationContext>;
 
-inline constexpr int64_t kMaxOptLevel = 3;
+using OptimizationPassRegistry =
+    PassRegistry<OptimizationPassOptions, OptimizationContext>;
+using OptimizationPassGenerator =
+    PassGenerator<OptimizationPassOptions, OptimizationContext>;
+
+namespace internal {
+// Wrapper that uses templates to force opt-level to a specific max value for
+// either a specific pass or a compound pass contents.
+template <typename InnerPass>
+  requires(std::is_base_of_v<OptimizationPass, InnerPass>)
+class DynamicCapOptLevel : public OptimizationPass {
+ public:
+  template <typename... Args>
+  explicit DynamicCapOptLevel(int64_t level, Args... args)
+      : OptimizationPass("short", "long"),
+        level_(level),
+        inner_(std::forward<Args>(args)...) {
+    short_name_ =
+        absl::StrFormat("%s(opt_level<=%d)", inner_.short_name(), level);
+    long_name_ =
+        absl::StrFormat("%s with opt_level <= %d", inner_.long_name(), level);
+  }
+
+  absl::StatusOr<PassPipelineProto::Element> ToProto() const override {
+    XLS_ASSIGN_OR_RETURN(PassPipelineProto::Element res, inner_.ToProto());
+    res.mutable_options()->set_max_opt_level(level_);
+    return res;
+  }
+
+  bool IsCompound() const override { return inner_.IsCompound(); }
+
+  InnerPass* inner_pass() { return &inner_; }
+
+  absl::StatusOr<bool> RunNested(
+      Package* ir, const OptimizationPassOptions& options, PassResults* results,
+      OptimizationContext& context, PassInvocation& invocation,
+      absl::Span<const typename OptimizationPass::InvariantChecker* const>
+          invariant_checkers) const override {
+    if (VLOG_IS_ON(4) && level_ < options.opt_level) {
+      VLOG(4) << "Lowering opt-level of compount pass '" << inner_.long_name()
+              << "' (" << inner_.short_name() << ") to " << level_;
+    }
+    return inner_.RunNested(
+        ir, options.WithOptLevel(std::min(level_, options.opt_level)), results,
+        context, invocation, invariant_checkers);
+  }
+
+ protected:
+  absl::StatusOr<bool> RunInternal(
+      Package* ir, const OptimizationPassOptions& options, PassResults* results,
+      OptimizationContext& context) const override {
+    if (VLOG_IS_ON(4) && level_ < options.opt_level) {
+      VLOG(4) << "Lowering opt-level of pass '" << inner_.long_name() << "' ("
+              << inner_.short_name() << ") to " << level_;
+    }
+    return inner_.Run(ir,
+                      options.WithOptLevel(std::min(level_, options.opt_level)),
+                      results, context);
+  }
+
+ private:
+  int64_t level_;
+  InnerPass inner_;
+};
+
+// Wrapper that disables the pass unless the opt-level is at least kLevel.
+template <typename InnerPass>
+  requires(std::is_base_of_v<OptimizationPass, InnerPass>)
+class DynamicIfOptLevelAtLeast : public OptimizationPass {
+ public:
+  template <typename... Args>
+  explicit DynamicIfOptLevelAtLeast(int64_t level, Args... args)
+      : OptimizationPass("short", "long"),
+        level_(level),
+        inner_(std::forward<Args>(args)...) {
+    short_name_ =
+        absl::StrFormat("%s(opt_level>=%d)", inner_.short_name(), level);
+    long_name_ =
+        absl::StrFormat("%s when opt_level >= %d", inner_.long_name(), level);
+  }
+
+  absl::StatusOr<PassPipelineProto::Element> ToProto() const override {
+    XLS_ASSIGN_OR_RETURN(PassPipelineProto::Element res, inner_.ToProto());
+    res.mutable_options()->set_min_opt_level(level_);
+    return res;
+  }
+
+  bool IsCompound() const override { return inner_.IsCompound(); }
+
+  InnerPass* inner_pass() { return &inner_; }
+
+  absl::StatusOr<bool> RunNested(
+      Package* ir, const OptimizationPassOptions& options, PassResults* results,
+      OptimizationContext& context, PassInvocation& invocation,
+      absl::Span<const typename OptimizationPass::InvariantChecker* const>
+          invariant_checkers) const override {
+    if (options.opt_level < level_) {
+      VLOG(4) << "Skipping compount pass '" << inner_.long_name() << "' ("
+              << inner_.short_name()
+              << ") because opt-level is lower than minimum level of "
+              << level_;
+      return false;
+    }
+    return inner_.RunNested(ir, options, results, context, invocation,
+                            invariant_checkers);
+  }
+
+ protected:
+  absl::StatusOr<bool> RunInternal(
+      Package* ir, const OptimizationPassOptions& options, PassResults* results,
+      OptimizationContext& context) const override {
+    if (options.opt_level < level_) {
+      VLOG(4) << "Skipping pass '" << inner_.long_name() << "' ("
+              << inner_.short_name()
+              << ") because opt-level is lower than minimum level of "
+              << level_;
+      return false;
+    }
+    return inner_.Run(ir, options, results, context);
+  }
+
+ private:
+  int64_t level_;
+  InnerPass inner_;
+};
+
+}  // namespace internal
+
+// Wrapper that uses templates to force opt-level to a specific max value for
+// either a specific pass or a compound pass contents.
+template <int64_t kLevel, typename InnerPass>
+  requires(std::is_base_of_v<OptimizationPass, InnerPass>)
+class CapOptLevel : public internal::DynamicCapOptLevel<InnerPass> {
+ public:
+  template <typename... Args>
+  explicit CapOptLevel(Args... args)
+      : internal::DynamicCapOptLevel<InnerPass>(kLevel,
+                                                std::forward<Args>(args)...) {}
+};
+
+// Wrapper that disables the pass unless the opt-level is at least kLevel.
+template <int64_t kLevel, typename InnerPass>
+  requires(std::is_base_of_v<OptimizationPass, InnerPass>)
+class IfOptLevelAtLeast : public internal::DynamicIfOptLevelAtLeast<InnerPass> {
+ public:
+  template <typename... Args>
+  explicit IfOptLevelAtLeast(Args... args)
+      : internal::DynamicIfOptLevelAtLeast<InnerPass>(
+            kLevel, std::forward<Args>(args)...) {}
+};
+
+// Wrapper that explicitly sets the opt level to a specific value.
+template <int64_t kLevel, typename InnerPass>
+  requires(std::is_base_of_v<OptimizationPass, InnerPass>)
+class WithOptLevel : public InnerPass {
+ public:
+  template <typename... Args>
+  explicit WithOptLevel(Args... args) : InnerPass(args...) {}
+
+  absl::StatusOr<PassPipelineProto::Element> ToProto() const override {
+    return absl::UnimplementedError("WithOptLevel not exportable to proto");
+  }
+
+ protected:
+  absl::StatusOr<bool> RunInternal(
+      Package* ir, const OptimizationPassOptions& options, PassResults* results,
+      OptimizationContext& context) const override {
+    return InnerPass::RunInternal(ir, options.WithOptLevel(kLevel), results,
+                                  context);
+  }
+};
+
+// Wrapper that disables the pass unless resource sharing is enabled.
+template <typename InnerPass>
+  requires(std::is_base_of_v<OptimizationPass, InnerPass>)
+class IfResourceSharingEnabled : public OptimizationPass {
+ public:
+  template <typename... Args>
+  explicit IfResourceSharingEnabled(Args... args)
+      : OptimizationPass("short", "long"), inner_(std::forward<Args>(args)...) {
+    short_name_ =
+        absl::StrFormat("%s(enable_resource_sharing)", inner_.short_name());
+    long_name_ = absl::StrFormat("%s when resource sharing is enabled",
+                                 inner_.long_name());
+  }
+
+  absl::StatusOr<PassPipelineProto::Element> ToProto() const override {
+    XLS_ASSIGN_OR_RETURN(PassPipelineProto::Element res, inner_.ToProto());
+    res.mutable_options()->set_requires_resource_sharing(true);
+    return res;
+  }
+
+ protected:
+  absl::StatusOr<bool> RunInternal(
+      Package* ir, const OptimizationPassOptions& options, PassResults* results,
+      OptimizationContext& context) const override {
+    if (!options.enable_resource_sharing) {
+      VLOG(4) << "Skipping pass '" << inner_.long_name() << "' ("
+              << inner_.short_name()
+              << ") because resource sharing is disabled";
+      return false;
+    }
+    return inner_.Run(ir, options, results, context);
+  }
+
+ private:
+  InnerPass inner_;
+};
 
 // Whether optimizations which split operations into multiple pieces should be
 // performed at the given optimization level.
 inline bool SplitsEnabled(int64_t opt_level) { return opt_level >= 3; }
 inline bool NarrowingEnabled(int64_t opt_level) { return opt_level >= 2; }
 
-// Abstract base class for passes operate at function/proc scope. The derived
-// class must define RunOnFunctionBaseInternal.
-class OptimizationFunctionBasePass : public OptimizationPass {
- public:
-  OptimizationFunctionBasePass(std::string_view short_name,
-                               std::string_view long_name)
-      : OptimizationPass(short_name, long_name) {}
+inline bool OptimizationPassOptions::narrowing_enabled() const {
+  return NarrowingEnabled(opt_level);
+}
 
-  // Runs the pass on a single function/proc.
-  absl::StatusOr<bool> RunOnFunctionBase(FunctionBase* f,
-                                         const OptimizationPassOptions& options,
-                                         PassResults* results) const;
+inline bool OptimizationPassOptions::splits_enabled() const {
+  return SplitsEnabled(opt_level);
+}
+
+// Abstract base class for passes operate at function/proc scope. The
+// derived class must define RunOnFunctionBaseInternal.
+class OptimizationFunctionBasePass
+    : public FunctionBasePass<OptimizationPassOptions, OptimizationContext> {
+ public:
+  using FunctionBasePass::FunctionBasePass;
 
  protected:
-  // Iterates over each function and proc in the package calling
-  // RunOnFunctionBase.
-  absl::StatusOr<bool> RunInternal(Package* p,
-                                   const OptimizationPassOptions& options,
-                                   PassResults* results) const override;
-
-  virtual absl::StatusOr<bool> RunOnFunctionBaseInternal(
-      FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const = 0;
-
-  // Calls the given function for every node in the graph in a loop until no
-  // further simplifications are possible.  simplify_f should return true if the
-  // IR was modified. simplify_f can add or remove nodes including the node
-  // passed to it.
-  //
   // TransformNodesToFixedPoint returns true iff any invocations of simplify_f
   // returned true.
   absl::StatusOr<bool> TransformNodesToFixedPoint(
@@ -180,28 +566,10 @@ class OptimizationFunctionBasePass : public OptimizationPass {
       std::function<absl::StatusOr<bool>(Node*)> simplify_f) const;
 };
 
-// Abstract base class for passes operate on procs. The derived
-// class must define RunOnProcInternal.
-class OptimizationProcPass : public OptimizationPass {
- public:
-  OptimizationProcPass(std::string_view short_name, std::string_view long_name)
-      : OptimizationPass(short_name, long_name) {}
-
-  // Proc the pass on a single proc.
-  absl::StatusOr<bool> RunOnProc(Proc* proc,
-                                 const OptimizationPassOptions& options,
-                                 PassResults* results) const;
-
- protected:
-  // Iterates over each proc in the package calling RunOnProc.
-  absl::StatusOr<bool> RunInternal(Package* p,
-                                   const OptimizationPassOptions& options,
-                                   PassResults* results) const override;
-
-  virtual absl::StatusOr<bool> RunOnProcInternal(
-      Proc* proc, const OptimizationPassOptions& options,
-      PassResults* results) const = 0;
-};
+// Abstract base class for passes operate on procs. The derived class must
+// define RunOnProcInternal.
+using OptimizationProcPass =
+    ProcPass<OptimizationPassOptions, OptimizationContext>;
 
 }  // namespace xls
 

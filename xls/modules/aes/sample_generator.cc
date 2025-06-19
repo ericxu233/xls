@@ -21,6 +21,9 @@
 //  - Output in formats other than DSLX.
 //
 // These will be added when/if needed.
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -31,9 +34,12 @@
 #include "absl/flags/flag.h"
 #include "absl/random/random.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "openssl/aead.h"  // NOLINT
+#include "openssl/base.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/init_xls.h"
 #include "xls/common/status/status_macros.h"
@@ -231,7 +237,7 @@ static absl::Status RealMain(EncryptionMode mode, int key_bits,
 
   XLS_ASSIGN_OR_RETURN(Result result, RunGcm(sample));
 
-  std::cout << DslxFormatOutput(sample, result) << std::endl;
+  std::cout << DslxFormatOutput(sample, result) << '\n';
 
   return absl::OkStatus();
 }

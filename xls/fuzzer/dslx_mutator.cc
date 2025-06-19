@@ -14,15 +14,22 @@
 
 #include "xls/fuzzer/dslx_mutator.h"
 
+#include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
+#include "absl/random/bit_gen_ref.h"
 #include "absl/random/random.h"
+#include "absl/status/status.h"
+#include "absl/types/span.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/frontend/scanner.h"
+#include "xls/dslx/frontend/token.h"
 
-using absl::InvalidArgumentError;
-using absl::StatusOr;
+using ::absl::InvalidArgumentError;
+using ::absl::StatusOr;
 
 namespace xls::dslx {
 namespace {
@@ -40,7 +47,8 @@ StatusOr<std::string> RemoveDslxToken(std::string_view dslx,
   if (dslx.empty()) {
     return InvalidArgumentError("dslx is empty");
   }
-  Scanner scan("x.x", std::string(dslx),
+  FileTable file_table;
+  Scanner scan(file_table, Fileno(0), std::string(dslx),
                /*include_whitespace_and_comments=*/true);
   XLS_ASSIGN_OR_RETURN(std::vector<Token> tokens, scan.PopAll());
   int64_t index_to_remove =

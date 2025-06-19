@@ -11,10 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-import xls.dslx.tests.mod_imported
+import xls.dslx.tests.mod_imported;
 
 fn main() -> mod_imported::Point[2] {
     mod_imported::Point[2]:[
-        mod_imported::Point { x: u32:0, y: u32:1 }, mod_imported::Point { x: u32:2, y: u32:3 }
+        mod_imported::Point { x: u32:0, y: u32:1 }, mod_imported::Point { x: u32:2, y: u32:3 },
     ]
 }

@@ -17,7 +17,7 @@
 
 #include <string_view>
 
-#include "xls/common/logging/logging.h"
+#include "absl/log/die_if_null.h"
 #include "xls/noc/config/network_config.pb.h"
 
 namespace xls::noc {
@@ -27,7 +27,7 @@ class PortConfigProtoBuilder {
  public:
   // proto cannot be nullptr.
   explicit PortConfigProtoBuilder(PortConfigProto* proto)
-      : proto_(XLS_DIE_IF_NULL(proto)) {}
+      : proto_(ABSL_DIE_IF_NULL(proto)) {}
 
   // Adds the name of the port.
   PortConfigProtoBuilder& WithName(std::string_view name);

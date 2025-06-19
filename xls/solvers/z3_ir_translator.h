@@ -15,27 +15,35 @@
 // API for turning XLS IR computations into Z3 solver form (so we can
 // compute/query formal properties of nodes in the XLS IR).
 
-#ifndef XLS_TOOLS_Z3_IR_TRANSLATOR_H_
-#define XLS_TOOLS_Z3_IR_TRANSLATOR_H_
+#ifndef XLS_SOLVERS_Z3_IR_TRANSLATOR_H_
+#define XLS_SOLVERS_Z3_IR_TRANSLATOR_H_
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <variant>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "xls/common/logging/logging.h"
+#include "xls/data_structures/leaf_type_tree.h"
 #include "xls/ir/bits.h"
-#include "xls/ir/function.h"
+#include "xls/ir/dfs_visitor.h"
+#include "xls/ir/function_base.h"
+#include "xls/ir/node.h"
 #include "xls/ir/nodes.h"
-#include "../z3/src/api/z3.h"  // IWYU pragma: keep
-#include "../z3/src/api/z3_api.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
+#include "z3/src/api/z3.h"  // IWYU pragma: keep
+#include "z3/src/api/z3_api.h"
 
 namespace xls {
 namespace solvers {
@@ -78,6 +86,11 @@ class IrTranslator : public DfsVisitorWithDefault {
 
   // Sets the amount of time to allow Z3 to execute before aborting.
   void SetTimeout(absl::Duration timeout);
+
+  // Sets the amount of "solver resources" Z3 can use before aborting.
+  //
+  // Useful for reproducible termination, since timeout is not reproducible.
+  void SetRlimit(int64_t rlimit);
 
   // Returns the Z3 value (or set of values) corresponding to the given Node.
   // Translates if the translation is not yet stored.
@@ -145,10 +158,12 @@ class IrTranslator : public DfsVisitorWithDefault {
   absl::Status HandleBitSlice(BitSlice* bit_slice) override;
   absl::Status HandleBitSliceUpdate(BitSliceUpdate* update) override;
   absl::Status HandleConcat(Concat* concat) override;
+  absl::Status HandleDecode(Decode* decode) override;
   absl::Status HandleDynamicBitSlice(
       DynamicBitSlice* dynamic_bit_slice) override;
   absl::Status HandleEncode(Encode* encode) override;
   absl::Status HandleEq(CompareOp* eq) override;
+  absl::Status HandleGate(Gate* gate) override;
   absl::Status HandleIdentity(UnOp* identity) override;
   absl::Status HandleLiteral(Literal* literal) override;
   absl::Status HandleNaryAnd(NaryOp* and_op) override;
@@ -158,6 +173,7 @@ class IrTranslator : public DfsVisitorWithDefault {
   absl::Status HandleNaryXor(NaryOp* xor_op) override;
   absl::Status HandleNe(CompareOp* ne) override;
   absl::Status HandleNeg(UnOp* neg) override;
+  absl::Status HandleNext(Next* next) override;
   absl::Status HandleNot(UnOp* not_op) override;
   absl::Status HandleParam(Param* param) override;
   absl::Status HandleOneHot(OneHot* one_hot) override;
@@ -202,9 +218,6 @@ class IrTranslator : public DfsVisitorWithDefault {
   IrTranslator(Z3_context ctx, FunctionBase* source,
                std::optional<absl::Span<const Z3_ast>> imported_params);
 
-  // Returns the index with the proper bitwidth for the given array_type.
-  Z3_ast GetAsFormattedArrayIndex(Z3_ast index, ArrayType* array_type);
-
   // Gets the bit count associated with the bit-vector-sort Z3 node "arg".
   // (Arg must be known to be of bit-vector sort.)
   int64_t GetBvBitCount(Z3_ast arg);
@@ -219,42 +232,59 @@ class IrTranslator : public DfsVisitorWithDefault {
 
   // Does the _actual_ work of processing binary, nary, etc. operations.
   template <typename OpT, typename FnT>
+    requires(std::is_base_of_v<Node, OpT>)
   absl::Status HandleBinary(OpT* op, FnT f);
+  template <typename FnT>
+  absl::Status HandleBinaryCompare(CompareOp* op, FnT f, bool zero_len_result);
   template <typename OpT, typename FnT>
-  absl::Status HandleNary(OpT* op, FnT f, bool invert_result);
+    requires(std::is_base_of_v<Node, OpT>)
+  absl::Status HandleNary(OpT* op, FnT f, bool invert_result,
+                          bool skip_empty_operands = false);
   template <typename FnT>
   absl::Status HandleShift(BinOp* shift, FnT f);
   template <typename FnT>
   absl::Status HandleUnary(Node* op, FnT f);
 
   // Recursive call to translate XLS literals into Z3 form.
-  // The `has_uses` parameter is used for checking whether the literal we're
-  // trying to translate contains a zero-width bitvector that has nontrivial
-  // uses in the IR graph.
-  absl::StatusOr<Z3_ast> TranslateLiteralValue(bool has_uses, Type* type,
-                                               const Value& value);
+  absl::StatusOr<Z3_ast> TranslateLiteralValue(Type* type, const Value& value);
 
   // Common multiply handling.
-  void HandleMul(ArithOp* mul, bool is_signed);
-  void HandleMulp(PartialProductOp* mul, bool is_signed);
+  absl::Status HandleMul(ArithOp* mul, bool is_signed);
+  absl::Status HandleMulp(PartialProductOp* mul, bool is_signed);
 
   // Translates a OneHotSelect or Sel node whose (non-selector) operands are
   // Tuple typed. Accepts a function to actually call into the AbstractEvaluator
-  // for that node. "FlatValue" is a helper to represent a value as a
-  // vector of individual Z3 bits.
-  using FlatValue = std::vector<Z3_ast>;
-  template <typename NodeT>
-  absl::Status HandleSelect(
-      NodeT* node, std::function<FlatValue(const FlatValue& selector,
-                                           const std::vector<FlatValue>& cases)>
-                       evaluator);
+  // for that node.
+  template <typename NodeT, typename Handler>
+    requires(std::is_invocable_r_v<absl::StatusOr<Z3_ast>, Handler, Z3_ast,
+                                   absl::Span<Z3_ast const>,
+                                   absl::Span<int64_t const>>)
+  absl::Status HandleSelect(NodeT* node, Handler evaluator);
+
+  // Turn a single possibly compound typed z3 value into a leaf-type-tree of
+  // bits values.
+  absl::StatusOr<LeafTypeTree<Z3_ast>> ToLeafTypeTree(Node* node) {
+    return ToLeafTypeTree(node->GetType(), GetValue(node));
+  }
+  // Turn a single possibly compound typed z3 value into a leaf-type-tree of
+  // bits values.
+  absl::StatusOr<LeafTypeTree<Z3_ast>> ToLeafTypeTree(Type* type, Z3_ast ast);
+  // Turn a shattered z3 leaf-type-tree back into a single z3 value.
+  absl::StatusOr<Z3_ast> FromLeafTypeTree(LeafTypeTreeView<Z3_ast> ast);
+
+  // Get a single element from the LeafTypeTree representation of the given z3
+  // value without actually creating the entire tree.
+  absl::StatusOr<Z3_ast> GetLttElement(Type* type, Z3_ast value,
+                                       absl::Span<int64_t const> index);
+
+  absl::StatusOr<Z3_ast> HandleBitSlice(Z3_ast value, int64_t start,
+                                        int64_t width);
 
   // Handles the translation of the given unary op using the AbstractEvaluator.
   absl::Status HandleUnaryViaAbstractEval(Node* op);
 
   // Converts a XLS param decl into a Z3 param type.
-  absl::StatusOr<Z3_ast> CreateZ3Param(Type* type,
-                                       std::string_view param_name);
+  absl::StatusOr<Z3_ast> CreateZ3Param(Type* type, std::string_view param_name);
 
   // Records the mapping of the specified XLS IR node to Z3 value.
   void NoteTranslation(Node* node, Z3_ast translated);
@@ -262,6 +292,7 @@ class IrTranslator : public DfsVisitorWithDefault {
   // Creates a Z3 tuple from the given XLS type or Z3 sort and Z3 elements.
   Z3_ast CreateTuple(Type* tuple_type, absl::Span<const Z3_ast> elements);
   Z3_ast CreateTuple(Z3_sort tuple_sort, absl::Span<const Z3_ast> elements);
+  Z3_ast CreateZeroBitsValue();
 
   // Creates a Z3 array from the given XLS type and Z3 elements.
   Z3_ast CreateArray(ArrayType* type, absl::Span<const Z3_ast> elements);
@@ -321,7 +352,7 @@ class Predicate {
   // `Predicate::IsEqualTo(other)`, returns the node the predicate is comparing
   // to (`other` in this example).
   Node* node() const {
-    XLS_CHECK(node_.has_value());
+    CHECK(node_.has_value());
     return node_.value();
   }
 
@@ -332,7 +363,7 @@ class Predicate {
   // `Predicate::UnsignedGreaterOrEqual(my_bits)` returns the value of
   // `my_bits`.
   const Bits& value() const {
-    XLS_CHECK(value_.has_value());
+    CHECK(value_.has_value());
     return value_.value();
   }
 
@@ -356,23 +387,78 @@ struct PredicateOfNode {
   Predicate p;
 };
 
+using ProvenTrue = std::true_type;
+struct ProvenFalse {
+  // If available, a set of Values for the function's Params that implement the
+  // counterexample; otherwise, an absl::Status documenting the failure to
+  // translate the counterexample.
+  absl::StatusOr<absl::flat_hash_map<const Param*, Value>> counterexample =
+      absl::UnimplementedError("no counterexample analysis attempted");
+
+  // Typically contains the encoded Z3 solver result (which usually includes the
+  // counterexample).
+  std::string message;
+};
+using ProverResult = std::variant<ProvenTrue, ProvenFalse>;
+
+template <typename Sink>
+void AbslStringify(Sink& sink, const ProverResult& p) {
+  if (std::holds_alternative<ProvenTrue>(p)) {
+    absl::Format(&sink, "[ProvenTrue]");
+    return;
+  }
+  absl::Format(&sink, "[ProvenFalse: %s]", std::get<ProvenFalse>(p).message);
+}
+
 // Attempts to prove the conjunction of "terms". "terms" refers to predicates on
 // nodes within function "f". Returns true iff "terms" can be proven true in
-// conjunction (over all possible inputs) within the given "timeout".
-absl::StatusOr<bool> TryProveConjunction(
-    Function* f, absl::Span<const PredicateOfNode> terms,
-    absl::Duration timeout);
+// conjunction (over all possible inputs) within the given "timeout" or
+// "rlimit".
+absl::StatusOr<ProverResult> TryProveConjunction(
+    FunctionBase* f, absl::Span<const PredicateOfNode> terms,
+    absl::Duration timeout, bool allow_unsupported = false);
+absl::StatusOr<ProverResult> TryProveConjunction(
+    FunctionBase* f, absl::Span<const PredicateOfNode> terms, int64_t rlimit,
+    bool allow_unsupported = false);
+
+// Attempts to prove the disjunction of "terms". "terms" refers to predicates on
+// nodes within function "f". Returns true iff "terms" can be proven true in
+// disjunction (over all possible inputs) within the given "timeout" or
+// "rlimit".
+absl::StatusOr<ProverResult> TryProveDisjunction(
+    FunctionBase* f, absl::Span<const PredicateOfNode> terms,
+    absl::Duration timeout, bool allow_unsupported = false);
+absl::StatusOr<ProverResult> TryProveDisjunction(
+    FunctionBase* f, absl::Span<const PredicateOfNode> terms, int64_t rlimit,
+    bool allow_unsupported = false);
 
 // Attempts to prove node "subject" in function "f" satisfies the given
-// predicate (over all possible inputs) within the duration "timeout".
+// predicate (over all possible inputs) within the duration "timeout" or the
+// "rlimit".
 //
 // This offers a simpler subset of the functionality of TryProveConjunction
 // above.
-absl::StatusOr<bool> TryProve(Function* f, Node* subject, Predicate p,
-                              absl::Duration timeout);
+absl::StatusOr<ProverResult> TryProve(FunctionBase* f, Node* subject,
+                                      Predicate p, absl::Duration timeout,
+                                      bool allow_unsupported = false);
+absl::StatusOr<ProverResult> TryProve(FunctionBase* f, Node* subject,
+                                      Predicate p, int64_t rlimit,
+                                      bool allow_unsupported = false);
+
+// Emits a self-contained SMT-LIB2 representation of `function` consisting of:
+// Returns Z3's pretty-printed SMT-LIB2 form of a λ-expression that binds all
+// parameters of `function` (currently Bits-typed only) and yields the
+// translated return-value expression.  Example:
+//   (lambda ((x (_ BitVec 32)) (y (_ BitVec 32))) (bvadd x y))
+// If parameter/return types are not flat bit-vectors the function returns
+// an `UNIMPLEMENTED` status.
+//
+// The helper keeps Z3 headers out of call-sites by handling translation and
+// printing internally.
+absl::StatusOr<std::string> EmitFunctionAsSmtLib(Function* function);
 
 }  // namespace z3
 }  // namespace solvers
 }  // namespace xls
 
-#endif  // XLS_TOOLS_Z3_IR_TRANSLATOR_H_
+#endif  // XLS_SOLVERS_Z3_IR_TRANSLATOR_H_

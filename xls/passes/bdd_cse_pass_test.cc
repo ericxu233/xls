@@ -18,6 +18,7 @@
 #include "gtest/gtest.h"
 #include "absl/status/statusor.h"
 #include "xls/common/status/matchers.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_matcher.h"
@@ -30,7 +31,7 @@ namespace m = ::xls::op_matchers;
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 
 class BddCsePassTest : public IrTestBase {
  protected:
@@ -38,8 +39,9 @@ class BddCsePassTest : public IrTestBase {
 
   absl::StatusOr<bool> Run(Function* f) {
     PassResults results;
+    OptimizationContext context;
     return BddCsePass().RunOnFunctionBase(f, OptimizationPassOptions(),
-                                          &results);
+                                          &results, context);
   }
 };
 

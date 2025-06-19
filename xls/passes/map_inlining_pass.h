@@ -15,8 +15,14 @@
 #ifndef XLS_PASSES_MAP_INLINING_PASS_H_
 #define XLS_PASSES_MAP_INLINING_PASS_H_
 
+#include <string_view>
+
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "xls/ir/function_base.h"
+#include "xls/ir/nodes.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
@@ -24,12 +30,17 @@ namespace xls {
 // maps to Verilog.
 class MapInliningPass : public OptimizationFunctionBasePass {
  public:
+  static constexpr std::string_view kName = "map_inlining";
   MapInliningPass();
+
+  // Inline a single Map instruction. Provided for test and utility
+  // (ir_minimizer) use.
+  static absl::Status InlineOneMap(Map* map);
 
  protected:
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* function, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
 
   // Replaces a single Map node with a CountedFor operation.
   absl::Status ReplaceMap(Map* map) const;

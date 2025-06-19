@@ -15,6 +15,8 @@
 #ifndef XLS_PASSES_RECEIVE_DEFAULT_VALUE_SIMPLIFICATION_PASS_H_
 #define XLS_PASSES_RECEIVE_DEFAULT_VALUE_SIMPLIFICATION_PASS_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
 #include "xls/ir/proc.h"
 #include "xls/passes/optimization_pass.h"
@@ -27,15 +29,16 @@ namespace xls {
 // zeros).
 class ReceiveDefaultValueSimplificationPass : public OptimizationProcPass {
  public:
+  static constexpr std::string_view kName = "recv_default";
+
   ReceiveDefaultValueSimplificationPass()
-      : OptimizationProcPass("recv_default",
-                             "Receive default value simplification") {}
+      : OptimizationProcPass(kName, "Receive default value simplification") {}
   ~ReceiveDefaultValueSimplificationPass() override = default;
 
  protected:
-  absl::StatusOr<bool> RunOnProcInternal(Proc* proc,
-                                         const OptimizationPassOptions& options,
-                                         PassResults* results) const override;
+  absl::StatusOr<bool> RunOnProcInternal(
+      Proc* proc, const OptimizationPassOptions& options, PassResults* results,
+      OptimizationContext& context) const override;
 };
 
 }  // namespace xls

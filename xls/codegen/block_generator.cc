@@ -15,41 +15,79 @@
 #include "xls/codegen/block_generator.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <deque>
 #include <optional>
+#include <random>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
+#include "absl/algorithm/container.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/random/bit_gen_ref.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
-#include "xls/codegen/block_conversion.h"
+#include "absl/types/span.h"
 #include "xls/codegen/codegen_options.h"
+#include "xls/codegen/conversion_utils.h"
 #include "xls/codegen/flattening.h"
 #include "xls/codegen/module_builder.h"
+#include "xls/codegen/module_signature.pb.h"
 #include "xls/codegen/node_expressions.h"
 #include "xls/codegen/node_representation.h"
-#include "xls/codegen/vast.h"
+#include "xls/codegen/op_override.h"
+#include "xls/codegen/op_override_impls.h"
+#include "xls/codegen/vast/vast.h"
 #include "xls/codegen/verilog_line_map.pb.h"
 #include "xls/common/logging/log_lines.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/block.h"
+#include "xls/ir/format_preference.h"
+#include "xls/ir/function.h"
 #include "xls/ir/instantiation.h"
-#include "xls/ir/node_iterator.h"
+#include "xls/ir/node.h"
 #include "xls/ir/nodes.h"
+#include "xls/ir/op.h"
+#include "xls/ir/register.h"
 #include "xls/ir/source_location.h"
+#include "xls/ir/topo_sort.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
 
 namespace xls {
 namespace verilog {
 namespace {
 
-// Returns true if the given type is representable in the Verilog.
-bool IsRepresentable(Type* type) {
-  return !TypeHasToken(type) && type->GetFlatBitCount() > 0;
+template <typename T>
+std::vector<T> Shuffle(absl::Span<const T> v, absl::BitGenRef rng) {
+  std::vector<T> vector(v.begin(), v.end());
+  absl::c_shuffle(vector, rng);
+  return vector;
 }
+
+template <typename T>
+absl::Span<const T> MaybeShuffle(absl::Span<const T> v, std::vector<T>& storage,
+                                 std::optional<absl::BitGenRef> rng) {
+  if (!rng.has_value()) {
+    return v;
+  }
+  storage = Shuffle(v, *rng);
+  return absl::MakeConstSpan(storage);
+}
+
+// Returns true if the given type is representable in the Verilog.
+bool IsRepresentable(Type* type) { return type->GetFlatBitCount() > 0; }
 
 // Return the Verilog representation for the given node which has at least one
 // operand which is not represented by an Expression*.
@@ -77,7 +115,8 @@ absl::StatusOr<NodeRepresentation> CodegenNodeWithUnrepresentedOperands(
         FlattenTuple(nonempty_elements, node->GetType()->AsTupleOrDie(),
                      mb->file(), node->loc()));
     if (emit_as_assignment) {
-      LogicRef* ref = mb->DeclareVariable(name, node->GetType());
+      XLS_ASSIGN_OR_RETURN(LogicRef * ref,
+                           mb->DeclareVariable(name, node->GetType()));
       XLS_RETURN_IF_ERROR(mb->Assign(ref, expr, node->GetType()));
       return ref;
     }
@@ -85,45 +124,6 @@ absl::StatusOr<NodeRepresentation> CodegenNodeWithUnrepresentedOperands(
   }
   return absl::UnimplementedError(
       absl::StrFormat("Unable to generate code for: %s", node->ToString()));
-}
-
-// Return a ResetProto representing the reset signal of the block. Requires that
-// any register with a reset value have identical reset behavior
-// (asynchronous/synchronous, and active high/low).
-absl::StatusOr<std::optional<ResetProto>> GetBlockResetProto(Block* block) {
-  std::optional<ResetProto> reset_proto;
-  for (Node* node : block->nodes()) {
-    if (node->Is<RegisterWrite>()) {
-      RegisterWrite* reg_write = node->As<RegisterWrite>();
-      if (!reg_write->reset().has_value()) {
-        continue;
-      }
-      Node* reset_signal = reg_write->reset().value();
-      Register* reg = reg_write->GetRegister();
-      XLS_RET_CHECK(reg->reset().has_value());
-      if (reset_proto.has_value()) {
-        if (reset_proto->name() != reset_signal->GetName()) {
-          return absl::InvalidArgumentError(absl::StrFormat(
-              "Block uses more than one reset signal: %s and %s",
-              reset_proto->name(), reset_signal->GetName()));
-        }
-        if (reset_proto->asynchronous() != reg->reset()->asynchronous) {
-          return absl::InvalidArgumentError(
-              "Block has asynchronous and synchronous reset signals");
-        }
-        if (reset_proto->active_low() != reg->reset()->active_low) {
-          return absl::InvalidArgumentError(
-              "Block has active low and active high reset signals");
-        }
-      } else {
-        reset_proto = ResetProto();
-        reset_proto->set_name(reset_signal->GetName());
-        reset_proto->set_asynchronous(reg->reset()->asynchronous);
-        reset_proto->set_active_low(reg->reset()->active_low);
-      }
-    }
-  }
-  return reset_proto;
 }
 
 // A data structure representing a stage within a feed-forward pipeline.
@@ -162,7 +162,8 @@ struct Stage {
 // TODO(meheff): 2021/08/27 Replace this pipeline reconstruction with tags on
 // the pipeline registers which indicate the stage. These markers then are used
 // to structure the Verilog.
-absl::StatusOr<std::vector<Stage>> SplitBlockIntoStages(Block* block) {
+absl::StatusOr<std::vector<Stage>> SplitBlockIntoStages(
+    Block* block, std::optional<absl::BitGenRef> rng) {
   // Construct a graph as an edge list which indicates the minimum distance in
   // stages between nodes in the block.
   struct Edge {
@@ -212,8 +213,10 @@ absl::StatusOr<std::vector<Stage>> SplitBlockIntoStages(Block* block) {
     // The number of stages should never exceed the number of nodes. In this
     // case, there is an impossible-to-pipeline graph.
     XLS_RET_CHECK_LT(node_stage.at(source), block->node_count())
-        << "Block is not a pipeline. May contain a (register) backedge or "
-           "registers are not layered";
+        << absl::StreamFormat(
+               "Node %v in stage %d! Block is not a pipeline. May contain a "
+               "(register) backedge or registers are not layered\n%s",
+               *source, node_stage.at(source), block->DumpIr());
 
     for (const Edge& edge : stage_graph.at(source)) {
       Node* target = edge.node;
@@ -255,7 +258,7 @@ absl::StatusOr<std::vector<Stage>> SplitBlockIntoStages(Block* block) {
 
   // Gather the nodes in a vector of stages.
   std::vector<Stage> stages(max_stage + 1);
-  for (Node* node : TopoSort(block)) {
+  for (Node* node : TopoSort(block, rng)) {
     if (node->Is<InputPort>() || node->Is<OutputPort>()) {
       continue;
     }
@@ -281,9 +284,42 @@ class BlockGenerator {
   // using the given options.
   static absl::Status Generate(Block* block, VerilogFile* file,
                                const CodegenOptions& options) {
-    XLS_ASSIGN_OR_RETURN(std::optional<ResetProto> reset_proto,
-                         GetBlockResetProto(block));
-    std::optional<std::string> clock_name;
+    // If reset is specified in the codegen options, it should match the reset
+    // behavior in the block.
+    if (options.reset().has_value()) {
+      if (block->GetResetBehavior() != options.GetResetBehavior()) {
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "Reset behavior specified in codegen options (%s) does not match "
+            "reset behavior specified in block `%s` (%s)",
+            options.GetResetBehavior()->ToString(), block->name(),
+            block->GetResetBehavior().has_value()
+                ? block->GetResetBehavior()->ToString()
+                : "<none>"));
+      }
+      if (block->GetResetPort().has_value() &&
+          block->GetResetPort().value()->name() != options.reset()->name()) {
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "Reset port specified in codegen options (%s) does not match "
+            "reset port specified in block `%s` (%s)",
+            options.reset()->name(), block->name(),
+            block->GetResetPort().value()->name()));
+      }
+    }
+    std::optional<ResetProto> reset_proto;
+    if (block->GetResetPort().has_value()) {
+      reset_proto = ResetProto();
+      reset_proto->set_name(block->GetResetPort().value()->name());
+      reset_proto->set_asynchronous(block->GetResetBehavior()->asynchronous);
+      reset_proto->set_active_low(block->GetResetBehavior()->active_low);
+    }
+
+    if (reset_proto.has_value()) {
+      VLOG(5) << absl::StreamFormat("Reset proto for %s: %s", block->name(),
+                                    reset_proto->DebugString());
+    } else {
+      VLOG(5) << absl::StreamFormat("No reset proto for %s", block->name());
+    }
+    std::optional<std::string_view> clock_name;
     if (block->GetClockPort().has_value()) {
       clock_name = block->GetClockPort()->name;
     } else if (!block->GetRegisters().empty()) {
@@ -296,14 +332,22 @@ class BlockGenerator {
   }
 
  private:
-  BlockGenerator(Block* block, const CodegenOptions& options,
-                 std::optional<std::string> clock_name,
-                 std::optional<ResetProto> reset_proto, VerilogFile* file)
+  BlockGenerator(
+      Block* block, const CodegenOptions& options,
+      std::optional<std::string_view> clock_name,
+      std::optional<ResetProto> reset_proto,
+      VerilogFile* file)
       : block_(block),
         options_(options),
         reset_proto_(reset_proto),
         file_(file),
-        mb_(block->name(), file_, options, clock_name, reset_proto) {}
+        mb_(block->name(), file_, options, clock_name, reset_proto) {
+    if (!options.randomize_order_seed().empty()) {
+      std::seed_seq seed_seq(options.randomize_order_seed().begin(),
+                             options.randomize_order_seed().end());
+      rng_.emplace(seed_seq);
+    }
+  }
 
   // Generates and returns the Verilog text for the underlying block.
   absl::Status Emit() {
@@ -314,12 +358,12 @@ class BlockGenerator {
     if (options_.emit_as_pipeline()) {
       // Emits the block as a sequence of pipeline stages. First reconstruct the
       // stages and emit the stages one-by-one. Emitting as a pipeline is purely
-      // cosmentic relative to the emit_as_pipeline=false option as the Verilog
+      // cosmetic relative to the emit_as_pipeline=false option as the Verilog
       // generated each way is functionally identical.
       XLS_ASSIGN_OR_RETURN(std::vector<Stage> stages,
-                           SplitBlockIntoStages(block_));
+                           SplitBlockIntoStages(block_, rng_));
       for (int64_t stage_num = 0; stage_num < stages.size(); ++stage_num) {
-        XLS_VLOG(2) << "Emitting stage: " << stage_num;
+        VLOG(2) << "Emitting stage: " << stage_num;
         const Stage& stage = stages.at(stage_num);
         mb_.NewDeclarationAndAssignmentSections();
         XLS_RETURN_IF_ERROR(EmitLogic(stage.reg_reads, stage_num));
@@ -342,9 +386,13 @@ class BlockGenerator {
         }
       }
     } else {
-      XLS_RETURN_IF_ERROR(DeclareRegisters(block_->GetRegisters()));
-      XLS_RETURN_IF_ERROR(EmitLogic(TopoSort(block_).AsVector()));
-      XLS_RETURN_IF_ERROR(AssignRegisters(block_->GetRegisters()));
+      std::vector<Register*> shuffled_storage;
+      absl::Span<Register* const> registers =
+          MaybeShuffle(block_->GetRegisters(), shuffled_storage, rng_);
+
+      XLS_RETURN_IF_ERROR(DeclareRegisters(registers));
+      XLS_RETURN_IF_ERROR(EmitLogic(TopoSort(block_, rng_)));
+      XLS_RETURN_IF_ERROR(AssignRegisters(registers));
     }
 
     // Emit instantiations separately at the end of the Verilog module.
@@ -356,7 +404,9 @@ class BlockGenerator {
   }
 
   absl::Status EmitInputPorts() {
-    for (const Block::Port& port : block_->GetPorts()) {
+    std::vector<Block::Port> shuffled_storage;
+    for (const Block::Port& port :
+         MaybeShuffle(block_->GetPorts(), shuffled_storage, rng_)) {
       if (std::holds_alternative<InputPort*>(port)) {
         InputPort* input_port = std::get<InputPort*>(port);
         if (reset_proto_.has_value() &&
@@ -366,7 +416,8 @@ class BlockGenerator {
         } else {
           XLS_ASSIGN_OR_RETURN(
               Expression * port_expr,
-              mb_.AddInputPort(input_port->GetName(), input_port->GetType()));
+              mb_.AddInputPort(input_port->GetName(), input_port->GetType(),
+                               input_port->system_verilog_type()));
           node_exprs_[input_port] = port_expr;
         }
       }
@@ -376,11 +427,12 @@ class BlockGenerator {
 
   // If the node has an assigned name then don't emit as an inline expression.
   // This ensures the name appears in the generated Verilog.
-  bool EmitAsAssignment(Node* const n) {
+  bool ShouldEmitAsAssignment(Node* const n, int64_t inline_depth) {
     if (n->HasAssignedName() ||
         (n->users().size() > 1 && !ShouldInlineExpressionIntoMultipleUses(n)) ||
         n->function_base()->HasImplicitUse(n) ||
-        !mb_.CanEmitAsInlineExpression(n) || options_.separate_lines()) {
+        !mb_.CanEmitAsInlineExpression(n) || options_.separate_lines() ||
+        inline_depth > options_.max_inline_depth()) {
       return true;
     }
     // Emit operands of RegisterWrite's as assignments rather than inline
@@ -406,11 +458,12 @@ class BlockGenerator {
   // defined by the nodes.
   absl::Status EmitLogic(absl::Span<Node* const> nodes,
                          std::optional<int64_t> stage = std::nullopt) {
+    absl::flat_hash_map<Node*, int64_t> node_depth;
     for (Node* node : nodes) {
-      XLS_VLOG(3) << "Emitting logic for: " << node->GetName();
+      VLOG(3) << "Emitting logic for: " << node->GetName();
 
       // TODO(google/xls#653): support per-node overrides?
-      std::optional<OpOverride*> op_override =
+      std::optional<OpOverride> op_override =
           options_.GetOpOverride(node->op());
 
       if (op_override.has_value()) {
@@ -421,8 +474,8 @@ class BlockGenerator {
 
         XLS_ASSIGN_OR_RETURN(
             node_exprs_[node],
-            (*op_override)
-                ->Emit(node, NodeAssignmentName(node, stage), inputs, mb_));
+            EmitOpOverride(*op_override, node, NodeAssignmentName(node, stage),
+                           inputs, mb_));
         continue;
       }
 
@@ -511,7 +564,7 @@ class BlockGenerator {
         }
         case Op::kLiteral: {
           if (!node->GetType()->IsBits() && IsRepresentable(node->GetType())) {
-            XLS_CHECK_EQ(node->operands().size(), 0);
+            CHECK_EQ(node->operands().size(), 0);
             XLS_ASSIGN_OR_RETURN(
                 node_exprs_[node],
                 mb_.DeclareModuleConstant(node->GetName(),
@@ -521,7 +574,7 @@ class BlockGenerator {
           break;
         }
         case Op::kGate: {
-          XLS_CHECK_EQ(node->operands().size(), 2);
+          CHECK_EQ(node->operands().size(), 2);
           const NodeRepresentation& data =
               node_exprs_.at(node->operands().at(0));
           const NodeRepresentation& condition =
@@ -553,17 +606,30 @@ class BlockGenerator {
         node_exprs_[node] = UnrepresentedSentinel();
         continue;
       }
+
+      int64_t input_depth = 0;
+      for (const Node* operand : node->operands()) {
+        if (auto it = node_depth.find(operand); it != node_depth.end()) {
+          input_depth = std::max(input_depth, it->second);
+        }
+      }
+      int64_t inline_depth = input_depth + 1;
+
       // If any of the operands do not have an Expression* representation then
       // handle the node specially.
       if (std::any_of(
               node->operands().begin(), node->operands().end(), [&](Node* n) {
                 return !std::holds_alternative<Expression*>(node_exprs_.at(n));
               })) {
+        bool emit_as_assignment = ShouldEmitAsAssignment(node, inline_depth);
         XLS_ASSIGN_OR_RETURN(
             node_exprs_[node],
             CodegenNodeWithUnrepresentedOperands(
                 node, &mb_, node_exprs_, NodeAssignmentName(node, stage),
-                EmitAsAssignment(node)));
+                emit_as_assignment));
+        if (!emit_as_assignment) {
+          node_depth[node] = inline_depth;
+        }
         continue;
       }
 
@@ -591,7 +657,7 @@ class BlockGenerator {
         inputs.push_back(std::get<Expression*>(node_exprs_.at(operand)));
       }
 
-      if (EmitAsAssignment(node)) {
+      if (ShouldEmitAsAssignment(node, inline_depth)) {
         XLS_ASSIGN_OR_RETURN(
             node_exprs_[node],
             mb_.EmitAsAssignment(NodeAssignmentName(node, stage), node,
@@ -599,6 +665,7 @@ class BlockGenerator {
       } else {
         XLS_ASSIGN_OR_RETURN(node_exprs_[node],
                              mb_.EmitAsInlineExpression(node, inputs));
+        node_depth[node] = inline_depth;
       }
     }
     return absl::OkStatus();
@@ -608,11 +675,11 @@ class BlockGenerator {
   absl::Status DeclareRegisters(absl::Span<Register* const> registers) {
     const std::optional<verilog::Reset>& reset = mb_.reset();
     for (Register* reg : registers) {
-      XLS_VLOG(3) << "Declaring register " << reg->name();
+      VLOG(3) << "Declaring register " << reg->name();
       Expression* reset_expr = nullptr;
-      if (reg->reset().has_value()) {
+      if (reg->reset_value().has_value()) {
         XLS_RET_CHECK(reset.has_value());
-        const Value& reset_value = reg->reset()->reset_value;
+        const Value& reset_value = reg->reset_value().value();
 
         // If the value is a bits type it can be emitted inline. Otherwise emit
         // as a module constant.
@@ -644,7 +711,7 @@ class BlockGenerator {
       XLS_RET_CHECK(mb_registers_.contains(reg)) << absl::StreamFormat(
           "Register `%s` was not previously declared", reg->name());
       ModuleBuilder::Register mb_reg = mb_registers_.at(reg);
-      if (reg->reset().has_value()) {
+      if (reg->reset_value().has_value()) {
         registers_with_reset.push_back(mb_reg);
       } else {
         registers_without_reset.push_back(mb_reg);
@@ -662,33 +729,44 @@ class BlockGenerator {
   absl::Status EmitOutputPorts() {
     // Iterate through GetPorts and pick out the output ports because GetPorts
     // contains the desired port ordering.
-    for (const Block::Port& port : block_->GetPorts()) {
+    std::vector<Block::Port> shuffled_storage;
+    for (const Block::Port& port :
+         MaybeShuffle(block_->GetPorts(), shuffled_storage, rng_)) {
       if (std::holds_alternative<OutputPort*>(port)) {
         OutputPort* output_port = std::get<OutputPort*>(port);
+        const NodeRepresentation& output_expr =
+            node_exprs_.at(output_port->operand(0));
+        XLS_RET_CHECK(std::holds_alternative<Expression*>(output_expr));
         XLS_RETURN_IF_ERROR(mb_.AddOutputPort(
             output_port->GetName(), output_port->operand(0)->GetType(),
-            std::get<Expression*>(node_exprs_.at(output_port->operand(0)))));
+            std::get<Expression*>(output_expr),
+            output_port->system_verilog_type()));
         node_exprs_[output_port] = UnrepresentedSentinel();
       }
     }
     return absl::OkStatus();
   }
 
-  // Declare a wire in the Verilog module for each output of each instantation
+  // Declare a wire in the Verilog module for each output of each instantiation
   // in the block. These declared outputs can then be used in downstream
   // expressions.
   absl::Status DeclareInstantiationOutputs() {
-    for (xls::Instantiation* instantiation : block_->GetInstantiations()) {
+    std::vector<xls::Instantiation*> shuffled_instantiations;
+    for (xls::Instantiation* instantiation : MaybeShuffle(
+             block_->GetInstantiations(), shuffled_instantiations, rng_)) {
+      std::vector<InstantiationOutput*> shuffled_outputs;
       for (InstantiationOutput* output :
-           block_->GetInstantiationOutputs(instantiation)) {
-        node_exprs_[output] =
-            mb_.DeclareVariable(output->GetName(), output->GetType());
+           MaybeShuffle(block_->GetInstantiationOutputs(instantiation),
+                        shuffled_outputs, rng_)) {
+        XLS_ASSIGN_OR_RETURN(
+            node_exprs_[output],
+            mb_.DeclareVariable(output->GetName(), output->GetType()));
       }
     }
     return absl::OkStatus();
   }
 
-  // Emit each instantation in the block into the separate instantation module
+  // Emit each instantiation in the block into the separate instantiation module
   // section.
   absl::Status EmitInstantiations() {
     // Since instantiations are emitted at the end, and not the pipeline stages
@@ -698,23 +776,51 @@ class BlockGenerator {
       mb_.instantiation_section()->Add<Comment>(SourceInfo(),
                                                 "===== Instantiations");
     }
-    for (xls::Instantiation* instantiation : block_->GetInstantiations()) {
-      std::vector<Connection> connections;
-      for (InstantiationInput* input :
-           block_->GetInstantiationInputs(instantiation)) {
-        XLS_RET_CHECK(std::holds_alternative<Expression*>(
-            node_exprs_.at(input->operand(0))));
-        connections.push_back(Connection{
-            input->port_name(),
-            std::get<Expression*>(node_exprs_.at(input->operand(0)))});
+
+    // Because we flatten arrays at module ports but otherwise use unpacked
+    // arrays internally, we may need to make an expression that packs/unpacks
+    // the port connection.
+    // TODO(google/xls#320): This can be much simpler if we don't use unpacked
+    // arrays.
+    auto connection_expression =
+        [this](const NodeRepresentation& expr,
+               Type* type) -> absl::StatusOr<Expression*> {
+      XLS_RET_CHECK(std::holds_alternative<Expression*>(expr));
+      Expression* to_connect = std::get<Expression*>(expr);
+      if (type->IsArray()) {
+        to_connect =
+            FlattenArray(to_connect->AsIndexableExpressionOrDie(),
+                         type->AsArrayOrDie(), mb_.file(), SourceInfo());
       }
+      return to_connect;
+    };
+    std::vector<xls::Instantiation*> shuffled_instantiations;
+    for (xls::Instantiation* instantiation : MaybeShuffle(
+             block_->GetInstantiations(), shuffled_instantiations, rng_)) {
+      std::vector<Connection> connections;
+      std::vector<InstantiationInput*> shuffled_inputs;
+      for (InstantiationInput* input :
+           MaybeShuffle(block_->GetInstantiationInputs(instantiation),
+                        shuffled_inputs, rng_)) {
+        XLS_RET_CHECK(input->operand_count() > 0);
+        const NodeRepresentation& expr = node_exprs_.at(input->operand(0));
+        XLS_RET_CHECK(std::holds_alternative<Expression*>(expr));
+        XLS_ASSIGN_OR_RETURN(
+            Expression * to_connect,
+            connection_expression(expr, input->operand(0)->GetType()));
+        connections.push_back(Connection{.port_name = input->port_name(),
+                                         .expression = to_connect});
+      }
+      std::vector<InstantiationOutput*> shuffled_outputs;
       for (InstantiationOutput* output :
-           block_->GetInstantiationOutputs(instantiation)) {
-        XLS_RET_CHECK(
-            std::holds_alternative<Expression*>(node_exprs_.at(output)));
-        connections.push_back(
-            Connection{output->port_name(),
-                       std::get<Expression*>(node_exprs_.at(output))});
+           MaybeShuffle(block_->GetInstantiationOutputs(instantiation),
+                        shuffled_outputs, rng_)) {
+        const NodeRepresentation& expr = node_exprs_.at(output);
+        XLS_RET_CHECK(std::holds_alternative<Expression*>(expr));
+        XLS_ASSIGN_OR_RETURN(Expression * to_connect,
+                             connection_expression(expr, output->GetType()));
+        connections.push_back(Connection{.port_name = output->port_name(),
+                                         .expression = to_connect});
       }
 
       if (xls::BlockInstantiation* block_instantiation =
@@ -741,6 +847,104 @@ class BlockGenerator {
                 ->ForeignFunctionData()
                 ->code_template(),
             connections);
+      } else if (xls::FifoInstantiation* fifo_instantiation =
+                     dynamic_cast<FifoInstantiation*>(instantiation)) {
+        std::vector<Connection> parameters;
+        parameters.reserve(6);
+
+        bool have_data = fifo_instantiation->data_type()->GetFlatBitCount() > 0;
+
+        if (have_data) {
+          parameters.push_back(Connection{
+              .port_name = "Width",
+              .expression = mb_.file()->Literal(
+                  UBits(fifo_instantiation->data_type()->GetFlatBitCount(), 32),
+                  SourceInfo(),
+                  /*format=*/FormatPreference::kUnsignedDecimal)});
+        }
+
+        parameters.insert(
+            parameters.end(),
+            {
+                Connection{
+                    .port_name = "Depth",
+                    .expression = mb_.file()->Literal(
+                        UBits(fifo_instantiation->fifo_config().depth(), 32),
+                        SourceInfo(),
+                        /*format=*/FormatPreference::kUnsignedDecimal)},
+                Connection{
+                    .port_name = "EnableBypass",
+                    .expression = mb_.file()->Literal(
+                        UBits(
+                            fifo_instantiation->fifo_config().bypass() ? 1 : 0,
+                            1),
+                        SourceInfo(),
+                        /*format=*/FormatPreference::kUnsignedDecimal)},
+                Connection{.port_name = "RegisterPushOutputs",
+                           .expression = mb_.file()->Literal(
+                               UBits(fifo_instantiation->fifo_config()
+                                             .register_push_outputs()
+                                         ? 1
+                                         : 0,
+                                     1),
+                               SourceInfo(),
+                               /*format=*/FormatPreference::kUnsignedDecimal)},
+                Connection{.port_name = "RegisterPopOutputs",
+                           .expression = mb_.file()->Literal(
+                               UBits(fifo_instantiation->fifo_config()
+                                             .register_pop_outputs()
+                                         ? 1
+                                         : 0,
+                                     1),
+                               SourceInfo(),
+                               /*format=*/FormatPreference::kUnsignedDecimal)},
+            });
+
+        // Append clock to connections.
+        connections.push_back(
+            Connection{.port_name = "clk", .expression = mb_.clock()});
+        // Sort clk and rst to top, then push, and finally pop ports.
+        constexpr std::array<std::string_view, 8> kFifoPortPriority = {
+            "clk",
+            xls::FifoInstantiation::kResetPortName,
+            xls::FifoInstantiation::kPushDataPortName,
+            xls::FifoInstantiation::kPushValidPortName,
+            xls::FifoInstantiation::kPopReadyPortName,
+            xls::FifoInstantiation::kPushReadyPortName,
+            xls::FifoInstantiation::kPopDataPortName,
+            xls::FifoInstantiation::kPopValidPortName};
+        absl::c_sort(connections, [&kFifoPortPriority](const Connection& a,
+                                                       const Connection& b) {
+          for (const std::string_view& port_name : kFifoPortPriority) {
+            if (a.port_name == b.port_name) {
+              // We don't want compare(x, x) == true.
+              return false;
+            }
+            if (a.port_name == port_name) {
+              return true;
+            }
+            if (b.port_name == port_name) {
+              return false;
+            }
+          }
+          return a.port_name < b.port_name;
+        });
+
+        std::string_view wrapper_name =
+            have_data ? options_.fifo_module() : options_.nodata_fifo_module();
+        if (wrapper_name.empty()) {
+          return absl::InvalidArgumentError(absl::StrFormat(
+              "No FIFO module specified, but %sFIFO instantiation required.",
+              have_data ? "" : "no-data "));
+        }
+
+        mb_.instantiation_section()->Add<Instantiation>(
+            SourceInfo(), wrapper_name, fifo_instantiation->name(),
+            /*parameters=*/parameters, connections);
+      } else {
+        return absl::UnimplementedError(absl::StrFormat(
+            "Instantiations of kind `%s` are not supported in code generation",
+            InstantiationKindToString(instantiation->kind())));
       }
     }
     return absl::OkStatus();
@@ -752,6 +956,8 @@ class BlockGenerator {
 
   VerilogFile* file_;
   ModuleBuilder mb_;
+
+  std::optional<std::mt19937_64> rng_;
 
   // Map from Node* to the Verilog expression representing its value.
   absl::flat_hash_map<Node*, NodeRepresentation> node_exprs_;
@@ -780,6 +986,10 @@ absl::Status DfsVisitBlocks(Block* block, absl::flat_hash_set<Block*>& visited,
       // An external block is a leaf from our perspective.
       continue;
     }
+    if (instantiation->kind() == InstantiationKind::kFifo) {
+      // A fifo is a leaf from our perspective.
+      continue;
+    }
 
     return absl::UnimplementedError(absl::StrFormat(
         "Instantiations of kind `%s` are not supported in code generation",
@@ -804,7 +1014,7 @@ absl::StatusOr<std::vector<Block*>> GatherInstantiatedBlocks(Block* top) {
 absl::StatusOr<std::string> GenerateVerilog(Block* top,
                                             const CodegenOptions& options,
                                             VerilogLineMap* verilog_line_map) {
-  XLS_VLOG(2) << absl::StreamFormat(
+  VLOG(2) << absl::StreamFormat(
       "Generating Verilog for packge with with top level block `%s`:",
       top->name());
   XLS_VLOG_LINES(2, top->DumpIr());
@@ -824,7 +1034,7 @@ absl::StatusOr<std::string> GenerateVerilog(Block* top,
   LineInfo line_info;
   std::string text = file.Emit(&line_info);
   if (verilog_line_map != nullptr) {
-    for (const auto& [vast_node, partial_spans] : line_info.Spans()) {
+    for (const VastNode* vast_node : line_info.nodes()) {
       std::optional<std::vector<LineSpan>> spans =
           line_info.LookupNode(vast_node);
       if (!spans.has_value()) {
@@ -848,7 +1058,7 @@ absl::StatusOr<std::string> GenerateVerilog(Block* top,
     }
   }
 
-  XLS_VLOG(2) << "Verilog output:";
+  VLOG(2) << "Verilog output:";
   XLS_VLOG_LINES(2, text);
 
   return text;

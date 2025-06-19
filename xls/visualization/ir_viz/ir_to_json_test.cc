@@ -14,44 +14,37 @@
 
 #include "xls/visualization/ir_viz/ir_to_json.h"
 
-#include <filesystem>
+#include <filesystem>  // NOLINT
 #include <memory>
+#include <string>
 #include <string_view>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "absl/memory/memory.h"
-#include "xls/common/golden_files.h"
-#include "xls/common/logging/logging.h"
+#include "absl/log/log.h"
 #include "xls/common/status/matchers.h"
-#include "xls/delay_model/delay_estimator.h"
-#include "xls/delay_model/delay_estimators.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimators.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_test_base.h"
 #include "xls/ir/package.h"
+#include "xls/scheduling/pipeline_schedule.h"
+#include "xls/scheduling/scheduling_options.h"
 
 namespace xls {
 namespace {
 
 using ::testing::HasSubstr;
 
-constexpr char kTestdataPath[] = "xls/visualization/ir_viz/testdata";
-
-class IrToJsonTest : public IrTestBase {
- protected:
-  std::filesystem::path GoldenFilePath(std::string_view file_ext) {
-    return absl::StrFormat("%s/ir_to_json_test_%s.%s", kTestdataPath,
-                           TestName(), file_ext);
-  }
-};
+using IrToJsonTest = IrTestBase;
 
 TEST_F(IrToJsonTest, SimpleFunction) {
   XLS_ASSERT_OK_AND_ASSIGN(auto p, ParsePackage(R"(
 package test
 
 fn main(x: bits[32], y: bits[32]) -> bits[32] {
-  ret add.1: bits[32] = add(x, y)
+  ret my_add: bits[32] = add(x, y)
 }
 )"));
   XLS_ASSERT_OK_AND_ASSIGN(DelayEstimator * delay_estimator,
@@ -62,27 +55,19 @@ fn main(x: bits[32], y: bits[32]) -> bits[32] {
   // We can't compare the JSON to a golden file because the underlying proto to
   // JSON library is nondeterministic in the order of fields so just check a
   // couple things.
-  XLS_VLOG(1) << json;
+  VLOG(1) << json;
   EXPECT_THAT(json, HasSubstr(R"("name": "main")"));
   EXPECT_THAT(json, HasSubstr(R"("id": "f0")"));
 
   EXPECT_THAT(json, HasSubstr(R"("edges": [)"));
   EXPECT_THAT(json, HasSubstr(R"("nodes": [)"));
-  EXPECT_THAT(json, HasSubstr(R"("id": "f0_p1")"));
-  EXPECT_THAT(
-      json,
-      HasSubstr(
-          "\"ir\": \"add.1: bits[32] = add(x: bits[32], y: bits[32], id=1)\""));
-  EXPECT_THAT(json, HasSubstr(R"("name": "add.1")"));
+  EXPECT_THAT(json, HasSubstr("\"ir\": \"my_add: bits[32] = add("));
+  EXPECT_THAT(json, HasSubstr(R"("name": "my_add")"));
   EXPECT_THAT(json, HasSubstr(R"("opcode": "add")"));
   EXPECT_THAT(
       json,
       HasSubstr(
           R"("known_bits": "0bXXXX_XXXX_XXXX_XXXX_XXXX_XXXX_XXXX_XXXX")"));
-
-  XLS_ASSERT_OK_AND_ASSIGN(std::string html, MarkUpIrText(p.get()));
-  XLS_VLOG(1) << html;
-  ExpectEqualToGoldenFile(GoldenFilePath("htmltext"), html);
 }
 
 TEST_F(IrToJsonTest, SimpleFunctionWithSchedule) {
@@ -106,14 +91,7 @@ TEST_F(IrToJsonTest, SimpleFunctionWithSchedule) {
   XLS_ASSERT_OK_AND_ASSIGN(std::string json, IrToJson(p.get(), *delay_estimator,
                                                       /*schedule=*/&schedule,
                                                       /*entry_name=*/"main"));
-  XLS_VLOG(1) << json;
-
-  // Compare the marked up html separately even though it is a field of the
-  // JSON. This makes visual comparison much easier because quotes and newlines
-  // are not escaped.
-  XLS_ASSERT_OK_AND_ASSIGN(std::string html, MarkUpIrText(p.get()));
-  XLS_VLOG(1) << html;
-  ExpectEqualToGoldenFile(GoldenFilePath("htmltext"), html);
+  VLOG(1) << json;
 }
 
 TEST_F(IrToJsonTest, MultipleFunctions) {
@@ -136,31 +114,25 @@ fn main(x: bits[32], xx: bits[32]) -> bits[32] {
   XLS_ASSERT_OK_AND_ASSIGN(std::string json, IrToJson(p.get(), *delay_estimator,
                                                       /*schedule=*/nullptr,
                                                       /*entry_name=*/"main"));
-  XLS_VLOG(1) << json;
-
-  // Compare the marked up html separately even though it is a field of the
-  // JSON. This makes visual comparison much easier because quotes and newlines
-  // are not escaped.
-  XLS_ASSERT_OK_AND_ASSIGN(std::string html, MarkUpIrText(p.get()));
-  XLS_VLOG(1) << html;
-  ExpectEqualToGoldenFile(GoldenFilePath("htmltext"), html);
+  VLOG(1) << json;
 }
 
 TEST_F(IrToJsonTest, SimpleProc) {
   XLS_ASSERT_OK_AND_ASSIGN(auto p, ParsePackage(R"(
 package test
 
-chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid, metadata="""""")
-chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid, metadata="""""")
+chan in(bits[32], id=0, kind=streaming, ops=receive_only, flow_control=ready_valid)
+chan out(bits[32], id=1, kind=streaming, ops=send_only, flow_control=ready_valid)
 
-top proc the_proc(tkn: token, x: bits[32], y: bits[64], init={0, 42}) {
-  rcv: (token, bits[32]) = receive(tkn, channel_id=0)
+top proc the_proc(x: bits[32], y: bits[64], init={0, 42}) {
+  tkn: token = literal(value=token)
+  rcv: (token, bits[32]) = receive(tkn, channel=in)
   rcv_token: token = tuple_index(rcv, index=0)
   rcv_data: bits[32] = tuple_index(rcv, index=1)
   next_x: bits[32] = add(x, rcv_data)
   not_y: bits[64] = not(y)
-  send: token = send(rcv_token, next_x, channel_id=1)
-  next (send, next_x, not_y)
+  send: token = send(rcv_token, next_x, channel=out)
+  next (next_x, not_y)
 }
 )"));
   XLS_ASSERT_OK_AND_ASSIGN(DelayEstimator * delay_estimator,
@@ -168,14 +140,7 @@ top proc the_proc(tkn: token, x: bits[32], y: bits[64], init={0, 42}) {
   XLS_ASSERT_OK_AND_ASSIGN(std::string json, IrToJson(p.get(), *delay_estimator,
                                                       /*schedule=*/nullptr,
                                                       /*entry_name=*/"main"));
-  XLS_VLOG(1) << json;
-
-  // Compare the marked up html separately even though it is a field of the
-  // JSON. This makes visual comparison much easier because quotes and newlines
-  // are not escaped.
-  XLS_ASSERT_OK_AND_ASSIGN(std::string html, MarkUpIrText(p.get()));
-  XLS_VLOG(1) << html;
-  ExpectEqualToGoldenFile(GoldenFilePath("htmltext"), html);
+  VLOG(1) << json;
 }
 
 }  // namespace

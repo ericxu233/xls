@@ -22,17 +22,17 @@
 #include <vector>
 
 #include "absl/flags/flag.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/delay_model/delay_estimator.h"
-#include "xls/delay_model/delay_estimators.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimators.h"
 #include "xls/ir/function_base.h"
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/package.h"
@@ -111,11 +111,11 @@ int main(int argc, char** argv) {
       xls::InitXls(kUsage, argc, argv);
 
   if (positional_arguments.size() != 1 || positional_arguments[0].empty()) {
-    XLS_LOG(QFATAL) << "Expected one position argument (IR path): " << argv[0]
-                    << " <ir_path>";
+    LOG(QFATAL) << "Expected one position argument (IR path): " << argv[0]
+                << " <ir_path>";
   }
   if (absl::GetFlag(FLAGS_delay_model).empty()) {
-    XLS_LOG(QFATAL) << "--delay_model is required";
+    LOG(QFATAL) << "--delay_model is required";
   }
 
   return xls::ExitStatus(xls::RealMain(

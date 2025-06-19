@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <cstdio>
+#include <cstdint>
 #include <list>
-#include <memory>
 #include <string>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/container/flat_hash_map.h"
-#include "absl/strings/str_format.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "xls/common/status/matchers.h"
-#include "xls/common/status/status_macros.h"
+#include "xls/contrib/xlscc/hls_block.pb.h"
 #include "xls/contrib/xlscc/translator.h"
 #include "xls/contrib/xlscc/unit_tests/unit_test.h"
 #include "xls/ir/bits.h"
@@ -248,8 +248,8 @@ TEST_F(TranslatorStaticTest, StaticMember) {
        })";
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                            testing::HasSubstr("static")));
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("static")));
 }
 
 // Add inner
@@ -271,12 +271,12 @@ TEST_F(TranslatorStaticTest, StaticProc) {
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out1 = block_spec.add_channels();
     ch_out1->set_name("out");
     ch_out1->set_is_input(false);
-    ch_out1->set_type(FIFO);
+    ch_out1->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -289,7 +289,7 @@ TEST_F(TranslatorStaticTest, StaticProc) {
                     xls::Value(xls::SBits(63, 32)),
                     xls::Value(xls::SBits(105, 32))};
 
-  ProcTest(content, block_spec, inputs, outputs, /*n_ticks = */ 3);
+  ProcTest(content, block_spec, inputs, outputs, /*min_ticks = */ 3);
 }
 
 TEST_F(TranslatorStaticTest, StaticInitListExpr) {
@@ -364,12 +364,12 @@ TEST_F(TranslatorStaticTest, IOProcStatic) {
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   {
@@ -407,12 +407,12 @@ TEST_F(TranslatorStaticTest, IOProcStaticNoIO) {
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   { ProcTest(content, block_spec, {}, {}); }
@@ -444,12 +444,12 @@ TEST_F(TranslatorStaticTest, IOProcStaticStruct) {
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   {
@@ -484,7 +484,7 @@ TEST_F(TranslatorStaticTest, OnReset) {
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -524,12 +524,12 @@ TEST_F(TranslatorStaticTest, OnReset2) {
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -568,12 +568,12 @@ TEST_F(TranslatorStaticTest, OnResetIOInit) {
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -612,12 +612,12 @@ TEST_F(TranslatorStaticTest, OnResetNonConstInit) {
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(DIRECT_IN);
+    ch_in->set_type(CHANNEL_TYPE_DIRECT_IN);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -656,7 +656,7 @@ TEST_F(TranslatorStaticTest, OnResetInPipelinedLoop) {
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -691,7 +691,7 @@ TEST_F(TranslatorStaticTest, OnResetInPipelinedLoop2) {
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -719,7 +719,7 @@ TEST_F(TranslatorStaticTest, OnResetScope) {
     }
 
     #pragma hls_top
-    void foo(__xls_channel<int> &out) {      
+    void foo(__xls_channel<int> &out) {
       sub(out);
       out.write((int)__xlscc_on_reset);
       sub(out);
@@ -732,7 +732,7 @@ TEST_F(TranslatorStaticTest, OnResetScope) {
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -769,7 +769,7 @@ TEST_F(TranslatorStaticTest, OnResetInitModify) {
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -804,12 +804,12 @@ TEST_F(TranslatorStaticTest, StaticChannelRef) {
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -832,7 +832,7 @@ TEST_F(TranslatorStaticTest, StaticChannelRefInStruct) {
         SenderThing(__xls_channel<int>& ch, int out_init = 3)
           : ch(ch), out(out_init)
         {}
-       
+
         void send(int offset) {
           ch.write(offset + out);
           ++out;
@@ -860,17 +860,17 @@ TEST_F(TranslatorStaticTest, StaticChannelRefInStruct) {
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out1 = block_spec.add_channels();
     ch_out1->set_name("out1");
     ch_out1->set_is_input(false);
-    ch_out1->set_type(FIFO);
+    ch_out1->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out2 = block_spec.add_channels();
     ch_out2->set_name("out2");
     ch_out2->set_is_input(false);
-    ch_out2->set_type(FIFO);
+    ch_out2->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -896,7 +896,7 @@ TEST_F(TranslatorStaticTest, StaticChannelRefInSubroutine) {
         SenderThing(__xls_channel<int>& ch, int out_init = 3)
           : ch(ch), out(out_init)
         {}
-       
+
         void send(int offset) {
           ch.write(offset + out);
           ++out;
@@ -926,12 +926,12 @@ TEST_F(TranslatorStaticTest, StaticChannelRefInSubroutine) {
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -970,12 +970,12 @@ TEST_F(TranslatorStaticTest, StaticChannelRefInSubroutine2) {
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -998,7 +998,7 @@ TEST_F(TranslatorStaticTest, StaticChannelRefInStructConst) {
         SenderThing(__xls_channel<int>& ch, int out_init = 3)
           : ch(ch), out(out_init)
         {}
-       
+
         void send(int offset)const {
           ch.write(offset + out);
         }
@@ -1025,17 +1025,17 @@ TEST_F(TranslatorStaticTest, StaticChannelRefInStructConst) {
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out1 = block_spec.add_channels();
     ch_out1->set_name("out1");
     ch_out1->set_is_input(false);
-    ch_out1->set_type(FIFO);
+    ch_out1->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out2 = block_spec.add_channels();
     ch_out2->set_name("out2");
     ch_out2->set_is_input(false);
-    ch_out2->set_type(FIFO);
+    ch_out2->set_type(CHANNEL_TYPE_FIFO);
   }
 
   absl::flat_hash_map<std::string, std::list<xls::Value>> inputs;
@@ -1061,7 +1061,7 @@ TEST_F(TranslatorStaticTest, StaticChannelRefInStructAssign) {
         SenderThing(__xls_channel<int>& ch, int out_init = 3)
           : ch(ch), out(out_init)
         {}
-       
+
         void send(int offset) {
           ch.write(offset + out);
           ++out;
@@ -1093,7 +1093,7 @@ TEST_F(TranslatorStaticTest, StaticChannelRefInStructAssign) {
   ASSERT_THAT(SourceToIr(content, &func, /* clang_argv= */ {},
                          /* io_test_mode= */ true)
                   .status(),
-              xls::status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kUnimplemented,
                   testing::HasSubstr("parameters containing LValues")));
 }
@@ -1105,7 +1105,7 @@ TEST_F(TranslatorStaticTest, StaticChannelRefInStructWithOnReset) {
         SenderThing(__xls_channel<int>& ch, int out_init = 3)
           : ch(ch), out(out_init)
         {}
-       
+
         void send(int offset) {
           ch.write(offset + out);
           ++out;
@@ -1128,12 +1128,12 @@ TEST_F(TranslatorStaticTest, StaticChannelRefInStructWithOnReset) {
        })";
 
   xlscc::GeneratedFunction* func;
-  ASSERT_THAT(SourceToIr(content, &func, /* clang_argv= */ {},
-                         /* io_test_mode= */ true)
-                  .status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kUnimplemented,
-                  testing::HasSubstr("ompound lvalue not present")));
+  ASSERT_THAT(
+      SourceToIr(content, &func, /* clang_argv= */ {},
+                 /* io_test_mode= */ true)
+          .status(),
+      absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                             testing::HasSubstr("ompound lvalue not present")));
 }
 
 TEST_F(TranslatorStaticTest, StaticChannelRefInStructWithOnReset2) {
@@ -1143,7 +1143,7 @@ TEST_F(TranslatorStaticTest, StaticChannelRefInStructWithOnReset2) {
         SenderThing(__xls_channel<int>& ch, int out_init = 3)
           : ch(ch), out(out_init)
         {}
-       
+
         void send(int offset) {
           ch.write(offset + out);
           ++out;
@@ -1165,12 +1165,11 @@ TEST_F(TranslatorStaticTest, StaticChannelRefInStructWithOnReset2) {
        })";
 
   xlscc::GeneratedFunction* func;
-  ASSERT_THAT(
-      SourceToIr(content, &func, /* clang_argv= */ {},
-                 /* io_test_mode= */ true)
-          .status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                    testing::HasSubstr("using side-effects")));
+  ASSERT_THAT(SourceToIr(content, &func, /* clang_argv= */ {},
+                         /* io_test_mode= */ true)
+                  .status(),
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("using side-effects")));
 }
 
 TEST_F(TranslatorStaticTest, ReturnStaticLValue) {

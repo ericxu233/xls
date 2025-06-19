@@ -16,6 +16,8 @@ syntax = "proto3";
 
 package xls.fuzzer;
 
+import "xls/tests/testvector.proto";
+
 enum SampleType {
   SAMPLE_TYPE_UNKNOWN = 0;
   SAMPLE_TYPE_FUNCTION = 1;
@@ -56,6 +58,11 @@ message SampleOptionsProto {
   // Generate Verilog from the optimized IR. Requires optimize_ir to be true.
   optional bool codegen = 7;
 
+  // Generate Verilog from the optimized IR using the 2.0 pipeline.
+  // Requires optimize_ir to be true.  Can be used simultaneously with
+  // codegen.
+  optional bool codegen_ng = 17;
+
   // Arguments to pass to codegen_main. Requires codegen to be true.
   repeated string codegen_args = 8;
 
@@ -81,6 +88,12 @@ message SampleOptionsProto {
   // Number ticks to execute the generated proc. Only meaningful for procs.
   optional int64 proc_ticks = 14;
 
+  // Inputs are spaced out with valid holdoffs
+  optional bool with_valid_holdoff = 16;
+
+  // If true unopt-interpreter is not run.
+  optional bool disable_unopt_interpreter = 18;
+
   // Regex of error messages which are known to be domain-errors in fuzzing.
   //
   // Any crasher which has a match the regular-expressions in the correct tool
@@ -88,33 +101,6 @@ message SampleOptionsProto {
   //
   // We should try to reduce these to nothing if possible over time.
   repeated KnownFailure known_failure = 15;
-}
-
-// Inputs fed to a single input channel of the sample proc.
-message ChannelInputProto {
-  optional string channel_name = 1;
-
-  // Values to feed into the channel. Each entry is a single xls::Value.
-  repeated string values = 2;
-}
-
-// Inputs fed to all channels of the sample proc.
-message ChannelInputsProto {
-  repeated ChannelInputProto inputs = 1;
-}
-
-// Inputs fed to as arguments to the sample function.
-message FunctionArgsProto {
-  // Each entry is a semicolon-separated list of xls::Values with one Value per
-  // function parameter. Example entry: "bits[1]:0; bits[32]:0x42"
-  repeated string args = 1;
-}
-
-message SampleInputsProto {
-  oneof input_oneof {
-    ChannelInputsProto channel_inputs = 1;
-    FunctionArgsProto function_args = 2;
-  }
 }
 
 message CrasherConfigurationProto {
@@ -126,5 +112,5 @@ message CrasherConfigurationProto {
 
   optional SampleOptionsProto sample_options = 3;
 
-  SampleInputsProto inputs = 4;
+  xls.testvector.SampleInputsProto inputs = 4;
 }

@@ -16,8 +16,8 @@
 This module contains *FDO-mode* codegen-related build rules for XLS.
 """
 
-load("@rules_hdl//pdk:build_defs.bzl", "StandardCellInfo")
 load("@bazel_skylib//lib:dicts.bzl", "dicts")
+load("@rules_hdl//pdk:build_defs.bzl", "StandardCellInfo")
 load(
     "//xls/build_rules:xls_codegen_rules.bzl",
     "validate_verilog_filename",
@@ -26,8 +26,11 @@ load(
     "//xls/build_rules:xls_common_rules.bzl",
     "append_default_to_args",
     "args_to_string",
+    "get_input_infos",
+    "get_original_input_files_for_xls",
     "get_output_filename_value",
     "get_runfiles_for_xls",
+    "get_src_ir_for_xls",
     "get_transitive_built_files_for_xls",
     "is_args_valid",
     "split_filename",
@@ -126,6 +129,9 @@ xls_ir_verilog_attrs = {
         providers = [StandardCellInfo],
         default = "@com_google_skywater_pdk_sky130_fd_sc_hd//:sky130_fd_sc_hd",
     ),
+    "synthesizer_linear_interpolation_factor": attr.string(
+        default = "",
+    ),
 }
 
 def _is_combinational_generator(arguments):
@@ -148,7 +154,7 @@ def _uses_fdo(arguments):
     """
     return (arguments.get("use_fdo", "false").lower() == "true")
 
-def xls_ir_verilog_fdo_impl(ctx, src):
+def xls_ir_verilog_fdo_impl(ctx, src, original_input_files):
     """The core implementation of the 'xls_ir_verilog' rule.
 
     Generates a Verilog file, module signature file, block file, Verilog line
@@ -157,6 +163,7 @@ def xls_ir_verilog_fdo_impl(ctx, src):
     Args:
       ctx: The current rule's context object.
       src: The source file.
+      original_input_files: All original source files that produced this IR file (used for errors).
 
     Returns:
       A tuple with the following elements in the order presented:
@@ -218,7 +225,6 @@ def xls_ir_verilog_fdo_impl(ctx, src):
         "ram_configurations",
         "gate_recvs",
         "array_index_bounds_checking",
-        "inline_procs",
     )
 
     SCHEDULING_FLAGS = (
@@ -227,13 +233,14 @@ def xls_ir_verilog_fdo_impl(ctx, src):
         "delay_model",
         "clock_margin_percent",
         "period_relaxation_percent",
-        "minimize_clock_on_error",
+        "minimize_clock_on_failure",
         "worst_case_throughput",
         "additional_input_delay_ps",
         "ffi_fallback_delay_ps",
         "io_constraints",
         "receives_first_sends_last",
         "mutual_exclusion_z3_rlimit",
+        "default_next_value_z3_rlimit",
         "use_fdo",
         "fdo_iteration_number",
         "fdo_delay_driven_path_number",
@@ -314,10 +321,18 @@ def xls_ir_verilog_fdo_impl(ctx, src):
         yosys_tool = ctx.executable.yosys_tool
         sta_tool = ctx.executable.sta_tool
         synth_lib = ctx.attr.standard_cells[StandardCellInfo].default_corner.liberty
-        final_args += " --fdo_synthesizer_name=yosys"
+        final_args += " --fdo_synthesizer_name={}".format(codegen_args.get("fdo_synthesizer_name", "yosys"))
         final_args += " --fdo_yosys_path={}".format(yosys_tool.path)
         final_args += " --fdo_sta_path={}".format(sta_tool.path)
         final_args += " --fdo_synthesis_libraries={}".format(synth_lib.path)
+        if getattr(ctx.attr.standard_cells[StandardCellInfo], "default_input_driver_cell", "") != "":
+            final_args += " --fdo_default_driver_cell='{}'".format(
+                ctx.attr.standard_cells[StandardCellInfo].default_input_driver_cell,
+            )
+        if getattr(ctx.attr.standard_cells[StandardCellInfo], "default_output_load", "") != "":
+            final_args += " --fdo_default_load='{}'".format(
+                ctx.attr.standard_cells[StandardCellInfo].default_output_load,
+            )
     else:
         yosys_tool = None
         sta_tool = None
@@ -326,7 +341,7 @@ def xls_ir_verilog_fdo_impl(ctx, src):
     # Get runfiles
     codegen_tool_runfiles = ctx.attr._xls_codegen_tool[DefaultInfo].default_runfiles
 
-    runfiles_list = [src]
+    runfiles_list = [src.ir_file] + original_input_files
     if ctx.file.codegen_options_proto:
         final_args += " --codegen_options_proto={}".format(ctx.file.codegen_options_proto.path)
         runfiles_list.append(ctx.file.codegen_options_proto)
@@ -334,6 +349,9 @@ def xls_ir_verilog_fdo_impl(ctx, src):
     if ctx.file.scheduling_options_proto:
         final_args += " --scheduling_options_proto={}".format(ctx.file.scheduling_options_proto.path)
         runfiles_list.append(ctx.file.scheduling_options_proto)
+
+    if ctx.attr.synthesizer_linear_interpolation_factor:
+        final_args += " --synthesizer_linear_interpolation_factor={}".format(ctx.attr.synthesizer_linear_interpolation_factor)
 
     if uses_fdo:
         dont_use_args = ""
@@ -367,7 +385,7 @@ def xls_ir_verilog_fdo_impl(ctx, src):
         inputs = runfiles.files,
         command = "{} {} {}".format(
             codegen_tool.path,
-            src.path,
+            src.ir_file.path,
             final_args,
         ),
         env = env,
@@ -411,7 +429,8 @@ def _xls_ir_verilog_fdo_impl_wrapper(ctx):
     """
     codegen_info, built_files_list, runfiles = xls_ir_verilog_fdo_impl(
         ctx,
-        ctx.file.src,
+        get_src_ir_for_xls(ctx),
+        get_original_input_files_for_xls(ctx),
     )
 
     return [
@@ -426,7 +445,7 @@ def _xls_ir_verilog_fdo_impl_wrapper(ctx):
             ),
             runfiles = runfiles,
         ),
-    ]
+    ] + get_input_infos(ctx.attr.src)
 
 xls_ir_verilog_fdo = rule(
     doc = """A build rule that generates a Verilog file from an IR file using

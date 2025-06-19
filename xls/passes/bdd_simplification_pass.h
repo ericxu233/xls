@@ -15,9 +15,12 @@
 #ifndef XLS_PASSES_BDD_SIMPLIFICATION_PASS_H_
 #define XLS_PASSES_BDD_SIMPLIFICATION_PASS_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
@@ -27,19 +30,16 @@ namespace xls {
 // TODO(meheff): Add more BDD-based optimizations.
 class BddSimplificationPass : public OptimizationFunctionBasePass {
  public:
-  explicit BddSimplificationPass(int64_t opt_level)
-      : OptimizationFunctionBasePass("bdd_simp", "BDD-based Simplification"),
-        opt_level_(opt_level) {}
+  static constexpr std::string_view kName = "bdd_simp";
+  explicit BddSimplificationPass()
+      : OptimizationFunctionBasePass(kName, "BDD-based Simplification") {}
   ~BddSimplificationPass() override = default;
 
  protected:
   // Run all registered passes in order of registration.
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
-
- private:
-  int64_t opt_level_;
+      PassResults* results, OptimizationContext& context) const override;
 };
 
 }  // namespace xls

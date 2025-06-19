@@ -12,21 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_DSLX_TYPE_SYSTEM_CPP_PARAMETRIC_INSTANTIATOR_H_
-#define XLS_DSLX_TYPE_SYSTEM_CPP_PARAMETRIC_INSTANTIATOR_H_
+#ifndef XLS_DSLX_TYPE_SYSTEM_PARAMETRIC_INSTANTIATOR_H_
+#define XLS_DSLX_TYPE_SYSTEM_PARAMETRIC_INSTANTIATOR_H_
 
-#include <cstdint>
 #include <memory>
 #include <string>
-#include <utility>
-#include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "xls/dslx/type_system/concrete_type.h"
+#include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/interp_value.h"
 #include "xls/dslx/type_system/deduce_ctx.h"
-#include "xls/dslx/type_system/parametric_constraint.h"
+#include "xls/dslx/type_system/parametric_with_type.h"
+#include "xls/dslx/type_system/type.h"
 #include "xls/dslx/type_system/type_and_parametric_env.h"
 
 namespace xls::dslx {
@@ -36,24 +37,24 @@ namespace xls::dslx {
 //
 // Args:
 //  span: Invocation span causing the instantiation to occur.
+//  callee_fn: The function being instantiated.
 //  function_type: Type (possibly parametric) of the function being
 //    instantiated.
 //  args: Arguments driving the instantiation of the function signature.
 //  ctx: Type deduction context, e.g. used in constexpr evaluation.
-//  parametric_constraints: Contains expressions being given as parametrics that
-//    must be evaluated. They are called "constraints" because they may be
-//    in conflict as a result of deductive inference; e.g. for
-//    `f<N: u32, R: u32 = N+N>(x: bits[N]) -> bits[R] { x }` we'll find the
-//    "constraint" on R of being `N+N` is incorrect/infeasible (when N != 0).
+//  typed_parametrics: Contains expressions being given as parametrics that
+//    must be evaluated along with their inferred types.
 //  explicit_bindings: Environment to use for evaluating the
-//    parametric_constraints expressions; e.g. for the example above if the
+//    typed_parametrics expressions; e.g. for the example above if the
 //    caller invoked `const M: u32 = 42; f<M>(x)`, this environment would
 //    be `{N: u32:42}` (since M is passed as the N value for the callee).
 absl::StatusOr<TypeAndParametricEnv> InstantiateFunction(
-    Span span, const FunctionType& function_type,
+    Span span, Function& callee_fn, const FunctionType& function_type,
     absl::Span<const InstantiateArg> args, DeduceCtx* ctx,
-    absl::Span<const ParametricConstraint> parametric_constraints,
-    const absl::flat_hash_map<std::string, InterpValue>& explicit_bindings);
+    absl::Span<const ParametricWithType> typed_parametrics,
+    const absl::flat_hash_map<std::string, InterpValue>& explicit_bindings,
+    absl::Span<const ParametricBinding* ABSL_NONNULL const>
+        parametric_bindings);
 
 // Instantiates a struct using the bindings derived from args' types.
 //
@@ -61,10 +62,11 @@ absl::StatusOr<TypeAndParametricEnv> InstantiateFunction(
 absl::StatusOr<TypeAndParametricEnv> InstantiateStruct(
     Span span, const StructType& struct_type,
     absl::Span<const InstantiateArg> args,
-    absl::Span<std::unique_ptr<ConcreteType> const> member_types,
-    DeduceCtx* ctx,
-    absl::Span<const ParametricConstraint> parametric_constraints);
+    absl::Span<std::unique_ptr<Type> const> member_types, DeduceCtx* ctx,
+    absl::Span<const ParametricWithType> typed_parametrics,
+    absl::Span<const ParametricBinding* ABSL_NONNULL const>
+        parametric_bindings);
 
 }  // namespace xls::dslx
 
-#endif  // XLS_DSLX_TYPE_SYSTEM_CPP_PARAMETRIC_INSTANTIATOR_H_
+#endif  // XLS_DSLX_TYPE_SYSTEM_PARAMETRIC_INSTANTIATOR_H_

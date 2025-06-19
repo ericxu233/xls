@@ -12,20 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_DSLX_MAKE_STRUCT_FORMAT_DESCRIPTOR_H_
-#define XLS_DSLX_MAKE_STRUCT_FORMAT_DESCRIPTOR_H_
+#ifndef XLS_DSLX_MAKE_VALUE_FORMAT_DESCRIPTOR_H_
+#define XLS_DSLX_MAKE_VALUE_FORMAT_DESCRIPTOR_H_
 
-#include <memory>
-
-#include "xls/dslx/type_system/concrete_type.h"
+#include "absl/status/statusor.h"
+#include "xls/dslx/type_system/type.h"
 #include "xls/dslx/value_format_descriptor.h"
+#include "xls/ir/format_preference.h"
 
 namespace xls::dslx {
 
-absl::StatusOr<std::unique_ptr<ValueFormatDescriptor>>
-MakeValueFormatDescriptor(const ConcreteType& type,
-                          FormatPreference field_preference);
+absl::StatusOr<ValueFormatDescriptor> MakeValueFormatDescriptor(
+    const Type& type, FormatPreference field_preference);
 
 }  // namespace xls::dslx
 
-#endif  // XLS_DSLX_MAKE_STRUCT_FORMAT_DESCRIPTOR_H_
+#endif  // XLS_DSLX_MAKE_VALUE_FORMAT_DESCRIPTOR_H_

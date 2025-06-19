@@ -10,6 +10,8 @@
 ## check_sha256sum_frozen
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "check_sha256sum_frozen")
+
 check_sha256sum_frozen(<a href="#check_sha256sum_frozen-name">name</a>, <a href="#check_sha256sum_frozen-src">src</a>, <a href="#check_sha256sum_frozen-frozen_file">frozen_file</a>, <a href="#check_sha256sum_frozen-sha256sum">sha256sum</a>)
 </pre>
 
@@ -86,7 +88,7 @@ Examples:
 | :------------- | :------------- | :------------- | :------------- | :------------- |
 | <a id="check_sha256sum_frozen-name"></a>name |  A unique name for this target.   | <a href="https://bazel.build/concepts/labels#target-names">Name</a> | required |  |
 | <a id="check_sha256sum_frozen-src"></a>src |  The source file.   | <a href="https://bazel.build/concepts/labels">Label</a> | required |  |
-| <a id="check_sha256sum_frozen-frozen_file"></a>frozen_file |  The frozen output file.   | <a href="https://bazel.build/concepts/labels">Label</a> | required |  |
+| <a id="check_sha256sum_frozen-frozen_file"></a>frozen_file |  The frozen output file.   | <a href="https://bazel.build/concepts/labels">Label</a>; <a href="https://bazel.build/reference/be/common-definitions#configurable-attributes">nonconfigurable</a> | required |  |
 | <a id="check_sha256sum_frozen-sha256sum"></a>sha256sum |  The sha256sum of the source file.   | String | required |  |
 
 
@@ -95,6 +97,8 @@ Examples:
 ## check_sha256sum_test
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "check_sha256sum_test")
+
 check_sha256sum_test(<a href="#check_sha256sum_test-name">name</a>, <a href="#check_sha256sum_test-src">src</a>, <a href="#check_sha256sum_test-sha256sum">sha256sum</a>)
 </pre>
 
@@ -130,6 +134,8 @@ Examples:
 ## proto_data
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "proto_data")
+
 proto_data(<a href="#proto_data-name">name</a>, <a href="#proto_data-src">src</a>, <a href="#proto_data-proto_name">proto_name</a>, <a href="#proto_data-protobin_file">protobin_file</a>)
 </pre>
 
@@ -157,55 +163,7 @@ Examples:
 | <a id="proto_data-name"></a>name |  A unique name for this target.   | <a href="https://bazel.build/concepts/labels#target-names">Name</a> | required |  |
 | <a id="proto_data-src"></a>src |  The source file.   | <a href="https://bazel.build/concepts/labels">Label</a> | required |  |
 | <a id="proto_data-proto_name"></a>proto_name |  The name of the message type in the .proto files that 'src' file represents.   | String | optional |  `"xlscc.HLSBlock"`  |
-| <a id="proto_data-protobin_file"></a>protobin_file |  The name of the output file to write binary proto to. If not specified, the target name of the bazel rule followed by a .protobin extension is used.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
-
-
-<a id="xls_benchmark_ir"></a>
-
-## xls_benchmark_ir
-
-<pre>
-xls_benchmark_ir(<a href="#xls_benchmark_ir-name">name</a>, <a href="#xls_benchmark_ir-src">src</a>, <a href="#xls_benchmark_ir-benchmark_ir_args">benchmark_ir_args</a>, <a href="#xls_benchmark_ir-scheduling_options_proto">scheduling_options_proto</a>, <a href="#xls_benchmark_ir-top">top</a>)
-</pre>
-
-Executes the benchmark tool on an IR file.
-
-Examples:
-
-1. A file as the source.
-
-    ```
-    xls_benchmark_ir(
-        name = "a_benchmark",
-        src = "a.ir",
-    )
-    ```
-
-1. An xls_ir_opt_ir target as the source.
-
-    ```
-    xls_ir_opt_ir(
-        name = "a_opt_ir",
-        src = "a.ir",
-    )
-
-
-    xls_benchmark_ir(
-        name = "a_benchmark",
-        src = ":a_opt_ir",
-    )
-    ```
-
-**ATTRIBUTES**
-
-
-| Name  | Description | Type | Mandatory | Default |
-| :------------- | :------------- | :------------- | :------------- | :------------- |
-| <a id="xls_benchmark_ir-name"></a>name |  A unique name for this target.   | <a href="https://bazel.build/concepts/labels#target-names">Name</a> | required |  |
-| <a id="xls_benchmark_ir-src"></a>src |  The IR source file for the rule. A single source file must be provided. The file must have a '.ir' extension.   | <a href="https://bazel.build/concepts/labels">Label</a> | required |  |
-| <a id="xls_benchmark_ir-benchmark_ir_args"></a>benchmark_ir_args |  Arguments of the benchmark IR tool. For details on the arguments, refer to the benchmark_main application at //xls/tools/benchmark_main.cc.   | <a href="https://bazel.build/rules/lib/dict">Dictionary: String -> String</a> | optional |  `{}`  |
-| <a id="xls_benchmark_ir-scheduling_options_proto"></a>scheduling_options_proto |  Protobuf filename of scheduling arguments to the benchmark IR tool. For details on the arguments, refer to the benchmark_main application at //xls/tools/benchmark_main.cc.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
-| <a id="xls_benchmark_ir-top"></a>top |  The (*mangled*) name of the entry point. See get_mangled_ir_symbol. Defines the 'top' argument of the IR tool/application.   | String | optional |  `""`  |
+| <a id="proto_data-protobin_file"></a>protobin_file |  The name of the output file to write binary proto to. If not specified, the target name of the bazel rule followed by a .protobin extension is used.   | <a href="https://bazel.build/concepts/labels">Label</a>; <a href="https://bazel.build/reference/be/common-definitions#configurable-attributes">nonconfigurable</a> | optional |  `None`  |
 
 
 <a id="xls_benchmark_verilog"></a>
@@ -213,6 +171,8 @@ Examples:
 ## xls_benchmark_verilog
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "xls_benchmark_verilog")
+
 xls_benchmark_verilog(<a href="#xls_benchmark_verilog-name">name</a>, <a href="#xls_benchmark_verilog-verilog_target">verilog_target</a>)
 </pre>
 
@@ -240,6 +200,8 @@ Example:
 ## xls_dslx_library
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "xls_dslx_library")
+
 xls_dslx_library(<a href="#xls_dslx_library-name">name</a>, <a href="#xls_dslx_library-deps">deps</a>, <a href="#xls_dslx_library-srcs">srcs</a>, <a href="#xls_dslx_library-warnings_as_errors">warnings_as_errors</a>)
 </pre>
 
@@ -299,8 +261,10 @@ Examples:
 ## xls_dslx_opt_ir_test
 
 <pre>
-xls_dslx_opt_ir_test(<a href="#xls_dslx_opt_ir_test-name">name</a>, <a href="#xls_dslx_opt_ir_test-benchmark_ir_args">benchmark_ir_args</a>, <a href="#xls_dslx_opt_ir_test-dep">dep</a>, <a href="#xls_dslx_opt_ir_test-dslx_test_args">dslx_test_args</a>, <a href="#xls_dslx_opt_ir_test-input_validator">input_validator</a>,
-                     <a href="#xls_dslx_opt_ir_test-input_validator_expr">input_validator_expr</a>, <a href="#xls_dslx_opt_ir_test-ir_equivalence_args">ir_equivalence_args</a>, <a href="#xls_dslx_opt_ir_test-ir_eval_args">ir_eval_args</a>,
+load("//xls/build_rules:xls_build_defs.bzl", "xls_dslx_opt_ir_test")
+
+xls_dslx_opt_ir_test(<a href="#xls_dslx_opt_ir_test-name">name</a>, <a href="#xls_dslx_opt_ir_test-benchmark_ir_args">benchmark_ir_args</a>, <a href="#xls_dslx_opt_ir_test-dep">dep</a>, <a href="#xls_dslx_opt_ir_test-dslx_test_args">dslx_test_args</a>, <a href="#xls_dslx_opt_ir_test-evaluator">evaluator</a>, <a href="#xls_dslx_opt_ir_test-expect_equivalent">expect_equivalent</a>,
+                     <a href="#xls_dslx_opt_ir_test-input_validator">input_validator</a>, <a href="#xls_dslx_opt_ir_test-input_validator_expr">input_validator_expr</a>, <a href="#xls_dslx_opt_ir_test-ir_equivalence_args">ir_equivalence_args</a>, <a href="#xls_dslx_opt_ir_test-ir_eval_args">ir_eval_args</a>,
                      <a href="#xls_dslx_opt_ir_test-scheduling_options_proto">scheduling_options_proto</a>, <a href="#xls_dslx_opt_ir_test-top">top</a>)
 </pre>
 
@@ -336,15 +300,72 @@ Examples:
 | Name  | Description | Type | Mandatory | Default |
 | :------------- | :------------- | :------------- | :------------- | :------------- |
 | <a id="xls_dslx_opt_ir_test-name"></a>name |  A unique name for this target.   | <a href="https://bazel.build/concepts/labels#target-names">Name</a> | required |  |
-| <a id="xls_dslx_opt_ir_test-benchmark_ir_args"></a>benchmark_ir_args |  Arguments of the benchmark IR tool. For details on the arguments, refer to the benchmark_main application at //xls/tools/benchmark_main.cc.   | <a href="https://bazel.build/rules/lib/dict">Dictionary: String -> String</a> | optional |  `{}`  |
+| <a id="xls_dslx_opt_ir_test-benchmark_ir_args"></a>benchmark_ir_args |  Arguments of the benchmark IR tool. For details on the arguments, refer to the benchmark_main application at //xls/dev_tools/benchmark_main.cc.   | <a href="https://bazel.build/rules/lib/dict">Dictionary: String -> String</a> | optional |  `{}`  |
 | <a id="xls_dslx_opt_ir_test-dep"></a>dep |  The xls_dslx_opt_ir target to test.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
 | <a id="xls_dslx_opt_ir_test-dslx_test_args"></a>dslx_test_args |  Arguments of the DSLX interpreter executable. For details on the arguments, refer to the interpreter_main application at //xls/dslx/interpreter_main.cc.   | <a href="https://bazel.build/rules/lib/dict">Dictionary: String -> String</a> | optional |  `{}`  |
+| <a id="xls_dslx_opt_ir_test-evaluator"></a>evaluator |  What type of evaluator to use. 'ir-jit' will execute the tests faster but has higher startup time and less helpful failure messages. Options: ["dslx-interpreter" (default), "ir-jit", "ir-interpreter"]. Note: The 'compare' dslx_test_arg is only available with the default 'dslx-interpreter' evaluator.   | String | optional |  `"dslx-interpreter"`  |
+| <a id="xls_dslx_opt_ir_test-expect_equivalent"></a>expect_equivalent |  If true this test fails if IRs are not equivalent. If false the test only passes if the IRs are not equivalent.   | Boolean | optional |  `True`  |
 | <a id="xls_dslx_opt_ir_test-input_validator"></a>input_validator |  The DSLX library defining the input validator for this test. Mutually exclusive with "input_validator_expr".   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
 | <a id="xls_dslx_opt_ir_test-input_validator_expr"></a>input_validator_expr |  The expression to validate an input for the test function. Mutually exclusive with "input_validator".   | String | optional |  `""`  |
-| <a id="xls_dslx_opt_ir_test-ir_equivalence_args"></a>ir_equivalence_args |  Arguments of the IR equivalence tool. For details on the arguments, refer to the check_ir_equivalence_main application at //xls/tools/check_ir_equivalence_main.cc. The 'function' argument is not assigned using this attribute.   | <a href="https://bazel.build/rules/lib/dict">Dictionary: String -> String</a> | optional |  `{}`  |
+| <a id="xls_dslx_opt_ir_test-ir_equivalence_args"></a>ir_equivalence_args |  Arguments of the IR equivalence tool. For details on the arguments, refer to the check_ir_equivalence_main application at //xls/dev_tools/check_ir_equivalence_main.cc. The 'function' argument is not assigned using this attribute.   | <a href="https://bazel.build/rules/lib/dict">Dictionary: String -> String</a> | optional |  `{}`  |
 | <a id="xls_dslx_opt_ir_test-ir_eval_args"></a>ir_eval_args |  Arguments of the IR interpreter. For details on the arguments, refer to the eval_ir_main application at //xls/tools/eval_ir_main.cc.The 'top' argument is not assigned using this attribute.   | <a href="https://bazel.build/rules/lib/dict">Dictionary: String -> String</a> | optional |  `{"random_inputs": "100", "optimize_ir": "true"}`  |
-| <a id="xls_dslx_opt_ir_test-scheduling_options_proto"></a>scheduling_options_proto |  Protobuf filename of scheduling arguments to the benchmark IR tool. For details on the arguments, refer to the benchmark_main application at //xls/tools/benchmark_main.cc.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
+| <a id="xls_dslx_opt_ir_test-scheduling_options_proto"></a>scheduling_options_proto |  Protobuf filename of scheduling arguments to the benchmark IR tool. For details on the arguments, refer to the benchmark_main application at //xls/dev_tools/benchmark_main.cc.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
 | <a id="xls_dslx_opt_ir_test-top"></a>top |  The (*mangled*) name of the entry point. See get_mangled_ir_symbol. Defines the 'top' argument of the IR tool/application.   | String | optional |  `""`  |
+
+
+<a id="xls_dslx_prove_quickcheck_test"></a>
+
+## xls_dslx_prove_quickcheck_test
+
+<pre>
+load("//xls/build_rules:xls_build_defs.bzl", "xls_dslx_prove_quickcheck_test")
+
+xls_dslx_prove_quickcheck_test(<a href="#xls_dslx_prove_quickcheck_test-name">name</a>, <a href="#xls_dslx_prove_quickcheck_test-deps">deps</a>, <a href="#xls_dslx_prove_quickcheck_test-srcs">srcs</a>, <a href="#xls_dslx_prove_quickcheck_test-library">library</a>, <a href="#xls_dslx_prove_quickcheck_test-test_filter">test_filter</a>)
+</pre>
+
+Attempts to prove DSLX quickcheck properties with a SAT solver.
+
+Examples:
+
+1. xls_dslx_prove_quickcheck_test on DSLX source files.
+
+    ```
+    # Assume a xls_dslx_library target bc_dslx is present.
+    xls_dslx_prove_quickcheck_test(
+        name = "e_dslx_quickcheck_test",
+        srcs = [
+            "d.x",
+            "e.x",
+        ],
+        deps = [":bc_dslx"],
+    )
+    ```
+
+1. xls_dslx_prove_quickcheck_test on a xls_dslx_library.
+
+    ```
+    xls_dslx_library(
+        name = "b_dslx",
+        srcs = ["b.x"],
+        deps = [":a_dslx"],
+    )
+
+    xls_dslx_prove_quickcheck_test(
+        name = "b_dslx_test",
+        library = "b_dslx",
+    )
+    ```
+
+**ATTRIBUTES**
+
+
+| Name  | Description | Type | Mandatory | Default |
+| :------------- | :------------- | :------------- | :------------- | :------------- |
+| <a id="xls_dslx_prove_quickcheck_test-name"></a>name |  A unique name for this target.   | <a href="https://bazel.build/concepts/labels#target-names">Name</a> | required |  |
+| <a id="xls_dslx_prove_quickcheck_test-deps"></a>deps |  Dependency targets for the files in the 'srcs' attribute. This attribute is mutually exclusive with the 'library' attribute.   | <a href="https://bazel.build/concepts/labels">List of labels</a> | optional |  `[]`  |
+| <a id="xls_dslx_prove_quickcheck_test-srcs"></a>srcs |  Source files for the rule. The files must have a '.x' extension. This attribute is mutually exclusive with the 'library' attribute.   | <a href="https://bazel.build/concepts/labels">List of labels</a> | optional |  `[]`  |
+| <a id="xls_dslx_prove_quickcheck_test-library"></a>library |  A DSLX library target where the direct (non-transitive) files of the target are tested. This attribute is mutually exclusive with the 'srcs' and 'deps' attribute.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
+| <a id="xls_dslx_prove_quickcheck_test-test_filter"></a>test_filter |  Regex to select quickcheck tests to run.   | String | optional |  `""`  |
 
 
 <a id="xls_dslx_test"></a>
@@ -352,7 +373,9 @@ Examples:
 ## xls_dslx_test
 
 <pre>
-xls_dslx_test(<a href="#xls_dslx_test-name">name</a>, <a href="#xls_dslx_test-deps">deps</a>, <a href="#xls_dslx_test-srcs">srcs</a>, <a href="#xls_dslx_test-dslx_test_args">dslx_test_args</a>, <a href="#xls_dslx_test-library">library</a>)
+load("//xls/build_rules:xls_build_defs.bzl", "xls_dslx_test")
+
+xls_dslx_test(<a href="#xls_dslx_test-name">name</a>, <a href="#xls_dslx_test-deps">deps</a>, <a href="#xls_dslx_test-srcs">srcs</a>, <a href="#xls_dslx_test-dslx_test_args">dslx_test_args</a>, <a href="#xls_dslx_test-evaluator">evaluator</a>, <a href="#xls_dslx_test-library">library</a>)
 </pre>
 
 A dslx test executes the tests and quick checks of a DSLX source file.
@@ -397,6 +420,7 @@ Examples:
 | <a id="xls_dslx_test-deps"></a>deps |  Dependency targets for the files in the 'srcs' attribute. This attribute is mutually exclusive with the 'library' attribute.   | <a href="https://bazel.build/concepts/labels">List of labels</a> | optional |  `[]`  |
 | <a id="xls_dslx_test-srcs"></a>srcs |  Source files for the rule. The files must have a '.x' extension. This attribute is mutually exclusive with the 'library' attribute.   | <a href="https://bazel.build/concepts/labels">List of labels</a> | optional |  `[]`  |
 | <a id="xls_dslx_test-dslx_test_args"></a>dslx_test_args |  Arguments of the DSLX interpreter executable. For details on the arguments, refer to the interpreter_main application at //xls/dslx/interpreter_main.cc.   | <a href="https://bazel.build/rules/lib/dict">Dictionary: String -> String</a> | optional |  `{}`  |
+| <a id="xls_dslx_test-evaluator"></a>evaluator |  What type of evaluator to use. 'ir-jit' will execute the tests faster but has higher startup time and less helpful failure messages. Options: ["dslx-interpreter" (default), "ir-jit", "ir-interpreter"]. Note: The 'compare' dslx_test_arg is only available with the default 'dslx-interpreter' evaluator.   | String | optional |  `"dslx-interpreter"`  |
 | <a id="xls_dslx_test-library"></a>library |  A DSLX library target where the direct (non-transitive) files of the target are tested. This attribute is mutually exclusive with the 'srcs' and 'deps' attribute.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
 
 
@@ -405,6 +429,8 @@ Examples:
 ## xls_eval_ir_test
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "xls_eval_ir_test")
+
 xls_eval_ir_test(<a href="#xls_eval_ir_test-name">name</a>, <a href="#xls_eval_ir_test-src">src</a>, <a href="#xls_eval_ir_test-input_validator">input_validator</a>, <a href="#xls_eval_ir_test-input_validator_expr">input_validator_expr</a>, <a href="#xls_eval_ir_test-ir_eval_args">ir_eval_args</a>, <a href="#xls_eval_ir_test-top">top</a>)
 </pre>
 
@@ -454,7 +480,9 @@ Examples:
 ## xls_ir_equivalence_test
 
 <pre>
-xls_ir_equivalence_test(<a href="#xls_ir_equivalence_test-name">name</a>, <a href="#xls_ir_equivalence_test-ir_equivalence_args">ir_equivalence_args</a>, <a href="#xls_ir_equivalence_test-src_0">src_0</a>, <a href="#xls_ir_equivalence_test-src_1">src_1</a>, <a href="#xls_ir_equivalence_test-top">top</a>)
+load("//xls/build_rules:xls_build_defs.bzl", "xls_ir_equivalence_test")
+
+xls_ir_equivalence_test(<a href="#xls_ir_equivalence_test-name">name</a>, <a href="#xls_ir_equivalence_test-expect_equivalent">expect_equivalent</a>, <a href="#xls_ir_equivalence_test-ir_equivalence_args">ir_equivalence_args</a>, <a href="#xls_ir_equivalence_test-src_0">src_0</a>, <a href="#xls_ir_equivalence_test-src_1">src_1</a>, <a href="#xls_ir_equivalence_test-top">top</a>)
 </pre>
 
 Executes the equivalence tool on two IR files.
@@ -492,7 +520,8 @@ Examples:
 | Name  | Description | Type | Mandatory | Default |
 | :------------- | :------------- | :------------- | :------------- | :------------- |
 | <a id="xls_ir_equivalence_test-name"></a>name |  A unique name for this target.   | <a href="https://bazel.build/concepts/labels#target-names">Name</a> | required |  |
-| <a id="xls_ir_equivalence_test-ir_equivalence_args"></a>ir_equivalence_args |  Arguments of the IR equivalence tool. For details on the arguments, refer to the check_ir_equivalence_main application at //xls/tools/check_ir_equivalence_main.cc. The 'function' argument is not assigned using this attribute.   | <a href="https://bazel.build/rules/lib/dict">Dictionary: String -> String</a> | optional |  `{}`  |
+| <a id="xls_ir_equivalence_test-expect_equivalent"></a>expect_equivalent |  If true this test fails if IRs are not equivalent. If false the test only passes if the IRs are not equivalent.   | Boolean | optional |  `True`  |
+| <a id="xls_ir_equivalence_test-ir_equivalence_args"></a>ir_equivalence_args |  Arguments of the IR equivalence tool. For details on the arguments, refer to the check_ir_equivalence_main application at //xls/dev_tools/check_ir_equivalence_main.cc. The 'function' argument is not assigned using this attribute.   | <a href="https://bazel.build/rules/lib/dict">Dictionary: String -> String</a> | optional |  `{}`  |
 | <a id="xls_ir_equivalence_test-src_0"></a>src_0 |  An IR source file for the rule. A single source file must be provided. The file must have a '.ir' extension.   | <a href="https://bazel.build/concepts/labels">Label</a> | required |  |
 | <a id="xls_ir_equivalence_test-src_1"></a>src_1 |  An IR source file for the rule. A single source file must be provided. The file must have a '.ir' extension.   | <a href="https://bazel.build/concepts/labels">Label</a> | required |  |
 | <a id="xls_ir_equivalence_test-top"></a>top |  The (*mangled*) name of the entry point. See get_mangled_ir_symbol. Defines the 'top' argument of the IR tool/application.   | String | optional |  `""`  |
@@ -503,9 +532,12 @@ Examples:
 ## xls_ir_verilog_fdo
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "xls_ir_verilog_fdo")
+
 xls_ir_verilog_fdo(<a href="#xls_ir_verilog_fdo-name">name</a>, <a href="#xls_ir_verilog_fdo-src">src</a>, <a href="#xls_ir_verilog_fdo-outs">outs</a>, <a href="#xls_ir_verilog_fdo-block_ir_file">block_ir_file</a>, <a href="#xls_ir_verilog_fdo-codegen_args">codegen_args</a>, <a href="#xls_ir_verilog_fdo-codegen_options_proto">codegen_options_proto</a>,
                    <a href="#xls_ir_verilog_fdo-module_sig_file">module_sig_file</a>, <a href="#xls_ir_verilog_fdo-schedule_file">schedule_file</a>, <a href="#xls_ir_verilog_fdo-schedule_ir_file">schedule_ir_file</a>, <a href="#xls_ir_verilog_fdo-scheduling_options_proto">scheduling_options_proto</a>,
-                   <a href="#xls_ir_verilog_fdo-sta_tool">sta_tool</a>, <a href="#xls_ir_verilog_fdo-standard_cells">standard_cells</a>, <a href="#xls_ir_verilog_fdo-verilog_file">verilog_file</a>, <a href="#xls_ir_verilog_fdo-verilog_line_map_file">verilog_line_map_file</a>, <a href="#xls_ir_verilog_fdo-yosys_tool">yosys_tool</a>)
+                   <a href="#xls_ir_verilog_fdo-sta_tool">sta_tool</a>, <a href="#xls_ir_verilog_fdo-standard_cells">standard_cells</a>, <a href="#xls_ir_verilog_fdo-synthesizer_linear_interpolation_factor">synthesizer_linear_interpolation_factor</a>, <a href="#xls_ir_verilog_fdo-verilog_file">verilog_file</a>,
+                   <a href="#xls_ir_verilog_fdo-verilog_line_map_file">verilog_line_map_file</a>, <a href="#xls_ir_verilog_fdo-yosys_tool">yosys_tool</a>)
 </pre>
 
 A build rule that generates a Verilog file from an IR file using
@@ -538,18 +570,61 @@ Example:
 | <a id="xls_ir_verilog_fdo-name"></a>name |  A unique name for this target.   | <a href="https://bazel.build/concepts/labels#target-names">Name</a> | required |  |
 | <a id="xls_ir_verilog_fdo-src"></a>src |  The IR source file for the rule. A single source file must be provided. The file must have a '.ir' extension.   | <a href="https://bazel.build/concepts/labels">Label</a> | required |  |
 | <a id="xls_ir_verilog_fdo-outs"></a>outs |  The list of generated files.   | List of strings | optional |  `[]`  |
-| <a id="xls_ir_verilog_fdo-block_ir_file"></a>block_ir_file |  The filename of block-level IR file generated during codegen. If not specified, the basename of the Verilog file followed by a .block.ir extension is used.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
+| <a id="xls_ir_verilog_fdo-block_ir_file"></a>block_ir_file |  The filename of block-level IR file generated during codegen. If not specified, the basename of the Verilog file followed by a .block.ir extension is used.   | <a href="https://bazel.build/concepts/labels">Label</a>; <a href="https://bazel.build/reference/be/common-definitions#configurable-attributes">nonconfigurable</a> | optional |  `None`  |
 | <a id="xls_ir_verilog_fdo-codegen_args"></a>codegen_args |  Arguments of the codegen tool. For details on the arguments, refer to the codegen_main application at //xls/tools/codegen_main.cc.   | <a href="https://bazel.build/rules/lib/dict">Dictionary: String -> String</a> | optional |  `{}`  |
 | <a id="xls_ir_verilog_fdo-codegen_options_proto"></a>codegen_options_proto |  Filename of a protobuf with arguments of the codegen tool. For details on the arguments, refer to the codegen_main application at //xls/tools/codegen_main.cc.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
-| <a id="xls_ir_verilog_fdo-module_sig_file"></a>module_sig_file |  The filename of module signature of the generated Verilog file. If not specified, the basename of the Verilog file followed by a .sig.textproto extension is used.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
-| <a id="xls_ir_verilog_fdo-schedule_file"></a>schedule_file |  The filename of schedule of the generated Verilog file.If not specified, the basename of the Verilog file followed by a .schedule.textproto extension is used.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
-| <a id="xls_ir_verilog_fdo-schedule_ir_file"></a>schedule_ir_file |  The filename of scheduled IR file generated during scheduled. If not specified, the basename of the Verilog file followed by a .schedule.opt.ir extension is used.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
+| <a id="xls_ir_verilog_fdo-module_sig_file"></a>module_sig_file |  The filename of module signature of the generated Verilog file. If not specified, the basename of the Verilog file followed by a .sig.textproto extension is used.   | <a href="https://bazel.build/concepts/labels">Label</a>; <a href="https://bazel.build/reference/be/common-definitions#configurable-attributes">nonconfigurable</a> | optional |  `None`  |
+| <a id="xls_ir_verilog_fdo-schedule_file"></a>schedule_file |  The filename of schedule of the generated Verilog file.If not specified, the basename of the Verilog file followed by a .schedule.textproto extension is used.   | <a href="https://bazel.build/concepts/labels">Label</a>; <a href="https://bazel.build/reference/be/common-definitions#configurable-attributes">nonconfigurable</a> | optional |  `None`  |
+| <a id="xls_ir_verilog_fdo-schedule_ir_file"></a>schedule_ir_file |  The filename of scheduled IR file generated during scheduled. If not specified, the basename of the Verilog file followed by a .schedule.opt.ir extension is used.   | <a href="https://bazel.build/concepts/labels">Label</a>; <a href="https://bazel.build/reference/be/common-definitions#configurable-attributes">nonconfigurable</a> | optional |  `None`  |
 | <a id="xls_ir_verilog_fdo-scheduling_options_proto"></a>scheduling_options_proto |  Filename of a protobuf with scheduling options arguments of the codegen tool. For details on the arguments, refer to the codegen_main application at //xls/tools/codegen_main.cc.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
 | <a id="xls_ir_verilog_fdo-sta_tool"></a>sta_tool |  -   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `"@org_theopenroadproject//:opensta"`  |
 | <a id="xls_ir_verilog_fdo-standard_cells"></a>standard_cells |  -   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `"@com_google_skywater_pdk_sky130_fd_sc_hd//:sky130_fd_sc_hd"`  |
-| <a id="xls_ir_verilog_fdo-verilog_file"></a>verilog_file |  The filename of Verilog file generated. The filename must have a v extension.   | <a href="https://bazel.build/concepts/labels">Label</a> | required |  |
-| <a id="xls_ir_verilog_fdo-verilog_line_map_file"></a>verilog_line_map_file |  The filename of line map for the generated Verilog file.If not specified, the basename of the Verilog file followed by a .verilog_line_map.textproto extension is used.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
+| <a id="xls_ir_verilog_fdo-synthesizer_linear_interpolation_factor"></a>synthesizer_linear_interpolation_factor |  -   | String | optional |  `""`  |
+| <a id="xls_ir_verilog_fdo-verilog_file"></a>verilog_file |  The filename of Verilog file generated. The filename must have a v extension.   | <a href="https://bazel.build/concepts/labels">Label</a>; <a href="https://bazel.build/reference/be/common-definitions#configurable-attributes">nonconfigurable</a> | required |  |
+| <a id="xls_ir_verilog_fdo-verilog_line_map_file"></a>verilog_line_map_file |  The filename of line map for the generated Verilog file.If not specified, the basename of the Verilog file followed by a .verilog_line_map.textproto extension is used.   | <a href="https://bazel.build/concepts/labels">Label</a>; <a href="https://bazel.build/reference/be/common-definitions#configurable-attributes">nonconfigurable</a> | optional |  `None`  |
 | <a id="xls_ir_verilog_fdo-yosys_tool"></a>yosys_tool |  -   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `"//third_party/yosys"`  |
+
+
+<a id="xls_model_generation"></a>
+
+## xls_model_generation
+
+<pre>
+load("//xls/build_rules:xls_build_defs.bzl", "xls_model_generation")
+
+xls_model_generation(<a href="#xls_model_generation-name">name</a>, <a href="#xls_model_generation-samples_file">samples_file</a>, <a href="#xls_model_generation-standard_cells">standard_cells</a>)
+</pre>
+
+Builds a script to generate an XLS estimator model of a metric for one PDK corner.
+The metric can be either area or delay.
+
+This rule gathers the locations of the required dependencies
+(Yosys, OpenSTA, helper scripts, and cell libraries) and
+generates a wrapper script that invokes "run_op_characterization"
+with the dependency locations provided as args.
+
+Any extra runtime args will get passed in to the
+"run_op_characterization" script (e.g. "--debug" or "--quick_run").
+
+The script must be "run" from the root of the workspace
+to perform the op characterization.  The output textproto
+will be produced in the current directory (which, as just
+stated, must be the root of the workspace).
+
+Currently, only a subset of XLS operators are characterized,
+including most arithmetic, logical, and shift operators.
+However, many common operators such as "concat", "bit_slice",
+and "encode" are missing, and so the delay model that is
+currently produced should be considered INCOMPLETE.
+
+**ATTRIBUTES**
+
+
+| Name  | Description | Type | Mandatory | Default |
+| :------------- | :------------- | :------------- | :------------- | :------------- |
+| <a id="xls_model_generation-name"></a>name |  A unique name for this target.   | <a href="https://bazel.build/concepts/labels#target-names">Name</a> | required |  |
+| <a id="xls_model_generation-samples_file"></a>samples_file |  Proto providing sample points.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
+| <a id="xls_model_generation-standard_cells"></a>standard_cells |  Target for the PDK; will use the target's default corner.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
 
 
 <a id="cc_xls_ir_jit_wrapper"></a>
@@ -557,7 +632,9 @@ Example:
 ## cc_xls_ir_jit_wrapper
 
 <pre>
-cc_xls_ir_jit_wrapper(<a href="#cc_xls_ir_jit_wrapper-name">name</a>, <a href="#cc_xls_ir_jit_wrapper-src">src</a>, <a href="#cc_xls_ir_jit_wrapper-jit_wrapper_args">jit_wrapper_args</a>, <a href="#cc_xls_ir_jit_wrapper-kwargs">kwargs</a>)
+load("//xls/build_rules:xls_build_defs.bzl", "cc_xls_ir_jit_wrapper")
+
+cc_xls_ir_jit_wrapper(<a href="#cc_xls_ir_jit_wrapper-name">name</a>, <a href="#cc_xls_ir_jit_wrapper-src">src</a>, <a href="#cc_xls_ir_jit_wrapper-jit_wrapper_args">jit_wrapper_args</a>, <a href="#cc_xls_ir_jit_wrapper-wrapper_type">wrapper_type</a>, <a href="#cc_xls_ir_jit_wrapper-top">top</a>, <a href="#cc_xls_ir_jit_wrapper-llvm_opt_level">llvm_opt_level</a>, <a href="#cc_xls_ir_jit_wrapper-kwargs">**kwargs</a>)
 </pre>
 
 Invokes the JIT wrapper generator and compiles the result as a cc_library.
@@ -575,6 +652,9 @@ identical to this macro.
 | <a id="cc_xls_ir_jit_wrapper-name"></a>name |  The name of the cc_library target.   |  none |
 | <a id="cc_xls_ir_jit_wrapper-src"></a>src |  The path to the IR file.   |  none |
 | <a id="cc_xls_ir_jit_wrapper-jit_wrapper_args"></a>jit_wrapper_args |  Arguments of the JIT wrapper tool. Note: argument 'output_name' cannot be defined.   |  `{}` |
+| <a id="cc_xls_ir_jit_wrapper-wrapper_type"></a>wrapper_type |  The type of XLS construct to wrap. Must be one of 'BLOCK', 'FUNCTION', or 'PROC'. You should use the exported FUNCTION_WRAPPER_TYPE, BLOCK_WRAPPER_TYPE, or PROC_WRAPPER_TYPE symbols. Defaults to FUNCTION_WRAPPER_TYPE for compatibility.   |  `"FUNCTION"` |
+| <a id="cc_xls_ir_jit_wrapper-top"></a>top |  Name of the top function/proc/block.   |  `""` |
+| <a id="cc_xls_ir_jit_wrapper-llvm_opt_level"></a>llvm_opt_level |  what opt level to configure aot compiled code to use.   |  `3` |
 | <a id="cc_xls_ir_jit_wrapper-kwargs"></a>kwargs |  Keyword arguments. Named arguments.   |  none |
 
 
@@ -583,8 +663,10 @@ identical to this macro.
 ## get_mangled_ir_symbol
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "get_mangled_ir_symbol")
+
 get_mangled_ir_symbol(<a href="#get_mangled_ir_symbol-module_name">module_name</a>, <a href="#get_mangled_ir_symbol-function_name">function_name</a>, <a href="#get_mangled_ir_symbol-parametric_values">parametric_values</a>, <a href="#get_mangled_ir_symbol-is_implicit_token">is_implicit_token</a>,
-                      <a href="#get_mangled_ir_symbol-is_proc_next">is_proc_next</a>)
+                      <a href="#get_mangled_ir_symbol-is_proc_next">is_proc_next</a>, <a href="#get_mangled_ir_symbol-scope">scope</a>)
 </pre>
 
 Returns the mangled IR symbol for the module/function combination.
@@ -605,51 +687,85 @@ converted, we use their mangled names to refer to them in the IR namespace.
 | <a id="get_mangled_ir_symbol-parametric_values"></a>parametric_values |  Any parametric values used for instantiation (e.g. for a parametric entry point that is known to be instantiated in the IR converted module). This is generally for more advanced use cases like internals testing. The argument is mutually exclusive with argument 'is_proc_next'.   |  `None` |
 | <a id="get_mangled_ir_symbol-is_implicit_token"></a>is_implicit_token |  A boolean flag denoting whether the symbol contains an implicit token. The argument is mutually exclusive with argument 'is_proc_next'.   |  `False` |
 | <a id="get_mangled_ir_symbol-is_proc_next"></a>is_proc_next |  A boolean flag denoting whether the symbol is a next proc function. The argument is mutually exclusive with arguments: 'parametric_values' and 'is_implicit_token'.   |  `False` |
+| <a id="get_mangled_ir_symbol-scope"></a>scope |  The scope of the function.   |  `""` |
 
 **RETURNS**
 
 The "mangled" symbol string.
 
 
-<a id="xls_delay_model_generation"></a>
+<a id="xls_benchmark_ir"></a>
 
-## xls_delay_model_generation
+## xls_benchmark_ir
 
 <pre>
-xls_delay_model_generation(<a href="#xls_delay_model_generation-name">name</a>, <a href="#xls_delay_model_generation-standard_cells">standard_cells</a>, <a href="#xls_delay_model_generation-samples_file">samples_file</a>, <a href="#xls_delay_model_generation-kwargs">kwargs</a>)
+load("//xls/build_rules:xls_build_defs.bzl", "xls_benchmark_ir")
+
+xls_benchmark_ir(<a href="#xls_benchmark_ir-name">name</a>, <a href="#xls_benchmark_ir-src">src</a>, <a href="#xls_benchmark_ir-synthesize">synthesize</a>, <a href="#xls_benchmark_ir-codegen_args">codegen_args</a>, <a href="#xls_benchmark_ir-benchmark_ir_args">benchmark_ir_args</a>, <a href="#xls_benchmark_ir-standard_cells">standard_cells</a>, <a href="#xls_benchmark_ir-tags">tags</a>,
+                 <a href="#xls_benchmark_ir-ir_tags">ir_tags</a>, <a href="#xls_benchmark_ir-synth_tags">synth_tags</a>, <a href="#xls_benchmark_ir-kwargs">**kwargs</a>)
 </pre>
 
-Generate an XLS delay model for one PDK corner.
+Executes the benchmark tool on an IR file.
 
-This macro gathers the locations of the required dependencies
-(Yosys, OpenSTA, helper scripts, and cell libraries) and
-generates a wrapper script that invokes "run_timing_characterization"
-with the dependency locations provided as args.
+Examples:
 
-Any extra runtime args will get passed in to the
-"run_timing_characterization" script (e.g. "--debug" or "--quick_run").
+1. A file as the source.
 
-The script must be "run" from the root of the workspace
-to perform the timing characterization.  The output textproto
-will be produced in the current directory (which, as just
-stated, must be the root of the workspace).
+    ```
+    xls_benchmark_ir(
+        name = "a_benchmark",
+        src = "a.ir",
+    )
+    ```
 
-Currently, only a subset of XLS operators are characterized,
-including most arithmetic, logical, and shift operators.
-However, many common operators such as "concat", "bit_slice",
-and "encode" are missing, and so the delay model that is
-currently produced should be considered INCOMPLETE.
+1. An xls_ir_opt_ir target as the source.
 
+    ```
+    xls_ir_opt_ir(
+        name = "a_opt_ir",
+        src = "a.ir",
+    )
+
+
+    xls_benchmark_ir(
+        name = "a_benchmark",
+        src = ":a_opt_ir",
+    )
+    ```
+
+    Args:
+        name: A unique name for this target.
+        src: The IR source file for the rule. A single source file must be provided. The file must
+          have a '.ir' extension.
+        synthesize: Add a synthesis benchmark in addition to the IR benchmark.
+        codegen_args: Arguments of the codegen tool. For details on the arguments,
+          refer to the codegen_main application at
+          //xls/tools/codegen_main.cc.
+        benchmark_ir_args: Arguments of the benchmark IR tool. For details on the arguments, refer
+          to the benchmark_main application at //xls/dev_tools/benchmark_main.cc.
+        standard_cells: Label for the PDK (possibly specifying a
+          non-default corner), with the assumption that $location will
+          return the timing (Liberty) library for the PDK corner. Unused if synthesize == False.
+        tags: Tags for IR and synthesis benchmark targets.
+        ir_tags: Tags for the IR benchmark target only.
+        synth_tags: Tags for the synthesis and synthesis benchmark targets. Unused if synthesize == False.
+        **kwargs: Keyword arguments for the IR benchmark target only.
 
 **PARAMETERS**
 
 
 | Name  | Description | Default Value |
 | :------------- | :------------- | :------------- |
-| <a id="xls_delay_model_generation-name"></a>name |  Used as basename for both the script and the output textproto.   |  none |
-| <a id="xls_delay_model_generation-standard_cells"></a>standard_cells |  Label for the PDK (possibly specifying a non-default corner), with the assumption that $location will return the timing (Liberty) library for the PDK corner.   |  none |
-| <a id="xls_delay_model_generation-samples_file"></a>samples_file |  Path to proto providing sample points.   |  none |
-| <a id="xls_delay_model_generation-kwargs"></a>kwargs |  Accepts add'l keyword arguments. Passed to native.genrule().   |  none |
+| <a id="xls_benchmark_ir-name"></a>name |  <p align="center"> - </p>   |  none |
+| <a id="xls_benchmark_ir-src"></a>src |  <p align="center"> - </p>   |  none |
+| <a id="xls_benchmark_ir-synthesize"></a>synthesize |  <p align="center"> - </p>   |  `True` |
+| <a id="xls_benchmark_ir-codegen_args"></a>codegen_args |  <p align="center"> - </p>   |  `{}` |
+| <a id="xls_benchmark_ir-benchmark_ir_args"></a>benchmark_ir_args |  <p align="center"> - </p>   |  `{}` |
+| <a id="xls_benchmark_ir-standard_cells"></a>standard_cells |  <p align="center"> - </p>   |  `None` |
+| <a id="xls_benchmark_ir-tags"></a>tags |  <p align="center"> - </p>   |  `None` |
+| <a id="xls_benchmark_ir-ir_tags"></a>ir_tags |  <p align="center"> - </p>   |  `None` |
+| <a id="xls_benchmark_ir-synth_tags"></a>synth_tags |  <p align="center"> - </p>   |  `None` |
+| <a id="xls_benchmark_ir-kwargs"></a>kwargs |  <p align="center"> - </p>   |  none |
 
 
 <a id="xls_dslx_cpp_type_library"></a>
@@ -657,7 +773,9 @@ currently produced should be considered INCOMPLETE.
 ## xls_dslx_cpp_type_library
 
 <pre>
-xls_dslx_cpp_type_library(<a href="#xls_dslx_cpp_type_library-name">name</a>, <a href="#xls_dslx_cpp_type_library-src">src</a>, <a href="#xls_dslx_cpp_type_library-namespace">namespace</a>)
+load("//xls/build_rules:xls_build_defs.bzl", "xls_dslx_cpp_type_library")
+
+xls_dslx_cpp_type_library(<a href="#xls_dslx_cpp_type_library-name">name</a>, <a href="#xls_dslx_cpp_type_library-src">src</a>, <a href="#xls_dslx_cpp_type_library-deps">deps</a>, <a href="#xls_dslx_cpp_type_library-namespace">namespace</a>)
 </pre>
 
 Creates a cc_library target for transpiled DSLX types.
@@ -673,6 +791,7 @@ a cc_library with its target name identical to this macro.
 | :------------- | :------------- | :------------- |
 | <a id="xls_dslx_cpp_type_library-name"></a>name |  The name of the eventual cc_library.   |  none |
 | <a id="xls_dslx_cpp_type_library-src"></a>src |  The DSLX file whose types to compile as C++.   |  none |
+| <a id="xls_dslx_cpp_type_library-deps"></a>deps |  <p align="center"> - </p>   |  `[]` |
 | <a id="xls_dslx_cpp_type_library-namespace"></a>namespace |  The C++ namespace to generate the code in (e.g., `foo::bar`).   |  `None` |
 
 
@@ -681,7 +800,9 @@ a cc_library with its target name identical to this macro.
 ## xls_dslx_fmt_test
 
 <pre>
-xls_dslx_fmt_test(<a href="#xls_dslx_fmt_test-name">name</a>, <a href="#xls_dslx_fmt_test-src">src</a>)
+load("//xls/build_rules:xls_build_defs.bzl", "xls_dslx_fmt_test")
+
+xls_dslx_fmt_test(<a href="#xls_dslx_fmt_test-name">name</a>, <a href="#xls_dslx_fmt_test-src">src</a>, <a href="#xls_dslx_fmt_test-opportunistic_postcondition">opportunistic_postcondition</a>)
 </pre>
 
 Creates a test target that confirms `src` is auto-formatted.
@@ -693,6 +814,7 @@ Creates a test target that confirms `src` is auto-formatted.
 | :------------- | :------------- | :------------- |
 | <a id="xls_dslx_fmt_test-name"></a>name |  Name of the (diff) test target this will emit.   |  none |
 | <a id="xls_dslx_fmt_test-src"></a>src |  Source file to auto-format.   |  none |
+| <a id="xls_dslx_fmt_test-opportunistic_postcondition"></a>opportunistic_postcondition |  Flag that checks whether the output text is highly similar to the input text. Note that sometimes this /can/ flag an error for some set of valid auto-formattings, so is intended primarily for use as a development/debugging tool.   |  `False` |
 
 
 <a id="xls_dslx_ir"></a>
@@ -700,8 +822,10 @@ Creates a test target that confirms `src` is auto-formatted.
 ## xls_dslx_ir
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "xls_dslx_ir")
+
 xls_dslx_ir(<a href="#xls_dslx_ir-name">name</a>, <a href="#xls_dslx_ir-dslx_top">dslx_top</a>, <a href="#xls_dslx_ir-srcs">srcs</a>, <a href="#xls_dslx_ir-deps">deps</a>, <a href="#xls_dslx_ir-library">library</a>, <a href="#xls_dslx_ir-ir_conv_args">ir_conv_args</a>, <a href="#xls_dslx_ir-enable_generated_file">enable_generated_file</a>,
-            <a href="#xls_dslx_ir-enable_presubmit_generated_file">enable_presubmit_generated_file</a>, <a href="#xls_dslx_ir-kwargs">kwargs</a>)
+            <a href="#xls_dslx_ir-enable_presubmit_generated_file">enable_presubmit_generated_file</a>, <a href="#xls_dslx_ir-kwargs">**kwargs</a>)
 </pre>
 
 A macro that instantiates a build rule converting a DSLX source file to an IR file.
@@ -746,8 +870,10 @@ An IR conversion with a top entity defined.
 ## xls_dslx_opt_ir
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "xls_dslx_opt_ir")
+
 xls_dslx_opt_ir(<a href="#xls_dslx_opt_ir-name">name</a>, <a href="#xls_dslx_opt_ir-dslx_top">dslx_top</a>, <a href="#xls_dslx_opt_ir-srcs">srcs</a>, <a href="#xls_dslx_opt_ir-deps">deps</a>, <a href="#xls_dslx_opt_ir-library">library</a>, <a href="#xls_dslx_opt_ir-ir_conv_args">ir_conv_args</a>, <a href="#xls_dslx_opt_ir-opt_ir_args">opt_ir_args</a>,
-                <a href="#xls_dslx_opt_ir-enable_generated_file">enable_generated_file</a>, <a href="#xls_dslx_opt_ir-enable_presubmit_generated_file">enable_presubmit_generated_file</a>, <a href="#xls_dslx_opt_ir-kwargs">kwargs</a>)
+                <a href="#xls_dslx_opt_ir-enable_generated_file">enable_generated_file</a>, <a href="#xls_dslx_opt_ir-enable_presubmit_generated_file">enable_presubmit_generated_file</a>, <a href="#xls_dslx_opt_ir-kwargs">**kwargs</a>)
 </pre>
 
 A macro that instantiates a build rule generating an optimized IR file from a DSLX source file.
@@ -799,8 +925,10 @@ Examples:
 ## xls_dslx_verilog
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "xls_dslx_verilog")
+
 xls_dslx_verilog(<a href="#xls_dslx_verilog-name">name</a>, <a href="#xls_dslx_verilog-dslx_top">dslx_top</a>, <a href="#xls_dslx_verilog-verilog_file">verilog_file</a>, <a href="#xls_dslx_verilog-srcs">srcs</a>, <a href="#xls_dslx_verilog-deps">deps</a>, <a href="#xls_dslx_verilog-library">library</a>, <a href="#xls_dslx_verilog-ir_conv_args">ir_conv_args</a>, <a href="#xls_dslx_verilog-opt_ir_args">opt_ir_args</a>,
-                 <a href="#xls_dslx_verilog-codegen_args">codegen_args</a>, <a href="#xls_dslx_verilog-enable_generated_file">enable_generated_file</a>, <a href="#xls_dslx_verilog-enable_presubmit_generated_file">enable_presubmit_generated_file</a>, <a href="#xls_dslx_verilog-kwargs">kwargs</a>)
+                 <a href="#xls_dslx_verilog-codegen_args">codegen_args</a>, <a href="#xls_dslx_verilog-enable_generated_file">enable_generated_file</a>, <a href="#xls_dslx_verilog-enable_presubmit_generated_file">enable_presubmit_generated_file</a>, <a href="#xls_dslx_verilog-kwargs">**kwargs</a>)
 </pre>
 
 A macro that instantiates a build rule generating a Verilog file from a DSLX source file and tests the build.
@@ -858,6 +986,8 @@ Examples:
 ## xls_ir_cc_library
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "xls_ir_cc_library")
+
 xls_ir_cc_library(<a href="#xls_ir_cc_library-name">name</a>, <a href="#xls_ir_cc_library-src">src</a>, <a href="#xls_ir_cc_library-top">top</a>, <a href="#xls_ir_cc_library-namespaces">namespaces</a>)
 </pre>
 
@@ -899,8 +1029,10 @@ This will produce a cc_library that will execute the fn `bar` from the
 ## xls_ir_opt_ir
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "xls_ir_opt_ir")
+
 xls_ir_opt_ir(<a href="#xls_ir_opt_ir-name">name</a>, <a href="#xls_ir_opt_ir-src">src</a>, <a href="#xls_ir_opt_ir-opt_ir_args">opt_ir_args</a>, <a href="#xls_ir_opt_ir-enable_generated_file">enable_generated_file</a>, <a href="#xls_ir_opt_ir-enable_presubmit_generated_file">enable_presubmit_generated_file</a>,
-              <a href="#xls_ir_opt_ir-debug_srcs">debug_srcs</a>, <a href="#xls_ir_opt_ir-kwargs">kwargs</a>)
+              <a href="#xls_ir_opt_ir-debug_srcs">debug_srcs</a>, <a href="#xls_ir_opt_ir-kwargs">**kwargs</a>)
 </pre>
 
 A macro that instantiates a build rule optimizing an IR file.
@@ -926,9 +1058,6 @@ Examples:
     xls_ir_opt_ir(
         name = "a_opt_ir",
         src = "a.ir",
-        opt_ir_args = {
-            "inline_procs" : "true",
-        },
     )
     ```
 
@@ -952,9 +1081,11 @@ Examples:
 ## xls_ir_verilog
 
 <pre>
+load("//xls/build_rules:xls_build_defs.bzl", "xls_ir_verilog")
+
 xls_ir_verilog(<a href="#xls_ir_verilog-name">name</a>, <a href="#xls_ir_verilog-src">src</a>, <a href="#xls_ir_verilog-verilog_file">verilog_file</a>, <a href="#xls_ir_verilog-codegen_args">codegen_args</a>, <a href="#xls_ir_verilog-codegen_options_proto">codegen_options_proto</a>,
                <a href="#xls_ir_verilog-scheduling_options_proto">scheduling_options_proto</a>, <a href="#xls_ir_verilog-enable_generated_file">enable_generated_file</a>, <a href="#xls_ir_verilog-enable_presubmit_generated_file">enable_presubmit_generated_file</a>,
-               <a href="#xls_ir_verilog-kwargs">kwargs</a>)
+               <a href="#xls_ir_verilog-kwargs">**kwargs</a>)
 </pre>
 
 A macro that instantiates a build rule generating a Verilog file from an IR file and tests the build.
@@ -998,7 +1129,9 @@ Example:
 ## xls_synthesis_metrics
 
 <pre>
-xls_synthesis_metrics(<a href="#xls_synthesis_metrics-name">name</a>, <a href="#xls_synthesis_metrics-srcs">srcs</a>, <a href="#xls_synthesis_metrics-kwargs">kwargs</a>)
+load("//xls/build_rules:xls_build_defs.bzl", "xls_synthesis_metrics")
+
+xls_synthesis_metrics(<a href="#xls_synthesis_metrics-name">name</a>, <a href="#xls_synthesis_metrics-srcs">srcs</a>, <a href="#xls_synthesis_metrics-kwargs">**kwargs</a>)
 </pre>
 
 Gather per-pipeline-stage metrics from log files.

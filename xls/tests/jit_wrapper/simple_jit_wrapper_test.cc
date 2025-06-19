@@ -12,10 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdint>
+#include <limits>
+#include <memory>
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "xls/common/status/matchers.h"
-#include "xls/ir/value_helpers.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/value.h"
+#include "xls/ir/value_utils.h"
+#include "xls/ir/value_view.h"
 #include "xls/tests/jit_wrapper/fail_on_42.h"
 #include "xls/tests/jit_wrapper/identity.h"
 #include "xls/tests/jit_wrapper/is_inf.h"
@@ -25,8 +34,8 @@
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
 
 TEST(SimpleJitWrapperTest, InvokeIdentity) {

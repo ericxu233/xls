@@ -15,11 +15,14 @@
 #ifndef XLS_IR_FORMAT_STRINGS_H_
 #define XLS_IR_FORMAT_STRINGS_H_
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
 
+#include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "xls/ir/format_preference.h"
 
 namespace xls {

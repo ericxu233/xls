@@ -27,12 +27,14 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 
 namespace xls {
 namespace {
 
-using testing::HasSubstr;
-using testing::IsEmpty;
+using ::testing::HasSubstr;
+using ::testing::IsEmpty;
 
 TEST(ComparisonUtilsTest, CompareBool) {
   EXPECT_THAT(::xls::Compare("boolean", true, true), IsEmpty());

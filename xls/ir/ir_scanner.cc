@@ -14,6 +14,8 @@
 
 #include "xls/ir/ir_scanner.h"
 
+#include <cctype>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -21,11 +23,15 @@
 #include <utility>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/number_parser.h"
 
 namespace xls {
@@ -72,6 +78,8 @@ std::string LexicalTokenTypeToString(LexicalTokenType token_type) {
       return "->";
     case LexicalTokenType::kHash:
       return "#";
+    case LexicalTokenType::kBang:
+      return "!";
   }
   return absl::StrCat("LexicalTokenType(", static_cast<int>(token_type), ")");
 }
@@ -84,9 +92,8 @@ absl::StatusOr<bool> Token::IsNegative() const {
   if (type() != LexicalTokenType::kLiteral) {
     return absl::InternalError("Can only get sign for literal tokens.");
   }
-  std::pair<bool, Bits> pair;
-  XLS_ASSIGN_OR_RETURN(pair, GetSignAndMagnitude(value()));
-  return pair.first;
+  XLS_ASSIGN_OR_RETURN((auto [sign, bits]), GetSignAndMagnitude(value()));
+  return sign == Sign::kNegative;
 }
 
 absl::StatusOr<Bits> Token::GetValueBits() const {
@@ -179,8 +186,8 @@ class Tokenizer {
     int64_t content_start = index();
     while (!EndOfString()) {
       if (MatchSubstring(quote)) {
-        std::string_view content = std::string_view(
-            str_.data() + content_start, index() - content_start);
+        std::string_view content = std::string_view(str_.data() + content_start,
+                                                    index() - content_start);
         Advance(quote.size());
         return content;
       }
@@ -197,7 +204,7 @@ class Tokenizer {
   // Advances the current index into the tokenized string by the given
   // amount. Updates column and line numbers.
   int64_t Advance(int64_t amount = 1) {
-    XLS_CHECK_LE(index_ + amount, str_.size());
+    CHECK_LE(index_ + amount, str_.size());
     for (int64_t i = 0; i < amount; ++i) {
       if (current() == '\t') {
         colno_ += 2;
@@ -220,7 +227,7 @@ class Tokenizer {
   // last matching character. min_chars is the minimum number of characters
   // which are unconditionally captured.
   std::string_view CaptureWhile(std::function<bool(char)> test_f,
-                                 int64_t min_chars = 0) {
+                                int64_t min_chars = 0) {
     int64_t start = index();
     while (!EndOfString() &&
            ((index() < min_chars + start) || test_f(current()))) {
@@ -245,8 +252,8 @@ class Tokenizer {
       // digit. Literal numbers can also contain '_'s after the first
       // character which are used to improve readability (example:
       // '0xabcd_ef00').
-      if (isdigit(current()) ||
-          (current() == '-' && next().has_value() && isdigit(*next()))) {
+      if ((isdigit(current()) != 0) ||
+          (current() == '-' && next().has_value() && (isdigit(*next()) != 0))) {
         std::string_view value = CaptureWhile(
             [](char c) { return absl::ascii_isalnum(c) || c == '_'; },
             /*min_chars=*/1);
@@ -340,11 +347,14 @@ class Tokenizer {
         case '#':
           token_type = LexicalTokenType::kHash;
           break;
+        case '!':
+          token_type = LexicalTokenType::kBang;
+          break;
         default:
           std::string char_str = absl::ascii_iscntrl(current())
                                      ? absl::StrFormat("\\x%02x", current())
                                      : std::string(1, current());
-          XLS_LOG(ERROR) << "IR text with error: " << str_;
+          LOG(ERROR) << "IR text with error: " << str_;
           return absl::InvalidArgumentError(absl::StrFormat(
               "Invalid character in IR text \"%s\" @ %s", char_str,
               TokenPos{lineno(), colno()}.ToHumanString()));

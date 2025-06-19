@@ -13,7 +13,12 @@
 # limitations under the License.
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -25,8 +30,7 @@ cc_library(
         "@com_icarus_iverilog//:vvp",
     ],
     deps = [
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
+        "//xls/codegen/vast",
         "//xls/common:module_initializer",
         "//xls/common:subprocess",
         "//xls/common/file:filesystem",
@@ -34,8 +38,14 @@ cc_library(
         "//xls/common/file:temp_directory",
         "//xls/common/file:temp_file",
         "//xls/common/status:status_macros",
+        "//xls/simulation:verilog_include",
         "//xls/simulation:verilog_simulator",
-        "//xls/tools:verilog_include",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:span",
     ],
     alwayslink = 1,
 )

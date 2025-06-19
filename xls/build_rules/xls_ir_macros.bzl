@@ -21,6 +21,14 @@ load(
     "enable_generated_file_wrapper",
 )
 load(
+    "//xls/build_rules:xls_internal_aot_rules.bzl",
+    "xls_aot_generate",
+)
+load(
+    "//xls/build_rules:xls_internal_build_defs.bzl",
+    "XLS_IS_MSAN_BUILD",
+)
+load(
     "//xls/build_rules:xls_ir_rules.bzl",
     "append_xls_dslx_ir_generated_files",
     "append_xls_ir_opt_ir_generated_files",
@@ -31,7 +39,7 @@ load(
     "xls_ir_opt_ir",
 )
 load(
-    "//xls/build_rules:xls_type_check_helpers.bzl",
+    "//xls/build_rules:xls_type_check_utils.bzl",
     "bool_type_check",
     "dictionary_type_check",
     "list_type_check",
@@ -149,9 +157,6 @@ def xls_ir_opt_ir_macro(
         xls_ir_opt_ir(
             name = "a_opt_ir",
             src = "a.ir",
-            opt_ir_args = {
-                "inline_procs" : "true",
-            },
         )
         ```
 
@@ -236,30 +241,35 @@ def xls_ir_cc_library_macro(
     string_type_check("top", top, True)
     string_type_check("namespaces", namespaces)
 
-    header_file = name + ".h"
-    object_file = name + ".o"
-    source_file = name + ".cc"
-    xls_ir_cc_library(
-        name = name + "_gen_aot",
-        header_file = header_file,
-        object_file = object_file,
-        source_file = source_file,
+    aot_name = name + "_gen_aot"
+    xls_aot_generate(
+        name = aot_name,
         src = src,
         top = top,
+        # The XLS AOT compiler does not currently support cross-compilation.
+        with_msan = XLS_IS_MSAN_BUILD,
+    )
+
+    wrapper_name = name + "_gen_aot_wrapper"
+    xls_ir_cc_library(
+        name = wrapper_name,
+        file_basename = name,
+        aot_info = ":" + aot_name,
+        src = src,
         namespaces = namespaces,
     )
 
     native.cc_library(
         name = name,
         srcs = [
-            ":" + object_file,
-            ":" + source_file,
+            ":" + wrapper_name,
         ],
         hdrs = [
-            ":" + header_file,
+            ":" + wrapper_name,
         ],
         # The XLS AOT compiler does not currently support cross-compilation.
         deps = [
+            ":" + aot_name,
             "@com_google_absl//absl/status:statusor",
             "@com_google_absl//absl/types:span",
             "//xls/ir:events",

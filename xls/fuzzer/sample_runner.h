@@ -15,12 +15,12 @@
 #ifndef XLS_FUZZER_SAMPLE_RUNNER_H_
 #define XLS_FUZZER_SAMPLE_RUNNER_H_
 
+#include <cstdint>
 #include <filesystem>  // NOLINT
 #include <functional>
 #include <optional>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -29,6 +29,11 @@
 #include "xls/fuzzer/sample_summary.pb.h"
 
 namespace xls {
+
+enum class CompletedSampleKind : std::uint8_t {
+  kSuccess,  // Sample completed succesfully.
+  kSkipped,  // Sample triggered known failure.
+};
 
 // A class for performing various operations on a code sample.
 
@@ -45,27 +50,20 @@ namespace xls {
 class SampleRunner {
  public:
   struct Commands {
+    // Call the particular operation with given arguments and options. Return
+    // their output or failure status.
     using Callable = std::function<absl::StatusOr<std::string>(
-        const std::vector<std::string>& /*args*/,
-        const std::filesystem::path& /*run_dir*/,
-        const SampleOptions& /*options*/)>;
+        const std::vector<std::string>& args,
+        const std::filesystem::path& run_dir, const SampleOptions& options)>;
 
-    // When a Command is a Callable:
-    ///  it will be called as needed.
-    // When a Command is a path:
-    //   it will be treated as the path of a binary to be invoked with the
-    //   provided args, using `run_dir` as its CWD, and with
-    //   other features configured via `options`.
-    // If a Command is unspecified, the SampleRunner will default to the
-    // appropriate tool present in its runfiles.
-    using Command = std::variant<std::filesystem::path, Callable>;
-
-    std::optional<Command> codegen_main;
-    std::optional<Command> eval_ir_main;
-    std::optional<Command> eval_proc_main;
-    std::optional<Command> ir_converter_main;
-    std::optional<Command> ir_opt_main;
-    std::optional<Command> simulate_module_main;
+    // Various tools that can be invoked as simple function call.
+    // Functions might invoke external binaries to perform their task.
+    std::optional<Callable> codegen_main;
+    std::optional<Callable> eval_ir_main;
+    std::optional<Callable> eval_proc_main;
+    std::optional<Callable> ir_converter_main;
+    std::optional<Callable> ir_opt_main;
+    std::optional<Callable> simulate_module_main;
   };
 
   explicit SampleRunner(std::filesystem::path run_dir)
@@ -75,28 +73,26 @@ class SampleRunner {
 
   // Runs the provided sample, writing out files under the SampleRunner's
   // `run_dir` as appropriate.
-  absl::Status Run(const Sample& sample);
+  absl::StatusOr<CompletedSampleKind> Run(const Sample& sample);
 
   // Runs the provided files as a sample, writing out only outputs under the
   // SampleRunner's `run_dir`.
-  absl::Status RunFromFiles(
+  absl::StatusOr<CompletedSampleKind> RunFromFiles(
       const std::filesystem::path& input_path,
       const std::filesystem::path& options_path,
-      const std::optional<std::filesystem::path>& args_path,
-      const std::optional<std::filesystem::path>& ir_channel_names_path);
+      const std::filesystem::path& testvector_path);
 
   const fuzzer::SampleTimingProto& timing() const { return timing_; }
 
  private:
   // Runs a sample with a function as the top which is read from files.
-  absl::Status RunFunction(
-      const std::filesystem::path& input_path, const SampleOptions& options,
-      const std::optional<std::filesystem::path>& args_path);
+  absl::Status RunFunction(const std::filesystem::path& input_path,
+                           const SampleOptions& options,
+                           const std::filesystem::path& testvector_path);
 
-  absl::Status RunProc(
-      const std::filesystem::path& input_path, const SampleOptions& options,
-      const std::optional<std::filesystem::path>& args_path,
-      const std::optional<std::filesystem::path>& ir_channel_names_path);
+  absl::Status RunProc(const std::filesystem::path& input_path,
+                       const SampleOptions& options,
+                       const std::filesystem::path& testvector_path);
 
   const std::filesystem::path run_dir_;
   const Commands commands_;

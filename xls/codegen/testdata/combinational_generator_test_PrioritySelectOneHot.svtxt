@@ -2,20 +2,17 @@ module main(
   input wire p,
   input wire [15:0] x,
   input wire [15:0] y,
+  input wire [15:0] d,
   output wire [15:0] out
 );
-  function automatic [15:0] priority_sel_16b_2way (input reg [1:0] sel, input reg [15:0] case0, input reg [15:0] case1);
-    begin
-      unique case (sel)
-        2'b01: begin
-          priority_sel_16b_2way = case0;
-        end
-        2'b10: begin
-          priority_sel_16b_2way = case1;
-        end
-      endcase
-    end
-  endfunction
-
-  assign out = priority_sel_16b_2way({!p, p}, x, y);
+  wire [1:0] one_hot_15;
+  wire [2:0] one_hot_18;
+  wire eq_20;
+  assign one_hot_15 = {!p, p};
+  assign one_hot_18 = {one_hot_15[1:0] == 2'h0, one_hot_15[1] && !one_hot_15[0], one_hot_15[0]};
+  assign eq_20 = one_hot_15 == one_hot_18[1:0];
+  assign out = x & {16{one_hot_15[0]}} | y & {16{one_hot_15[1]}};
+  `ifdef ASSERT_ON
+  __xls_invariant_priority_sel_16_selector_one_hot_A: assert final ($isunknown(eq_20) || eq_20) else $fatal(0, "Selector one_hot.15 was expected to be one-hot, and is not.");
+  `endif  // ASSERT_ON
 endmodule

@@ -14,13 +14,17 @@
 
 // Library defining how arrays and tuples are lowered into vectors of bits by
 // the generators.
+
 #ifndef XLS_CODEGEN_FLATTENING_H_
 #define XLS_CODEGEN_FLATTENING_H_
 
+#include <cstdint>
+
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "xls/codegen/vast.h"
+#include "xls/codegen/vast/vast.h"
 #include "xls/ir/bits.h"
+#include "xls/ir/source_location.h"
 #include "xls/ir/type.h"
 #include "xls/ir/value.h"
 #include "xls/ir/xls_type.pb.h"

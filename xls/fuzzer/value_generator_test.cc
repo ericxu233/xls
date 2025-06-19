@@ -21,22 +21,24 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status_matchers.h"
 #include "xls/common/status/matchers.h"
 #include "xls/dslx/frontend/ast.h"
+#include "xls/dslx/frontend/module.h"
 #include "xls/dslx/frontend/pos.h"
 #include "xls/dslx/interp_value.h"
-#include "xls/dslx/type_system/concrete_type.h"
+#include "xls/dslx/type_system/type.h"
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
 using ::testing::HasSubstr;
 using ::testing::MatchesRegex;
 
 TEST(ValueGeneratorTest, GenerateEmptyValues) {
   std::mt19937_64 rng;
-  std::vector<const dslx::ConcreteType*> param_type_ptrs;
+  std::vector<const dslx::Type*> param_type_ptrs;
   XLS_ASSERT_OK_AND_ASSIGN(std::vector<dslx::InterpValue> values,
                            GenerateInterpValues(rng, param_type_ptrs));
   ASSERT_TRUE(values.empty());
@@ -44,12 +46,12 @@ TEST(ValueGeneratorTest, GenerateEmptyValues) {
 
 TEST(ValueGeneratorTest, GenerateSingleBitsArgument) {
   std::mt19937_64 rng;
-  std::vector<std::unique_ptr<dslx::ConcreteType>> param_types;
+  std::vector<std::unique_ptr<dslx::Type>> param_types;
   param_types.push_back(std::make_unique<dslx::BitsType>(
       /*signed=*/false,
-      /*size=*/dslx::ConcreteTypeDim::CreateU32(42)));
+      /*size=*/dslx::TypeDim::CreateU32(42)));
 
-  std::vector<const dslx::ConcreteType*> param_type_ptrs;
+  std::vector<const dslx::Type*> param_type_ptrs;
   param_type_ptrs.reserve(param_types.size());
   for (auto& t : param_types) {
     param_type_ptrs.push_back(t.get());
@@ -63,14 +65,14 @@ TEST(ValueGeneratorTest, GenerateSingleBitsArgument) {
 
 TEST(ValueGeneratorTest, GenerateMixedBitsArguments) {
   std::mt19937_64 rng;
-  std::vector<std::unique_ptr<dslx::ConcreteType>> param_types;
+  std::vector<std::unique_ptr<dslx::Type>> param_types;
   param_types.push_back(std::make_unique<dslx::BitsType>(
       /*signed=*/false,
-      /*size=*/dslx::ConcreteTypeDim::CreateU32(123)));
+      /*size=*/dslx::TypeDim::CreateU32(123)));
   param_types.push_back(std::make_unique<dslx::BitsType>(
       /*signed=*/true,
-      /*size=*/dslx::ConcreteTypeDim::CreateU32(22)));
-  std::vector<const dslx::ConcreteType*> param_type_ptrs;
+      /*size=*/dslx::TypeDim::CreateU32(22)));
+  std::vector<const dslx::Type*> param_type_ptrs;
   param_type_ptrs.reserve(param_types.size());
   for (auto& t : param_types) {
     param_type_ptrs.push_back(t.get());
@@ -86,8 +88,8 @@ TEST(ValueGeneratorTest, GenerateMixedBitsArguments) {
 
 TEST(ValueGeneratorTest, GenerateTupleArgument) {
   std::mt19937_64 rng;
-  std::vector<std::unique_ptr<dslx::ConcreteType>> param_types;
-  std::vector<std::unique_ptr<dslx::ConcreteType>> tuple_members;
+  std::vector<std::unique_ptr<dslx::Type>> param_types;
+  std::vector<std::unique_ptr<dslx::Type>> tuple_members;
   tuple_members.push_back(
       std::make_unique<dslx::BitsType>(/*signed=*/false, /*size=*/123));
   tuple_members.push_back(
@@ -95,7 +97,7 @@ TEST(ValueGeneratorTest, GenerateTupleArgument) {
   param_types.push_back(
       std::make_unique<dslx::TupleType>(std::move(tuple_members)));
 
-  std::vector<const dslx::ConcreteType*> param_type_ptrs;
+  std::vector<const dslx::Type*> param_type_ptrs;
   param_type_ptrs.reserve(param_types.size());
   for (auto& t : param_types) {
     param_type_ptrs.push_back(t.get());
@@ -111,14 +113,14 @@ TEST(ValueGeneratorTest, GenerateTupleArgument) {
 
 TEST(ValueGeneratorTest, GenerateArrayArgument) {
   std::mt19937_64 rng;
-  std::vector<std::unique_ptr<dslx::ConcreteType>> param_types;
+  std::vector<std::unique_ptr<dslx::Type>> param_types;
   param_types.push_back(std::make_unique<dslx::ArrayType>(
       std::make_unique<dslx::BitsType>(
           /*signed=*/true,
-          /*size=*/dslx::ConcreteTypeDim::CreateU32(4)),
-      dslx::ConcreteTypeDim::CreateU32(24)));
+          /*size=*/dslx::TypeDim::CreateU32(4)),
+      dslx::TypeDim::CreateU32(24)));
 
-  std::vector<const dslx::ConcreteType*> param_type_ptrs;
+  std::vector<const dslx::Type*> param_type_ptrs;
   param_type_ptrs.reserve(param_types.size());
   for (auto& t : param_types) {
     param_type_ptrs.push_back(t.get());
@@ -133,11 +135,12 @@ TEST(ValueGeneratorTest, GenerateArrayArgument) {
 }
 
 TEST(ValueGeneratorTest, GenerateDslxConstantBits) {
-  dslx::Module module("test", /*fs_path=*/std::nullopt);
+  dslx::FileTable file_table;
+  dslx::Module module("test", /*fs_path=*/std::nullopt, file_table);
   std::mt19937_64 rng;
   dslx::BuiltinTypeAnnotation* type = module.Make<dslx::BuiltinTypeAnnotation>(
       dslx::FakeSpan(), dslx::BuiltinType::kU32,
-      module.GetOrCreateBuiltinNameDef("u32"));
+      module.GetOrCreateBuiltinNameDef(dslx::BuiltinType::kU32));
   XLS_ASSERT_OK_AND_ASSIGN(dslx::Expr * expr,
                            GenerateDslxConstant(rng, &module, type));
   ASSERT_NE(expr, nullptr);
@@ -145,18 +148,19 @@ TEST(ValueGeneratorTest, GenerateDslxConstantBits) {
 }
 
 TEST(ValueGeneratorTest, GenerateDslxConstantArrayOfBuiltinLessThan64) {
-  dslx::Module module("test", /*fs_path=*/std::nullopt);
+  dslx::FileTable file_table;
+  dslx::Module module("test", /*fs_path=*/std::nullopt, file_table);
   std::mt19937_64 rng;
   dslx::BuiltinTypeAnnotation* dim_type =
       module.Make<dslx::BuiltinTypeAnnotation>(
           dslx::FakeSpan(), dslx::BuiltinType::kU32,
-          module.GetOrCreateBuiltinNameDef("u32"));
+          module.GetOrCreateBuiltinNameDef(dslx::BuiltinType::kU32));
   dslx::Number* dim = module.Make<dslx::Number>(
       dslx::FakeSpan(), "32", dslx::NumberKind::kOther, dim_type);
   dslx::BuiltinTypeAnnotation* element_type =
       module.Make<dslx::BuiltinTypeAnnotation>(
           dslx::FakeSpan(), dslx::BuiltinType::kSN,
-          module.GetOrCreateBuiltinNameDef("sN"));
+          module.GetOrCreateBuiltinNameDef(dslx::BuiltinType::kSN));
   dslx::ArrayTypeAnnotation* type = module.Make<dslx::ArrayTypeAnnotation>(
       dslx::FakeSpan(), element_type, dim);
   XLS_ASSERT_OK_AND_ASSIGN(dslx::Expr * expr,
@@ -166,18 +170,19 @@ TEST(ValueGeneratorTest, GenerateDslxConstantArrayOfBuiltinLessThan64) {
 }
 
 TEST(ValueGeneratorTest, GenerateDslxConstantArrayOfBuiltinGreaterThan64) {
-  dslx::Module module("test", /*fs_path=*/std::nullopt);
+  dslx::FileTable file_table;
+  dslx::Module module("test", /*fs_path=*/std::nullopt, file_table);
   std::mt19937_64 rng;
   dslx::BuiltinTypeAnnotation* dim_type =
       module.Make<dslx::BuiltinTypeAnnotation>(
           dslx::FakeSpan(), dslx::BuiltinType::kU32,
-          module.GetOrCreateBuiltinNameDef("u32"));
+          module.GetOrCreateBuiltinNameDef(dslx::BuiltinType::kU32));
   dslx::Number* dim = module.Make<dslx::Number>(
       dslx::FakeSpan(), "65", dslx::NumberKind::kOther, dim_type);
   dslx::BuiltinTypeAnnotation* element_type =
       module.Make<dslx::BuiltinTypeAnnotation>(
           dslx::FakeSpan(), dslx::BuiltinType::kSN,
-          module.GetOrCreateBuiltinNameDef("sN"));
+          module.GetOrCreateBuiltinNameDef(dslx::BuiltinType::kSN));
   dslx::ArrayTypeAnnotation* type = module.Make<dslx::ArrayTypeAnnotation>(
       dslx::FakeSpan(), element_type, dim);
   XLS_ASSERT_OK_AND_ASSIGN(dslx::Expr * expr,
@@ -186,17 +191,47 @@ TEST(ValueGeneratorTest, GenerateDslxConstantArrayOfBuiltinGreaterThan64) {
   EXPECT_THAT(expr->ToString(), HasSubstr("sN[u32:65]:"));
 }
 
+TEST(ValueGeneratorTest, GenerateDslxConstantArrayOfBitsConstructor) {
+  dslx::FileTable file_table;
+  dslx::Module module("test", /*fs_path=*/std::nullopt, file_table);
+  std::mt19937_64 rng;
+
+  // The type annotation for a bits constructor is:
+  // `x: xN[false][7]`
+  // i.e. a nested array type annotation.
+  auto* element_type = module.Make<dslx::BuiltinTypeAnnotation>(
+      dslx::FakeSpan(), dslx::BuiltinType::kXN,
+      module.GetOrCreateBuiltinNameDef(dslx::BuiltinType::kXN));
+
+  // Wrap that in an array of dimension `false`.
+  auto* expr_false = module.Make<dslx::Number>(
+      dslx::FakeSpan(), "0", dslx::NumberKind::kOther, /*type=*/nullptr);
+  auto* xn_false = module.Make<dslx::ArrayTypeAnnotation>(
+      dslx::FakeSpan(), element_type, expr_false);
+
+  // Wrap that in an array of dimension `7`.
+  auto* expr_7 = module.Make<dslx::Number>(
+      dslx::FakeSpan(), "7", dslx::NumberKind::kOther, /*type=*/nullptr);
+  auto* xn_false_7 = module.Make<dslx::ArrayTypeAnnotation>(dslx::FakeSpan(),
+                                                            xn_false, expr_7);
+  XLS_ASSERT_OK_AND_ASSIGN(dslx::Expr * expr,
+                           GenerateDslxConstant(rng, &module, xn_false_7));
+  ASSERT_NE(expr, nullptr);
+  EXPECT_THAT(expr->ToString(), HasSubstr("xN[0][7]:"));
+}
+
 TEST(ValueGeneratorTest, GenerateDslxConstantTuple) {
-  dslx::Module module("test", /*fs_path=*/std::nullopt);
+  dslx::FileTable file_table;
+  dslx::Module module("test", /*fs_path=*/std::nullopt, file_table);
   std::mt19937_64 rng;
   dslx::BuiltinTypeAnnotation* element0 =
       module.Make<dslx::BuiltinTypeAnnotation>(
           dslx::FakeSpan(), dslx::BuiltinType::kU32,
-          module.GetOrCreateBuiltinNameDef("u32"));
+          module.GetOrCreateBuiltinNameDef(dslx::BuiltinType::kU32));
   dslx::BuiltinTypeAnnotation* element1 =
       module.Make<dslx::BuiltinTypeAnnotation>(
           dslx::FakeSpan(), dslx::BuiltinType::kS32,
-          module.GetOrCreateBuiltinNameDef("s32"));
+          module.GetOrCreateBuiltinNameDef(dslx::BuiltinType::kS32));
   dslx::TupleTypeAnnotation* type = module.Make<dslx::TupleTypeAnnotation>(
       dslx::FakeSpan(), std::vector<dslx::TypeAnnotation*>{element0, element1});
   XLS_ASSERT_OK_AND_ASSIGN(dslx::Expr * expr,

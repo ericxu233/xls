@@ -12,31 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <cstdio>
+#include <cstdint>
 #include <list>
-#include <memory>
-#include <ostream>
 #include <string>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
-#include "absl/strings/match.h"
-#include "absl/strings/str_format.h"
-#include "google/protobuf/message.h"
-#include "google/protobuf/text_format.h"
-#include "xls/common/file/temp_file.h"
-#include "xls/common/status/matchers.h"
-#include "xls/common/status/status_macros.h"
+#include "absl/status/status_matchers.h"
 #include "xls/contrib/xlscc/hls_block.pb.h"
-#include "xls/contrib/xlscc/metadata_output.pb.h"
 #include "xls/contrib/xlscc/translator.h"
+#include "xls/contrib/xlscc/translator_types.h"
 #include "xls/contrib/xlscc/unit_tests/unit_test.h"
-#include "xls/interpreter/function_interpreter.h"
 #include "xls/ir/bits.h"
-#include "xls/ir/ir_test_base.h"
-#include "xls/ir/nodes.h"
 #include "xls/ir/value.h"
 
 namespace xlscc {
@@ -147,12 +137,12 @@ TEST_F(TranslatorIOTest, ProcNonblockingRead) {
     HLSChannel* ch_in = block_spec.add_channels();
     ch_in->set_name("in");
     ch_in->set_is_input(true);
-    ch_in->set_type(FIFO);
+    ch_in->set_type(CHANNEL_TYPE_FIFO);
 
     HLSChannel* ch_out = block_spec.add_channels();
     ch_out->set_name("out");
     ch_out->set_is_input(false);
-    ch_out->set_type(FIFO);
+    ch_out->set_type(CHANNEL_TYPE_FIFO);
   }
 
   {
@@ -397,10 +387,10 @@ TEST_F(TranslatorIOTest, SubroutineDeclMissing) {
          out.write(55);
        })";
 
-  ASSERT_THAT(SourceToIr(content, /*func=*/nullptr, /* clang_argv= */ {},
+  ASSERT_THAT(SourceToIr(content, /*pfunc=*/nullptr, /* clang_argv= */ {},
                          /* io_test_mode= */ true)
                   .status(),
-              xls::status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kNotFound,
                   testing::HasSubstr("sub_recv used but has no body")));
 }
@@ -553,7 +543,7 @@ TEST_F(TranslatorIOTest, OperatorSubroutine) {
       SourceToIr(content, /* pfunc= */ nullptr, /* clang_argv= */ {},
                  /* io_test_mode= */ true)
           .status(),
-      xls::status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kUnimplemented,
           testing::HasSubstr("IO ops in operator calls are not supported")));
 }
@@ -803,7 +793,38 @@ TEST_F(TranslatorIOTest, Unrolled) {
   IOTest(content, /*inputs=*/{},
          /*outputs=*/
          {IOOpTest("out", 0, true), IOOpTest("out", 1, true),
-          IOOpTest("out", 2, true), IOOpTest("out", 3, true)});
+          IOOpTest("out", 2, true), IOOpTest("out", 3, true)},
+         /*args=*/{},
+         /*total_io_ops=*/4);
+}
+
+TEST_F(TranslatorIOTest, UnrolledConditionalIO) {
+  const std::string content = R"(
+       #pragma hls_top
+       void my_package(__xls_channel<int>& in,
+                       __xls_channel<int>& out) {
+         int ctrl = in.read();
+         int ret = 5;
+         #pragma hls_unroll yes
+         for(int i=0;i<3;++i) {
+           if(ctrl == 1) {
+            ret += 2*in.read();
+           }
+         }
+         out.write(ret);
+       })";
+
+  IOTest(content,
+         /*inputs=*/
+         {IOOpTest("in", 1, true), IOOpTest("in", 10, true),
+          IOOpTest("in", 20, true), IOOpTest("in", 100, true)},
+         /*outputs=*/{IOOpTest("out", 265, true)});
+
+  IOTest(content,
+         /*inputs=*/
+         {IOOpTest("in", 0, true), IOOpTest("in", 0, false),
+          IOOpTest("in", 0, false), IOOpTest("in", 0, false)},
+         /*outputs=*/{IOOpTest("out", 5, true)});
 }
 
 TEST_F(TranslatorIOTest, UnrolledSubroutine) {
@@ -1021,7 +1042,7 @@ TEST_F(TranslatorIOTest, NonparameterIOOps) {
        })";
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kInvalidArgument,
                   testing::HasSubstr("hannel declaration uninitialized")));
 }
@@ -1207,10 +1228,10 @@ TEST_F(TranslatorIOTest, MuxTwoInputs) {
       out.write(v);
     })";
 
-  ASSERT_THAT(SourceToIr(content, /*func=*/nullptr, /* clang_argv= */ {},
+  ASSERT_THAT(SourceToIr(content, /*pfunc=*/nullptr, /* clang_argv= */ {},
                          /* io_test_mode= */ true)
                   .status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kOk));
+              absl_testing::StatusIs(absl::StatusCode::kOk));
 }
 
 TEST_F(TranslatorIOTest, AcChannelAlias) {
@@ -1266,7 +1287,7 @@ TEST_F(TranslatorIOTest, TernaryOnChannelsRead) {
   const std::string content = R"(
        #include "/xls_builtin.h"
        #pragma hls_top
-       void my_package(__xls_channel<int>& dir_in, 
+       void my_package(__xls_channel<int>& dir_in,
                        __xls_channel<int>& in1,
                        __xls_channel<int>& in2,
                        __xls_channel<int>& out) {
@@ -1291,15 +1312,15 @@ TEST_F(TranslatorIOTest, ReturnChannelSubroutine) {
   const std::string content = R"(
        template<typename T>
        using my_ch = __xls_channel<T>;
-  
-       my_ch<int>& SelectCh(bool select_a, 
+
+       my_ch<int>& SelectCh(bool select_a,
                         my_ch<int>& ac,
                         my_ch<int>& bc) {
           return ac;
        }
-       
+
        #pragma hls_top
-       void my_package(my_ch<int>& dir_in, 
+       void my_package(my_ch<int>& dir_in,
                        my_ch<int>& in1,
                        my_ch<int>& in2,
                        my_ch<int>& out) {
@@ -1324,15 +1345,15 @@ TEST_F(TranslatorIOTest, TernaryOnChannelsReadSubroutine) {
   const std::string content = R"(
        template<typename T>
        using my_ch = __xls_channel<T>;
-  
-       my_ch<int>& SelectCh(bool select_a, 
+
+       my_ch<int>& SelectCh(bool select_a,
                         my_ch<int>& ac,
                         my_ch<int>& bc) {
           return select_a ? ac : bc;
        }
-       
+
        #pragma hls_top
-       void my_package(my_ch<int>& dir_in, 
+       void my_package(my_ch<int>& dir_in,
                        my_ch<int>& in1,
                        my_ch<int>& in2,
                        my_ch<int>& out) {
@@ -1359,16 +1380,16 @@ TEST_F(TranslatorIOTest, TernaryOnChannelsReadSubroutineTemplated) {
   const std::string content = R"(
        template<typename T>
        using my_ch = __xls_channel<T>;
-  
+
        template<typename T>
-       my_ch<T>& SelectCh(bool select_a, 
+       my_ch<T>& SelectCh(bool select_a,
                         my_ch<T>& ac,
                         my_ch<T>& bc) {
           return select_a ? ac : bc;
        }
-       
+
        #pragma hls_top
-       void my_package(my_ch<int>& dir_in, 
+       void my_package(my_ch<int>& dir_in,
                        my_ch<int>& in1,
                        my_ch<int>& in2,
                        my_ch<int>& out) {
@@ -1395,17 +1416,17 @@ TEST_F(TranslatorIOTest, TernaryOnChannelsReadSubroutine2) {
   const std::string content = R"(
        template<typename T>
        using my_ch = __xls_channel<T>;
-  
-       my_ch<int>& SelectCh(bool select_a, 
+
+       my_ch<int>& SelectCh(bool select_a,
                             bool select_c,
                             my_ch<int>& ac,
                             my_ch<int>& bc,
                             my_ch<int>& cc) {
           return select_c ? cc : (!select_a ? ac : bc);
        }
-       
+
        #pragma hls_top
-       void my_package(my_ch<int>& dir_a_in, 
+       void my_package(my_ch<int>& dir_a_in,
                        my_ch<int>& dir_c_in,
                        my_ch<int>& ina,
                        my_ch<int>& inb,
@@ -1447,7 +1468,7 @@ TEST_F(TranslatorIOTest, TernaryOnChannelsReadSubroutineSwitch) {
   const std::string content = R"(
        template<typename T>
        using my_ch = __xls_channel<T>;
-  
+
        my_ch<int>& SelectCh(int idx, my_ch<int>& a, my_ch<int>& b) {
         switch (idx) {
           default:
@@ -1459,9 +1480,9 @@ TEST_F(TranslatorIOTest, TernaryOnChannelsReadSubroutineSwitch) {
             return a;
           }
         }
-  
+
        #pragma hls_top
-       void my_package(my_ch<int>& dir_in, 
+       void my_package(my_ch<int>& dir_in,
                        my_ch<int>& in1,
                        my_ch<int>& in2,
                        my_ch<int>& out) {
@@ -1514,12 +1535,12 @@ TEST_F(TranslatorIOTest, TernaryOnChannelsReadSubroutineSwitchTemplated) {
             return a;
           }
         }
-  
+
        template<typename T>
        using my_ch = __xls_channel<T>;
 
        #pragma hls_top
-       void my_package(my_ch<int>& dir_in, 
+       void my_package(my_ch<int>& dir_in,
                        my_ch<int>& in1,
                        my_ch<int>& in2,
                        my_ch<int>& out) {
@@ -1561,7 +1582,7 @@ TEST_F(TranslatorIOTest, TernaryOnChannelsReadAssign) {
   const std::string content = R"(
        #include "/xls_builtin.h"
        #pragma hls_top
-       void my_package(__xls_channel<int>& dir_in, 
+       void my_package(__xls_channel<int>& dir_in,
                        __xls_channel<int>& in1,
                        __xls_channel<int>& in2,
                        __xls_channel<int>& out) {
@@ -1589,7 +1610,7 @@ TEST_F(TranslatorIOTest, TernaryOnChannelsWrite) {
        #include "/xls_builtin.h"
        #pragma hls_top
        void my_package(__xls_channel<int>& dir_in,
-                       __xls_channel<int>& in, 
+                       __xls_channel<int>& in,
                        __xls_channel<int>& out1,
                        __xls_channel<int>& out2) {
           const int dir = dir_in.read();
@@ -1611,7 +1632,7 @@ TEST_F(TranslatorIOTest, TernaryOnChannelsNonblocking) {
   const std::string content = R"(
        #include "/xls_builtin.h"
        #pragma hls_top
-       void my_package(__xls_channel<int>& dir_in, 
+       void my_package(__xls_channel<int>& dir_in,
                        __xls_channel<int>& in1,
                        __xls_channel<int>& in2,
                        __xls_channel<int>& out) {
@@ -1659,7 +1680,7 @@ TEST_F(TranslatorIOTest, TernaryChannelRefParam) {
         return ch.read();
        }
        #pragma hls_top
-       void my_package(__xls_channel<int>& dir_in, 
+       void my_package(__xls_channel<int>& dir_in,
                        __xls_channel<int>& in1,
                        __xls_channel<int>& in2,
                        __xls_channel<int>& out) {
@@ -1672,7 +1693,7 @@ TEST_F(TranslatorIOTest, TernaryChannelRefParam) {
   ASSERT_THAT(SourceToIr(content, &func, /* clang_argv= */ {},
                          /* io_test_mode= */ true)
                   .status(),
-              xls::status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kUnimplemented,
                   testing::HasSubstr("hannel select passed as parameter")));
 }
@@ -1684,7 +1705,7 @@ TEST_F(TranslatorIOTest, ChannelRefInStructSubroutineRef) {
         SenderThing(__xls_channel<int>& ch, int out_init = 3)
           : ch(ch), out(out_init)
         {}
-       
+
         void send(int offset) {
           ch.write(offset + out);
         }
@@ -1692,7 +1713,7 @@ TEST_F(TranslatorIOTest, ChannelRefInStructSubroutineRef) {
         __xls_channel<int>& ch;
         int out;
        };
-       
+
        void SubSend(SenderThing& sender, int val) {
         sender.send(val);
        }
@@ -1709,7 +1730,7 @@ TEST_F(TranslatorIOTest, ChannelRefInStructSubroutineRef) {
   ASSERT_THAT(SourceToIr(content, &func, /* clang_argv= */ {},
                          /* io_test_mode= */ true)
                   .status(),
-              xls::status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kUnimplemented,
                   testing::HasSubstr("arameters containing LValues")));
 }
@@ -1720,7 +1741,7 @@ TEST_F(TranslatorIOTest, TopParameterStructWithChannel) {
         int x;
         __xls_channel<int> ch;
         int y;
-      }; 
+      };
       #include "/xls_builtin.h"
       #pragma hls_top
       void my_package(Block in,
@@ -1729,12 +1750,12 @@ TEST_F(TranslatorIOTest, TopParameterStructWithChannel) {
       })";
 
   xlscc::GeneratedFunction* func;
-  ASSERT_THAT(SourceToIr(content, &func, /* clang_argv= */ {},
-                         /* io_test_mode= */ true)
-                  .status(),
-              xls::status_testing::StatusIs(
-                  absl::StatusCode::kUnimplemented,
-                  testing::HasSubstr("lvalues in nested structs")));
+  ASSERT_THAT(
+      SourceToIr(content, &func, /* clang_argv= */ {},
+                 /* io_test_mode= */ true)
+          .status(),
+      absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                             testing::HasSubstr("lvalues in nested structs")));
 }
 
 TEST_F(TranslatorIOTest, DebugAssert) {
@@ -1971,10 +1992,9 @@ TEST_F(TranslatorIOTest, DebugTracePointer) {
          out.write(3*r);
        })";
 
-  ASSERT_THAT(
-      SourceToIr(content).status(),
-      xls::status_testing::StatusIs(absl::StatusCode::kInvalidArgument,
-                                    testing::HasSubstr("must have R-Value")));
+  ASSERT_THAT(SourceToIr(content).status(),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     testing::HasSubstr("must have R-Value")));
 }
 
 TEST_F(TranslatorIOTest, DebugTraceStruct) {
@@ -2023,8 +2043,8 @@ TEST_F(TranslatorIOTest, DebugTraceStructWithReference) {
        })";
 
   ASSERT_THAT(SourceToIr(content).status(),
-              xls::status_testing::StatusIs(absl::StatusCode::kUnimplemented,
-                                            testing::HasSubstr("LValue")));
+              absl_testing::StatusIs(absl::StatusCode::kUnimplemented,
+                                     testing::HasSubstr("LValue")));
 }
 
 }  // namespace

@@ -21,6 +21,8 @@
 #include <cstdint>
 
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
+#include "xls/netlist/cell_library.h"
 #include "xls/netlist/netlist.h"
 
 namespace xls {

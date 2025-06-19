@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_NOC_CONFIG_CUSTOM_TOPOLOGY_OPTIONS_PROTO_BUILDER_H_
-#define XLS_NOC_CONFIG_CUSTOM_TOPOLOGY_OPTIONS_PROTO_BUILDER_H_
-
-#include "xls/noc/config_ng/topology_options_network_config_builder.pb.h"
+#ifndef XLS_NOC_CONFIG_NG_CUSTOM_TOPOLOGY_OPTIONS_PROTO_BUILDER_H_
+#define XLS_NOC_CONFIG_NG_CUSTOM_TOPOLOGY_OPTIONS_PROTO_BUILDER_H_
 
 #include "xls/noc/config_ng/channel_options_proto_builder.h"
 #include "xls/noc/config_ng/node_options_proto_builder.h"
+#include "xls/noc/config_ng/topology_options_network_config_builder.pb.h"
 
 namespace xls::noc {
 
@@ -60,4 +59,4 @@ class CustomTopologyOptionsProtoBuilder {
 
 }  // namespace xls::noc
 
-#endif  // XLS_NOC_CONFIG_CUSTOM_TOPOLOGY_OPTIONS_PROTO_BUILDER_H_
+#endif  // XLS_NOC_CONFIG_NG_CUSTOM_TOPOLOGY_OPTIONS_PROTO_BUILDER_H_

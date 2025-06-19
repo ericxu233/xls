@@ -14,21 +14,32 @@
 
 #include "xls/interpreter/serial_proc_runtime.h"
 
-#include <algorithm>
 #include <deque>
 #include <memory>
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
+#include "absl/memory/memory.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
 #include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/interpreter/channel_queue.h"
+#include "xls/interpreter/evaluator_options.h"
+#include "xls/interpreter/proc_evaluator.h"
+#include "xls/ir/events.h"
+#include "xls/ir/package.h"
+#include "xls/ir/proc_elaboration.h"
 
 namespace xls {
 
-/* static */
-absl::StatusOr<std::unique_ptr<SerialProcRuntime>> SerialProcRuntime::Create(
-    Package* package, std::vector<std::unique_ptr<ProcEvaluator>>&& evaluators,
-    std::unique_ptr<ChannelQueueManager>&& queue_manager) {
+/* static */ absl::StatusOr<std::unique_ptr<SerialProcRuntime>>
+SerialProcRuntime::Create(
+    std::vector<std::unique_ptr<ProcEvaluator>>&& evaluators,
+    std::unique_ptr<ChannelQueueManager>&& queue_manager,
+    const EvaluatorOptions& options) {
   // Verify there exists exactly one evaluator per proc in the package.
   absl::flat_hash_map<Proc*, std::unique_ptr<ProcEvaluator>> evaluator_map;
   for (std::unique_ptr<ProcEvaluator>& evaluator : evaluators) {
@@ -37,81 +48,98 @@ absl::StatusOr<std::unique_ptr<SerialProcRuntime>> SerialProcRuntime::Create(
     XLS_RET_CHECK(inserted) << absl::StreamFormat(
         "More than one evaluator given for proc `%s`", proc->name());
   }
-  for (const std::unique_ptr<Proc>& proc : package->procs()) {
-    XLS_RET_CHECK(evaluator_map.contains(proc.get()))
+  for (Proc* proc : queue_manager->elaboration().procs()) {
+    XLS_RET_CHECK(evaluator_map.contains(proc))
         << absl::StreamFormat("No evaluator given for proc `%s`", proc->name());
   }
-  XLS_RET_CHECK_EQ(evaluator_map.size(), package->procs().size())
+  XLS_RET_CHECK_EQ(evaluator_map.size(),
+                   queue_manager->elaboration().procs().size())
       << "More evaluators than procs given.";
   auto network_interpreter = absl::WrapUnique(new SerialProcRuntime(
-      package, std::move(evaluator_map), std::move(queue_manager)));
+      std::move(evaluator_map), std::move(queue_manager), options));
   return std::move(network_interpreter);
 }
 
 absl::StatusOr<SerialProcRuntime::NetworkTickResult>
 SerialProcRuntime::TickInternal() {
-  XLS_VLOG(3) << absl::StreamFormat("TickInternal on package %s",
-                                    package_->name());
-  // Map containing any blocked procs and the channels they are blocked on.
-  absl::flat_hash_map<Channel*, Proc*> blocked_procs;
+  VLOG(3) << absl::StreamFormat("TickInternal on package %s",
+                                package()->name());
+  // Map containing any blocked proc instances and the channels they are blocked
+  // on.
+  absl::flat_hash_map<ChannelInstance*, ProcInstance*> blocked_instances;
 
-  std::deque<Proc*> ready_procs;
+  struct QueueElement {
+    ProcInstance* instance;
+    ProcEvaluator* evaluator;
+    ProcContinuation* continuation;
+  };
+  std::deque<QueueElement> ready_instances;
 
-  // Put all procs on the ready list.
-  for (const std::unique_ptr<Proc>& proc : package_->procs()) {
-    XLS_VLOG(3) << absl::StreamFormat("Proc `%s` added to ready list",
-                                      proc->name());
-    ready_procs.push_back(proc.get());
+  // Put all proc instances on the ready list.
+  for (ProcInstance* instance : elaboration().proc_instances()) {
+    VLOG(3) << absl::StreamFormat("Proc instance `%s` added to ready list",
+                                  instance->GetName());
+    ready_instances.push_back(
+        QueueElement{.instance = instance,
+                     .evaluator = evaluators_.at(instance->proc()).get(),
+                     .continuation = continuations_.at(instance).get()});
   }
 
   bool progress_made = false;
   bool progress_made_on_io_procs = false;
-  while (!ready_procs.empty()) {
-    Proc* proc = ready_procs.front();
-    EvaluatorContext& context = evaluator_contexts_.at(proc);
-    ready_procs.pop_front();
+  while (!ready_instances.empty()) {
+    const QueueElement element = ready_instances.front();
+    ready_instances.pop_front();
 
-    XLS_VLOG(3) << absl::StreamFormat("Ticking proc `%s`", proc->name());
+    VLOG(3) << absl::StreamFormat("Ticking proc instance `%s`",
+                                  element.instance->GetName());
     XLS_ASSIGN_OR_RETURN(TickResult tick_result,
-                         context.evaluator->Tick(*context.continuation));
-    XLS_VLOG(3) << "Tick result: " << tick_result;
+                         element.evaluator->Tick(*element.continuation));
+    const InterpreterEvents& events =
+        this->GetInterpreterEvents(element.instance);
+    XLS_RETURN_IF_ERROR(InterpreterEventsToStatus(events));
+    VLOG(3) << "Tick result: " << tick_result;
 
     progress_made |= tick_result.progress_made;
     progress_made_on_io_procs |=
-        (tick_result.progress_made && context.evaluator->ProcHasIoOperations());
+        (tick_result.progress_made && element.evaluator->ProcHasIoOperations());
     if (tick_result.execution_state == TickExecutionState::kSentOnChannel) {
-      Channel* channel = tick_result.channel.value();
-      if (blocked_procs.contains(channel)) {
-        XLS_VLOG(3) << absl::StreamFormat(
-            "Unblocking proc `%s` and adding to ready list",
-            blocked_procs.at(channel)->name());
-        ready_procs.push_back(blocked_procs.at(channel));
-        blocked_procs.erase(channel);
+      ChannelInstance* channel_instance = tick_result.channel_instance.value();
+      if (blocked_instances.contains(channel_instance)) {
+        VLOG(3) << absl::StreamFormat(
+            "Unblocking proc instance `%s` and adding to ready list",
+            blocked_instances.at(channel_instance)->GetName());
+        ProcInstance* instance = blocked_instances.at(channel_instance);
+        ready_instances.push_back(
+            QueueElement{.instance = instance,
+                         .evaluator = evaluators_.at(instance->proc()).get(),
+                         .continuation = continuations_.at(instance).get()});
+        blocked_instances.erase(channel_instance);
       }
-      // This proc can go back on the ready queue.
-      ready_procs.push_back(proc);
+      // This proc instance can go back on the ready queue.
+      ready_instances.push_back(element);
     } else if (tick_result.execution_state ==
                TickExecutionState::kBlockedOnReceive) {
-      Channel* channel = tick_result.channel.value();
-      XLS_VLOG(3) << absl::StreamFormat(
-          "Proc `%s` is now blocked on channel `%s`", proc->name(),
-          channel->ToString());
-      blocked_procs[channel] = proc;
+      ChannelInstance* channel_instance = tick_result.channel_instance.value();
+      VLOG(3) << absl::StreamFormat(
+          "Proc instance `%s` is now blocked on channel instance `%s`",
+          element.instance->GetName(), channel_instance->ToString());
+      blocked_instances[channel_instance] = element.instance;
     }
   }
-  auto get_blocked_channels = [&]() {
-    std::vector<Channel*> channels;
-    for (auto [channel, proc] : blocked_procs) {
-      channels.push_back(channel);
+  auto get_blocked_channel_instances = [&]() {
+    std::vector<ChannelInstance*> instances;
+    for (ChannelInstance* instance : elaboration().channel_instances()) {
+      if (blocked_instances.contains(instance)) {
+        instances.push_back(instance);
+      }
     }
-    std::sort(channels.begin(), channels.end(),
-              [](Channel* a, Channel* b) { return a->id() < b->id(); });
-    return channels;
+    return instances;
   };
   return NetworkTickResult{
       .progress_made = progress_made,
       .progress_made_on_io_procs = progress_made_on_io_procs,
-      .blocked_channels = get_blocked_channels(),
+      .blocked_channel_instances = get_blocked_channel_instances(),
   };
 }
 

@@ -13,18 +13,27 @@
 // limitations under the License.
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "gtest/gtest.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
 #include "xls/dslx/frontend/builtins_metadata.h"
-#include "xls/dslx/run_routines.h"
+#include "xls/dslx/run_routines/run_routines.h"
 
 namespace xls::dslx {
 namespace {
+
+absl::StatusOr<TestResultData> ParseAndTest(
+    std::string_view program, std::string_view module_name,
+    std::string_view filename, const ParseAndTestOptions& options) {
+  return DslxInterpreterTestRunner().ParseAndTest(program, module_name,
+                                                  filename, options);
+}
 
 template <typename K, typename V>
 std::vector<K> MapKeysSorted(const absl::flat_hash_map<K, V>& m) {
@@ -58,13 +67,16 @@ fn test_main() {
     if (name == "assert_eq") {
       continue;  // Used in our expectation.
     }
-    XLS_LOG(INFO) << "builtin: " << name;
+    if (name == "token") {
+      continue;  // Type name, cannot be shadowed.
+    }
+    LOG(INFO) << "builtin: " << name;
     std::string program = absl::StrFormat(kTemplate, name, name);
     ParseAndTestOptions options;
     XLS_ASSERT_OK_AND_ASSIGN(
-        TestResult test_result,
+        TestResultData test_result,
         ParseAndTest(program, /*module_name=*/"fake", kFakePath, options));
-    EXPECT_EQ(test_result, TestResult::kAllPassed);
+    EXPECT_EQ(test_result.result(), TestResult::kAllPassed);
   }
 }
 
@@ -91,13 +103,16 @@ fn test_main() {
     if (name == "assert_eq") {
       continue;  // Used in our expectation.
     }
-    XLS_LOG(INFO) << "builtin: " << name;
+    if (name == "token") {
+      continue;  // Type name, cannot be shadowed.
+    }
+    LOG(INFO) << "builtin: " << name;
     std::string program = absl::StrFormat(kTemplate, name, name);
     ParseAndTestOptions options;
     XLS_ASSERT_OK_AND_ASSIGN(
-        TestResult test_result,
+        TestResultData test_result,
         ParseAndTest(program, /*module_name=*/"fake", kFakePath, options));
-    EXPECT_EQ(test_result, TestResult::kAllPassed);
+    EXPECT_EQ(test_result.result(), TestResult::kAllPassed);
   }
 }
 

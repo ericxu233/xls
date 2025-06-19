@@ -14,29 +14,35 @@
 
 #include "xls/passes/useless_assert_removal_pass.h"
 
+#include <optional>
+
 #include "absl/status/statusor.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/function_base.h"
-#include "xls/ir/node_iterator.h"
-#include "xls/ir/node_util.h"
 #include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
 #include "xls/passes/pass_base.h"
+#include "xls/passes/stateless_query_engine.h"
 
 namespace xls {
 
 absl::StatusOr<bool> UselessAssertRemovalPass::RunOnFunctionBaseInternal(
     FunctionBase* f, const OptimizationPassOptions& options,
-    PassResults* results) const {
+    PassResults* results, OptimizationContext& context) const {
+  StatelessQueryEngine query_engine;
+
   bool changed = false;
   // Remove asserts with literal true conditions.
-  for (Node* node : TopoSort(f)) {
+  for (Node* node : context.TopoSort(f)) {
     if (node->op() == Op::kAssert) {
       Assert* current_assert = node->As<Assert>();
       Node* condition = current_assert->condition();
-      if (IsLiteralUnsignedOne(condition)) {
+      std::optional<Bits> constant_condition =
+          query_engine.KnownValueAsBits(condition);
+      if (constant_condition.has_value() && constant_condition->IsOne()) {
         // Set token operand user to the assert user (rewire token).
         XLS_RETURN_IF_ERROR(node->ReplaceUsesWith(node->As<Assert>()->token()));
         XLS_RETURN_IF_ERROR(f->RemoveNode(node));
@@ -46,5 +52,7 @@ absl::StatusOr<bool> UselessAssertRemovalPass::RunOnFunctionBaseInternal(
   }
   return changed;
 }
+
+REGISTER_OPT_PASS(UselessAssertRemovalPass);
 
 }  // namespace xls

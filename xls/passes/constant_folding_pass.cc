@@ -14,30 +14,30 @@
 
 #include "xls/passes/constant_folding_pass.h"
 
-#include <algorithm>
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/interpreter/function_interpreter.h"
 #include "xls/interpreter/ir_interpreter.h"
 #include "xls/ir/function_base.h"
 #include "xls/ir/node.h"
-#include "xls/ir/node_iterator.h"
 #include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/ir/type.h"
 #include "xls/ir/value.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
 #include "xls/passes/pass_base.h"
+#include "xls/passes/query_engine.h"
+#include "xls/passes/stateless_query_engine.h"
 
 namespace xls {
 
 namespace {
 // Check if we can do constant folding on this node.
-bool NodeIsConstantFoldable(Node* node) {
+bool NodeIsConstantFoldable(Node* node, QueryEngine& query_engine) {
   if (node->Is<Literal>()) {
     // Already a constant, nothing to do.
     return false;
@@ -51,25 +51,28 @@ bool NodeIsConstantFoldable(Node* node) {
     return false;
   }
   // Only ops with all literal operands can be folded.
-  return absl::c_all_of(node->operands(),
-                        [](Node* operand) { return operand->Is<Literal>(); });
+  return absl::c_all_of(node->operands(), [&](Node* operand) {
+    return query_engine.IsFullyKnown(operand);
+  });
 }
 }  // namespace
 
 absl::StatusOr<bool> ConstantFoldingPass::RunOnFunctionBaseInternal(
     FunctionBase* f, const OptimizationPassOptions& options,
-    PassResults* results) const {
+    PassResults* results, OptimizationContext& context) const {
+  StatelessQueryEngine query_engine;
+
   bool changed = false;
-  for (Node* node : TopoSort(f)) {
+  for (Node* node : context.TopoSort(f)) {
     // Fold any non-side-effecting op with constant parameters. Avoid any types
     // with tokens because literal tokens are not allowed.
     // TODO(meheff): 2019/6/26 Consider not folding loops with large trip counts
     // to avoid hanging at compile time.
-    if (NodeIsConstantFoldable(node)) {
-      XLS_VLOG(2) << "Folding: " << *node;
+    if (NodeIsConstantFoldable(node, query_engine)) {
+      VLOG(2) << "Folding: " << *node;
       std::vector<Value> operand_values;
       for (Node* operand : node->operands()) {
-        operand_values.push_back(operand->As<Literal>()->value());
+        operand_values.push_back(*query_engine.KnownValue(operand));
       }
       XLS_ASSIGN_OR_RETURN(Value result, InterpretNode(node, operand_values));
       XLS_RETURN_IF_ERROR(node->ReplaceUsesWithNew<Literal>(result).status());
@@ -79,5 +82,7 @@ absl::StatusOr<bool> ConstantFoldingPass::RunOnFunctionBaseInternal(
 
   return changed;
 }
+
+REGISTER_OPT_PASS(ConstantFoldingPass);
 
 }  // namespace xls

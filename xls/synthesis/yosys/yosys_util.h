@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_SYNTHESIS_YOSYS_UTIL_H_
-#define XLS_SYNTHESIS_YOSYS_UTIL_H_
+#ifndef XLS_SYNTHESIS_YOSYS_YOSYS_UTIL_H_
+#define XLS_SYNTHESIS_YOSYS_YOSYS_UTIL_H_
 
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 
 namespace xls {
@@ -36,6 +36,10 @@ absl::StatusOr<int64_t> ParseNextpnrOutput(std::string_view nextpnr_output);
 struct YosysSynthesisStatistics {
   // Could add other fields for things like wires / memory...
   absl::flat_hash_map<std::string, int64_t> cell_histogram;
+  // `area` is the total area, which includes the sequential area.
+  double area;
+  double sequential_area;
+  std::vector<std::string> cell_type_with_unknown_area;
 };
 
 absl::StatusOr<YosysSynthesisStatistics> ParseYosysOutput(
@@ -53,4 +57,4 @@ absl::StatusOr<STAStatistics> ParseOpenSTAOutput(std::string_view sta_output);
 }  // namespace synthesis
 }  // namespace xls
 
-#endif  // XLS_SYNTHESIS_YOSYS_UTIL_H_
+#endif  // XLS_SYNTHESIS_YOSYS_YOSYS_UTIL_H_

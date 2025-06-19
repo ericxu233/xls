@@ -14,16 +14,22 @@
 
 #include "xls/codegen/mulp_combining_pass.h"
 
+#include <cstdint>
+#include <memory>
 #include <optional>
 
+#include "absl/status/statusor.h"
+#include "xls/codegen/codegen_pass.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/ir/block.h"
+#include "xls/ir/node_util.h"
 #include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
+#include "xls/ir/package.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls::verilog {
 namespace {
-
-bool HasSingleUse(Node* node) { return node->users().size() == 1; }
 
 // Tries to match `node` to the sum of the two elements of a single-use mulp
 // operation. Returns the mulp node if successful, nullopt otherwise. For
@@ -84,21 +90,24 @@ std::optional<PartialProductOp*> MatchMulpAdd(Node* node) {
 }  // namespace
 
 absl::StatusOr<bool> MulpCombiningPass::RunInternal(
-    CodegenPassUnit* unit, const CodegenPassOptions& options,
-    PassResults* results) const {
+    Package* package, const CodegenPassOptions& options, PassResults* results,
+    CodegenContext& context) const {
   bool changed = false;
-  Block* block = unit->block;
-
-  for (Node* node : block->nodes()) {
-    if (std::optional<PartialProductOp*> mulp = MatchMulpAdd(node)) {
-      XLS_RETURN_IF_ERROR(
-          node->ReplaceUsesWithNew<ArithOp>(
-                  mulp.value()->operand(0), mulp.value()->operand(1),
-                  node->BitCountOrDie(),
-                  mulp.value()->op() == Op::kSMulp ? Op::kSMul : Op::kUMul)
-              .status());
-      changed = true;
+  for (const std::unique_ptr<Block>& block : package->blocks()) {
+    for (Node* node : block->nodes()) {
+      if (std::optional<PartialProductOp*> mulp = MatchMulpAdd(node)) {
+        XLS_RETURN_IF_ERROR(
+            node->ReplaceUsesWithNew<ArithOp>(
+                    mulp.value()->operand(0), mulp.value()->operand(1),
+                    node->BitCountOrDie(),
+                    mulp.value()->op() == Op::kSMulp ? Op::kSMul : Op::kUMul)
+                .status());
+        changed = true;
+      }
     }
+  }
+  if (changed) {
+    context.GcMetadata();
   }
   return changed;
 }

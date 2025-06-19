@@ -14,21 +14,40 @@
 
 #include "xls/ir/function_builder.h"
 
+#include <cstdint>
+#include <string>
+#include <vector>
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "xls/common/status/matchers.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/block.h"
+#include "xls/ir/channel_ops.h"
+#include "xls/ir/fileno.h"
+#include "xls/ir/format_preference.h"
+#include "xls/ir/format_strings.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/node_util.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/op.h"
 #include "xls/ir/package.h"
+#include "xls/ir/register.h"
+#include "xls/ir/source_location.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
 
 namespace m = ::xls::op_matchers;
 
 namespace xls {
 
-using status_testing::StatusIs;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::AllOf;
+using ::testing::ElementsAre;
 using ::testing::HasSubstr;
 
 TEST(FunctionBuilderTest, SimpleSourceLocation) {
@@ -142,7 +161,7 @@ TEST(FunctionBuilderTest, MapTest) {
   }
   Function* top;
   {
-    FunctionBuilder b("top", &p);
+    FunctionBuilder b("top_f", &p);
     b.Map(b.Param("input", array_type), to_apply);
     XLS_ASSERT_OK_AND_ASSIGN(top, b.Build());
   }
@@ -169,13 +188,13 @@ TEST(FunctionBuilderTest, Match) {
            {b.Literal(UBits(8, 8)), z}},
           the_default);
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, b.Build());
-  EXPECT_THAT(f->return_value(),
-              m::OneHotSelect(
-                  m::OneHot(m::Concat(m::Eq(m::Param("cond"), m::Literal(8)),
-                                      m::Eq(m::Param("cond"), m::Literal(123)),
-                                      m::Eq(m::Param("cond"), m::Literal(42)))),
-                  /*cases=*/{m::Param("x"), m::Param("y"), m::Param("z"),
-                             m::Param("default")}));
+  EXPECT_THAT(
+      f->return_value(),
+      m::PrioritySelect(m::Concat(m::Eq(m::Param("cond"), m::Literal(8)),
+                                  m::Eq(m::Param("cond"), m::Literal(123)),
+                                  m::Eq(m::Param("cond"), m::Literal(42))),
+                        /*cases=*/{m::Param("x"), m::Param("y"), m::Param("z")},
+                        m::Param("default")));
 }
 
 TEST(FunctionBuilderTest, MatchTrue) {
@@ -192,12 +211,11 @@ TEST(FunctionBuilderTest, MatchTrue) {
   BValue the_default = b.Param("default", value_type);
   b.MatchTrue({{p0, x}, {p1, y}, {p2, z}}, the_default);
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, b.Build());
-  EXPECT_THAT(
-      f->return_value(),
-      m::OneHotSelect(
-          m::OneHot(m::Concat(m::Param("p2"), m::Param("p1"), m::Param("p0"))),
-          /*cases=*/{m::Param("x"), m::Param("y"), m::Param("z"),
-                     m::Param("default")}));
+  EXPECT_THAT(f->return_value(),
+              m::PrioritySelect(
+                  m::Concat(m::Param("p2"), m::Param("p1"), m::Param("p0")),
+                  /*cases=*/{m::Param("x"), m::Param("y"), m::Param("z")},
+                  m::Param("default")));
 }
 
 // Note: for API consistency we allow the definition of MatchTrue to work when
@@ -210,8 +228,8 @@ TEST(FunctionBuilderTest, MatchTrueNoCaseArmsOnlyDefault) {
   b.MatchTrue({}, the_default);
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, b.Build());
   EXPECT_THAT(f->return_value(),
-              m::OneHotSelect(m::OneHot(),
-                              /*cases=*/{m::Param("default")}));
+              m::PrioritySelect(m::Concat(),
+                                /*cases=*/{}, m::Param("default")));
 }
 
 TEST(FunctionBuilderTest, PrioritySelectOp) {
@@ -223,12 +241,14 @@ TEST(FunctionBuilderTest, PrioritySelectOp) {
   BValue x = b.Param("x", value_type);
   BValue y = b.Param("y", value_type);
   BValue z = b.Param("z", value_type);
-  b.PrioritySelect(sel, {x, y, z});
+  BValue d = b.Param("d", value_type);
+  b.PrioritySelect(sel, {x, y, z}, d);
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, b.Build());
-  EXPECT_THAT(f->return_value(),
-              m::PrioritySelect(
-                  m::Param("sel"),
-                  /*cases=*/{m::Param("x"), m::Param("y"), m::Param("z")}));
+  EXPECT_THAT(
+      f->return_value(),
+      m::PrioritySelect(m::Param("sel"),
+                        /*cases=*/{m::Param("x"), m::Param("y"), m::Param("z")},
+                        /*default_value=*/m::Param("d")));
 }
 
 TEST(FunctionBuilderTest, ConcatTuples) {
@@ -238,7 +258,7 @@ TEST(FunctionBuilderTest, ConcatTuples) {
   BValue x = b.Param("x", value_type);
   BValue t = b.Tuple({x});
   b.Concat({t, t});
-  EXPECT_THAT(b.Build(), status_testing::StatusIs(
+  EXPECT_THAT(b.Build(), absl_testing::StatusIs(
                              absl::StatusCode::kInvalidArgument,
                              testing::HasSubstr("it has non-bits type")));
 }
@@ -264,7 +284,7 @@ TEST(FunctionBuilderTest, AfterAllNonTokenArg) {
 
   EXPECT_THAT(
       fb.Build(),
-      status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kInvalidArgument,
           testing::HasSubstr("Dependency type bits[32] is not a token.")));
 }
@@ -297,7 +317,7 @@ TEST(FunctionBuilderTest, MinDelayNonTokenArg) {
   fb.MinDelay(x, /*delay=*/1);
 
   EXPECT_THAT(fb.Build(),
-              status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kInvalidArgument,
                   testing::HasSubstr("Input type bits[32] is not a token.")));
 }
@@ -308,7 +328,7 @@ TEST(FunctionBuilderTest, MinDelayNegative) {
   BValue token = fb.AfterAll({});
   fb.MinDelay(token, /*delay=*/-5);
 
-  EXPECT_THAT(fb.Build(), status_testing::StatusIs(
+  EXPECT_THAT(fb.Build(), absl_testing::StatusIs(
                               absl::StatusCode::kInvalidArgument,
                               testing::HasSubstr("Delay cannot be negative")));
 }
@@ -321,9 +341,10 @@ TEST(FunctionBuilderTest, MinDelayNegativeWithGetError) {
   BValue token = fb.AfterAll({});
   fb.MinDelay(token, /*delay=*/-5);
 
-  EXPECT_THAT(fb.GetError(),
-      status_testing::StatusIs(absl::StatusCode::kInvalidArgument,
-                               testing::HasSubstr("Delay cannot be negative")));
+  EXPECT_THAT(
+      fb.GetError(),
+      absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                             testing::HasSubstr("Delay cannot be negative")));
 }
 
 TEST(FunctionBuilderTest, ArrayIndexBits) {
@@ -334,7 +355,7 @@ TEST(FunctionBuilderTest, ArrayIndexBits) {
   b.ArrayIndex(x, {x});
   EXPECT_THAT(
       b.Build(),
-      status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kInvalidArgument,
           testing::HasSubstr(
               "Too many indices (1) to index into array of type bits[32]")));
@@ -361,7 +382,7 @@ TEST(FunctionBuilderTest, ArrayUpdateOnNonArray) {
                 {b.Literal(Value(UBits(1, 32)))});
   EXPECT_THAT(
       b.Build(),
-      status_testing::StatusIs(
+      absl_testing::StatusIs(
           absl::StatusCode::kInvalidArgument,
           testing::HasSubstr(
               "Too many indices (1) to index into array of type bits[32]")));
@@ -374,7 +395,7 @@ TEST(FunctionBuilderTest, ArrayUpdateIncompatibleUpdateValue) {
       b.Literal(Value::ArrayOrDie({Value(UBits(1, 32)), Value(UBits(2, 32))})),
       b.Literal(Value(UBits(99, 64))), {b.Literal(Value(UBits(1, 32)))});
   EXPECT_THAT(b.Build(),
-              status_testing::StatusIs(
+              absl_testing::StatusIs(
                   absl::StatusCode::kInvalidArgument,
                   testing::HasSubstr("Expected update value to have type "
                                      "bits[32]; has type bits[64]")));
@@ -483,31 +504,36 @@ TEST(FunctionBuilderTest, SendAndReceive) {
       Channel * ch3, p.CreateStreamingChannel("ch3", ChannelOps::kSendReceive,
                                               p.GetBitsType(32)));
 
-  ProcBuilder b("sending_receiving", /*token_name=*/"my_token", &p);
+  ProcBuilder b("sending_receiving", &p);
+  BValue my_token = b.StateElement("my_token", Value::Token());
   BValue state = b.StateElement("my_state", Value(UBits(42, 32)));
-  BValue send = b.Send(ch0, b.GetTokenParam(), state);
-  BValue receive = b.Receive(ch1, b.GetTokenParam());
+  BValue send = b.Send(ch0, my_token, state);
+  BValue receive = b.Receive(ch1, my_token);
   BValue pred = b.Literal(UBits(1, 1));
-  BValue send_if = b.SendIf(ch2, b.GetTokenParam(), pred, state);
-  BValue receive_if = b.ReceiveIf(ch3, b.GetTokenParam(), pred);
+  BValue send_if = b.SendIf(ch2, my_token, pred, state);
+  BValue receive_if = b.ReceiveIf(ch3, my_token, pred);
   BValue after_all = b.AfterAll(
       {send, b.TupleIndex(receive, 0), send_if, b.TupleIndex(receive_if, 0)});
   BValue next_state =
       b.Add(b.TupleIndex(receive, 1), b.TupleIndex(receive_if, 1));
 
-  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, b.Build(after_all, {next_state}));
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, b.Build({after_all, next_state}));
 
-  EXPECT_THAT(proc->NextToken(),
-              m::AfterAll(m::Send(), m::TupleIndex(m::Receive()),
-                          m::Send(m::Param(), m::Param(), m::Literal(1)),
-                          m::TupleIndex(m::Receive())));
-  EXPECT_THAT(proc->GetNextStateElement(0),
-              m::Add(m::TupleIndex(m::Receive()), m::TupleIndex(m::Receive())));
+  EXPECT_THAT(
+      proc->next_values(proc->GetStateRead(int64_t{0})),
+      ElementsAre(m::Next(
+          m::StateRead("my_token"),
+          m::AfterAll(m::Send(), m::TupleIndex(m::Receive()),
+                      m::Send(m::StateRead(), m::StateRead(), m::Literal(1)),
+                      m::TupleIndex(m::Receive())))));
+  EXPECT_THAT(proc->next_values(proc->GetStateRead(1)),
+              ElementsAre(m::Next(m::StateRead("my_state"),
+                                  m::Add(m::TupleIndex(m::Receive()),
+                                         m::TupleIndex(m::Receive())))));
 
-  EXPECT_EQ(proc->GetInitValueElement(0), Value(UBits(42, 32)));
-  EXPECT_EQ(proc->GetStateParam(0)->GetName(), "my_state");
-  EXPECT_EQ(proc->TokenParam()->GetName(), "my_token");
-  EXPECT_EQ(proc->GetStateElementType(0), p.GetBitsType(32));
+  EXPECT_THAT(proc->StateElements(),
+              ElementsAre(m::StateElement("my_token", Value::Token()),
+                          m::StateElement("my_state", Value(UBits(42, 32)))));
 
   EXPECT_EQ(send.node()->GetType(), p.GetTokenType());
   EXPECT_EQ(send_if.node()->GetType(), p.GetTokenType());
@@ -790,7 +816,7 @@ TEST(FunctionBuilderTest, DynamicCountedForTest) {
   }
   Function* top;
   {
-    FunctionBuilder b("top", &p);
+    FunctionBuilder b("top_f", &p);
     b.DynamicCountedFor(b.Param("init", int32_type),
                         b.Param("trip_count", int16_type),
                         b.Param("stride", int16_type), body,
@@ -809,11 +835,11 @@ TEST(FunctionBuilderTest, DynamicCountedForTest) {
 
 TEST(FunctionBuilderTest, AddParamToProc) {
   Package p("p");
-  ProcBuilder b("param_proc", /*token_name=*/"my_token", &p);
+  ProcBuilder b("param_proc", &p);
   BValue state = b.StateElement("my_state", Value(UBits(42, 32)));
   b.Param("x", p.GetBitsType(32));
   EXPECT_THAT(
-      b.Build(b.GetTokenParam(), {state}).status(),
+      b.Build({state}).status(),
       StatusIs(absl::StatusCode::kInvalidArgument,
                HasSubstr("Use StateElement to add state parameters to procs")));
 }
@@ -834,49 +860,88 @@ TEST(FunctionBuilderTest, TokenlessProcBuilder) {
   BValue state = pb.StateElement("st", Value(UBits(42, 16)));
   BValue a_plus_b = pb.Add(pb.Receive(a_ch), pb.Receive(b_ch));
   pb.MinDelay(5);
-  pb.Send(out_ch, pb.Add(state, a_plus_b));
+  pb.Send(out_ch, pb.Add(state, a_plus_b), SourceInfo(), "final_send");
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build({a_plus_b}));
 
-  EXPECT_THAT(proc->NextToken(), m::Send(m::MinDelay(m::TupleIndex(m::Receive(
-                                             m::TupleIndex(m::Receive())))),
-                                         m::Add()));
+  EXPECT_THAT(
+      proc->GetNode("final_send"),
+      IsOkAndHolds(m::Send(
+          m::MinDelay(m::TupleIndex(m::Receive(m::TupleIndex(m::Receive())))),
+          m::Add())));
 
-  EXPECT_THAT(proc->GetNextStateElement(0),
-              m::Add(m::TupleIndex(m::Receive(m::Channel("a")), 1),
-                     m::TupleIndex(m::Receive(m::Channel("b")), 1)));
+  EXPECT_THAT(proc->next_values(proc->GetStateRead(int64_t{0})),
+              ElementsAre(m::Next(
+                  m::StateRead("st"),
+                  m::Add(m::TupleIndex(m::Receive(m::Channel("a")), 1),
+                         m::TupleIndex(m::Receive(m::Channel("b")), 1)))));
 }
 
 TEST(FunctionBuilderTest, StatelessProcBuilder) {
   Package p("p");
-  ProcBuilder pb("the_proc", "tkn", &p);
-  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build(pb.GetTokenParam(), {}));
-  EXPECT_TRUE(proc->StateParams().empty());
+  ProcBuilder pb("the_proc", &p);
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build({}));
+  EXPECT_TRUE(proc->StateElements().empty());
 }
 
 TEST(FunctionBuilderTest, ProcWithMultipleStateElements) {
   Package p("p");
-  ProcBuilder pb("the_proc", "tkn", &p);
+  ProcBuilder pb("the_proc", &p);
+  BValue tkn = pb.StateElement("tkn", Value::Token());
   BValue x = pb.StateElement("x", Value(UBits(1, 32)));
   BValue y = pb.StateElement("y", Value(UBits(2, 32)));
   BValue z = pb.StateElement("z", Value(UBits(3, 32)));
 
-  EXPECT_EQ(pb.GetStateParam(0).node()->GetName(), "x");
-  EXPECT_EQ(pb.GetStateParam(1).node()->GetName(), "y");
-  EXPECT_EQ(pb.GetStateParam(2).node()->GetName(), "z");
+  EXPECT_EQ(pb.GetStateParam(0).node()->GetName(), "tkn");
+  EXPECT_EQ(pb.GetStateParam(1).node()->GetName(), "x");
+  EXPECT_EQ(pb.GetStateParam(2).node()->GetName(), "y");
+  EXPECT_EQ(pb.GetStateParam(3).node()->GetName(), "z");
 
   XLS_ASSERT_OK_AND_ASSIGN(
-      Proc * proc, pb.Build(pb.GetTokenParam(), /*next_state=*/{
-                                x, pb.Add(x, y, SourceInfo(), "x_plus_y"), z}));
-  EXPECT_EQ(proc->GetStateElementCount(), 3);
-  EXPECT_EQ(proc->GetStateParam(0)->GetName(), "x");
-  EXPECT_EQ(proc->GetStateParam(1)->GetName(), "y");
-  EXPECT_EQ(proc->GetStateParam(2)->GetName(), "z");
+      Proc * proc, pb.Build(/*next_state=*/{
+                       tkn, x, pb.Add(x, y, SourceInfo(), "x_plus_y"), z}));
+  EXPECT_THAT(proc->StateElements(),
+              ElementsAre(m::StateElement("tkn"), m::StateElement("x"),
+                          m::StateElement("y"), m::StateElement("z")));
   EXPECT_THAT(proc->DumpIr(),
               HasSubstr("proc the_proc(tkn: token, x: bits[32], y: bits[32], "
-                        "z: bits[32], init={1, 2, 3})"));
-  EXPECT_EQ(proc->GetNextStateElement(0)->GetName(), "x");
-  EXPECT_EQ(proc->GetNextStateElement(1)->GetName(), "x_plus_y");
-  EXPECT_EQ(proc->GetNextStateElement(2)->GetName(), "z");
+                        "z: bits[32], init={token, 1, 2, 3})"));
+  EXPECT_THAT(proc->next_values(proc->GetStateRead(int64_t{0})),
+              ElementsAre(m::Next(m::StateRead("tkn"), m::StateRead("tkn"))));
+  EXPECT_THAT(proc->next_values(proc->GetStateRead(1)),
+              ElementsAre(m::Next(m::StateRead("x"), m::StateRead("x"))));
+  EXPECT_THAT(proc->next_values(proc->GetStateRead(2)),
+              ElementsAre(m::Next(m::StateRead("y"), m::Name("x_plus_y"))));
+  EXPECT_THAT(proc->next_values(proc->GetStateRead(3)),
+              ElementsAre(m::Next(m::StateRead("z"), m::StateRead("z"))));
+}
+
+TEST(FunctionBuilderTest, ProcWithNextValue) {
+  Package p("p");
+  ProcBuilder pb("the_proc", &p);
+  BValue x = pb.StateElement("x", Value(UBits(1, 1)));
+  BValue y = pb.StateElement("y", Value(UBits(2, 32)));
+  BValue z = pb.StateElement("z", Value(UBits(3, 32)));
+  BValue next = pb.Next(/*state_read=*/y, /*value=*/z, /*pred=*/x);
+
+  XLS_ASSERT_OK(pb.Build());
+  EXPECT_THAT(next.node(),
+              m::Next(m::StateRead("y"), /*value=*/m::StateRead("z"),
+                      /*predicate=*/m::StateRead("x")));
+}
+
+TEST(FunctionBuilderTest, ProcWithNextValueBadPredicate) {
+  Package p("p");
+  ProcBuilder pb("the_proc", &p);
+  BValue x = pb.StateElement("x", Value(UBits(1, 32)));
+  BValue y = pb.StateElement("y", Value(UBits(2, 32)));
+  BValue z = pb.StateElement("z", Value(UBits(3, 32)));
+  pb.Next(/*state_read=*/y, /*value=*/z, /*pred=*/x);
+
+  EXPECT_THAT(pb.Build(/*next_state=*/{x, y, z}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       AllOf(HasSubstr("Predicate operand"),
+                             HasSubstr("must be of bits type of width 1"),
+                             HasSubstr("is: bits[32]"))));
 }
 
 TEST(FunctionBuilderTest, TokenlessProcBuilderNoChannelOps) {
@@ -885,8 +950,8 @@ TEST(FunctionBuilderTest, TokenlessProcBuilderNoChannelOps) {
   BValue state = pb.StateElement("st", Value(UBits(42, 16)));
   XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build({state}));
 
-  EXPECT_THAT(proc->NextToken(), m::Param("tkn"));
-  EXPECT_THAT(proc->GetNextStateElement(0), m::Param("st"));
+  EXPECT_THAT(proc->next_values(proc->GetStateRead(int64_t{0})),
+              ElementsAre(m::Next(m::StateRead("st"), m::StateRead("st"))));
 }
 
 TEST(FunctionBuilderTest, Assert) {
@@ -900,7 +965,7 @@ TEST(FunctionBuilderTest, Assert) {
             "It's about sending a message");
 }
 
-TEST(FunctionBuilderTest, AssertWrongTypeOperand0) {
+TEST(FunctionBuilderTest, AssertWrongTypeTokenOperand) {
   Package p("p");
   FunctionBuilder b("f", &p);
   b.Assert(b.Param("blah", p.GetBitsType(42)),
@@ -912,7 +977,7 @@ TEST(FunctionBuilderTest, AssertWrongTypeOperand0) {
                HasSubstr("First operand of assert must be of token type")));
 }
 
-TEST(FunctionBuilderTest, AssertWrongTypeOperand1) {
+TEST(FunctionBuilderTest, AssertWrongTypeConditionOperand) {
   Package p("p");
   FunctionBuilder b("f", &p);
   b.Assert(b.Param("blah", p.GetTokenType()), b.Param("cond", p.GetBitsType(2)),
@@ -943,7 +1008,20 @@ TEST(FunctionBuilderTest, Trace) {
   EXPECT_EQ(f->return_value()->As<Trace>()->format(), format);
 }
 
-TEST(FunctionBuilderTest, TraceWrongTypeOperand0) {
+TEST(FunctionBuilderTest, TraceWithVerbosity) {
+  Package p("p");
+  FunctionBuilder b("f", &p);
+
+  auto x = b.Param("x", p.GetBitsType(17));
+
+  b.Trace(b.Param("tkn", p.GetTokenType()), b.Param("cond", p.GetBitsType(1)),
+          {x}, "x is {}", /*verbosity=*/1);
+
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, b.Build());
+  EXPECT_EQ(f->return_value()->As<Trace>()->verbosity(), 1);
+}
+
+TEST(FunctionBuilderTest, TraceWrongTypeTokenOperand) {
   Package p("p");
   FunctionBuilder b("f", &p);
 
@@ -958,7 +1036,7 @@ TEST(FunctionBuilderTest, TraceWrongTypeOperand0) {
                HasSubstr("First operand of trace must be of token type")));
 }
 
-TEST(FunctionBuilderTest, TraceWrongTypeOperand1) {
+TEST(FunctionBuilderTest, TraceWrongTypeConditionOperand) {
   Package p("p");
   FunctionBuilder b("f", &p);
 
@@ -972,19 +1050,6 @@ TEST(FunctionBuilderTest, TraceWrongTypeOperand1) {
           absl::StatusCode::kInvalidArgument,
           HasSubstr(
               "Condition operand of trace must be of bits type of width 1")));
-}
-
-TEST(FunctionBuilderTest, TraceWrongTypeTraceArg) {
-  Package p("p");
-  FunctionBuilder b("f", &p);
-
-  auto tkn = b.Param("tkn", p.GetTokenType());
-
-  b.Trace(tkn, b.Param("cond", p.GetBitsType(1)), {tkn}, "x is {}");
-
-  EXPECT_THAT(b.Build().status(),
-              StatusIs(absl::StatusCode::kInvalidArgument,
-                       HasSubstr("Trace arguments must be of bits type")));
 }
 
 TEST(FunctionBuilderTest, TraceWrongNumberOfArgs) {
@@ -1001,6 +1066,20 @@ TEST(FunctionBuilderTest, TraceWrongNumberOfArgs) {
       StatusIs(absl::StatusCode::kInvalidArgument,
                HasSubstr(
                    "Trace node expects 1 data operands, but 2 were supplied")));
+}
+
+TEST(FunctionBuilderTest, TraceNegativeVerbosity) {
+  Package p("p");
+  FunctionBuilder b("f", &p);
+
+  auto x = b.Param("x", p.GetBitsType(17));
+
+  b.Trace(b.Param("tkn", p.GetTokenType()), b.Param("cond", p.GetBitsType(1)),
+          {x}, "x is {}", /*verbosity=*/-1);
+
+  EXPECT_THAT(b.Build().status(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Trace verbosity must be >= 0, got -1")));
 }
 
 TEST(FunctionBuilderTest, NaryBitwiseXor) {
@@ -1042,31 +1121,37 @@ TEST(FunctionBuilderTest, NaryBitwiseAnd) {
               m::And(m::Param("a"), m::Param("b"), m::Param("c")));
 }
 
+TEST(FunctionBuilderTest, Ports) {
+  Package p("p");
+  BlockBuilder b("b", &p);
+  b.OutputPort("bar", b.InputPort("foo", p.GetBitsType(32)));
+  XLS_ASSERT_OK_AND_ASSIGN(Block * blk, b.Build());
+  EXPECT_TRUE(blk->HasInputPort("foo"));
+  EXPECT_FALSE(blk->HasOutputPort("foo"));
+  EXPECT_TRUE(blk->HasOutputPort("bar"));
+  EXPECT_FALSE(blk->HasInputPort("bar"));
+}
+
 TEST(FunctionBuilderTest, Registers) {
   Package p("p");
   BlockBuilder b("b", &p);
   XLS_ASSERT_OK(b.block()->AddClockPort("clk"));
 
   BValue x = b.InputPort("x", p.GetBitsType(32));
-  BValue rst = b.InputPort("rst", p.GetBitsType(1));
+  BValue rst = b.ResetPort(
+      "rst", ResetBehavior{.asynchronous = false, .active_low = false});
   BValue le = b.InputPort("le", p.GetBitsType(1));
 
   BValue x_1 = b.InsertRegister("x_1", x);
-  BValue x_2 =
-      b.InsertRegister("x_2", x, rst,
-                       Reset{Value(UBits(42, 32)), /*asynchronous=*/false,
-                             /*active_low=*/false});
-  BValue x_3 =
-      b.InsertRegister("x_3", x, rst,
-                       Reset{Value(UBits(123, 32)), /*asynchronous=*/false,
-                             /*active_low=*/true},
-                       le);
+  BValue x_2 = b.InsertRegister("x_2", x, rst, Value(UBits(42, 32)));
+  BValue x_3 = b.InsertRegister("x_3", x, rst, Value(UBits(123, 32)), le);
 
   XLS_ASSERT_OK_AND_ASSIGN(Block * block, b.Build());
 
   auto get_reg_write = [&](BValue reg_read) {
     return block
-        ->GetRegisterWrite(reg_read.node()->As<RegisterRead>()->GetRegister())
+        ->GetUniqueRegisterWrite(
+            reg_read.node()->As<RegisterRead>()->GetRegister())
         .value();
   };
   EXPECT_FALSE(get_reg_write(x_1)->reset().has_value());
@@ -1079,6 +1164,102 @@ TEST(FunctionBuilderTest, Registers) {
   EXPECT_TRUE(get_reg_write(x_3)->reset().has_value());
   EXPECT_THAT(get_reg_write(x_3)->reset().value(), m::InputPort("rst"));
   EXPECT_THAT(get_reg_write(x_3)->load_enable().value(), m::InputPort("le"));
+}
+
+TEST(FunctionBuilderTest, BinOpMismatchedWidths) {
+  Package p("p");
+  BitsType* type8 = p.GetBitsType(8);
+  BitsType* type16 = p.GetBitsType(16);
+
+  // Test Add
+  {
+    FunctionBuilder b_add("f_add", &p);
+    BValue param8 = b_add.Param("p8", type8);
+    BValue param16 = b_add.Param("p16", type16);
+    b_add.Add(param8, param16);
+    EXPECT_THAT(b_add.Build().status(),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("Expected operand 1 of add")));
+  }
+
+  // Test And
+  {
+    FunctionBuilder b_and("f_and", &p);
+    BValue param8 = b_and.Param("p8", type8);
+    BValue param16 = b_and.Param("p16", type16);
+    b_and.And(param8, param16);
+    EXPECT_THAT(b_and.Build().status(),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("Expected operand 1 of and")));
+  }
+}
+
+TEST(FunctionBuilderTest, UnaryOpIncorrectType) {
+  Package p("p");
+  Type* token_type = p.GetTokenType();
+  Type* array_type = p.GetArrayType(4, p.GetBitsType(8));
+
+  // Test Negate on token
+  {
+    FunctionBuilder b_neg("f_neg", &p);
+    BValue tok_param = b_neg.Param("tok", token_type);
+    b_neg.Negate(tok_param);
+    EXPECT_THAT(b_neg.Build().status(),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("Expected neg")));
+  }
+
+  // Test Not on array
+  {
+    FunctionBuilder b_not("f_not", &p);
+    BValue arr_param = b_not.Param("arr", array_type);
+    b_not.Not(arr_param);
+    EXPECT_THAT(b_not.Build().status(),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("Expected not")));
+  }
+}
+
+TEST(FunctionBuilderTest, BitSliceIncorrectType) {
+  Package p("p");
+  Type* tuple_type = p.GetTupleType({p.GetBitsType(8), p.GetBitsType(16)});
+
+  FunctionBuilder b("f_slice", &p);
+  BValue tuple_param = b.Param("tup", tuple_type);
+  b.BitSlice(tuple_param, /*start=*/0, /*width=*/4);
+  EXPECT_THAT(b.Build().status(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Expected operand 0 of bit_slice")));
+}
+
+TEST(FunctionBuilderTest, SelectMismatchedCaseTypes) {
+  Package p("p");
+  BitsType* type8 = p.GetBitsType(8);
+  BitsType* type16 = p.GetBitsType(16);
+
+  // Test 1: Mismatched bits widths between cases (no default value)
+  {
+    FunctionBuilder b("f_sel_cases_mismatch", &p);
+    BValue sel = b.Param("sel", p.GetBitsType(1));
+    BValue case0 = b.Param("case0", type8);
+    BValue case1 = b.Param("case1", type16);
+    b.Select(sel, {case0, case1});
+    EXPECT_THAT(b.Build().status(),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("type bits[16] does not match node type")));
+  }
+
+  // Test 2: Default value type mismatches case type
+  {
+    FunctionBuilder b("f_sel_default_mismatch", &p);
+    BValue sel = b.Param("sel", p.GetBitsType(1));
+    BValue case0 = b.Param("case0", type8);
+    BValue default_val = b.Param("default_val", type16);
+    b.Select(sel, {case0}, default_val);
+    EXPECT_THAT(b.Build().status(),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("type bits[8] does not match node type")));
+  }
 }
 
 }  // namespace xls

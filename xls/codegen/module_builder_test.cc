@@ -14,15 +14,20 @@
 
 #include "xls/codegen/module_builder.h"
 
+#include <cstdint>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "xls/codegen/vast.h"
+#include "absl/status/status.h"
+#include "absl/types/span.h"
+#include "xls/codegen/module_signature.pb.h"
+#include "xls/codegen/vast/vast.h"
 #include "xls/common/status/matchers.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/package.h"
+#include "xls/ir/source_location.h"
 #include "xls/ir/type.h"
 #include "xls/ir/value.h"
 #include "xls/simulation/verilog_test_base.h"
@@ -31,7 +36,7 @@ namespace xls {
 namespace verilog {
 namespace {
 
-using status_testing::StatusIs;
+using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
 
 constexpr char kTestName[] = "module_builder_test";
@@ -79,11 +84,11 @@ TEST_P(ModuleBuilderTest, NewSections) {
   XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x, mb.AddInputPort("x", u32));
   XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y, mb.AddInputPort("y", u32));
 
-  LogicRef* a = mb.DeclareVariable("a", u32);
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * a, mb.DeclareVariable("a", u32));
   XLS_ASSERT_OK(mb.Assign(a, file.Add(x, y, SourceInfo()), u32));
 
   mb.NewDeclarationAndAssignmentSections();
-  LogicRef* b = mb.DeclareVariable("b", u32);
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * b, mb.DeclareVariable("b", u32));
   XLS_ASSERT_OK(mb.Assign(b, file.Add(a, y, SourceInfo()), u32));
 
   XLS_ASSERT_OK(mb.AddOutputPort("out", u32, file.Negate(b, SourceInfo())));
@@ -214,7 +219,7 @@ TEST_P(ModuleBuilderTest, RegisterWithLoadEnable) {
                    /*clk_name=*/"clk");
   XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x, mb.AddInputPort("x", u32));
   XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y, mb.AddInputPort("y", u32));
-  LogicRef* load_enable = mb.AddInputPort("le", 1);
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * load_enable, mb.AddInputPort("le", 1));
 
   XLS_ASSERT_OK_AND_ASSIGN(
       ModuleBuilder::Register a,
@@ -244,7 +249,7 @@ TEST_P(ModuleBuilderTest, RegisterWithLoadEnableAndReset) {
                    /*clk_name=*/"clk", reset);
   XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x, mb.AddInputPort("x", u32));
   XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y, mb.AddInputPort("y", u32));
-  LogicRef* load_enable = mb.AddInputPort("le", 1);
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * load_enable, mb.AddInputPort("le", 1));
 
   XLS_ASSERT_OK_AND_ASSIGN(
       ModuleBuilder::Register a,
@@ -278,9 +283,9 @@ TEST_P(ModuleBuilderTest, ComplexComputation) {
   XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y, mb.AddInputPort("y", u32));
   mb.declaration_section()->Add<Comment>(SourceInfo(), "Declaration section.");
   mb.assignment_section()->Add<Comment>(SourceInfo(), "Assignment section.");
-  LogicRef* a = mb.DeclareVariable("a", u32);
-  LogicRef* b = mb.DeclareVariable("b", u16);
-  LogicRef* c = mb.DeclareVariable("c", u16);
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * a, mb.DeclareVariable("a", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * b, mb.DeclareVariable("b", u16));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * c, mb.DeclareVariable("c", u16));
   XLS_ASSERT_OK(mb.Assign(a, file.Shrl(x, y, SourceInfo()), u32));
   XLS_ASSERT_OK(mb.Assign(b, file.Slice(y, 16, 0, SourceInfo()), u16));
   XLS_ASSERT_OK(mb.Assign(c, file.Add(b, b, SourceInfo()), u16));
@@ -479,6 +484,413 @@ TEST_P(ModuleBuilderTest, BitSliceUpdateAsFunction) {
 
   ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
                                  file.Emit());
+}
+
+TEST_P(ModuleBuilderTest, ArrayIndexAsFunction) {
+  VerilogFile file = NewVerilogFile();
+  Package package(TestBaseName());
+  FunctionBuilder fb(TestBaseName(), &package);
+  Type* u32 = package.GetBitsType(32);
+  Type* big_array = package.GetArrayType(
+      6, package.GetArrayType(16, package.GetArrayType(4, u32)));
+  BValue x_param = fb.Param("x", big_array);
+  BValue y_param = fb.Param("y", u32);
+  BValue z_param = fb.Param("z", u32);
+  BValue array_index_x_y_z = fb.ArrayIndex(x_param, {y_param, z_param});
+  XLS_ASSERT_OK(fb.Build());
+
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options());
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x, mb.AddInputPort("x", big_array));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y, mb.AddInputPort("y", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * z, mb.AddInputPort("z", u32));
+
+  XLS_ASSERT_OK(mb.EmitAsAssignment("array_index_x_y_z",
+                                    array_index_x_y_z.node(), {x, y, z})
+                    .status());
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 file.Emit());
+}
+
+TEST_P(ModuleBuilderTest, PrioritySelectAsFunction) {
+  VerilogFile file = NewVerilogFile();
+  Package package(TestBaseName());
+  FunctionBuilder fb(TestBaseName(), &package);
+  Type* u3 = package.GetBitsType(3);
+  Type* u32 = package.GetBitsType(32);
+  BValue s_param = fb.Param("s", u3);
+  BValue x_param = fb.Param("x", u32);
+  BValue y_param = fb.Param("y", u32);
+  BValue z_param = fb.Param("z", u32);
+  BValue d_param = fb.Param("d", u32);
+  BValue priority_select =
+      fb.PrioritySelect(s_param, {x_param, y_param, z_param}, d_param);
+  XLS_ASSERT_OK(fb.Build());
+
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options());
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * s, mb.AddInputPort("s", u3));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x, mb.AddInputPort("x", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y, mb.AddInputPort("y", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * z, mb.AddInputPort("z", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * d, mb.AddInputPort("d", u32));
+
+  XLS_ASSERT_OK(mb.EmitAsAssignment("priority_select", priority_select.node(),
+                                    {s, x, y, z, d})
+                    .status());
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 file.Emit());
+}
+
+TEST_P(ModuleBuilderTest, TwoWayPrioritySelectAsFunction) {
+  VerilogFile file = NewVerilogFile();
+  Package package(TestBaseName());
+  FunctionBuilder fb(TestBaseName(), &package);
+  Type* u1 = package.GetBitsType(1);
+  Type* u32 = package.GetBitsType(32);
+  BValue s_param = fb.Param("s", u1);
+  BValue x_param = fb.Param("x", u32);
+  BValue d_param = fb.Param("d", u32);
+  BValue priority_select = fb.PrioritySelect(s_param, {x_param}, d_param);
+  XLS_ASSERT_OK(fb.Build());
+
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options());
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * s, mb.AddInputPort("s", u1));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x, mb.AddInputPort("x", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * d, mb.AddInputPort("d", u32));
+
+  XLS_ASSERT_OK(
+      mb.EmitAsAssignment("priority_select", priority_select.node(), {s, x, d})
+          .status());
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 file.Emit());
+}
+
+TEST_P(ModuleBuilderTest, SimilarPrioritySelects) {
+  VerilogFile file = NewVerilogFile();
+  Package package(TestBaseName());
+  FunctionBuilder fb(TestBaseName(), &package);
+  Type* u2 = package.GetBitsType(2);
+  Type* u32 = package.GetBitsType(32);
+  BValue s1_param = fb.Param("s1", u2);
+  BValue s2_param = fb.Param("s2", u2);
+  BValue x1_param = fb.Param("x1", u32);
+  BValue x2_param = fb.Param("x2", u32);
+  BValue y1_param = fb.Param("y1", u32);
+  BValue y2_param = fb.Param("y2", u32);
+  BValue d1_param = fb.Param("d1", u32);
+  BValue d2_param = fb.Param("d2", u32);
+  BValue priority_select1 =
+      fb.PrioritySelect(s1_param, {x1_param, y1_param}, d1_param);
+  BValue priority_select2 =
+      fb.PrioritySelect(s2_param, {x2_param, y2_param}, d2_param);
+  XLS_ASSERT_OK(
+      fb.BuildWithReturnValue(fb.Tuple({priority_select1, priority_select2})));
+
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options());
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * s1, mb.AddInputPort("s1", u2));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * s2, mb.AddInputPort("s2", u2));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x1, mb.AddInputPort("x1", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x2, mb.AddInputPort("x2", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y1, mb.AddInputPort("y1", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y2, mb.AddInputPort("y2", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * d1, mb.AddInputPort("d1", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * d2, mb.AddInputPort("d2", u32));
+
+  XLS_ASSERT_OK(mb.EmitAsAssignment("priority_select1", priority_select1.node(),
+                                    {s1, x1, y1, d1})
+                    .status());
+  XLS_ASSERT_OK(mb.EmitAsAssignment("priority_select2", priority_select2.node(),
+                                    {s2, x2, y2, d2})
+                    .status());
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 file.Emit());
+}
+
+TEST_P(ModuleBuilderTest, DifferentPrioritySelects) {
+  VerilogFile file = NewVerilogFile();
+  Package package(TestBaseName());
+  FunctionBuilder fb(TestBaseName(), &package);
+  Type* u1 = package.GetBitsType(1);
+  Type* u2 = package.GetBitsType(2);
+  Type* u32 = package.GetBitsType(32);
+  BValue s1_param = fb.Param("s1", u2);
+  BValue x1_param = fb.Param("x1", u32);
+  BValue y1_param = fb.Param("y1", u32);
+  BValue d1_param = fb.Param("d1", u32);
+  BValue s2_param = fb.Param("s2", u1);
+  BValue x2_param = fb.Param("x2", u32);
+  BValue d2_param = fb.Param("d2", u32);
+  BValue priority_select1 =
+      fb.PrioritySelect(s1_param, {x1_param, y1_param}, d1_param);
+  BValue priority_select2 = fb.PrioritySelect(s2_param, {x2_param}, d2_param);
+  XLS_ASSERT_OK(
+      fb.BuildWithReturnValue(fb.Tuple({priority_select1, priority_select2})));
+
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options());
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * s1, mb.AddInputPort("s1", u2));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x1, mb.AddInputPort("x1", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y1, mb.AddInputPort("y1", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * d1, mb.AddInputPort("d1", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * s2, mb.AddInputPort("s2", u1));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x2, mb.AddInputPort("x2", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * d2, mb.AddInputPort("d2", u32));
+
+  XLS_ASSERT_OK(mb.EmitAsAssignment("priority_select1", priority_select1.node(),
+                                    {s1, x1, y1, d1})
+                    .status());
+  XLS_ASSERT_OK(mb.EmitAsAssignment("priority_select2", priority_select2.node(),
+                                    {s2, x2, d2})
+                    .status());
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 file.Emit());
+}
+
+TEST_P(ModuleBuilderTest, SimilarArrayPrioritySelects) {
+  VerilogFile file = NewVerilogFile();
+  Package package(TestBaseName());
+  FunctionBuilder fb(TestBaseName(), &package);
+  Type* u2 = package.GetBitsType(2);
+  Type* u32 = package.GetBitsType(32);
+  Type* big_array = package.GetArrayType(
+      6, package.GetArrayType(16, package.GetArrayType(4, u32)));
+  BValue s1_param = fb.Param("s1", u2);
+  BValue s2_param = fb.Param("s2", u2);
+  BValue x1_param = fb.Param("x1", big_array);
+  BValue x2_param = fb.Param("x2", big_array);
+  BValue y1_param = fb.Param("y1", big_array);
+  BValue y2_param = fb.Param("y2", big_array);
+  BValue d1_param = fb.Param("d1", big_array);
+  BValue d2_param = fb.Param("d2", big_array);
+  BValue priority_select1 =
+      fb.PrioritySelect(s1_param, {x1_param, y1_param}, d1_param);
+  BValue priority_select2 =
+      fb.PrioritySelect(s2_param, {x2_param, y2_param}, d2_param);
+  XLS_ASSERT_OK(
+      fb.BuildWithReturnValue(fb.Tuple({priority_select1, priority_select2})));
+
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options());
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * s1, mb.AddInputPort("s1", u2));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * s2, mb.AddInputPort("s2", u2));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x1, mb.AddInputPort("x1", big_array));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x2, mb.AddInputPort("x2", big_array));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y1, mb.AddInputPort("y1", big_array));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y2, mb.AddInputPort("y2", big_array));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * d1, mb.AddInputPort("d1", big_array));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * d2, mb.AddInputPort("d2", big_array));
+
+  XLS_ASSERT_OK(mb.EmitAsAssignment("priority_select1", priority_select1.node(),
+                                    {s1, x1, y1, d1})
+                    .status());
+  XLS_ASSERT_OK(mb.EmitAsAssignment("priority_select2", priority_select2.node(),
+                                    {s2, x2, y2, d2})
+                    .status());
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 file.Emit());
+}
+
+TEST_P(ModuleBuilderTest, DifferentArrayPrioritySelects) {
+  VerilogFile file = NewVerilogFile();
+  Package package(TestBaseName());
+  FunctionBuilder fb(TestBaseName(), &package);
+  Type* u1 = package.GetBitsType(1);
+  Type* u2 = package.GetBitsType(2);
+  Type* u32 = package.GetBitsType(32);
+  Type* big_array = package.GetArrayType(
+      6, package.GetArrayType(16, package.GetArrayType(4, u32)));
+  BValue s1_param = fb.Param("s1", u2);
+  BValue x1_param = fb.Param("x1", big_array);
+  BValue y1_param = fb.Param("y1", big_array);
+  BValue d1_param = fb.Param("d1", big_array);
+  BValue s2_param = fb.Param("s2", u1);
+  BValue x2_param = fb.Param("x2", big_array);
+  BValue d2_param = fb.Param("d2", big_array);
+  BValue priority_select1 =
+      fb.PrioritySelect(s1_param, {x1_param, y1_param}, d1_param);
+  BValue priority_select2 = fb.PrioritySelect(s2_param, {x2_param}, d2_param);
+  XLS_ASSERT_OK(
+      fb.BuildWithReturnValue(fb.Tuple({priority_select1, priority_select2})));
+
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options());
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * s1, mb.AddInputPort("s1", u2));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x1, mb.AddInputPort("x1", big_array));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y1, mb.AddInputPort("y1", big_array));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * d1, mb.AddInputPort("d1", big_array));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * s2, mb.AddInputPort("s2", u1));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x2, mb.AddInputPort("x2", big_array));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * d2, mb.AddInputPort("d2", big_array));
+
+  XLS_ASSERT_OK(mb.EmitAsAssignment("priority_select1", priority_select1.node(),
+                                    {s1, x1, y1, d1})
+                    .status());
+  XLS_ASSERT_OK(mb.EmitAsAssignment("priority_select2", priority_select2.node(),
+                                    {s2, x2, d2})
+                    .status());
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 file.Emit());
+}
+
+TEST_P(ModuleBuilderTest, ShraAsFunction) {
+  VerilogFile file = NewVerilogFile();
+  Package package(TestBaseName());
+  FunctionBuilder fb(TestBaseName(), &package);
+  Type* u32 = package.GetBitsType(32);
+  BValue x_param = fb.Param("x", u32);
+  BValue y_param = fb.Param("y", u32);
+  BValue x_shra_y = fb.Shra(x_param, y_param);
+  XLS_ASSERT_OK(fb.Build());
+
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options());
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x, mb.AddInputPort("x", u32));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y, mb.AddInputPort("y", u32));
+  XLS_ASSERT_OK(
+      mb.EmitAsAssignment("x_smul_y", x_shra_y.node(), {x, y}).status());
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 file.Emit());
+}
+
+TEST_P(ModuleBuilderTest, ShraAsFunctionSingleBit) {
+  VerilogFile file = NewVerilogFile();
+  Package package(TestBaseName());
+  FunctionBuilder fb(TestBaseName(), &package);
+  Type* u1 = package.GetBitsType(1);
+  BValue x_param = fb.Param("x", u1);
+  BValue y_param = fb.Param("y", u1);
+  BValue x_shra_y = fb.Shra(x_param, y_param);
+  XLS_ASSERT_OK(fb.Build());
+
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options());
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * x, mb.AddInputPort("x", u1));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * y, mb.AddInputPort("y", u1));
+  XLS_ASSERT_OK(
+      mb.EmitAsAssignment("x_smul_y", x_shra_y.node(), {x, y}).status());
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 file.Emit());
+}
+
+TEST_P(ModuleBuilderTest, ArrayUpdate1D) {
+  VerilogFile file = NewVerilogFile();
+  Package package(TestBaseName());
+  FunctionBuilder fb(TestBaseName(), &package);
+  ArrayType* array_type = package.GetArrayType(4, package.GetBitsType(32));
+  BValue array = fb.Param("array", array_type);
+  BValue index = fb.Param("index", package.GetBitsType(2));
+  BValue value = fb.Param("value", package.GetBitsType(32));
+  BValue updated_array = fb.ArrayUpdate(array, value, /*indices=*/{index});
+  XLS_ASSERT_OK(fb.Build());
+
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options());
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * array_ref,
+                           mb.AddInputPort("array", array_type));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * index_ref,
+                           mb.AddInputPort("index", package.GetBitsType(2)));
+  XLS_ASSERT_OK_AND_ASSIGN(LogicRef * value_ref,
+                           mb.AddInputPort("value", package.GetBitsType(32)));
+  XLS_ASSERT_OK(mb.EmitAsAssignment("updated_array", updated_array.node(),
+                                    {array_ref, index_ref, value_ref})
+                    .status());
+
+  ExpectVerilogEqualToGoldenFile(GoldenFilePath(kTestName, kTestdataPath),
+                                 file.Emit());
+}
+
+TEST_P(ModuleBuilderTest, NameCollisionsOnPorts) {
+  VerilogFile file = NewVerilogFile();
+  Package p(TestBaseName());
+  Type* u32 = p.GetBitsType(32);
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options(),
+                   /*clk_name=*/"clk");
+  XLS_ASSERT_OK(mb.AddInputPort("x", u32).status());
+  EXPECT_THAT(mb.AddInputPort("x", u32),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Unable to name input port `x` on module")));
+}
+
+TEST_P(ModuleBuilderTest, NameCollisionsBetweenRegAndPortRegDeclaredFirst) {
+  VerilogFile file = NewVerilogFile();
+  Package p(TestBaseName());
+  Type* u32 = p.GetBitsType(32);
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options(),
+                   /*clk_name=*/"clk");
+  XLS_ASSERT_OK(
+      mb.DeclareRegister("x", u32, file.Literal(UBits(0, 32), SourceInfo()))
+          .status());
+  EXPECT_THAT(mb.AddInputPort("x", u32),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Unable to name input port `x` on module")));
+}
+
+TEST_P(ModuleBuilderTest, NameCollisionsBetweenRegAndPortRegDeclaredSecond) {
+  VerilogFile file = NewVerilogFile();
+  Package p(TestBaseName());
+  Type* u32 = p.GetBitsType(32);
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options(),
+                   /*clk_name=*/"clk");
+
+  // A name collision is not an error if the port is declared before the reg
+  // because the reg has some flexibility when named (it can have a uniquifying
+  // suffix);
+  XLS_ASSERT_OK(mb.AddInputPort("x", u32).status());
+  XLS_ASSERT_OK(
+      mb.DeclareRegister("x", u32, file.Literal(UBits(0, 32), SourceInfo()))
+          .status());
+}
+
+TEST_P(ModuleBuilderTest, PortNamedWithVerilogKeyword) {
+  VerilogFile file = NewVerilogFile();
+  Package p(TestBaseName());
+  Type* u32 = p.GetBitsType(32);
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options(),
+                   /*clk_name=*/"clk");
+  EXPECT_THAT(
+      mb.AddInputPort("module", u32),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("Unable to name input port `module` on module")));
+}
+
+TEST_P(ModuleBuilderTest, RegNamedWithVerilogKeyword) {
+  VerilogFile file = NewVerilogFile();
+  Package p(TestBaseName());
+  Type* u32 = p.GetBitsType(32);
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options(),
+                   /*clk_name=*/"clk");
+  // Reg names have some flexibility when named (it can have a
+  // uniquifying/sanitizing suffix);
+  XLS_ASSERT_OK(mb.DeclareRegister("module", u32,
+                                   file.Literal(UBits(0, 32), SourceInfo()))
+                    .status());
+}
+
+TEST_P(ModuleBuilderTest, PortCollidesWithClockName) {
+  VerilogFile file = NewVerilogFile();
+  Package p(TestBaseName());
+  Type* u32 = p.GetBitsType(32);
+  ModuleBuilder mb(TestBaseName(), &file, codegen_options(),
+                   /*clk_name=*/"clk");
+  EXPECT_THAT(mb.AddInputPort("clk", u32),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Unable to name input port `clk` on module")));
+}
+
+TEST_P(ModuleBuilderTest, PortCollidesWithModuleName) {
+  VerilogFile file = NewVerilogFile();
+  Package p(TestBaseName());
+  Type* u32 = p.GetBitsType(32);
+  ModuleBuilder mb("my,module", &file, codegen_options(),
+                   /*clk_name=*/"clk");
+  EXPECT_THAT(
+      mb.AddInputPort("my_module", u32),
+      StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          HasSubstr(
+              "Unable to name input port `my_module` on module `my_module`")));
 }
 
 INSTANTIATE_TEST_SUITE_P(ModuleBuilderTestInstantiation, ModuleBuilderTest,

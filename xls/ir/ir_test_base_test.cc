@@ -14,12 +14,13 @@
 
 #include "xls/ir/ir_test_base.h"
 
+#include <memory>
 #include <string_view>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest-spi.h"
 #include "gtest/gtest.h"
 #include "xls/common/status/matchers.h"
+#include "xls/ir/function_base.h"
 
 namespace xls {
 namespace {
@@ -54,32 +55,6 @@ TEST_F(IrTestBaseTest, ValidVerifiedPackageSucceeds) {
   // Verify that a valid VerifiedPackage does not raise any errors during
   // destruction. The package is created then immediately dropped.
   XLS_ASSERT_OK(ParsePackage(kTestPackage).status());
-}
-
-TEST_F(IrTestBaseTest, RunAndExpectEqRightValue) {
-  RunAndExpectEq({{"p", 3}, {"q", 10}}, 23, kTestPackage);
-}
-
-TEST_F(IrTestBaseTest, RunAndExpectEqWrongValue) {
-  EXPECT_FATAL_FAILURE(RunAndExpectEq({{"p", 3}, {"q", 10}}, 55, kTestPackage),
-                       "bits[8]:55 != bits[8]:23");
-}
-
-TEST_F(IrTestBaseTest, RunAndExpectEqArgDoesNotFit) {
-  EXPECT_FATAL_FAILURE(
-      RunAndExpectEq({{"p", 12345}, {"q", 10}}, 23, kTestPackage),
-      "Argument value 12345 for parameter 'p' does not fit in type bits[8]");
-}
-
-TEST_F(IrTestBaseTest, RunAndExpectEqExpectedResultDoesNotFit) {
-  EXPECT_FATAL_FAILURE(
-      RunAndExpectEq({{"p", 3}, {"q", 10}}, 12345, kTestPackage),
-      "Value 12345 does not fit in return type bits[8]");
-}
-
-TEST_F(IrTestBaseTest, RunAndExpectEqMissingArg) {
-  EXPECT_FATAL_FAILURE(RunAndExpectEq({{"p", 3}}, 10, kTestPackage),
-                       "Missing argument 'q'");
 }
 
 TEST_F(IrTestBaseTest, HasNodes) {

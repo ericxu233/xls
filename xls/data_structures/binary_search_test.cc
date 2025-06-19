@@ -14,17 +14,20 @@
 
 #include "xls/data_structures/binary_search.h"
 
+#include <cstdint>
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
-#include "xls/common/status/matchers.h"
 
 namespace xls {
 namespace {
 
-using testing::HasSubstr;
-using xls::status_testing::IsOkAndHolds;
-using xls::status_testing::StatusIs;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
+using ::testing::HasSubstr;
 
 TEST(BinarySearchTest, MaxTrue) {
   const int64_t kMaxSize = 10;

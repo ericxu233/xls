@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_DSLX_TYPE_SYSTEM_SYMBOLIC_BIND_H_
-#define XLS_DSLX_TYPE_SYSTEM_SYMBOLIC_BIND_H_
+#ifndef XLS_DSLX_TYPE_SYSTEM_PARAMETRIC_BIND_H_
+#define XLS_DSLX_TYPE_SYSTEM_PARAMETRIC_BIND_H_
 
 #include <memory>
 #include <string>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
+#include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/frontend/pos.h"
-#include "xls/dslx/type_system/concrete_type.h"
+#include "xls/dslx/interp_value.h"
 #include "xls/dslx/type_system/deduce_ctx.h"
+#include "xls/dslx/type_system/type.h"
 
 namespace xls::dslx {
 
@@ -37,7 +41,7 @@ namespace xls::dslx {
 //  deduce_ctx: Made available for error reporting.
 struct ParametricBindContext {
   const Span& span;
-  const absl::flat_hash_map<std::string, std::unique_ptr<ConcreteType>>&
+  const absl::flat_hash_map<std::string, std::unique_ptr<Type>>&
       parametric_binding_types;
   const absl::flat_hash_map<std::string, Expr*>& parametric_default_exprs;
   absl::flat_hash_map<std::string, InterpValue>& parametric_env;
@@ -50,36 +54,34 @@ struct ParametricBindContext {
 // Returns an appropriate error if the binding has a type error or is in
 // conflict with a previous binding.
 //
-// This is key to the process that populates parametrics automatically from
-// actual arguments; e.g.
+// This is part of the process that populates parametrics from actual
+// arguments; e.g.,
 //
 //    fn p<X: u32>(x: uN[X])
 //
-// Implicitly gets X=8 bound via this invocation using an actual argument in
+// Implicitly binds X=8 via this invocation using an actual argument in
 // the caller where we know the concrete type:
 //
 //    p(u8:42)
 //
 // Args:
-//  param_type: The type of the (formal) parameter.
-//  param_dim: The dimension held by param_type, this may be parametric.
-//  arg_type: The type of the *actual* argument being passed to the formal
+//  formal_type: The type of the formal parameter.
+//  formal_dim: The dimension held by formal_type; this may be parametric.
+//  actual_type: The type of the actual argument being passed to the formal
 //    parameter.
-//  arg_dim: The dimension held by arg_type.
+//  actual_dim: The dimension held by actual_type.
 //  ctx: The parametric binding context.
-//  deduce_ctx: Used for reporting errors.
-absl::Status ParametricBindConcreteTypeDim(const ConcreteType& param_type,
-                                           const ConcreteTypeDim& param_dim,
-                                           const ConcreteType& arg_type,
-                                           const ConcreteTypeDim& arg_dim,
-                                           ParametricBindContext& ctx);
+absl::Status ParametricBindTypeDim(const Type& formal_type,
+                                   const TypeDim& formal_dim,
+                                   const Type& actual_type,
+                                   const TypeDim& actual_dim,
+                                   ParametricBindContext& ctx);
 
-// As described above in ParametricBindConcreteTypeDim, but handles arbitrary
+// As described above in ParametricBindTypeDim, but handles arbitrary
 // parameter types / argument type bindings.
-absl::Status ParametricBind(const ConcreteType& param_type,
-                            const ConcreteType& arg_type,
+absl::Status ParametricBind(const Type& param_type, const Type& arg_type,
                             ParametricBindContext& ctx);
 
 }  // namespace xls::dslx
 
-#endif  // XLS_DSLX_TYPE_SYSTEM_SYMBOLIC_BIND_H_
+#endif  // XLS_DSLX_TYPE_SYSTEM_PARAMETRIC_BIND_H_

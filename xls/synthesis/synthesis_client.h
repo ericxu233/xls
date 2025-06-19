@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_SYNTHESIS_CLIENT_H_
-#define XLS_SYNTHESIS_CLIENT_H_
+#ifndef XLS_SYNTHESIS_SYNTHESIS_CLIENT_H_
+#define XLS_SYNTHESIS_SYNTHESIS_CLIENT_H_
 
 #include <string>
 
@@ -25,10 +25,9 @@ namespace synthesis {
 
 // This creates a new channel and stub *each* invocation
 absl::StatusOr<CompileResponse> SynthesizeViaClient(
-    const std::string& server,
-    const CompileRequest& request);
+    const std::string& server, const CompileRequest& request);
 
 }  // namespace synthesis
 }  // namespace xls
 
-#endif  // XLS_SYNTHESIS_CLIENT_H_
+#endif  // XLS_SYNTHESIS_SYNTHESIS_CLIENT_H_

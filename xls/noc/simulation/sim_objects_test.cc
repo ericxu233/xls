@@ -14,13 +14,20 @@
 
 #include "xls/noc/simulation/sim_objects.h"
 
-#include "gmock/gmock.h"
+#include <cstdint>
+
 #include "gtest/gtest.h"
-#include "xls/common/logging/logging.h"
+#include "absl/log/log.h"
+#include "absl/types/span.h"
 #include "xls/common/status/matchers.h"
+#include "xls/ir/bits.h"
 #include "xls/noc/config/network_config.pb.h"
+#include "xls/noc/simulation/common.h"
 #include "xls/noc/simulation/flit.h"
+#include "xls/noc/simulation/global_routing_table.h"
+#include "xls/noc/simulation/network_graph.h"
 #include "xls/noc/simulation/network_graph_builder.h"
+#include "xls/noc/simulation/parameters.h"
 #include "xls/noc/simulation/sample_network_graphs.h"
 
 namespace xls {
@@ -38,7 +45,7 @@ TEST(SimObjectsTest, BackToBackNetwork0) {
   ASSERT_EQ(graph.GetNetworkIds().size(), 1);
   EXPECT_EQ(params.GetNetworkParam(graph.GetNetworkIds()[0])->GetName(),
             "Test");
-  XLS_LOG(INFO) << "Network Checks Complete";
+  LOG(INFO) << "Network Checks Complete";
 
   XLS_ASSERT_OK_AND_ASSIGN(
       NetworkComponentId routera_id,
@@ -127,7 +134,7 @@ TEST(SimObjectsTest, TreeNetwork0) {
   ASSERT_EQ(graph.GetNetworkIds().size(), 1);
   EXPECT_EQ(params.GetNetworkParam(graph.GetNetworkIds()[0])->GetName(),
             "Test");
-  XLS_LOG(INFO) << "Network Graph Complete ...";
+  LOG(INFO) << "Network Graph Complete ...";
 
   XLS_ASSERT_OK_AND_ASSIGN(
       NetworkComponentId routera_id,

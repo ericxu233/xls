@@ -14,15 +14,17 @@
 
 #include "xls/ir/value_conversion_utils.h"
 
+#include <cstdint>
 #include <tuple>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xls/common/status/matchers.h"
-#include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/package.h"
 #include "xls/ir/type.h"
 #include "xls/ir/value.h"
@@ -30,8 +32,8 @@
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::ElementsAre;
 
 TEST(ValueConversionUtils, ConvertCppToXlsValueSignedIntegrals) {
@@ -139,10 +141,10 @@ TEST(ValueConversionUtils, ConvertCppToXlsValueTupleWithArray) {
   Package p("package");
   TupleType tuple_type(
       {p.GetBitsType(10), p.GetArrayType(2, p.GetBitsType(10))});
-  absl::StatusOr<Value> result_or = xls::ConvertToXlsValue(
+  absl::StatusOr<Value> result = xls::ConvertToXlsValue(
       &tuple_type, std::make_tuple<uint64_t, absl::Span<const uint64_t>>(
                        64, std::vector<uint64_t>{42, 64}));
-  EXPECT_THAT(result_or,
+  EXPECT_THAT(result,
               IsOkAndHolds(Value::Tuple({Value(UBits(64, 10)), element1})));
 }
 
@@ -153,9 +155,9 @@ TEST(ValueConversionUtils, ConvertCppToXlsValueTupleWithValueAsElement) {
   Package p("package");
   TupleType tuple_type(
       {p.GetBitsType(10), p.GetArrayType(2, p.GetBitsType(10))});
-  absl::StatusOr<Value> result_or =
+  absl::StatusOr<Value> result =
       xls::ConvertToXlsValue(&tuple_type, std::make_tuple(64, element1));
-  EXPECT_THAT(result_or,
+  EXPECT_THAT(result,
               IsOkAndHolds(Value::Tuple({Value(UBits(64, 10)), element1})));
 }
 

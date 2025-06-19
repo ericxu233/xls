@@ -18,13 +18,30 @@
 #include <optional>
 #include <utility>
 
+#include "absl/algorithm/container.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
+#include "xls/data_structures/leaf_type_tree.h"
 #include "xls/ir/bits.h"
-#include "xls/ir/function.h"
-#include "xls/ir/nodes.h"
+#include "xls/ir/function_base.h"
+#include "xls/ir/node.h"
+#include "xls/ir/ternary.h"
+#include "xls/ir/type.h"
 #include "xls/passes/query_engine.h"
+#include "xls/passes/ternary_evaluator.h"
 
 namespace xls {
+
+// Helper to provide a-priori known ternaries to the query engine.
+class TernaryDataProvider {
+ public:
+  TernaryDataProvider() = default;
+  virtual ~TernaryDataProvider() = default;
+  virtual std::optional<LeafTypeTree<TernaryVector>> GetKnownTernary(
+      Node* n) const = 0;
+};
 
 // A query engine which uses abstract evaluation of an XLS function using
 // ternary logic (0, 1, and unknown value X). Ternary logic evaluation is fast
@@ -33,28 +50,22 @@ namespace xls {
 // function (implications, equality, etc).
 class TernaryQueryEngine : public QueryEngine {
  public:
-  TernaryQueryEngine() = default;
-
   absl::StatusOr<ReachedFixpoint> Populate(FunctionBase* f) override;
+  absl::StatusOr<ReachedFixpoint> PopulateWithGivens(
+      FunctionBase* f, const TernaryDataProvider& givens);
 
   bool IsTracked(Node* node) const override {
-    return known_bits_.contains(node);
+    return values_.contains(node) && values_.at(node).type() == node->GetType();
   }
 
-  LeafTypeTree<TernaryVector> GetTernary(Node* node) const override {
-    if (!node->GetType()->IsBits()) {
-      LeafTypeTree<absl::monostate> shape(node->GetType());
-      return LeafTypeTree<Type*>(shape.type(), shape.leaf_types())
-          .Map<TernaryVector>([](Type* type) -> TernaryVector {
-            return TernaryVector(type->GetFlatBitCount(),
-                                 TernaryValue::kUnknown);
-          });
-    }
-    TernaryVector ternary =
-        ternary_ops::FromKnownBits(known_bits_.at(node), bits_values_.at(node));
-    LeafTypeTree<TernaryVector> result(node->GetType());
-    result.Set({}, ternary);
-    return result;
+  std::optional<SharedLeafTypeTree<TernaryVector>> GetTernary(
+      Node* node) const override {
+    return GetTernaryView(node).AsShared();
+  }
+
+  LeafTypeTreeView<TernaryVector> GetTernaryView(Node* node) const {
+    CHECK(IsTracked(node)) << node;
+    return values_.at(node).AsView();
   }
 
   bool AtMostOneTrue(absl::Span<TreeBitLocation const> bits) const override;
@@ -76,14 +87,25 @@ class TernaryQueryEngine : public QueryEngine {
     return std::nullopt;
   }
 
- private:
-  // Holds which bits values are known for nodes in the function. A one in a bit
-  // position indications the respective bit value in the respective node is
-  // statically known.
-  absl::flat_hash_map<Node*, Bits> known_bits_;
+  std::optional<TernaryVector> ImpliedNodeTernary(
+      absl::Span<const std::pair<TreeBitLocation, bool>> predicate_bit_values,
+      Node* node) const override {
+    return std::nullopt;
+  }
 
-  // Holds the values of statically known bits of nodes in the function.
-  absl::flat_hash_map<Node*, Bits> bits_values_;
+  bool IsFullyKnown(Node* n) const override {
+    if (!IsTracked(n) || TypeHasToken(n->GetType())) {
+      return false;
+    }
+    return absl::c_all_of(values_.at(n).AsView().elements(),
+                          [](const TernaryVector& tv) -> bool {
+                            return ternary_ops::IsFullyKnown(tv);
+                          });
+  }
+
+ private:
+  // Holds which bits values are known for nodes in the function.
+  absl::flat_hash_map<Node*, LeafTypeTree<TernaryEvaluator::Vector>> values_;
 };
 
 }  // namespace xls

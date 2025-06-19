@@ -14,12 +14,18 @@
 
 #include "xls/noc/config_ng/network_component.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "xls/common/logging/logging.h"
+#include "absl/log/die_if_null.h"
+#include "absl/memory/memory.h"
+#include "absl/status/status.h"
+#include "xls/common/iterator_range.h"
+#include "xls/ir/unwrapping_iterator.h"
+#include "xls/noc/config_ng/network_component_port.h"
 
 namespace xls::noc {
 
@@ -54,7 +60,7 @@ NetworkComponent::ports() const {
 }
 
 NetworkComponent::NetworkComponent(NetworkView* network_view)
-    : network_view_(*XLS_DIE_IF_NULL(network_view)) {}
+    : network_view_(*ABSL_DIE_IF_NULL(network_view)) {}
 
 absl::Status NetworkComponent::Accept(NetworkComponentVisitor& v) {
   return Visit(v);

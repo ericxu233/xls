@@ -16,25 +16,35 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/function.h"
+#include "xls/ir/function_builder.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
 #include "xls/ir/package.h"
 #include "xls/passes/dce_pass.h"
 #include "xls/passes/optimization_pass.h"
 #include "xls/passes/pass_base.h"
+#include "xls/solvers/z3_ir_equivalence.h"
+#include "xls/solvers/z3_ir_translator.h"
 
 namespace m = ::xls::op_matchers;
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
+
+using ::testing::_;
+using ::testing::Each;
+using ::testing::UnorderedElementsAre;
+using ::testing::VariantWith;
 
 class StrengthReductionPassTest : public IrTestBase {
  protected:
@@ -42,19 +52,36 @@ class StrengthReductionPassTest : public IrTestBase {
 
   absl::StatusOr<bool> Run(Function* f) {
     PassResults results;
+    OptimizationContext context;
     XLS_ASSIGN_OR_RETURN(bool changed,
                          StrengthReductionPass().RunOnFunctionBase(
-                             f, OptimizationPassOptions(), &results));
+                             f, OptimizationPassOptions(), &results, context));
     // Run dce to clean things up.
     XLS_RETURN_IF_ERROR(
         DeadCodeEliminationPass()
-            .RunOnFunctionBase(f, OptimizationPassOptions(), &results)
+            .RunOnFunctionBase(f, OptimizationPassOptions(), &results, context)
             .status());
     // Return whether strength reduction changed anything.
     return changed;
   }
 };
 
+class StrengthReductionPassSemanticsTest : public StrengthReductionPassTest {
+ public:
+  void TestReductionIsEquivalent(FunctionBuilder& fb) {
+    XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+    TestReductionIsEquivalent(f);
+  }
+  void TestReductionIsEquivalent(Function* f) {
+    EXPECT_THAT(solvers::z3::TryProveEquivalence(
+                    f,
+                    [&](auto package, auto function) {
+                      return StrengthReductionPassTest::Run(function).status();
+                    }),
+                IsOkAndHolds(VariantWith<solvers::z3::ProvenTrue>(_)))
+        << "Pass changed meaning of the function";
+  }
+};
 
 TEST_F(StrengthReductionPassTest, ReducibleAdd) {
   auto p = CreatePackage();
@@ -343,6 +370,157 @@ TEST_F(StrengthReductionPassTest, GateKnownDataZero) {
 
   EXPECT_THAT(Run(f), IsOkAndHolds(true));
   EXPECT_THAT(f->return_value(), m::Literal(UBits(0, 8)));
+}
+
+TEST_F(StrengthReductionPassSemanticsTest, ArithToSelect) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue param = fb.Param("unknown", p->GetBitsType(1));
+  // Value is 42 (0b101010) or 40 (0b101000)
+  BValue big_unknown = fb.Concat(
+      {fb.Literal(UBits(0b1010, 62)), param, fb.Literal(UBits(0, 1))});
+  fb.Tuple({
+      fb.UMul(big_unknown, fb.Literal(UBits(10, 64))),    // 400 or 420
+      fb.UMul(fb.Literal(UBits(10, 64)), big_unknown),    // 400 or 420
+      fb.SMul(big_unknown, fb.Literal(UBits(-10, 64))),   // -400 or -420
+      fb.SMul(fb.Literal(UBits(-12, 64)), big_unknown),   // -400 or -420
+      fb.UDiv(big_unknown, fb.Literal(UBits(2, 64))),     // 20 or 21
+      fb.UDiv(fb.Literal(UBits(84, 64)), big_unknown),    // 2 or 1
+      fb.SDiv(big_unknown, fb.Literal(UBits(-2, 64))),    // -20 or -21
+      fb.SDiv(fb.Literal(UBits(-84, 64)), big_unknown),   // -2 or -1
+      fb.UMod(big_unknown, fb.Literal(UBits(7, 64))),     // 0 or 5
+      fb.UMod(fb.Literal(UBits(120, 64)), big_unknown),   // 36 or 0
+      fb.SMod(big_unknown, fb.Literal(UBits(-7, 64))),    // 0 or -5
+      fb.SMod(fb.Literal(UBits(-120, 64)), big_unknown),  // -36 or 0
+  });
+  TestReductionIsEquivalent(fb);
+}
+
+TEST_F(StrengthReductionPassTest, ArithToSelect) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue param = fb.Param("unknown", p->GetBitsType(1));
+  // Value is 42 (0b101010) or 40 (0b101000)
+  BValue big_unknown = fb.Concat(
+      {fb.Literal(UBits(0b1010, 62)), param, fb.Literal(UBits(0, 1))});
+  fb.Tuple({
+      fb.UMul(big_unknown, fb.Literal(UBits(10, 64))),    // 400 or 420
+      fb.UMul(fb.Literal(UBits(10, 64)), big_unknown),    // 400 or 420
+      fb.SMul(big_unknown, fb.Literal(UBits(-10, 64))),   // -400 or -420
+      fb.SMul(fb.Literal(UBits(-12, 64)), big_unknown),   // -400 or -420
+      fb.UDiv(big_unknown, fb.Literal(UBits(2, 64))),     // 20 or 21
+      fb.UDiv(fb.Literal(UBits(84, 64)), big_unknown),    // 2 or 1
+      fb.SDiv(big_unknown, fb.Literal(UBits(-2, 64))),    // -20 or -21
+      fb.SDiv(fb.Literal(UBits(-84, 64)), big_unknown),   // -2 or -1
+      fb.UMod(big_unknown, fb.Literal(UBits(7, 64))),     // 0 or 5
+      fb.UMod(fb.Literal(UBits(120, 64)), big_unknown),   // 36 or 0
+      fb.SMod(big_unknown, fb.Literal(UBits(-7, 64))),    // 0 or -5
+      fb.SMod(fb.Literal(UBits(-120, 64)), big_unknown),  // -36 or 0
+  });
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  // Actual verification of result is done by semantics test.
+  EXPECT_THAT(f->return_value()->operands(),
+              Each(m::Select(m::Eq(), {m::Literal(), m::Literal()})));
+}
+
+TEST_F(StrengthReductionPassTest, ArithToSelectOnlyWithOneBit) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  // 4 unknown bits.
+  BValue param = fb.Param("unknown", p->GetBitsType(4));
+  BValue big_unknown =
+      fb.Concat({fb.Literal(UBits(0b101, 59)), param, fb.Literal(UBits(0, 1))});
+  fb.UMul(big_unknown, fb.Literal(UBits(10, 64)));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(f), IsOkAndHolds(false))
+      << "Optimization triggered unexpectedly. Got:\n"
+      << f->DumpIr();
+}
+
+TEST_F(StrengthReductionPassTest, PushDownSelectValues) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  fb.Add(fb.Literal(UBits(3, 32)),
+         fb.Select(fb.Param("selector", p->GetBitsType(1)),
+                   {fb.Literal(UBits(1, 32)), fb.Literal(UBits(2, 32))}));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+
+  EXPECT_THAT(
+      f->return_value(),
+      m::Select(m::Param(),
+                {
+                    m::Add(m::Literal(UBits(3, 32)), m::Literal(UBits(1, 32))),
+                    m::Add(m::Literal(UBits(3, 32)), m::Literal(UBits(2, 32))),
+                }))
+      << f->DumpIr();
+}
+
+TEST_F(StrengthReductionPassTest, DoNotPushDownCheapExtendingOps) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  fb.SignExtend(
+      fb.Select(fb.Param("selector", p->GetBitsType(1)),
+                {fb.Literal(UBits(0xFFFFFFFF, 32)), fb.Literal(UBits(2, 32))}),
+      64);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(f), IsOkAndHolds(false)) << f->DumpIr();
+}
+
+// This is something we might want to support at some point.
+TEST_F(StrengthReductionPassTest, DoNotPushDownMultipleSelects) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  fb.Add(
+      fb.Select(fb.Param("selector", p->GetBitsType(1)),
+                {fb.Literal(UBits(0xFFFFFFFF, 32)), fb.Literal(UBits(2, 32))}),
+      fb.Select(fb.Param("selector2", p->GetBitsType(1)),
+                {fb.Literal(UBits(33, 32)), fb.Literal(UBits(45, 32))}));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
+  ASSERT_THAT(Run(f), IsOkAndHolds(false)) << f->DumpIr();
+}
+
+TEST_F(StrengthReductionPassTest, ReplaceWidth0Param) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  BValue ret = fb.Or(fb.ZeroExtend(fb.Param("x", p->GetBitsType(0)), 1),
+                     fb.Param("y", p->GetBitsType(1)));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.BuildWithReturnValue(ret));
+  EXPECT_THAT(f->nodes(), UnorderedElementsAre(
+                              m::Param("x"), m::Param("y"), m::ZeroExt(),
+                              m::Or(m::ZeroExt(m::Param("x")), m::Param("y"))));
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
+  EXPECT_THAT(f->nodes(),
+              UnorderedElementsAre(m::Param("x"), m::Param("y"), m::Literal(),
+                                   m::Or(m::Literal(0), m::Param("y"))));
+}
+
+TEST_F(StrengthReductionPassTest, DoNotReplaceUnusedWidth0Param) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  fb.Param("x", p->GetBitsType(0));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Function * f, fb.BuildWithReturnValue(fb.Param("y", p->GetBitsType(1))));
+  EXPECT_THAT(f->nodes(), UnorderedElementsAre(m::Param("x"), m::Param("y")));
+  // Normally, the empty param would be replaced with a literal, but since it
+  // is unused, it doesn't get replaced.
+  // Replacing unused params with literals can lead to an infinite loop with
+  // strength reduction adding the literal and DCE removing it.
+  ASSERT_THAT(Run(f), IsOkAndHolds(false));
+  EXPECT_THAT(f->nodes(), UnorderedElementsAre(m::Param("x"), m::Param("y")));
+}
+
+TEST_F(StrengthReductionPassTest, HandlesOneBitMuxWithDefault) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn func() -> bits[1] {
+       literal.3: bits[1] = literal(value=0, id=3)
+       ret x6__1: bits[1] = sel(literal.3, cases=[literal.3], default=literal.3, id=6, pos=[(0,12,27)])
+     }
+  )",
+                                                       p.get()));
+  ASSERT_THAT(Run(f), IsOkAndHolds(true));
 }
 
 }  // namespace

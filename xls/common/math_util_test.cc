@@ -14,10 +14,13 @@
 
 #include "xls/common/math_util.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <limits>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "xls/common/fuzzing/fuzztest.h"
+#include "absl/base/macros.h"
 
 namespace xls {
 namespace {
@@ -59,7 +62,7 @@ void TestCeilOfRatio(const IntegralType test_data[][kNumTestArguments],
 
 template <typename UnsignedIntegralType>
 void TestCeilOfRatioUnsigned() {
-  typedef std::numeric_limits<UnsignedIntegralType> Limits;
+  using Limits = std::numeric_limits<UnsignedIntegralType>;
   EXPECT_TRUE(Limits::is_integer);
   EXPECT_FALSE(Limits::is_signed);
   const UnsignedIntegralType kMax = Limits::max();
@@ -90,7 +93,7 @@ void TestCeilOfRatioUnsigned() {
 
 template <typename SignedInteger>
 void TestCeilOfRatioSigned() {
-  typedef std::numeric_limits<SignedInteger> Limits;
+  using Limits = std::numeric_limits<SignedInteger>;
   EXPECT_TRUE(Limits::is_integer);
   EXPECT_TRUE(Limits::is_signed);
   const SignedInteger kMin = Limits::min();
@@ -181,7 +184,8 @@ TEST(MathUtil, CeilOfRatioInt64) { TestCeilOfRatioSigned<int64_t>(); }
 TEST(MathUtil, CeilOfRatioDenomMinusOneIsIncorrect) {
   // Here we demonstrate why not to use CeilOfRatioDenomMinusOne: It does not
   // work with negative values.
-  TestThatCeilOfRatioDenomMinusOneIsIncorrect(-1LL, -2LL, -1LL);
+  TestThatCeilOfRatioDenomMinusOneIsIncorrect(int64_t{-1}, int64_t{-2},
+                                              int64_t{-1});
 
   // This would also fail if given kint64max because of signed integer overflow.
 }
@@ -222,11 +226,11 @@ TEST(MathUtil, IsEven) {
 }
 
 TEST(MathUtil, Exp2) {
-  EXPECT_EQ(Exp2<uint>(0), 1);
-  EXPECT_EQ(Exp2<uint>(1), 2);
-  EXPECT_EQ(Exp2<uint>(2), 4);
-  EXPECT_EQ(Exp2<uint>(3), 8);
-  EXPECT_EQ(Exp2<uint>(31), 2147483648);
+  EXPECT_EQ(Exp2<uint32_t>(0), 1);
+  EXPECT_EQ(Exp2<uint32_t>(1), 2);
+  EXPECT_EQ(Exp2<uint32_t>(2), 4);
+  EXPECT_EQ(Exp2<uint32_t>(3), 8);
+  EXPECT_EQ(Exp2<uint32_t>(31), 2147483648);
   EXPECT_EQ(Exp2<uint64_t>(63), 1ULL << 63);
 }
 
@@ -273,6 +277,206 @@ TEST(MathUtil, FactorizePowerOfTwo) {
     EXPECT_EQ(exponent, 55);
   }
 }
+
+TEST(MathUtil, SaturatingAdd) {
+  {
+    auto sa = SaturatingAdd(int8_t{3}, int8_t{4});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, 7);
+    EXPECT_FALSE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingAdd(int8_t{100}, int8_t{27});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, 127);
+    EXPECT_FALSE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingAdd(int8_t{101}, int8_t{27});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, 127);
+    EXPECT_TRUE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingAdd(int8_t{120}, int8_t{120});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, 127);
+    EXPECT_TRUE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingAdd(int8_t{127}, int8_t{127});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, 127);
+    EXPECT_TRUE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingAdd(int8_t{-127}, int8_t{127});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, 0);
+    EXPECT_FALSE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingAdd(int8_t{127}, int8_t{-127});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, 0);
+    EXPECT_FALSE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingAdd(int8_t{0}, int8_t{127});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, 127);
+    EXPECT_FALSE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingAdd(int8_t{127}, int8_t{0});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, 127);
+    EXPECT_FALSE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingAdd(uint8_t{3}, uint8_t{4});
+    uint8_t u8 = sa.result;
+    EXPECT_EQ(u8, 7);
+    EXPECT_FALSE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingAdd(uint8_t{255}, uint8_t{4});
+    uint8_t u8 = sa.result;
+    EXPECT_EQ(u8, 255);
+    EXPECT_TRUE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingAdd(uint8_t{3}, uint8_t{255});
+    uint8_t u8 = sa.result;
+    EXPECT_EQ(u8, 255);
+    EXPECT_TRUE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingAdd(uint8_t{0}, uint8_t{255});
+    uint8_t u8 = sa.result;
+    EXPECT_EQ(u8, 255);
+    EXPECT_FALSE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingAdd(uint8_t{255}, uint8_t{0});
+    uint8_t u8 = sa.result;
+    EXPECT_EQ(u8, 255);
+    EXPECT_FALSE(sa.did_overflow);
+  }
+}
+
+TEST(MathUtil, SaturatingSub) {
+  {
+    auto sa = SaturatingSub(int8_t{3}, int8_t{4});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, -1);
+    EXPECT_FALSE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingSub(int8_t{0}, int8_t{-127});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, 127);
+    EXPECT_FALSE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingSub(uint8_t{100}, uint8_t{101});
+    int8_t u8 = sa.result;
+    EXPECT_EQ(u8, 0);
+    EXPECT_TRUE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingSub(int8_t{100}, int8_t{-101});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, 127);
+    EXPECT_TRUE(sa.did_overflow);
+  }
+}
+
+TEST(MathUtil, SaturatingMul) {
+  {
+    auto sa = SaturatingMul(int8_t{3}, int8_t{4});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, 12);
+    EXPECT_FALSE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingMul(int8_t{2}, int8_t{-88});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, -128);
+    EXPECT_TRUE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingMul(uint8_t{100}, uint8_t{101});
+    uint8_t u8 = sa.result;
+    EXPECT_EQ(u8, 255);
+    EXPECT_TRUE(sa.did_overflow);
+  }
+  {
+    auto sa = SaturatingMul(int8_t{-100}, int8_t{-101});
+    int8_t i8 = sa.result;
+    EXPECT_EQ(i8, 127);
+    EXPECT_TRUE(sa.did_overflow);
+  }
+}
+TEST(MathUtil, ExhaustiveSaturatingAdd) {
+  for (int16_t i16 = std::numeric_limits<int8_t>::min();
+       i16 <= std::numeric_limits<int8_t>::max(); ++i16) {
+    int8_t i = static_cast<int8_t>(i16);
+    for (int16_t j16 = 0; j16 <= std::numeric_limits<int8_t>::max(); ++j16) {
+      int8_t j = static_cast<int8_t>(j16);
+      int16_t sum_16 = i16 + j16;
+      bool expect_overflow = sum_16 > std::numeric_limits<int8_t>::max();
+      auto sa = SaturatingAdd(i, j);
+      if (expect_overflow) {
+        EXPECT_EQ(std::numeric_limits<int8_t>::max(), sa.result);
+        EXPECT_TRUE(sa.did_overflow);
+      } else {
+        EXPECT_EQ(sum_16, sa.result);
+        EXPECT_FALSE(sa.did_overflow);
+      }
+    }
+  }
+}
+
+void SaturatingAddFuzz(int16_t l, int16_t r) {
+  auto res = SaturatingAdd(l, r);
+  int32_t raw = static_cast<int32_t>(l) + static_cast<int32_t>(r);
+  int32_t clamped =
+      std::clamp<int32_t>(raw, std::numeric_limits<int16_t>::min(),
+                          std::numeric_limits<int16_t>::max());
+  EXPECT_EQ(static_cast<int32_t>(res.result), clamped);
+  if (raw != clamped) {
+    // Might have just hit the i16 max/min
+    EXPECT_TRUE(res.did_overflow);
+  }
+}
+void SaturatingSubFuzz(int16_t l, int16_t r) {
+  auto res = SaturatingSub(l, r);
+  int32_t raw = static_cast<int32_t>(l) - static_cast<int32_t>(r);
+  int32_t clamped =
+      std::clamp<int32_t>(raw, std::numeric_limits<int16_t>::min(),
+                          std::numeric_limits<int16_t>::max());
+  EXPECT_EQ(static_cast<int32_t>(res.result), clamped);
+  if (raw != clamped) {
+    // Might have just hit the i16 max/min
+    EXPECT_TRUE(res.did_overflow);
+  }
+}
+void SaturatingMulFuzz(int8_t l, int8_t r) {
+  auto res = SaturatingMul(l, r);
+  int32_t raw = static_cast<int32_t>(l) * static_cast<int32_t>(r);
+  int32_t clamped = std::clamp<int32_t>(raw, std::numeric_limits<int8_t>::min(),
+                                        std::numeric_limits<int8_t>::max());
+  EXPECT_EQ(static_cast<int32_t>(res.result), clamped);
+  if (raw != clamped) {
+    // Might have just hit the i16 max/min
+    EXPECT_TRUE(res.did_overflow);
+  }
+}
+
+FUZZ_TEST(MathUtil, SaturatingAddFuzz);
+FUZZ_TEST(MathUtil, SaturatingSubFuzz);
+FUZZ_TEST(MathUtil, SaturatingMulFuzz);
 
 }  // namespace
 }  // namespace xls

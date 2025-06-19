@@ -14,19 +14,21 @@
 
 #include "xls/noc/simulation/network_graph_builder.h"
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "xls/common/logging/logging.h"
+#include "absl/log/log.h"
 #include "xls/common/status/matchers.h"
 #include "xls/noc/config/network_config.pb.h"
 #include "xls/noc/config/network_config_proto_builder.h"
+#include "xls/noc/simulation/common.h"
+#include "xls/noc/simulation/network_graph.h"
+#include "xls/noc/simulation/parameters.h"
 
 namespace xls {
 namespace noc {
 namespace {
 
 TEST(SimNetworkGraphBuilderTest, UnitTest) {
-  XLS_LOG(INFO) << "Setting up network ...";
+  LOG(INFO) << "Setting up network ...";
 
   // Use builder to build noc
   NetworkConfigProtoBuilder builder("Test");
@@ -40,8 +42,8 @@ TEST(SimNetworkGraphBuilderTest, UnitTest) {
   builder.WithLink("Link1").WithSourcePort("out0").WithSinkPort("RecvPort");
 
   XLS_ASSERT_OK_AND_ASSIGN(NetworkConfigProto network, builder.Build());
-  XLS_LOG(INFO) << network.DebugString();
-  XLS_LOG(INFO) << "Done ...";
+  LOG(INFO) << network;
+  LOG(INFO) << "Done ...";
 
   // Build and assign simulation objects
   NetworkManager graph;
@@ -73,7 +75,7 @@ TEST(SimNetworkGraphBuilderTest, UnitTest) {
             params.GetPortParam(network_component.GetPortIds()[0])->GetName(),
             "SendPort");
 
-        // Retreive and check link attached with this network component
+        // Retrieve and check link attached with this network component
         connection_id = network_component.GetPortByIndex(0).connection();
         link_id =
             graph.GetConnection(connection_id).sink().GetNetworkComponentId();
@@ -81,7 +83,7 @@ TEST(SimNetworkGraphBuilderTest, UnitTest) {
                       .GetName(),
                   "Link0");
 
-        // Link ports are assoicated with the protos for the network components.
+        // Link ports are associated with the protos for the network components.
         EXPECT_EQ(
             params
                 .GetPortParam(
@@ -110,7 +112,7 @@ TEST(SimNetworkGraphBuilderTest, UnitTest) {
                       .GetName(),
                   "Link1");
 
-        // Link ports are assoicated with the protos for the network components.
+        // Link ports are associated with the protos for the network components.
         EXPECT_EQ(
             params
                 .GetPortParam(
@@ -144,7 +146,7 @@ TEST(SimNetworkGraphBuilderTest, UnitTest) {
           EXPECT_EQ(in0, network_component.GetInputPortIds()[0]);
         }
 
-        // Retreive and check link attached to input port
+        // Retrieve and check link attached to input port
         connection_id =
             graph.GetPort(network_component.GetInputPortIds()[0]).connection();
         link_id =
@@ -153,7 +155,7 @@ TEST(SimNetworkGraphBuilderTest, UnitTest) {
                       .GetName(),
                   "Link0");
 
-        // Retreive and check link attached to output port
+        // Retrieve and check link attached to output port
         connection_id =
             graph.GetPort(network_component.GetOutputPortIds()[0]).connection();
         link_id =

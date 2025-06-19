@@ -18,13 +18,14 @@
 #include <utility>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/import_data.h"
 #include "xls/dslx/interp_value.h"
-#include "xls/dslx/type_system/concrete_type.h"
 #include "xls/dslx/type_system/parametric_env.h"
+#include "xls/dslx/type_system/type.h"
 #include "xls/dslx/type_system/type_info.h"
 #include "xls/dslx/warning_collector.h"
 
@@ -46,14 +47,14 @@ class ConstexprEvaluator : public xls::dslx::ExprVisitor {
   static absl::Status Evaluate(ImportData* import_data, TypeInfo* type_info,
                                WarningCollector* warning_collector,
                                const ParametricEnv& bindings, const Expr* expr,
-                               const ConcreteType* concrete_type = nullptr);
+                               const Type* type = nullptr);
 
   // Performs the same action as `Evaluate`, but returns the resulting constexpr
   // value. Returns an error status if `expr` is non-constexpr.
   static absl::StatusOr<InterpValue> EvaluateToValue(
       ImportData* import_data, TypeInfo* type_info,
       WarningCollector* warning_collector, const ParametricEnv& bindings,
-      const Expr* expr, const ConcreteType* concrete_type = nullptr);
+      const Expr* expr);
 
   // A concrete type is only necessary when:
   //  - Deducing a Number that is undecorated and whose type is specified by
@@ -62,26 +63,26 @@ class ConstexprEvaluator : public xls::dslx::ExprVisitor {
   //  - Deducing a constant array whose declaration terminates in an ellipsis:
   //    `u32[4]:[0, 1, ...]`. The type is needed to determine the number of
   //    elements to fill in.
-  // In all other cases, `concrete_type` can be nullptr.
+  // In all other cases, `type` can be nullptr.
   ~ConstexprEvaluator() override = default;
 
+  absl::Status HandleAllOnesMacro(const AllOnesMacro* expr) override;
   absl::Status HandleArray(const Array* expr) override;
   absl::Status HandleAttr(const Attr* expr) override;
   absl::Status HandleBinop(const Binop* expr) override;
-  absl::Status HandleBlock(const Block* expr) override;
   absl::Status HandleCast(const Cast* expr) override;
   absl::Status HandleChannelDecl(const ChannelDecl* expr) override;
   absl::Status HandleColonRef(const ColonRef* expr) override;
+  absl::Status HandleConditional(const Conditional* expr) override;
   absl::Status HandleConstAssert(const ConstAssert* const_assert) override;
-  absl::Status HandleConstantArray(const ConstantArray* expr) override;
-  absl::Status HandleConstRef(const ConstRef* expr) override;
   absl::Status HandleFor(const For* expr) override;
   absl::Status HandleFormatMacro(const FormatMacro* expr) override {
     return absl::OkStatus();
   }
-  absl::Status HandleZeroMacro(const ZeroMacro* expr) override;
+  absl::Status HandleFunctionRef(const FunctionRef* expr) override;
   absl::Status HandleIndex(const Index* expr) override;
   absl::Status HandleInvocation(const Invocation* expr) override;
+  absl::Status HandleLambda(const Lambda* expr) override;
   absl::Status HandleLet(const Let* expr) override { return absl::OkStatus(); }
   absl::Status HandleMatch(const Match* expr) override;
   absl::Status HandleNameRef(const NameRef* expr) override;
@@ -90,30 +91,30 @@ class ConstexprEvaluator : public xls::dslx::ExprVisitor {
   absl::Status HandleSpawn(const Spawn* expr) override {
     return absl::OkStatus();
   }
-  absl::Status HandleString(const String* expr) override;
-  absl::Status HandleStructInstance(const StructInstance* expr) override;
   absl::Status HandleSplatStructInstance(
       const SplatStructInstance* expr) override;
-  absl::Status HandleConditional(const Conditional* expr) override;
+  absl::Status HandleStatementBlock(const StatementBlock* expr) override;
+  absl::Status HandleString(const String* expr) override;
+  absl::Status HandleStructInstance(const StructInstance* expr) override;
   absl::Status HandleTupleIndex(const TupleIndex* expr) override;
   absl::Status HandleUnop(const Unop* expr) override;
   absl::Status HandleUnrollFor(const UnrollFor* expr) override;
+  absl::Status HandleVerbatimNode(const VerbatimNode* node) override;
   absl::Status HandleXlsTuple(const XlsTuple* expr) override;
-
-  static absl::StatusOr<InterpValue> CreateChannelValue(
-      const ConcreteType* concrete_type);
+  absl::Status HandleZeroMacro(const ZeroMacro* expr) override;
 
  private:
+  absl::Status HandleExternRef(const NameRef* name_ref, const NameDef* name_def,
+                               UseTreeEntry* use_tree_entry);
+
   ConstexprEvaluator(ImportData* import_data, TypeInfo* type_info,
                      WarningCollector* warning_collector,
-                     ParametricEnv bindings, const ConcreteType* concrete_type)
+                     ParametricEnv bindings, const Type* type)
       : import_data_(import_data),
         type_info_(type_info),
         warning_collector_(warning_collector),
         bindings_(std::move(bindings)),
-        concrete_type_(concrete_type) {}
-
-  bool IsConstExpr(const Expr* expr);
+        type_(type) {}
 
   // Interprets the given expression. Prior to calling this function, it's
   // necessary to determine that all expression components are constexpr.
@@ -123,17 +124,43 @@ class ConstexprEvaluator : public xls::dslx::ExprVisitor {
   TypeInfo* const type_info_;
   WarningCollector* const warning_collector_;
   const ParametricEnv bindings_;
-  const ConcreteType* const concrete_type_;
+  const Type* const type_;
 };
 
-// Creates a map of symbol name to value for all known symbols in the current
-// environment. This will be populated with symbolic bindings as well as
-// constexpr freevars of "node", which is useful when there are local
+// Holds the results of `MakeConstexprEnv()` -- generally users will use `env`,
+// but `freevars` and `non_constexpr` provide useful information in cases where
+// something goes wrong or needs to be reported via error messages.
+struct ConstexprEnvData {
+  // Free variables for the given expression.
+  FreeVariables freevars;
+
+  // Constexpr environment we were able to construct.
+  //
+  // Note that it seems ok for now for the keys to be std::string rather than
+  // NameDef* because we only use this map in the context of a single
+  // expression, and free variables from the expression for a given identifier
+  // will all point to the same thing, there is no partial shadowing that can
+  // occur.
+  absl::flat_hash_map<std::string, InterpValue> env;
+
+  // Free variable references that we were unable to resolve to a constexpr
+  // value.
+  //
+  // Note that this can include things like references to imported modules,
+  // as those are not themselves constexpr.
+  absl::flat_hash_set<const NameRef*> non_constexpr;
+};
+
+// Creates a map of `{symbol_name: value}` for all known symbols in the required
+// environment for `env`.
+//
+// This will be populated with parametric bindings as well as
+// constexpr freevars of `node`, which is useful when there are local
 // const bindings closed over e.g. in function scope.
 //
 // `type_info` is required to look up the value of previously computed
 // constexprs.
-absl::StatusOr<absl::flat_hash_map<std::string, InterpValue>> MakeConstexprEnv(
+absl::StatusOr<ConstexprEnvData> MakeConstexprEnv(
     ImportData* import_data, TypeInfo* type_info,
     WarningCollector* warning_collector, const Expr* node,
     const ParametricEnv& parametric_env);
@@ -146,6 +173,10 @@ absl::StatusOr<absl::flat_hash_map<std::string, InterpValue>> MakeConstexprEnv(
 // Note the returned string is deterministic.
 std::string EnvMapToString(
     const absl::flat_hash_map<std::string, InterpValue>& map);
+
+// Evaluates a Number AST node to an InterpValue.
+absl::StatusOr<InterpValue> EvaluateNumber(const Number& expr,
+                                           const Type& type);
 
 }  // namespace xls::dslx
 

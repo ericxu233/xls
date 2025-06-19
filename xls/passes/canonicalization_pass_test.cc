@@ -14,33 +14,48 @@
 
 #include "xls/passes/canonicalization_pass.h"
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "xls/common/status/matchers.h"
 #include "xls/interpreter/function_interpreter.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/events.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/op.h"
 #include "xls/ir/package.h"
+#include "xls/ir/value.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace m = ::xls::op_matchers;
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
+using ::absl_testing::IsOkAndHolds;
+using ::testing::ElementsAre;
+using ::testing::IsEmpty;
+using ::testing::Optional;
 
 class CanonicalizePassTest : public IrTestBase {
  protected:
   absl::StatusOr<bool> Run(Package* p) {
     PassResults results;
-    return CanonicalizationPass().Run(p, OptimizationPassOptions(), &results);
+    OptimizationContext context;
+    return CanonicalizationPass().Run(p, OptimizationPassOptions(), &results,
+                                      context);
   }
 };
 
@@ -95,6 +110,22 @@ TEST_F(CanonicalizePassTest, ZeroExtendReplacedWithConcat) {
 
   ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
   EXPECT_THAT(f->return_value(), m::Concat(m::Literal(0), m::Param()));
+}
+
+TEST_F(CanonicalizePassTest, NopBitwiseReductions) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn nop_bitwise_reductions(x: bits[1]) -> (bits[1], bits[1], bits[1]) {
+        and_reduce.1: bits[1] = and_reduce(x)
+        or_reduce.2: bits[1] = or_reduce(x)
+        xor_reduce.3: bits[1] = xor_reduce(x)
+        ret tuple: (bits[1], bits[1], bits[1]) = tuple(and_reduce.1, or_reduce.2, xor_reduce.3)
+     }
+  )",
+                                                       p.get()));
+
+  ASSERT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(f->return_value(), m::Tuple(m::Param(), m::Param(), m::Param()));
 }
 
 TEST_F(CanonicalizePassTest, ComparisonWithLiteralCanonicalization) {
@@ -181,7 +212,7 @@ TEST_F(CanonicalizePassTest, ExhaustiveClampTest) {
                 "%s %s %s ? %s : %s", x_on_lhs ? "x" : k0_str,
                 OpToString(cmp_op), x_on_lhs ? k0_str : "x",
                 x_on_true ? "x" : k1_str, x_on_true ? k1_str : "x");
-            XLS_VLOG(1) << "Testing: " << expr_str;
+            VLOG(1) << "Testing: " << expr_str;
 
             auto p = CreatePackage();
             FunctionBuilder fb(TestName(), p.get());
@@ -195,7 +226,7 @@ TEST_F(CanonicalizePassTest, ExhaustiveClampTest) {
             XLS_ASSERT_OK_AND_ASSIGN(Function * f,
                                      fb.BuildWithReturnValue(select));
 
-            XLS_VLOG(2) << "Before canonicalization: " << f->DumpIr();
+            VLOG(2) << "Before canonicalization: " << f->DumpIr();
 
             std::vector<Value> expected(kMaxValue);
             for (int64_t x_value = 0; x_value < kMaxValue; ++x_value) {
@@ -207,8 +238,8 @@ TEST_F(CanonicalizePassTest, ExhaustiveClampTest) {
 
             XLS_ASSERT_OK_AND_ASSIGN(bool changed, Run(p.get()));
 
-            XLS_VLOG(2) << "changed: " << changed;
-            XLS_VLOG(2) << "After canonicalization: " << f->DumpIr();
+            VLOG(2) << "changed: " << changed;
+            VLOG(2) << "After canonicalization: " << f->DumpIr();
 
             for (int64_t x_value = 0; x_value < kMaxValue; ++x_value) {
               XLS_ASSERT_OK_AND_ASSIGN(
@@ -253,6 +284,71 @@ TEST_F(CanonicalizePassTest, SelectWithInvertedSelector) {
   EXPECT_THAT(f->return_value(),
               m::Select(m::Param("p"),
                         /*cases=*/{m::Param("y"), m::Param("x")}));
+}
+
+TEST_F(CanonicalizePassTest, SelectWithGiantSelector) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, ParseFunction(R"(
+     fn f(p: bits[128], x: bits[8], y: bits[8]) -> bits[8] {
+        ret sel.2: bits[8] = sel(p, cases=[x], default=y)
+     }
+  )",
+                                                       p.get()));
+
+  EXPECT_THAT(Run(p.get()), IsOkAndHolds(false));
+  EXPECT_THAT(f->return_value(), m::Select(m::Param("p"),
+                                           /*cases=*/{m::Param("x")},
+                                           /*default_value=*/m::Param("y")));
+}
+
+TEST_F(CanonicalizePassTest, NextValueWithAlwaysTruePredicate) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, ParseProc(R"(
+     proc test(st: bits[1], init={0}) {
+        literal.1: bits[1] = literal(value=1)
+        next_value.2: () = next_value(param=st, value=literal.1, predicate=literal.1)
+     }
+  )",
+                                                  p.get()));
+  EXPECT_THAT(proc->next_values(proc->GetStateRead(int64_t{0})),
+              ElementsAre(m::Next(m::StateRead("st"), m::Literal(1),
+                                  /*predicate=*/m::Literal(1))));
+
+  EXPECT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(proc->next_values(proc->GetStateRead(int64_t{0})),
+              ElementsAre(m::Next(/*state_read=*/m::StateRead("st"),
+                                  /*value=*/m::Literal(1))));
+}
+
+TEST_F(CanonicalizePassTest, NextValueWithAlwaysFalsePredicate) {
+  auto p = CreatePackage();
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, ParseProc(R"(
+     proc test(st: bits[1], init={1}) {
+        literal.1: bits[1] = literal(value=0)
+        next_value.2: () = next_value(param=st, value=literal.1, predicate=literal.1)
+     }
+  )",
+                                                  p.get()));
+  EXPECT_THAT(proc->next_values(proc->GetStateRead(int64_t{0})),
+              ElementsAre(m::Next(m::StateRead("st"), m::Literal(0),
+                                  /*predicate=*/m::Literal(0))));
+
+  EXPECT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_THAT(proc->next_values(), IsEmpty());
+}
+
+TEST_F(CanonicalizePassTest, StateReadWithAlwaysTruePredicate) {
+  auto p = CreatePackage();
+  ProcBuilder pb("test", p.get());
+  BValue x = pb.StateElement("x", Value(UBits(0, 32)),
+                             /*read_predicate=*/pb.Literal(UBits(1, 1)));
+  pb.Next(x, pb.Literal(UBits(1, 32)));
+  XLS_ASSERT_OK_AND_ASSIGN(Proc * proc, pb.Build());
+  EXPECT_THAT(proc->GetStateRead(int64_t{0})->predicate(),
+              Optional(m::Literal(1)));
+
+  EXPECT_THAT(Run(p.get()), IsOkAndHolds(true));
+  EXPECT_EQ(proc->GetStateRead(int64_t{0})->predicate(), std::nullopt);
 }
 
 }  // namespace

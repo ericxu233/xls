@@ -72,6 +72,44 @@ Rebased branches can be pushed to their corresponding PRs with `--force`.
 See also [this Stack Overflow
 question](https://stackoverflow.com/questions/17354353/git-squash-all-commits-in-branch-without-conflicting).
 
+### Documenting PPA Impact
+
+We've noted that both open-source and commercial tools have non-negligible noise
+when it comes to measuring PPA changes; even reordering lines of Verilog, or
+changing the names of variables, can have substantial impact. The following
+procedure empirically seems to produce results with at most 2% noise in area and
+at most 10% noise in estimated delay.
+
+When contributing a change intended to improve timing or area, or when filing an
+issue about PPA, please:
+
+1.  Both before and after your change, run your circuit through Yosys synthesis
+    targeting ASAP7 with at least 50 different seeds. Your seed should involve
+    passing 50 different values for the flags `--autoidx` and `--hash-seed`.
+    -   If you are using `bazel_rules_hdl`, you may pass these values using the
+        `"autoidx_seed"` and `"hash_seed"` parameters on the `synthesize_rtl`
+        build rule.
+2.  Report the **best** area of the 50 different values both before & after your
+    change.
+
+If the difference is less than 2% in area or less than 10% in delay, please be
+prepared to work with us to verify that your change is a net improvement!
+
+Alternatively, if you're using a commercial tool, we ask that you similarly run
+at least 10 seeds using whatever mechanism your tool supports for seeded runs.
+Please confirm that you are getting different results each time, and - if at all
+possible - try to make sure you've captured about 90% of the variability of your
+tool. (You can do this by running a large number of seeds the first time you try
+this, and checking how many data points you would have needed to cover the 5% to
+95% range.)
+
+If your tool does not support seeded runs, XLS's `codegen_main` supports a
+`--randomize_order_seed` flag, which randomizes the order of the resulting lines
+of Verilog while respecting topological order and other reasonable constraints.
+The resulting Verilog is trivially equivalent for all seed values, but (for most
+tools) will produce results of varying quality. Run as many different seeds
+through codegen & your synthesis tool as you would seeded runs.
+
 ## Rendering Documentation
 
 XLS uses [mkdocs](https://www.mkdocs.org/) to render its documentation, and
@@ -80,7 +118,7 @@ documentation locally as a preview, you can set up mkdocs as follows:
 
 ```console
 proj/xls$ mkvirtualenv xls-mkdocs-env
-proj/xls$ pip install mkdocs-material mkdocs-exclude mdx_truly_sane_lists
+proj/xls$ pip install mkdocs-material mkdocs-exclude mdx_truly_sane_lists mkdocs-print-site-plugin
 proj/xls$ mkdocs serve
 ```
 
@@ -89,7 +127,7 @@ documentation on the fly as you make changes.
 
 Note that the `mkvirtualenv` command assumes you're using
 [virtualenvwrapper](https://virtualenvwrapper.readthedocs.io/en/latest/index.html)
-to manage your Python environment. You'll need to adjust these instrutions if
+to manage your Python environment. You'll need to adjust these instructions if
 you're doing something different. That can include explicitly adding `mkdocs` to
 your path, if locally installed Python binaries aren't available by default.
 

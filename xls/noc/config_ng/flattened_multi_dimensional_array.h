@@ -12,15 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_NOC_CONFIG_FLATTENED_MULTI_DIMENSIONAL_ARRAY_H_
-#define XLS_NOC_CONFIG_FLATTENED_MULTI_DIMENSIONAL_ARRAY_H_
+#ifndef XLS_NOC_CONFIG_NG_FLATTENED_MULTI_DIMENSIONAL_ARRAY_H_
+#define XLS_NOC_CONFIG_NG_FLATTENED_MULTI_DIMENSIONAL_ARRAY_H_
 
 #include <algorithm>
+#include <cstdint>
 #include <optional>
 #include <vector>
 
 #include "absl/container/inlined_vector.h"
-#include "xls/common/logging/logging.h"
+#include "absl/log/check.h"
+#include "absl/types/span.h"
 #include "xls/noc/config_ng/coordinate.h"
 #include "xls/noc/config_ng/dimension_bounds.h"
 
@@ -74,19 +76,18 @@ class FlattenedMultiDimensionalArray {
   // valid.
   void SetValue(const Coordinate& coordinate, const T& element) {
     if (dimensions_.HasZeroDimensions()) {
-      XLS_CHECK(coordinate.HasZeroDimensions());
+      CHECK(coordinate.HasZeroDimensions());
       elements_[0] = element;
     }
     std::optional<int64_t> index = GetIndexOfCoordinate(coordinate);
-    XLS_CHECK(index.has_value())
-        << "The coordinate did not resolve to an index";
+    CHECK(index.has_value()) << "The coordinate did not resolve to an index";
     elements_[index.value()] = element;
   }
 
   // Set the entry at the index of the flattened array to the element. The index
   // must be valid.
   void SetValue(int64_t index, const T& element) {
-    XLS_CHECK(IsIndexValid(index));
+    CHECK(IsIndexValid(index));
     elements_[index] = element;
   }
 
@@ -152,16 +153,16 @@ class FlattenedMultiDimensionalArray {
     // dimensional bounds, otherwise the result is 1.
     int64_t DistanceFromEnd(std::optional<int64_t> dimension_index) const {
       if (coordinate_.HasZeroDimensions()) {
-        XLS_CHECK(dimension_index == std::nullopt)
+        CHECK(dimension_index == std::nullopt)
             << "For a zero-dimension, the dimension index must be nullopt.";
         return traversed_zero_dimension_ ? 0 : 1;
       }
-      XLS_CHECK(dimension_index.has_value())
+      CHECK(dimension_index.has_value())
           << "Dimension index must have a value.";
       int64_t dimension_index_value = dimension_index.value();
-      XLS_CHECK_GE(dimension_index_value, 0)
+      CHECK_GE(dimension_index_value, 0)
           << "Dimension index must be greater than zero.";
-      XLS_CHECK_LT(dimension_index_value, dimensions_.GetDimensionCount())
+      CHECK_LT(dimension_index_value, dimensions_.GetDimensionCount())
           << "Dimension index is out of range: received "
           << dimension_index_value << ", maximum value is "
           << dimensions_.GetDimensionCount() << ".";
@@ -230,7 +231,7 @@ class FlattenedMultiDimensionalArray {
           dimension_index_order_(dimension_index_order.size(), 0),
           data_(data),
           traversed_zero_dimension_(false) {
-      XLS_QCHECK_EQ(space.GetDimensionCount(), dimension_index_order.size())
+      QCHECK_EQ(space.GetDimensionCount(), dimension_index_order.size())
           << "The size of space and dimension_index_order must be equivalent.";
       int64_t total = 0;
       int64_t total_golden = 0;
@@ -240,7 +241,7 @@ class FlattenedMultiDimensionalArray {
         total = total ^ dimension_index_order[count];
         total_golden = total_golden ^ count;
       }
-      XLS_QCHECK_EQ(total, total_golden)
+      QCHECK_EQ(total, total_golden)
           << "The values of the dimension_index_order must be sequential "
              "starting from zero.";
       std::copy(dimension_index_order.begin(), dimension_index_order.end(),
@@ -252,29 +253,26 @@ class FlattenedMultiDimensionalArray {
       if (coordinate_.HasZeroDimensions()) {
         traversed_zero_dimension_ = true;
         return;
-      } else {
-        // Already at the end. Do not increment.
-        if (IsAtBounds()) {
-          return;
-        }
-        bool carry = false;
-        for (int64_t count : dimension_index_order_) {
-          coordinate_.SetCoordinate(count,
-                                    coordinate_.GetCoordinate(count) + 1);
-          carry = coordinate_.GetCoordinate(count) ==
-                  dimensions_.GetDimensionBound(count);
-          if (carry) {
-            coordinate_.SetCoordinate(count, 0);
-          } else {
-            break;
-          }
-        }
+      }
+      // Already at the end. Do not increment.
+      if (IsAtBounds()) {
+        return;
+      }
+      bool carry = false;
+      for (int64_t count : dimension_index_order_) {
+        coordinate_.SetCoordinate(count, coordinate_.GetCoordinate(count) + 1);
+        carry = coordinate_.GetCoordinate(count) ==
+                dimensions_.GetDimensionBound(count);
         if (carry) {
-          for (int index = 0; index < dimensions_.GetDimensionCount();
-               index++) {
-            coordinate_.SetCoordinate(index,
-                                      dimensions_.GetDimensionBound(index));
-          }
+          coordinate_.SetCoordinate(count, 0);
+        } else {
+          break;
+        }
+      }
+      if (carry) {
+        for (int index = 0; index < dimensions_.GetDimensionCount(); index++) {
+          coordinate_.SetCoordinate(index,
+                                    dimensions_.GetDimensionBound(index));
         }
       }
     }
@@ -294,16 +292,16 @@ class FlattenedMultiDimensionalArray {
  private:
   const T& GetValueByCoordinate(const Coordinate& coordinate) const {
     if (dimensions_.HasZeroDimensions()) {
-      XLS_CHECK(coordinate.HasZeroDimensions());
+      CHECK(coordinate.HasZeroDimensions());
       return elements_[0];
     }
     std::optional<int64_t> index = GetIndexOfCoordinate(coordinate);
-    XLS_CHECK(index.has_value());
+    CHECK(index.has_value());
     return elements_[index.value()];
   }
 
   const T& GetValueByIndex(int64_t index) const {
-    XLS_CHECK(IsIndexValid(index));
+    CHECK(IsIndexValid(index));
     return elements_[index];
   }
 
@@ -349,4 +347,4 @@ class FlattenedMultiDimensionalArray {
 
 }  // namespace xls::noc
 
-#endif  // XLS_NOC_CONFIG_FLATTENED_MULTI_DIMENSIONAL_ARRAY_H_
+#endif  // XLS_NOC_CONFIG_NG_FLATTENED_MULTI_DIMENSIONAL_ARRAY_H_

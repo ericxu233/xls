@@ -14,11 +14,10 @@
 
 #include "xls/common/file/temp_directory.h"
 
-#include <filesystem>
+#include <filesystem>  // NOLINT
 #include <system_error>
 #include <utility>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/status/matchers.h"

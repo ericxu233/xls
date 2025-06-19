@@ -14,13 +14,16 @@
 
 #include "xls/noc/config_ng/custom_topology_options_proto_builder.h"
 
-#include "xls/common/logging/logging.h"
+#include "absl/log/die_if_null.h"
+#include "xls/noc/config_ng/channel_options_proto_builder.h"
+#include "xls/noc/config_ng/node_options_proto_builder.h"
+#include "xls/noc/config_ng/topology_options_network_config_builder.pb.h"
 
 namespace xls::noc {
 
 CustomTopologyOptionsProtoBuilder::CustomTopologyOptionsProtoBuilder(
     CustomTopologyOptionsProto* proto_ptr)
-    : proto_ptr_(XLS_DIE_IF_NULL(proto_ptr)) {}
+    : proto_ptr_(ABSL_DIE_IF_NULL(proto_ptr)) {}
 
 CustomTopologyOptionsProtoBuilder::CustomTopologyOptionsProtoBuilder(
     CustomTopologyOptionsProto* proto_ptr,
@@ -51,10 +54,8 @@ CustomTopologyOptionsProtoBuilder::AddChannel(
   return *this;
 }
 
-ChannelOptionsProtoBuilder
-CustomTopologyOptionsProtoBuilder::AddChannel() {
+ChannelOptionsProtoBuilder CustomTopologyOptionsProtoBuilder::AddChannel() {
   return ChannelOptionsProtoBuilder(proto_ptr_->add_channels());
 }
-
 
 }  // namespace xls::noc

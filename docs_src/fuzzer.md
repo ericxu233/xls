@@ -10,9 +10,10 @@ bazel run -c opt \
   -- --crash_path=/tmp/crashers-$(date +'%Y-%m-%d') --seed=0 --duration=8h
 ```
 
-NOTE: The `--seed=0` flag makes the fuzzer run from a deterministic seed, so the
-same sequence of examples will be tested each time command line invocation. To
-run non-deterministically, do not provide the `--seed` flag.
+!!! NOTE
+    The `--seed=0` flag makes the fuzzer run from a deterministic seed, so the
+    same sequence of examples will be tested each time command line invocation. To
+    run non-deterministically, do not provide the `--seed` flag.
 
 The XLS fuzzer generates a sequence of randomly generated DSLX functions and a
 set of random inputs to each function often with interesting bit patterns.
@@ -26,7 +27,9 @@ which may be disabled/enabled via flags (run with `--help` for more details):
 *   Optimizes the converted IR
 *   Interprets the pre-optimized and optimized IR with the batch of arguments
 *   Generates the Verilog from the IR with randomly selected codegen options
+    (with `--codegen`)
 *   Simulates the generated Verilog using the batch of arguments
+    (with `--simulate`)
 *   Performs a multi-way comparison of the DSLX interpreter results, the
     pre-optimized IR interpreter results, post-optimized IR interpreter results,
     and the simulator results
@@ -52,12 +55,18 @@ To avoid collisions the subdirectory is named using a hash of the DSLX code.
 Each crasher subdirectory has the following contents:
 
 ```
-$ ls /tmp/crashers-2019-06-25/05adbd50
-args.txt                   ir_converter_main.stderr   run.sh
-cl.txt                     ir_minimizer.options.json  sample.ir
-crasher_2020-04-23_9b05.x  ir_minimizer_test.sh       sample.ir.results
-eval_ir_main.stderr        options.json               sample.x
-exception.txt              opt_main.stderr            sample.x.results
+$ ls /tmp/crashers-2024-09-19/433f5244
+args.txt                        run.sh
+codegen_main.stderr             sample.block.ir
+crasher_2024-09-19_433f.x       sample.ir
+eval_ir_main.stderr             sample.ir.results
+exception.txt                   sample.opt.ir
+ir_converter_main.stderr        sample.opt.ir.results
+minimized.ir                    sample.v
+module_sig.textproto            sample.x
+options.pbtxt                   sample.x.results
+opt_main.stderr                 simulate_module_main.stderr
+revision.txt
 ```
 
 The directory includes the problematic DSLX sample (`sample.x`) and the input
@@ -65,10 +74,11 @@ arguments (`args.txt`) as well as all artifacts generated and stderr output
 emitted by the various utilities invoked to test the sample. Notable files
 include:
 
-*   `options.json` : Options used to run the sample.
+*   `options.pbtxt` : Options used to run the sample (text protobuffer).
 *   `sample.ir` : Unoptimized IR generated from the DSLX sample.
 *   `sample.opt.ir` : IR after optimizations.
-*   `sample.v` : Generated Verilog.
+*   `sample.v` : Generated Verilog (or `sample.sv` with
+     `--use_system_verilog=true` on fuzz runner)
 *   `*.results` : The results (numeric values) produced by interpreting or
     simulating the respective input (DSLX, IR, or Verilog).
 *   `exception.txt` : The exception raised when running the sample. Typically
@@ -76,6 +86,7 @@ include:
     status (for example, the IR optimizer crashed).
 *   `crasher_*.x`: A single file reproducer which includes the DSLX code,
     arguments, and options. See [below](#reproducers) for details.
+*   `run.sh`: a script to re-run this example.
 
 Typically the exact nature of the failure can be identified by reading the file
 `exception.txt` and possibly the stderr outputs of the various tools.
@@ -274,15 +285,67 @@ higher, and the assembly is dumped at level 3 or higher. For example:
   eval_ir_main -v=3 --logtostderr --random_inputs=1 sample.opt.ir
 ```
 
-You can also send the optimized or unoptimized IR or asm to a file with the
-`--llvm_jit_ir_output=<file>`, `--llvm_jit_opt_ir_output=<file>` and
-`--llvm_jit_asm_output=<file>` flags.
+##### Generating LLVM Artifacts
 
-For example:
+You can generate LLVM IR artifacts for a piece of ir code using
+`dump_llvm_artifacts`
 
+This tool invokes the aot compiler to generate LLVM bytecode for a given ir file
+and (if possible) some additional files to enable one to run it with `lli` or
+similar tools.
+
+!!! NOTE
+    Currently this tool does not support block IRs since it is built on the
+    AOT-compiler which only supports proc and functions.
+
+Note: LLVM can change significantly and bytecode is not always compatible
+between versions. If possible, LLVM tools built at the same commit as the JIT
+should be used to interact with the generated llvm bytecode. This can be done by
+building the LLVM tools using `bazel` from the XLS repo.
+
+###### If you have an example input-output pair:
+
+```sh
+$ bazel run jit:dump_llvm_artifacts -- --out_dir=/tmp/muladd --ir=/tmp/muladd.ir '--input=bits[8]:0x1' '--input=bits[8]:0x2' '--input=bits[8]:0x3' '--result=bits[8]:0x5'
+Generating XLS artifacts
+Generating main.cc
+Compiling main.cc
+Linking unopt main.cc
+Linking opt main.cc
+$ ls /tmp/muladd
+linked.ll      main.ll                result.entrypoints.txtpb  result.opt.ll
+linked.opt.ll  result.asm             result.ll
+main.cc        result.entrypoints.pb  result.o
+$ lli /tmp/muladd/linked.ll
+$ echo $?
+0
 ```
-  eval_ir_main --random_inputs=1 sample.opt.ir --llvm_jit_ir_output=sample.ll
+
+This generates a number of files.
+
+-   `result.ll`: The unoptimized llvm ir that our JIT/aot produces
+-   `result.opt.ll`: The optimized llvm ir that our JIT/aot actually compiles.
+-   `result.asm`: Result of compiling the `result.opt.ll` as assembly
+-   `result.o`: Result of compiling the `result.opt.ll` as object code
+-   `result.entrypoints.{txt,}pb`: The AotPackageEntrypointsProto describing the
+    compiled code in both text and binary format.
+-   `main.cc`: A cc file which contains a main function that invokes the
+    compiled code and compares it against the 'result'. It does not link against
+    any xls code. It requires that the code not use trace or asserts.
+-   `main.ll`: The llvm-ir version of `main.cc`.
+-   `linked.ll`: A fully linked llvm ir version of `main.ll` linked with
+    `result.ll`.
+-   `linked.opt.ll`: A fully linked llvm ir version of `main.ll` linked with
+    `result.opt.ll`.
+
+###### If you have a proc or do not have an reproducer value.
+
+```sh
+$ bazel run //xls/jit:dump_llvm_artifacts -- \
+        --out_dir=/some/path --ir=/path/to/test.ir
 ```
+
+This generates the same files but lacks the `main.` and `linked.` files.
 
 ##### Building LLVM tools
 
@@ -330,20 +393,27 @@ opt -S --instcombine sample.ll --debug-counter=instcombine-visit-skip=0,instcomb
 ##### Evaluating LLVM IR
 
 The LLVM tool `lli` evaluates LLVM IR. The tool expects the IR to include a
-entry function `main`. See the uploaded file in this
-[LLVM bug](https://bugs.llvm.org/show_bug.cgi?id=45762) for an example LLVM IR
-file which includes a main function that calls a (slightly modified)
-XLS-generated function.
+entry function `main`. This can be generated by `eval_ir_main
+--llvm_jit_main_wrapper_output=<file> --llvm_jit_main_wrapper_write_is_linked`.
+See the description in the [tools page](tools.md#jit-inspection) for how these
+flags work.
+
+Once both the main wrapper bytecode file and the function bytecode files are
+created they can be linked to a single file using `llvm-link`:
+
+```bash
+llvm-link -S -o sample_linked.ll sample.ll sample_main.ll
+```
 
 The LLVM tool `opt` optimizes the LLVM IR and can be piped to `lli` like so:
 
 ```
-  opt sample.ll --O2 | lli
+  opt sample_linked.ll --O2 | lli
 ```
 
 The LLVM IR can also compiled to an object file using `llc` and driven using a
-C/C++ test harness. The directory `xls/fuzzer/debug` includes a script and
-example demonstrating how to run JIT-generated LLVM IR in this manner.
+generated llvm test wrapper. The directory `xls/fuzzer/debug` includes a script
+and example demonstrating how to run JIT-generated LLVM IR in this manner.
 
 ##### Running LLVM code generation
 
@@ -353,7 +423,7 @@ IR and produces assembly or object code. Example invocation for producing object
 code:
 
 ```
-llc sample.ll -o sample.o --filetype=obj
+llc sample_linked.ll -o sample.o --filetype=obj
 ```
 
 The exact output of `llc` depends on the target machine used during compilation.

@@ -18,11 +18,14 @@ This module contains build macros for XLS.
 
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
+load("@rules_hdl//synthesis:build_defs.bzl", "benchmark_synth", "synthesize_rtl")
+load("@rules_hdl//verilog:providers.bzl", "verilog_library")
 load(
     "//xls/build_rules:xls_codegen_rules.bzl",
     "append_xls_ir_verilog_generated_files",
     "get_xls_ir_verilog_generated_files",
     "validate_verilog_filename",
+    "xls_ir_verilog",
 )
 load(
     "//xls/build_rules:xls_common_rules.bzl",
@@ -30,7 +33,17 @@ load(
 )
 load(
     "//xls/build_rules:xls_config_rules.bzl",
+    "DEFAULT_BENCHMARK_SYNTH_DELAY_MODEL",
+    "delay_model_to_standard_cells",
     "enable_generated_file_wrapper",
+)
+load(
+    "//xls/build_rules:xls_dslx_rules.bzl",
+    "xls_dslx_generate_cpp_type_files",
+)
+load(
+    "//xls/build_rules:xls_ir_macros.bzl",
+    _xls_ir_opt_ir_macro = "xls_ir_opt_ir_macro",
 )
 load(
     "//xls/build_rules:xls_ir_rules.bzl",
@@ -38,6 +51,7 @@ load(
     "append_xls_ir_opt_ir_generated_files",
     "get_xls_dslx_ir_generated_files",
     "get_xls_ir_opt_ir_generated_files",
+    "xls_benchmark_ir",
 )
 load(
     "//xls/build_rules:xls_rules.bzl",
@@ -49,7 +63,7 @@ load(
     "DEFAULT_DSLX_FMT_TARGET",
 )
 load(
-    "//xls/build_rules:xls_type_check_helpers.bzl",
+    "//xls/build_rules:xls_type_check_utils.bzl",
     "bool_type_check",
     "dictionary_type_check",
     "list_type_check",
@@ -265,6 +279,7 @@ def xls_dslx_verilog_build_and_test(
     build_test(
         name = "__" + name,
         targets = [":" + name],
+        tags = kwargs["tags"] if "tags" in kwargs else [],
     )
 
 def xls_dslx_opt_ir_macro(
@@ -365,6 +380,7 @@ def xls_dslx_opt_ir_macro(
 def xls_dslx_cpp_type_library(
         name,
         src,
+        deps = [],
         namespace = None):
     """Creates a cc_library target for transpiled DSLX types.
 
@@ -376,21 +392,13 @@ def xls_dslx_cpp_type_library(
       src: The DSLX file whose types to compile as C++.
       namespace: The C++ namespace to generate the code in (e.g., `foo::bar`).
     """
-    native.genrule(
+    xls_dslx_generate_cpp_type_files(
         name = name + "_generate_sources",
         srcs = [src],
-        outs = [
-            name + ".h",
-            name + ".cc",
-        ],
-        tools = [
-            "//xls/dslx/cpp_transpiler:cpp_transpiler_main",
-        ],
-        cmd = "$(location //xls/dslx/cpp_transpiler:cpp_transpiler_main) " +
-              "--output_header_path=$(@D)/{}.h ".format(name) +
-              "--output_source_path=$(@D)/{}.cc ".format(name) +
-              ("" if namespace == None else "--namespaces={} ".format(namespace)) +
-              "$(location {})".format(src),
+        source_file = name + ".cc",
+        header_file = name + ".h",
+        deps = deps,
+        namespace = namespace,
     )
 
     native.cc_library(
@@ -405,6 +413,9 @@ def xls_dslx_cpp_type_library(
             "@com_google_absl//absl/types:span",
             "//xls/public:status_macros",
             "//xls/public:value",
+        ],
+        data = [
+            ":" + name + "_generate_sources",
         ],
     )
 
@@ -443,93 +454,30 @@ def xls_synthesis_metrics(
         **kwargs
     )
 
-def xls_delay_model_generation(
-        name,
-        standard_cells,
-        samples_file,
-        **kwargs):
-    """Generate an XLS delay model for one PDK corner.
-
-    This macro gathers the locations of the required dependencies
-    (Yosys, OpenSTA, helper scripts, and cell libraries) and
-    generates a wrapper script that invokes "run_timing_characterization"
-    with the dependency locations provided as args.
-
-    Any extra runtime args will get passed in to the
-    "run_timing_characterization" script (e.g. "--debug" or "--quick_run").
-
-    The script must be "run" from the root of the workspace
-    to perform the timing characterization.  The output textproto
-    will be produced in the current directory (which, as just
-    stated, must be the root of the workspace).
-
-    Currently, only a subset of XLS operators are characterized,
-    including most arithmetic, logical, and shift operators.
-    However, many common operators such as "concat", "bit_slice",
-    and "encode" are missing, and so the delay model that is
-    currently produced should be considered INCOMPLETE.
-
-    Args:
-        name: Used as basename for both the script and the output textproto.
-        standard_cells: Label for the PDK (possibly specifying a
-          non-default corner), with the assumption that $location will
-          return the timing (Liberty) library for the PDK corner.
-        samples_file: Path to proto providing sample points.
-        **kwargs: Accepts add'l keyword arguments. Passed to native.genrule().
-    """
-    native.genrule(
-        name = name,
-        executable = True,
-        output_to_bindir = True,
-        local = True,
-        srcs = [standard_cells, samples_file],
-        outs = [name + ".sh"],
-        tools = [
-            "@at_clifford_yosys//:yosys",
-            "@org_theopenroadproject//:opensta",
-            "//xls/synthesis/yosys:yosys_server_main",
-            "//xls/synthesis:timing_characterization_client_main",
-            "//xls/tools:run_timing_characterization",
-        ],
-        cmd = "libs=($(locations " + standard_cells + ")); \
-                lib=$${libs[0]}; \
-                rm -f $@; \
-                touch $@; \
-                _yosys_runfiles_dir=$(location @at_clifford_yosys//:yosys).runfiles; \
-                echo export YOSYS_DATDIR=$${_yosys_runfiles_dir}/at_clifford_yosys/techlibs/ >> $@; \
-                echo export ABC=$${_yosys_runfiles_dir}/edu_berkeley_abc/abc >> $@; \
-                _sta_runfiles_dir=$(location @org_theopenroadproject//:opensta).runfiles; \
-                echo export TCL_LIBRARY=$${_sta_runfiles_dir}/tk_tcl/library >> $@; \
-                echo export DONT_USE_ARGS=\"\" >> $@; \
-                echo 'set -e' >> $@; \
-                echo -n $(location //xls/tools:run_timing_characterization) >> $@; \
-                echo -n ' ' --yosys_path $(location @at_clifford_yosys//:yosys) >> $@; \
-                echo -n ' ' --sta_path $(location @org_theopenroadproject//:opensta) >> $@; \
-                echo -n ' ' --synth_libs $${lib} >> $@; \
-                echo -n ' ' --client $(location //xls/synthesis:timing_characterization_client_main) >> $@; \
-                echo -n ' ' --server $(location //xls/synthesis/yosys:yosys_server_main) >> $@; \
-                echo -n ' ' --samples_path $(location " + samples_file + ") >> $@; \
-                echo -n ' ' --out_path " + name + ".textproto >> $@; \
-                echo -n ' ' \\\"\\$$\\@\\\" >> $@; \
-                echo '' >> $@",
-        **kwargs
-    )
-
-def xls_dslx_fmt_test_macro(name, src):
+def xls_dslx_fmt_test_macro(name, src, opportunistic_postcondition = False):
     """Creates a test target that confirms `src` is auto-formatted.
 
     Args:
         name: Name of the (diff) test target this will emit.
         src: Source file to auto-format.
+        opportunistic_postcondition: Flag that checks whether the output text
+            is highly similar to the input text. Note that sometimes this /can/
+            flag an error for some set of valid auto-formattings, so is
+            intended primarily for use as a development/debugging tool.
     """
     out = name + ".fmt.x"
+    flag = "--opportunistic_postcondition" if opportunistic_postcondition else ""
+    cmd = "$(location %s) %s $< > $@" % (Label(DEFAULT_DSLX_FMT_TARGET), flag)
     native.genrule(
         name = name + "_dslx_fmt",
         srcs = [src],
         outs = [out],
-        tools = [DEFAULT_DSLX_FMT_TARGET],
-        cmd = "$(location %s) $< > $@" % DEFAULT_DSLX_FMT_TARGET,
+        tools = [Label(DEFAULT_DSLX_FMT_TARGET)],
+        cmd = cmd,
     )
+
+    # TODO(tedhong): 2023-11-02, adjust package_name depending on the WORKSPACE
+    # the target is in.
     package_name = native.package_name()
     target = package_name + ":" + out
     src_file = package_name + "/" + src
@@ -539,4 +487,184 @@ def xls_dslx_fmt_test_macro(name, src):
         file1 = src,
         file2 = ":" + name + "_dslx_fmt",
         failure_message = "File %s was not canonically auto-formatted; to update, in the top level directory of your WORKSPACE run: bazel build -c opt %s && cp bazel-genfiles/%s %s" % (src_file, target, out_file, src_file),
+    )
+
+def xls_full_benchmark_ir_macro(
+        name,
+        src,
+        synthesize = True,
+        codegen_args = {},
+        benchmark_ir_args = {},
+        standard_cells = None,
+        tags = None,
+        ir_tags = None,
+        synth_tags = None,
+        **kwargs):
+    """Executes the benchmark tool on an IR file.
+
+Examples:
+
+1. A file as the source.
+
+    ```
+    xls_benchmark_ir(
+        name = "a_benchmark",
+        src = "a.ir",
+    )
+    ```
+
+1. An xls_ir_opt_ir target as the source.
+
+    ```
+    xls_ir_opt_ir(
+        name = "a_opt_ir",
+        src = "a.ir",
+    )
+
+
+    xls_benchmark_ir(
+        name = "a_benchmark",
+        src = ":a_opt_ir",
+    )
+    ```
+
+    Args:
+        name: A unique name for this target.
+        src: The IR source file for the rule. A single source file must be provided. The file must
+          have a '.ir' extension.
+        synthesize: Add a synthesis benchmark in addition to the IR benchmark.
+        codegen_args: Arguments of the codegen tool. For details on the arguments,
+          refer to the codegen_main application at
+          //xls/tools/codegen_main.cc.
+        benchmark_ir_args: Arguments of the benchmark IR tool. For details on the arguments, refer
+          to the benchmark_main application at //xls/dev_tools/benchmark_main.cc.
+        standard_cells: Label for the PDK (possibly specifying a
+          non-default corner), with the assumption that $location will
+          return the timing (Liberty) library for the PDK corner. Unused if synthesize == False.
+        tags: Tags for IR and synthesis benchmark targets.
+        ir_tags: Tags for the IR benchmark target only.
+        synth_tags: Tags for the synthesis and synthesis benchmark targets. Unused if synthesize == False.
+        **kwargs: Keyword arguments for the IR benchmark target only.
+    """
+
+    list_type_check("tags", tags, can_be_none = True)
+    list_type_check("ir_tags", ir_tags, can_be_none = True)
+    list_type_check("synth_tags", synth_tags, can_be_none = True)
+    tags = tags if tags != None else []
+    ir_tags = ir_tags if ir_tags != None else []
+    synth_tags = synth_tags if synth_tags != None else []
+
+    # Setup shared arguments
+    SHARED_FLAGS = (
+        "top",
+    )
+    IR_OPT_FLAGS = (
+        "ir_dump_path",
+        "passes",
+        "skip_passes",
+        "opt_level",
+        "convert_array_index_to_select",
+        "use_context_narrowing_analysis",
+        "optimize_for_best_case_throughput",
+        "enable_resource_sharing",
+        "force_resource_sharing",
+        "area_model",
+    )
+    opt_ir_args = {
+        k: v
+        for k, v in benchmark_ir_args.items()
+        if k in IR_OPT_FLAGS or k in SHARED_FLAGS
+    }
+    benchmark_ir_codegen_args = {
+        k: v
+        for k, v in benchmark_ir_args.items()
+        if k not in IR_OPT_FLAGS or k in SHARED_FLAGS
+    }
+
+    # Add default opt args (currently empty)
+    full_opt_args = dict()
+    full_opt_args.update(opt_ir_args)
+
+    # Add default codegen args
+    full_codegen_args = {
+        "delay_model": DEFAULT_BENCHMARK_SYNTH_DELAY_MODEL,
+        "generator": "pipeline",
+        "pipeline_stages": "1",
+        "reset": "rst",
+        "reset_data_path": "false",
+        "use_system_verilog": "false",
+        "module_name": name + "_default",
+    }
+    full_codegen_args.update(benchmark_ir_codegen_args)
+    full_codegen_args.update(codegen_args)
+    if "clock_period_ps" in full_codegen_args:
+        full_codegen_args.pop("pipeline_stages")
+    codegen_args = full_codegen_args
+
+    delay_model = codegen_args["delay_model"]
+
+    full_benchmark_ir_args = dict(full_codegen_args)
+    full_benchmark_ir_args.update(benchmark_ir_args)
+
+    if standard_cells == None:
+        # Use default standard cells for the given delay model.
+        standard_cells = delay_model_to_standard_cells(delay_model)
+
+    # Some synthesis benchmarks require special permissions and amy not build so
+    # mark these as manual.
+    synth_tags.append("manual")
+
+    # Create required targets.
+    xls_benchmark_ir(
+        name = name,
+        src = src,
+        benchmark_ir_args = full_benchmark_ir_args,
+        tags = ir_tags + tags,
+        **kwargs
+    )
+    if not synthesize:
+        return
+
+    opt_ir_target = name + ".default.opt_ir"
+    _xls_ir_opt_ir_macro(
+        name = opt_ir_target,
+        src = src,
+        opt_ir_args = full_opt_args,
+        tags = tags,
+    )
+
+    codegen_target = "{}.default_{}.codegen".format(name, delay_model)
+    if full_codegen_args.get("use_system_verilog", "false") == "true":
+        verilog_file = codegen_target + ".sv"
+    else:
+        verilog_file = codegen_target + ".v"
+    xls_ir_verilog(
+        name = codegen_target,
+        src = ":{}".format(opt_ir_target),
+        codegen_args = codegen_args,
+        verilog_file = verilog_file,
+        tags = tags,
+    )
+    verilog_target = "{}.default_{}.verilog".format(name, delay_model)
+    verilog_library(
+        name = verilog_target,
+        srcs = [
+            ":" + verilog_file,
+        ],
+        tags = tags,
+    )
+    synth_target = "{}.default_{}.synth".format(name, delay_model)
+    synthesize_rtl(
+        name = synth_target,
+        standard_cells = standard_cells,
+        top_module = codegen_args["module_name"],
+        deps = [
+            ":" + verilog_target,
+        ],
+        tags = synth_tags + tags,
+    )
+    benchmark_synth(
+        name = "{}.default_{}.benchmark_synth".format(name, delay_model),
+        synth_target = ":" + synth_target,
+        tags = synth_tags + tags,
     )

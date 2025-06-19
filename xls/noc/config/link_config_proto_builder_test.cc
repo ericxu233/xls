@@ -14,8 +14,11 @@
 
 #include "xls/noc/config/link_config_proto_builder.h"
 
+#include <cstdint>
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "xls/noc/config/network_config.pb.h"
 
 namespace xls::noc {
 

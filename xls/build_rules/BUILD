@@ -18,12 +18,19 @@ load(":xls_toolchains.bzl", "xls_toolchain")
 package(
     default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
 filegroup(
     name = "release_files",
-    srcs = glob(["*.bzl"]) + [":default_xls_toolchain"],
+    srcs = glob(["*.bzl"]) + [
+        ":default_xls_toolchain",
+        ":xls_macros_bzl",
+    ],
 )
 
 exports_files(
@@ -54,14 +61,18 @@ exports_files(
 )
 
 bzl_library(
-    name = "xls_type_check_helpers_bzl",
-    srcs = ["xls_type_check_helpers.bzl"],
+    name = "xls_type_check_utils_bzl",
+    srcs = ["xls_type_check_utils.bzl"],
 )
 
 bzl_library(
     name = "xls_utilities_bzl",
     srcs = ["xls_utilities.bzl"],
-    deps = ["xls_common_rules_bzl"],
+    deps = [
+        ":xls_common_rules_bzl",
+        "@bazel_skylib//lib:dicts",
+        "@rules_proto//proto:defs",
+    ],
 )
 
 bzl_library(
@@ -74,18 +85,22 @@ bzl_library(
     name = "xls_config_rules_bzl",
     srcs = ["xls_config_rules.bzl"],
     deps = [
-        "xls_oss_config_rules_bzl",
+        ":xls_oss_config_rules_bzl",
     ],
 )
 
 bzl_library(
     name = "xls_common_rules_bzl",
     srcs = ["xls_common_rules.bzl"],
+    deps = [":xls_providers_bzl"],
 )
 
 bzl_library(
     name = "xls_providers_bzl",
     srcs = ["xls_providers.bzl"],
+    deps = [
+        "@bazel_skylib//lib:dicts",
+    ],
 )
 
 bzl_library(
@@ -94,6 +109,7 @@ bzl_library(
     visibility = ["//visibility:private"],
     deps = [
         ":xls_common_rules_bzl",
+        ":xls_config_rules_bzl",
         ":xls_providers_bzl",
         ":xls_toolchains_bzl",
         "@bazel_skylib//lib:dicts",
@@ -109,9 +125,14 @@ bzl_library(
         ":xls_dslx_rules_bzl",
         ":xls_providers_bzl",
         ":xls_toolchains_bzl",
-        ":xls_type_check_helpers_bzl",
+        ":xls_type_check_utils_bzl",
         "@bazel_skylib//lib:dicts",
     ],
+)
+
+bzl_library(
+    name = "xls_internal_build_defs_bzl",
+    srcs = ["xls_internal_build_defs.bzl"],
 )
 
 bzl_library(
@@ -119,8 +140,10 @@ bzl_library(
     srcs = ["xls_ir_macros.bzl"],
     deps = [
         ":xls_config_rules_bzl",
+        ":xls_internal_aot_rules_bzl",
+        ":xls_internal_build_defs_bzl",
         ":xls_ir_rules_bzl",
-        ":xls_type_check_helpers_bzl",
+        ":xls_type_check_utils_bzl",
     ],
 )
 
@@ -130,6 +153,7 @@ bzl_library(
         "xls_codegen_fdo_rules.bzl",
         "xls_codegen_rules.bzl",
     ],
+    visibility = ["//xls:xls_users"],
     deps = [
         ":xls_common_rules_bzl",
         ":xls_config_rules_bzl",
@@ -148,10 +172,12 @@ bzl_library(
     deps = [
         ":xls_common_rules_bzl",
         ":xls_config_rules_bzl",
+        ":xls_internal_aot_rules_bzl",
+        ":xls_internal_build_defs_bzl",
         ":xls_ir_rules_bzl",
         ":xls_providers_bzl",
         ":xls_toolchains_bzl",
-        ":xls_type_check_helpers_bzl",
+        ":xls_type_check_utils_bzl",
         "@bazel_skylib//lib:dicts",
     ],
 )
@@ -163,7 +189,7 @@ bzl_library(
     deps = [
         ":xls_codegen_rules_bzl",
         ":xls_config_rules_bzl",
-        ":xls_type_check_helpers_bzl",
+        ":xls_type_check_utils_bzl",
         "@bazel_skylib//rules:build_test",
     ],
 )
@@ -191,9 +217,10 @@ bzl_library(
     deps = [
         ":xls_codegen_rules_bzl",
         ":xls_config_rules_bzl",
+        ":xls_ir_macros_bzl",
         ":xls_ir_rules_bzl",
         ":xls_rules_bzl",
-        ":xls_type_check_helpers_bzl",
+        ":xls_type_check_utils_bzl",
         "@bazel_skylib//rules:build_test",
         "@bazel_skylib//rules:diff_test",
     ],
@@ -233,6 +260,22 @@ bzl_library(
 bzl_library(
     name = "xls_toolchains_bzl",
     srcs = ["xls_toolchains.bzl"],
+)
+
+bzl_library(
+    name = "xls_internal_aot_rules_bzl",
+    srcs = ["xls_internal_aot_rules.bzl"],
+    visibility = ["//visibility:private"],
+    deps = [
+        ":xls_common_rules_bzl",
+        ":xls_config_rules_bzl",
+        ":xls_ir_rules_bzl",
+        ":xls_providers_bzl",
+        ":xls_toolchains_bzl",
+        ":xls_utilities_bzl",
+        "@bazel_skylib//lib:dicts",
+        "@bazel_skylib//rules:common_settings",
+    ],
 )
 
 xls_toolchain(

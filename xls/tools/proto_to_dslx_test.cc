@@ -14,17 +14,20 @@
 
 #include "xls/tools/proto_to_dslx.h"
 
+#include <memory>
 #include <optional>
 #include <string>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "absl/status/statusor.h"
+#include "google/protobuf/descriptor.h"
+#include "google/protobuf/dynamic_message.h"
+#include "google/protobuf/message.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/temp_directory.h"
 #include "xls/common/file/temp_file.h"
 #include "xls/common/status/matchers.h"
-#include "xls/common/status/status_macros.h"
+#include "xls/dslx/frontend/module.h"
+#include "xls/dslx/frontend/pos.h"
 
 namespace xls {
 namespace {
@@ -80,9 +83,11 @@ fields {
   XLS_ASSERT_OK_AND_ASSIGN(auto schema_file,
                            TempFile::CreateInDirectory(tempdir.path()));
   XLS_ASSERT_OK(SetFileContents(schema_file.path(), kSchema));
-  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<dslx::Module> module,
-                           ProtoToDslx(tempdir.path(), schema_file.path(),
-                                       "xls.Fields", textproto, "foo"));
+  dslx::FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<dslx::Module> module,
+      ProtoToDslx(tempdir.path(), schema_file.path(), "xls.Fields", textproto,
+                  "foo", file_table));
 
   EXPECT_EQ(module->ToString(),
             R"(pub struct SubField {
@@ -140,9 +145,11 @@ imported_field { field_0: 0xfeed }
   XLS_ASSERT_OK(SetFileContents(schema_file.path(), kSchema));
   XLS_ASSERT_OK(
       SetFileContents(tempdir.path() / "imported.proto", kImportedSchema));
-  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<dslx::Module> module,
-                           ProtoToDslx(tempdir.path(), schema_file.path(),
-                                       "xls.Top", kTextproto, "foo"));
+  dslx::FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<dslx::Module> module,
+      ProtoToDslx(tempdir.path(), schema_file.path(), "xls.Top", kTextproto,
+                  "foo", file_table));
   EXPECT_EQ(module->ToString(),
             R"(pub struct imported_Field {
     field_0: sN[32],
@@ -186,9 +193,11 @@ my_repeated_enum: VALUE_600
       auto schema_file,
       TempFile::CreateWithContentInDirectory(kSchema, tempdir.path()));
   XLS_ASSERT_OK(SetFileContents(schema_file.path(), kSchema));
-  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<dslx::Module> module,
-                           ProtoToDslx(tempdir.path(), schema_file.path(),
-                                       "xls.Top", kTextproto, "foo"));
+  dslx::FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<dslx::Module> module,
+      ProtoToDslx(tempdir.path(), schema_file.path(), "xls.Top", kTextproto,
+                  "foo", file_table));
   EXPECT_EQ(module->ToString(),
             R"(pub enum MyEnum : bits[11] {
     VALUE_1 = 1,
@@ -255,9 +264,11 @@ enum_holder {
   XLS_ASSERT_OK(SetFileContents(schema_file.path(), kSchema));
   XLS_ASSERT_OK(
       SetFileContents(tempdir.path() / "imported.proto", kImportedSchema));
-  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<dslx::Module> module,
-                           ProtoToDslx(tempdir.path(), schema_file.path(),
-                                       "xls.Top", kTextproto, "foo"));
+  dslx::FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<dslx::Module> module,
+      ProtoToDslx(tempdir.path(), schema_file.path(), "xls.Top", kTextproto,
+                  "foo", file_table));
   EXPECT_EQ(module->ToString(),
             R"(pub enum imported_Enum : bits[11] {
     VALUE_1 = 1,
@@ -299,9 +310,11 @@ my_string: "le boeuf"
       auto schema_file,
       TempFile::CreateWithContentInDirectory(kSchema, tempdir.path()));
   XLS_ASSERT_OK(SetFileContents(schema_file.path(), kSchema));
-  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<dslx::Module> module,
-                           ProtoToDslx(tempdir.path(), schema_file.path(),
-                                       "xls.Top", kTextproto, "foo"));
+  dslx::FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<dslx::Module> module,
+      ProtoToDslx(tempdir.path(), schema_file.path(), "xls.Top", kTextproto,
+                  "foo", file_table));
   EXPECT_EQ(module->ToString(),
             R"(pub struct Top {
     my_int: sN[64],
@@ -336,9 +349,11 @@ my_submessage { my_int: 6 }
       auto schema_file,
       TempFile::CreateWithContentInDirectory(kSchema, tempdir.path()));
   XLS_ASSERT_OK(SetFileContents(schema_file.path(), kSchema));
-  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<dslx::Module> module,
-                           ProtoToDslx(tempdir.path(), schema_file.path(),
-                                       "xls.Top", kTextproto, "foo"));
+  dslx::FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<dslx::Module> module,
+      ProtoToDslx(tempdir.path(), schema_file.path(), "xls.Top", kTextproto,
+                  "foo", file_table));
   EXPECT_EQ(module->ToString(),
             R"(pub struct SubMessage {
     my_int: sN[64],
@@ -380,9 +395,11 @@ submessage {
       auto schema_file,
       TempFile::CreateWithContentInDirectory(kSchema, tempdir.path()));
   XLS_ASSERT_OK(SetFileContents(schema_file.path(), kSchema));
-  XLS_ASSERT_OK_AND_ASSIGN(std::unique_ptr<dslx::Module> module,
-                           ProtoToDslx(tempdir.path(), schema_file.path(),
-                                       "xls.Top", kTextproto, "foo"));
+  dslx::FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<dslx::Module> module,
+      ProtoToDslx(tempdir.path(), schema_file.path(), "xls.Top", kTextproto,
+                  "foo", file_table));
   EXPECT_EQ(module->ToString(),
             R"(pub struct SubMessage {
     my_ints: sN[64][4],
@@ -445,7 +462,8 @@ message TypeB {
       ConstructProtoViaText(textproto_b2, "xls.TypeB", descriptor_pool.get(),
                             &factory));
 
-  dslx::Module module("test_module", /*fs_path=*/std::nullopt);
+  dslx::FileTable file_table;
+  dslx::Module module("test_module", /*fs_path=*/std::nullopt, file_table);
 
   ProtoToDslxManager proto_to_dslx(&module);
   XLS_ASSERT_OK(
@@ -468,6 +486,53 @@ pub struct TypeB {
 }
 pub const b1 = TypeB { index_b: uN[64]:2 };
 pub const b2 = TypeB { index_b: uN[64]:3 };)");
+}
+
+TEST(ProtoToDslxTest, CreateDslxFromParamsTest) {
+  const std::string kSchema = R"(
+syntax = "proto2";
+
+package xls;
+
+message TypeA {
+  optional uint32 index_a = 1;
+}
+)";
+
+  std::string textproto_a1 = R"(
+  index_a: 10
+)";
+  std::string textproto_a2 = R"(
+  index_a: 11
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<google::protobuf::DescriptorPool> descriptor_pool,
+      ProcessStringProtoSchema(kSchema));
+  google::protobuf::DynamicMessageFactory factory;
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<google::protobuf::Message> message_a1,
+      ConstructProtoViaText(textproto_a1, "xls.TypeA", descriptor_pool.get(),
+                            &factory));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<google::protobuf::Message> message_a2,
+      ConstructProtoViaText(textproto_a2, "xls.TypeA", descriptor_pool.get(),
+                            &factory));
+
+  dslx::FileTable file_table;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<dslx::Module> module,
+      CreateDslxFromParams("module_test",
+                           {{"a1", message_a1.get()}, {"a2", message_a2.get()}},
+                           file_table));
+
+  EXPECT_EQ(module->ToString(),
+            R"(pub struct TypeA {
+    index_a: uN[32],
+}
+pub const a1 = TypeA { index_a: uN[32]:10 };
+pub const a2 = TypeA { index_a: uN[32]:11 };)");
 }
 
 }  // namespace

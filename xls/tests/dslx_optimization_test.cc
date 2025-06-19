@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <cstdint>
+#include <filesystem>  // NOLINT
 #include <memory>
 #include <string>
 #include <string_view>
@@ -20,11 +22,13 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "xls/common/file/get_runfile_path.h"
 #include "xls/common/file/temp_file.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/common/subprocess.h"
 #include "xls/dslx/mangle.h"
 #include "xls/ir/function.h"
@@ -76,7 +80,7 @@ class DslxOptimizationTest : public IrTestBase {
 };
 
 TEST_F(DslxOptimizationTest, StdFindIndexOfLiteralArray) {
-  std::string input = R"(import std
+  std::string input = R"(import std;
 
 const A = u32[3]:[10, 20, 30];
 
@@ -91,7 +95,7 @@ fn main(i: u32) -> (bool, u32) {
                            dslx::CallingConvention::kTypical));
   XLS_ASSERT_OK(package->SetTopByName(mangled_name));
   Function* entry = package->GetTop().value()->AsFunctionOrDie();
-  XLS_VLOG(1) << package->DumpIr();
+  VLOG(1) << package->DumpIr();
   // Verify that no ArrayIndex or ArrayUpdate operations exist in the IR.
   // TODO(b/159035667): The optimized IR is much more complicated than it should
   // be. When optimizations have been added which simplify the IR, add stricter
@@ -99,11 +103,6 @@ fn main(i: u32) -> (bool, u32) {
   EXPECT_FALSE(HasOp(entry, Op::kArrayIndex));
   EXPECT_FALSE(HasOp(entry, Op::kArrayUpdate));
   EXPECT_FALSE(HasOp(entry, Op::kReverse));
-
-  // TODO(https://github.com/google/xls/issues/423) 2021/04/05 Sensitivity
-  // analysis should be able to remove these nodes.
-  EXPECT_TRUE(HasOp(entry, Op::kSignExt));
-  EXPECT_TRUE(HasOp(entry, Op::kAnd));
 }
 
 TEST_F(DslxOptimizationTest, AttributeNamePropagation) {
@@ -207,7 +206,7 @@ fn main(idx: u4, update: u32, original: bits[320]) -> bits[320] {
   EXPECT_EQ(OpCount(entry, {Op::kUGt, Op::kUGe, Op::kULt, Op::kULe}), 0);
 
   // The original has five shifts. Verify that only four remain.
-  EXPECT_EQ(OpCount(entry, {Op::kShll, Op::kShrl, Op::kShra}), 4);
+  EXPECT_EQ(OpCount(entry, {Op::kShll, Op::kDecode, Op::kShrl, Op::kShra}), 4);
 }
 
 TEST_F(DslxOptimizationTest, ReceiveZeroDefaultValue) {
@@ -221,8 +220,8 @@ proc main {
     (ch, )
   }
 
-  next (tok: token, state: u32) {
-    let (tok, data) = recv_if(tok, in_ch, state == u32:0, u32:0);
+  next (state: u32) {
+    let (tok, data) = recv_if(join(), in_ch, state == u32:0, u32:0);
     data
   }
 }
@@ -248,8 +247,8 @@ proc main {
     (ch, )
   }
 
-  next (tok: token, state: (u32, u16, u8)) {
-    let (tok, data) = recv_if(tok, in_ch, state.0 == u32:0, (u32:0, u16:0, u8:0));
+  next (state: (u32, u16, u8)) {
+    let (tok, data) = recv_if(join(), in_ch, state.0 == u32:0, (u32:0, u16:0, u8:0));
     data
   }
 }

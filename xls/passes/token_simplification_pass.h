@@ -15,9 +15,12 @@
 #ifndef XLS_PASSES_TOKEN_SIMPLIFICATION_PASS_H_
 #define XLS_PASSES_TOKEN_SIMPLIFICATION_PASS_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
@@ -27,14 +30,15 @@ namespace xls {
 // and AfterAlls with one operand can be replaced with their operand.
 class TokenSimplificationPass : public OptimizationFunctionBasePass {
  public:
+  static constexpr std::string_view kName = "token_simp";
   TokenSimplificationPass()
-      : OptimizationFunctionBasePass("token_simp", "Simplify token networks") {}
+      : OptimizationFunctionBasePass(kName, "Simplify token networks") {}
   ~TokenSimplificationPass() override = default;
 
  protected:
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
 };
 
 }  // namespace xls

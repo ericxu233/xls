@@ -17,11 +17,15 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/base/attributes.h"
+#include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
 #include "absl/status/statusor.h"
-#include "xls/common/logging/logging.h"
+#include "absl/types/span.h"
 #include "xls/common/math_util.h"
 #include "xls/data_structures/inline_bitmap.h"
 #include "xls/ir/bit_push_buffer.h"
@@ -33,7 +37,7 @@ namespace internal {
 // a result.
 template <typename T>
 T CheckGe(T lhs, T rhs) {
-  XLS_CHECK_GE(lhs, rhs);
+  CHECK_GE(lhs, rhs);
   return lhs;
 }
 
@@ -85,6 +89,10 @@ class Bits {
     return Bits(std::move(bitmap));
   }
 
+  static Bits FromBitmapView(BitmapView bitmap) {
+    return Bits(bitmap.ToBitmap());
+  }
+
   // Note: we flatten into the pushbuffer with the MSb pushed first.
   void FlattenTo(BitPushBuffer* buffer) const {
     for (int64_t i = 0; i < bit_count(); ++i) {
@@ -133,7 +141,7 @@ class Bits {
   // As above, but retrieves with index "0" starting at the MSb side of the bit
   // vector.
   bool GetFromMsb(int64_t index) const {
-    XLS_DCHECK_LT(index, bit_count());
+    DCHECK_LT(index, bit_count());
     return bitmap_.Get(bit_count() - index - 1);
   }
 
@@ -190,14 +198,16 @@ class Bits {
   // uint64_t/int64_t.
   bool FitsInUint64() const;
   bool FitsInInt64() const;
+  bool FitsInInt64Unsigned() const;
 
   // Converts the value held by this "bits" object into a uint64_t (int64_t).
-  // ToUint64 interprets the bits as unsigned. ToInt64 interprets the bits in
-  // twos-complement representation. Returns an error if the *value* cannot be
-  // represented in 64 bits (the width of the Bits object can be arbitrarily
-  // large).
+  // ToUint64 & UnsignedToInt64 interpret the bits as unsigned. ToInt64
+  // interprets the bits in twos-complement representation. Returns an error if
+  // the *value* cannot be represented in the target 64-bit type (the width of
+  // the Bits object can be arbitrarily large).
   absl::StatusOr<uint64_t> ToUint64() const;
   absl::StatusOr<int64_t> ToInt64() const;
+  absl::StatusOr<int64_t> UnsignedToInt64() const;
 
   // Extracts the "word_number"th u64 from this value, as in Bitmap::GetWord.
   // (Zero-bit values get 0 by convention.)
@@ -212,7 +222,8 @@ class Bits {
   // the slice. 'start' is zero-indexed with zero being the LSb (same indexing
   // as Get/Set). 'width' is the number of bits to slice out and is the
   // bit_count of the result.
-  Bits Slice(int64_t start, int64_t width) const;
+  Bits Slice(int64_t start, int64_t width) const&;
+  Bits Slice(int64_t start, int64_t width) &&;
 
   // Returns the minimum number of bits required to store the given value as an
   // unsigned number.
@@ -224,7 +235,12 @@ class Bits {
   // twos complement signed number.
   static int64_t MinBitCountSigned(int64_t value);
 
-  const InlineBitmap& bitmap() const { return bitmap_; }
+  const InlineBitmap& bitmap() const& { return bitmap_; }
+  InlineBitmap&& bitmap() && { return std::move(bitmap_); }
+
+  using Iterator = InlineBitmap::Iterator;
+  Iterator begin() const { return bitmap_.begin(); }
+  Iterator end() const { return bitmap_.end(); }
 
   template <typename H>
   friend H AbslHashValue(H h, const Bits& bits) {
@@ -243,6 +259,9 @@ class Bits {
 
 // Helper for "stringing together" bits objects into a final result, avoiding
 // intermediate allocations.
+//
+// Note that to use this object you have to know the total bit count up front.
+// If the total bit count is unknown see `BitPushBuffer`.
 class BitsRope {
  public:
   explicit BitsRope(int64_t total_bit_count) : bitmap_(total_bit_count) {}
@@ -261,16 +280,15 @@ class BitsRope {
   //
   // So b.Get(0) is now at result.Get(2).
   void push_back(const Bits& bits) {
-    for (int64_t i = 0; i < bits.bit_count(); ++i) {
-      bitmap_.Set(index_ + i, bits.Get(i));
-    }
+    bitmap_.Overwrite(bits.bitmap(), bits.bit_count(),
+                      /*w_offset=*/index_, /*r_offset=*/0);
     index_ += bits.bit_count();
   }
 
   void push_back(bool bit) { bitmap_.Set(index_++, bit); }
 
   Bits Build() {
-    XLS_CHECK_EQ(index_, bitmap_.bit_count());
+    CHECK_EQ(index_, bitmap_.bit_count());
     return Bits{std::move(bitmap_)};
   }
 

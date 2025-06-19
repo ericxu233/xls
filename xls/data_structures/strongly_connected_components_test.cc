@@ -14,11 +14,13 @@
 
 #include "xls/data_structures/strongly_connected_components.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/container/btree_map.h"
+#include "absl/container/btree_set.h"
 
 namespace xls {
 namespace {

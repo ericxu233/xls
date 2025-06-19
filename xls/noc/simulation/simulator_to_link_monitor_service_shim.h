@@ -12,11 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_NOC_SIMULATION_NOC_SIMULATOR_TO_LINK_MONITOR_SERVICE_SHIM_H_
-#define XLS_NOC_SIMULATION_NOC_SIMULATOR_TO_LINK_MONITOR_SERVICE_SHIM_H_
+#ifndef XLS_NOC_SIMULATION_SIMULATOR_TO_LINK_MONITOR_SERVICE_SHIM_H_
+#define XLS_NOC_SIMULATION_SIMULATOR_TO_LINK_MONITOR_SERVICE_SHIM_H_
 
+#include <cstdint>
+
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
 #include "xls/noc/simulation/common.h"
 #include "xls/noc/simulation/sim_objects.h"
+#include "xls/noc/simulation/simulator_shims.h"
 
 namespace xls::noc {
 
@@ -44,8 +49,7 @@ inline bool operator==(const FlitDestination& lhs, const FlitDestination& rhs) {
 using DestinationToPacketCount = absl::flat_hash_map<FlitDestination, int64_t>;
 
 // Shim to collect information from the links of the simulator.
-class NocSimulatorToLinkMonitorServiceShim
-    : public NocSimulatorServiceShim {
+class NocSimulatorToLinkMonitorServiceShim : public NocSimulatorServiceShim {
  public:
   explicit NocSimulatorToLinkMonitorServiceShim(NocSimulator& simulator);
   absl::Status RunCycle() override;
@@ -64,4 +68,4 @@ class NocSimulatorToLinkMonitorServiceShim
 
 }  // namespace xls::noc
 
-#endif  // XLS_NOC_SIMULATION_NOC_SIMULATOR_TO_LINK_MONITOR_SERVICE_SHIM_H_
+#endif  // XLS_NOC_SIMULATION_SIMULATOR_TO_LINK_MONITOR_SERVICE_SHIM_H_

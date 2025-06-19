@@ -15,10 +15,9 @@
 #ifndef XLS_JIT_ORC_JIT_H_
 #define XLS_JIT_ORC_JIT_H_
 
+#include <cstdint>
 #include <memory>
-#include <string>
 #include <string_view>
-#include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -26,56 +25,58 @@
 #include "llvm/include/llvm/ExecutionEngine/Orc/IRCompileLayer.h"
 #include "llvm/include/llvm/ExecutionEngine/Orc/IRTransformLayer.h"
 #include "llvm/include/llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
+#include "llvm/include/llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/include/llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/include/llvm/IR/DataLayout.h"
+#include "llvm/include/llvm/Support/Error.h"
+#include "llvm/include/llvm/Support/raw_ostream.h"
 #include "llvm/include/llvm/Target/TargetMachine.h"
+#include "xls/jit/llvm_compiler.h"
 #include "xls/jit/observer.h"
 
 namespace xls {
-
 // A wrapper around ORC JIT which hides some of the internals of the LLVM
 // interface.
-class OrcJit {
+class OrcJit : public LlvmCompiler {
  public:
-  ~OrcJit();
-  // Create an LLVM ORC JIT instance which compiles at the given optimization
-  // level. If `emit_object_code` is true then `GetObjectCode` can be called
-  // after compilation to get the object code. Calls functions on the given
-  // observer as compilation proceeds.
+  static constexpr int64_t kDefaultOptLevel = 2;
+
+  ~OrcJit() override;
+
+  absl::StatusOr<OrcJit*> AsOrcJit() override { return this; }
+
+  // Create an LLVM orc jit. This can be used by the AOT generator to manually
+  // control whether asan calls should be included. Users other than the AOT
+  // compiler should use the 3-argument version above. Passing nullopt to
+  // emit_msan directs the jit to use MSAN if the running binary is MSAN and
+  // vice-versa.
   static absl::StatusOr<std::unique_ptr<OrcJit>> Create(
-      int64_t opt_level = 3, bool emit_object_code = false,
-      JitObserver* observer = nullptr);
+      int64_t opt_level = kDefaultOptLevel,
+      bool include_observer_callbacks = false,
+      JitObserver* jit_observer = nullptr);
 
   void SetJitObserver(JitObserver* o) { jit_observer_ = o; }
 
   JitObserver* jit_observer() const { return jit_observer_; }
 
-  // Creates and returns a new LLVM module of the given name.
-  std::unique_ptr<llvm::Module> NewModule(std::string_view name);
-
   // Compiles the given LLVM module into the JIT's execution session.
-  absl::Status CompileModule(std::unique_ptr<llvm::Module>&& module);
+  absl::Status CompileModule(std::unique_ptr<llvm::Module>&& module) override;
 
   // Returns the address of the given JIT'ed function.
   absl::StatusOr<llvm::orc::ExecutorAddr> LoadSymbol(
       std::string_view function_name);
 
   // Return the underlying LLVM context.
-  llvm::LLVMContext* GetContext() { return context_.getContext(); }
+  llvm::LLVMContext* GetContext() override { return context_.getContext(); }
 
-  // Returns the object code which was created in the previous CompileModule
-  // call (if `emit_object_code` is true).
-  const std::vector<uint8_t>& GetObjectCode() { return object_code_; }
+  absl::StatusOr<std::unique_ptr<llvm::TargetMachine>> CreateTargetMachine()
+      override;
 
-  // Creates and returns a data layout object.
-  static absl::StatusOr<llvm::DataLayout> CreateDataLayout();
+ protected:
+  absl::Status InitInternal() override;
 
  private:
-  OrcJit(int64_t opt_level, bool emit_object_code);
-  absl::Status Init();
-
-  static absl::StatusOr<std::unique_ptr<llvm::TargetMachine>>
-  CreateTargetMachine();
+  OrcJit(int64_t opt_level, bool include_msan, bool include_observer_callbacks);
 
   // Method which optimizes the given module. Used within the JIT to form an IR
   // transform layer.
@@ -88,38 +89,11 @@ class OrcJit {
   llvm::orc::RTDyldObjectLinkingLayer object_layer_;
   llvm::orc::JITDylib& dylib_;
 
-  int64_t opt_level_;
-  bool emit_object_code_;
-
-  std::unique_ptr<llvm::TargetMachine> target_machine_;
-  llvm::DataLayout data_layout_;
-
   std::unique_ptr<llvm::orc::IRCompileLayer> compile_layer_;
   std::unique_ptr<llvm::orc::IRTransformLayer> transform_layer_;
-  // If set, this contains the logic to emit object code.
-  std::unique_ptr<llvm::orc::IRTransformLayer> object_code_layer_;
-
-  // When `CompileModule` is called and `emit_object_code` is true, this vector
-  // will be allocated and filled with the object code of the compiled module.
-  std::vector<uint8_t> object_code_;
 
   JitObserver* jit_observer_ = nullptr;
 };
-
-// Calls the dump method on the given LLVM object and returns the string.
-template <typename T>
-std::string DumpLlvmObjectToString(const T& llvm_object) {
-  std::string buffer;
-  llvm::raw_string_ostream ostream(buffer);
-  llvm_object.print(ostream);
-  ostream.flush();
-  return buffer;
-}
-
-// Calls the dump method on the given LLVM module object and returns the string.
-// DumpLlvmObjectToString cannot be used because modules are dumped slightly
-// differently.
-std::string DumpLlvmModuleToString(const llvm::Module& module);
 
 }  // namespace xls
 

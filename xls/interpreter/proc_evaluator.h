@@ -15,16 +15,20 @@
 #ifndef XLS_INTERPRETER_PROC_EVALUATOR_H_
 #define XLS_INTERPRETER_PROC_EVALUATOR_H_
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <ostream>
 #include <string>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "xls/ir/channel.h"
+#include "xls/interpreter/observer.h"
 #include "xls/ir/events.h"
 #include "xls/ir/proc.h"
+#include "xls/ir/proc_elaboration.h"
 #include "xls/ir/value.h"
 
 namespace xls {
@@ -34,11 +38,18 @@ namespace xls {
 // of a proc tick.
 class ProcContinuation {
  public:
+  explicit ProcContinuation(ProcInstance* proc_instance)
+      : proc_instance_(proc_instance) {}
   virtual ~ProcContinuation() = default;
 
   // Returns the Proc state at the beginning of the tick currently being
   // executed.
   virtual std::vector<Value> GetState() const = 0;
+
+  // Sets the internal state.
+  // Note: Calling when the proc is not AtStartOfTick() may result in
+  // incorrect proc behavior.
+  virtual absl::Status SetState(std::vector<Value> v) = 0;
 
   // Returns the events recorded during execution of this continuation.
   virtual const InterpreterEvents& GetEvents() const = 0;
@@ -49,10 +60,42 @@ class ProcContinuation {
   // of a tick, rather than, for example, blocked on a receive in the middle of
   // a tick execution.
   virtual bool AtStartOfTick() const = 0;
+
+  ProcInstance* proc_instance() const { return proc_instance_; }
+  Proc* proc() const { return proc_instance_->proc(); }
+
+  const std::optional<EvaluationObserver*>& GetObserver() const {
+    return observer_;
+  }
+
+  virtual void ClearObserver() { observer_ = std::nullopt; }
+
+  // Set the callbacks for node calculation. Only one may be set at a time. If
+  // this execution environment cannot support the observer api an
+  // absl::UnimplementedError will be returned.
+  virtual absl::Status SetObserver(EvaluationObserver* observer) {
+    CHECK(observer != nullptr);
+    observer_ = observer;
+    return absl::OkStatus();
+  }
+
+  // Does this execution environment support the observer api. If false then
+  // setting an observer might fail and callbacks might not always occur or
+  // could cause crashes.
+  virtual bool SupportsObservers() const { return true; }
+
+ protected:
+  absl::Status CheckConformsToStateType(const std::vector<Value>& v) const;
+
+ private:
+  ProcInstance* proc_instance_;
+
+  // If not-null an observer for each node in the proc being evaluated.
+  std::optional<EvaluationObserver*> observer_ = std::nullopt;
 };
 
 // The execution state that a proc may be left in after callin Tick.
-enum class TickExecutionState {
+enum class TickExecutionState : int8_t {
   // The proc tick completed.
   kCompleted,
   // The proc tick was blocked on a blocking receive.
@@ -69,8 +112,8 @@ struct TickResult {
   TickExecutionState execution_state;
 
   // If tick state is kBlockedOnReceive or kSentOnChannel then this field holds
-  // the respective channel.
-  std::optional<Channel*> channel;
+  // the respective channel instance.
+  std::optional<ChannelInstance*> channel_instance;
 
   // Whether any progress was made (at least one instruction was executed).
   bool progress_made;
@@ -93,7 +136,8 @@ class ProcEvaluator {
   // Creates and returns a new continuation for the proc. The continuation is
   // initialized to start execution at the beginning of the proc with state set
   // to its initial value.
-  virtual std::unique_ptr<ProcContinuation> NewContinuation() const = 0;
+  virtual std::unique_ptr<ProcContinuation> NewContinuation(
+      ProcInstance* proc_instance) const = 0;
 
   // Runs the proc from the given continuation until the tick is complete or
   // execution exits early (e.g., blocked on a receive operation). The

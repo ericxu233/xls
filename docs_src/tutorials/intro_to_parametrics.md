@@ -2,7 +2,8 @@
 
 This tutorial demonstrates how types and functions can be parameterized to
 enable them to work on data of different formats and layouts, e.g., for a
-function `foo` to work on both u16 and u32 data types, and anywhere in between.
+function `foo` to work on both `u16` and `u32` data types, and anywhere in
+between.
 
 It's recommended that you're familiar with the concepts in the previous
 tutorial,
@@ -11,13 +12,11 @@ before following this tutorial.
 
 ## Simple parametrics
 
-Consider the simple example of the `umax` function
+Consider the simple example of a `umax` function -- similar to the `max` function
 [in the DSLX standard library](https://github.com/google/xls/tree/main/xls/dslx/stdlib/std.x):
 
 ```dslx
-pub fn umax<N: u32>(x: uN[N], y: uN[N]) -> uN[N] {
-  if x > y { x } else { y }
-}
+pub fn umax<N: u32>(x: uN[N], y: uN[N]) -> uN[N] { if x > y { x } else { y } }
 ```
 
 Most of this function looks like other DSLX functions you may have seen, except
@@ -40,11 +39,9 @@ infer them:
 Explicit specification:
 
 ```dslx
-import std
+fn umax<N: u32>(x: uN[N], y: uN[N]) -> uN[N] { if x > y { x } else { y } }
 
-fn foo(a: u32, b: u16) -> u64 {
-  std::umax<u32:64>(a as u64, b as u64)
-}
+fn foo(a: u32, b: u16) -> u64 { umax<u32:64>(a as u64, b as u64) }
 ```
 
 Here, the user has directly told the language what the values of all parametrics
@@ -53,11 +50,9 @@ are.
 Parametric inference:
 
 ```dslx
-import std
+fn umax<N: u32>(x: uN[N], y: uN[N]) -> uN[N] { if x > y { x } else { y } }
 
-fn foo(a: u32, b: u16) -> u64 {
-  std::umax(a as u64, b as u64)
-}
+fn foo(a: u32, b: u16) -> u64 { umax(a as u64, b as u64) }
 ```
 
 Here, though, the language is able to determine that `N` is 64, since that
@@ -67,9 +62,9 @@ exist parametrics that aren't referenced in the argument list:
 
 ```dslx
 fn my_parametric_sum<N: u32>(a: u32, b: u32) -> uN[N] {
-  let a_mod = a as uN[N];
-  let b_mod = a as uN[N];
-  a_mod + b_mod
+    let a_mod = a as uN[N];
+    let b_mod = a as uN[N];
+    a_mod + b_mod
 }
 ```
 
@@ -86,9 +81,9 @@ handy to also have a `SIGNED_EXP_SZ` symbol that was equal to 9. This can be
 done as follows:
 
 ```dslx-snippet
-fn unbias_exponent<EXP_SZ: u32, SIGNED_EXP_SZ: u32 = EXP_SZ + u32:1>(
-    exp: uN[EXP_SZ]) -> sN[SIGNED_EXP_SZ] {
-  exp as sN[SIGNED_EXP_SZ] - sN[SIGNED_EXP_SZ]:???
+fn unbias_exponent<EXP_SZ: u32, SIGNED_EXP_SZ: u32 = {EXP_SZ + u32:1}>(
+      exp: uN[EXP_SZ]) -> sN[SIGNED_EXP_SZ] {
+    exp as sN[SIGNED_EXP_SZ] - sN[SIGNED_EXP_SZ]:???
 }
 ```
 
@@ -106,12 +101,12 @@ This is a bit unwieldy in practice, so we can wrap it in a function:
 
 ```dslx
 fn bias_scaler<N: u32, WIDE_N: u32 = {N + u32:1}>() -> sN[WIDE_N] {
-  (sN[WIDE_N]:1 << (N - u32:1)) - sN[WIDE_N]:1
+    (sN[WIDE_N]:1 << (N - u32:1)) - sN[WIDE_N]:1
 }
 
-fn unbias_exponent<EXP_SZ: u32, SIGNED_EXP_SZ: u32 = {EXP_SZ + u32:1}>(
-    exp: uN[EXP_SZ]) -> sN[SIGNED_EXP_SZ] {
-  exp as sN[SIGNED_EXP_SZ] - bias_scaler<EXP_SZ>()
+fn unbias_exponent<EXP_SZ: u32, SIGNED_EXP_SZ: u32 = {EXP_SZ + u32:1}>
+    (exp: uN[EXP_SZ]) -> sN[SIGNED_EXP_SZ] {
+    exp as sN[SIGNED_EXP_SZ] - bias_scaler<EXP_SZ>()
 }
 ```
 
@@ -128,16 +123,10 @@ such conversions - even to floating-point formats we haven't considered!
 The first step in such a parameterization is to have a working single-typed
 example, which we take from the previous codelab:
 
-```dslx
-pub struct float32 {
-  sign: u1,
-  bexp: u8,
-  fraction: u23,
-}
+```dslx-snippet
+pub struct float32 { sign: u1, bexp: u8, fraction: u23 }
 
-fn unbias_exponent(exp: u8) -> s9 {
-  exp as s9 - s9:127
-}
+fn unbias_exponent(exp: u8) -> s9 { exp as s9 - s9:127 }
 
 pub fn float_to_int(x: float32) -> s32 {
   let exp = unbias_exponent(x.bexp);
@@ -166,16 +155,16 @@ Next is to identify all types needing parameterization, here being the intended
 size of the result and the layout of the floating-point type itself; all other
 types flow from that base definition:
 
-*   `exp:`float32::bexp` size + 1 sign bit
-*   `fraction:`float32::fraction` size + 1 implicit leading bit
+*   `exp`: `float32::bexp` size + 1 sign bit
+*   `fraction`: `float32::fraction` size + 1 implicit leading bit
 
 Thus, the struct declaration and function signature will be:
 
 ```dslx-snippet
 pub struct float<EXP_SZ: u32, FRACTION_SZ: u32> {
-  sign: u1,
-  bexp: uN[EXP_SZ],
-  fraction: uN[FRACTION_SZ],
+    sign: u1,
+    bexp: uN[EXP_SZ],
+    fraction: uN[FRACTION_SZ],
 }
 
 pub fn float_to_int<EXP_SZ: u32, FRACTION_SZ: u32, RESULT_SZ: u32>(
@@ -189,41 +178,43 @@ the original implementation with the parameterized ones in the signature:
 
 ```dslx
 pub struct float<EXP_SZ: u32, FRACTION_SZ: u32> {
-  sign: u1,
-  bexp: uN[EXP_SZ],
-  fraction: uN[FRACTION_SZ],
+    sign: u1,
+    bexp: uN[EXP_SZ],
+    fraction: uN[FRACTION_SZ],
 }
 
 fn bias_scaler<N: u32, WIDE_N: u32 = {N + u32:1}>() -> sN[WIDE_N] {
-  (sN[WIDE_N]:1 << (N - u32:1)) - sN[WIDE_N]:1
+    (sN[WIDE_N]:1 << (N - u32:1)) - sN[WIDE_N]:1
 }
 
-fn unbias_exponent<EXP_SZ: u32, SIGNED_EXP_SZ: u32 = {EXP_SZ + u32:1}>(
-    exp: uN[EXP_SZ]) -> sN[SIGNED_EXP_SZ] {
-  exp as sN[SIGNED_EXP_SZ] - bias_scaler<EXP_SZ>()
+fn unbias_exponent<EXP_SZ: u32, SIGNED_EXP_SZ: u32 = {EXP_SZ + u32:1}>
+    (exp: uN[EXP_SZ]) -> sN[SIGNED_EXP_SZ] {
+    exp as sN[SIGNED_EXP_SZ] - bias_scaler<EXP_SZ>()
 }
 
-pub fn float_to_int<
-    EXP_SZ: u32, FRACTION_SZ: u32, RESULT_SZ: u32,
-    WIDE_EXP_SZ: u32 = {EXP_SZ + u32:1},
-    WIDE_FRACTION_SZ: u32 = {FRACTION_SZ + u32:1}>(
-    x: float<EXP_SZ, FRACTION_SZ>) -> sN[RESULT_SZ] {
-  let exp = unbias_exponent(x.bexp);
+pub fn float_to_int
+    <RESULT_SZ: u32, EXP_SZ: u32, FRACTION_SZ: u32, WIDE_RESULT_SZ: u32 = {RESULT_SZ + u32:1},
+     WIDE_EXP_SZ: u32 = {EXP_SZ + u32:1}, WIDE_FRACTION_SZ: u32 = {FRACTION_SZ + u32:1}>
+    (x: float<EXP_SZ, FRACTION_SZ>) -> sN[RESULT_SZ] {
+    let exp = unbias_exponent(x.bexp);
 
-  let fraction = uN[WIDE_FRACTION_SZ]:1 << FRACTION_SZ |
-      (x.fraction as uN[WIDE_FRACTION_SZ]);
+    let fraction = uN[WIDE_RESULT_SZ]:1 << FRACTION_SZ | (x.fraction as uN[WIDE_RESULT_SZ]);
 
-  let fraction =
-      if (exp as u32) < FRACTION_SZ { fraction >> (FRACTION_SZ - (exp as u32)) }
-      else { fraction };
+    let fraction = if (exp as u32) < FRACTION_SZ {
+        fraction >> (FRACTION_SZ - (exp as u32))
+    } else {
+        fraction
+    };
 
-  let fraction =
-      if (exp as u32) > FRACTION_SZ { fraction << ((exp as u32) - FRACTION_SZ) }
-      else { fraction };
+    let fraction = if (exp as u32) > FRACTION_SZ {
+        fraction << ((exp as u32) - FRACTION_SZ)
+    } else {
+        fraction
+    };
 
-  let result = fraction as sN[RESULT_SZ];
-  let result = if x.sign { -result } else { result };
-  result
+    let result = fraction as sN[RESULT_SZ];
+    let result = if x.sign { -result } else { result };
+    result
 }
 ```
 
@@ -232,12 +223,30 @@ could be inferred from the argument! (Also note that this implementation doesn't
 contain the fixes from the missing cases from the previous tutorial. Exercise to
 the reader: apply those fixes here, too!)
 
+By listing `RESULT_SZ` as the first parametric value of `float_to_int()`, it
+allows calling it with only the result size specified, because `EXP_SZ` and
+`FRACTION_SZ` can be inferred from the argument.
+
+```dslx-snippet
+pub type float32 = float<u32:8, u32:23>;
+
+#[test]
+fn test_float32_to_int32 {
+  let test_input = float32 {
+    sign: u1:0x0,
+    bexp: u8:0x8e,
+    fraction: u23:0x3eef00
+  };
+  assert_eq(s32:0xbeef, float_to_int<u32:32>(test_input))
+}
+```
+
 This technique underlies all of XLS' floating-point libraries. Common operations
 are defined in common files, such as
 [apfloat.x](https://github.com/google/xls/tree/main/xls/dslx/stdlib/apfloat.x) (general
 utilities). Specializations of the above are then available in, e.g.,
-[float32.x](https://github.com/google/xls/tree/main/xls/stdlib/float32.x) to hide internal
-implementation details from end users.
+[float32.x](https://github.com/google/xls/tree/main/xls/dslx/stdlib/float32.x) to hide
+internal implementation details from end users.
 
 With this technique, you can write single implementations of functionality that
 can be applicable across all sorts of hardware configurations for minimal

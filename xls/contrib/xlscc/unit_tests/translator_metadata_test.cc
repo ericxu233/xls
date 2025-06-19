@@ -12,19 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <cstdio>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "absl/container/flat_hash_set.h"
-#include "absl/strings/str_format.h"
 #include "google/protobuf/message.h"
 #include "google/protobuf/text_format.h"
 #include "google/protobuf/util/message_differencer.h"
 #include "xls/common/status/matchers.h"
-#include "xls/common/status/status_macros.h"
 #include "xls/contrib/xlscc/metadata_output.pb.h"
 #include "xls/contrib/xlscc/translator.h"
 #include "xls/contrib/xlscc/unit_tests/unit_test.h"
@@ -216,6 +213,7 @@ TEST_F(TranslatorMetadataTest, NamespaceStructArray) {
               }
             }
             size: 2
+            use_tuple: false
           }
         }
         is_reference: true
@@ -353,6 +351,7 @@ TEST_F(TranslatorMetadataTest, NamespaceNestedStruct) {
               }
             }
             size: 2
+            use_tuple: false
           }
         }
         is_reference: true
@@ -418,6 +417,7 @@ TEST_F(TranslatorMetadataTest, ArrayOfStructs) {
                 }
               }
               size: 10
+              use_tuple: false
             }
           }
         }
@@ -495,6 +495,7 @@ TEST_F(TranslatorMetadataTest, ArrayOfStructs) {
               }
             }
             size: 2
+            use_tuple: false
           }
         }
         is_reference: true
@@ -868,6 +869,7 @@ TEST_F(TranslatorMetadataTest, StaticArray) {
               }
             }
             size: 2
+            use_tuple: false
           }
         }
         value {
@@ -1066,9 +1068,11 @@ TEST_F(TranslatorMetadataTest, Static2DArray) {
                   }
                 }
                 size: 2
+                use_tuple: false
               }
             }
             size: 2
+            use_tuple: false
           }
         }
         value {
@@ -1200,9 +1204,8 @@ TEST_F(TranslatorMetadataTest, SyntheticInt) {
       __xls_bits<W> val_;
     };
 
-    #pragma hls_synthetic_int
     template<int W, int S>
-    struct Blah : Base<W> {
+    struct [[hls_synthetic_int]] Blah : Base<W> {
     };
     #pragma hls_top
     int i_am_top(Blah<17, false> a) {
@@ -1256,15 +1259,13 @@ TEST_F(TranslatorMetadataTest, SyntheticInt) {
 
 TEST_F(TranslatorMetadataTest, StaticSyntheticInt) {
   const std::string content = R"(
-    #pragma hls_synthetic_int
     template<int W, bool S>
-    struct Base {
+    struct [[hls_synthetic_int]] Base {
       __xls_bits<W> val_;
     };
 
-    #pragma hls_synthetic_int
     template<int W, bool S>
-    struct Blah : Base<W, S> {
+    struct [[hls_synthetic_int]] Blah : Base<W, S> {
       Blah(int val) {
         asm("fn (fid)(a: bits[i]) -> bits[i] { ret op_1_(aid): bits[i] = "
             "identity(a, pos=(loc)) }"
@@ -1410,15 +1411,13 @@ TEST_F(TranslatorMetadataTest, ReturnReference) {
 
 TEST_F(TranslatorMetadataTest, StaticBits) {
   const std::string content = R"(
-    #pragma hls_no_tuple
     template<int W, bool S>
-    struct Base {
+    struct [[hls_no_tuple]] Base {
       __xls_bits<W> val_;
     };
 
-    #pragma hls_no_tuple
     template<int W, bool S>
-    struct Blah : Base<W, S> {
+    struct [[hls_no_tuple]] Blah : Base<W, S> {
       Blah(int val) {
         asm("fn (fid)(a: bits[i]) -> bits[i] { ret op_1_(aid): bits[i] = "
             "identity(a, pos=(loc)) }"
@@ -1691,6 +1690,26 @@ TEST_F(TranslatorMetadataTest, NoContextCrash) {
     )";
 
   XLS_ASSERT_OK_AND_ASSIGN(std::string ir, SourceToIr(content, nullptr));
+
+  XLS_ASSERT_OK_AND_ASSIGN(xlscc_metadata::MetadataOutput meta,
+                           translator_->GenerateMetadata());
+}
+
+TEST_F(TranslatorMetadataTest, XlsFixedBitIndexNoCrash) {
+  const std::string content = R"(
+    #include "xls_fixed.h"
+    long long my_package(long long a) {
+      XlsFixed<16, 8, true> x = 0;
+      XlsFixed<16, 8, true> y = 0;
+      x[0] = y[0];
+      return x.to_int();
+    })";
+  XLS_ASSERT_OK_AND_ASSIGN(std::vector<std::string> clang_args,
+                           GetClangArgForIntTest());
+  std::vector<std::string_view> clang_argv(clang_args.begin(),
+                                           clang_args.end());
+  XLS_ASSERT_OK_AND_ASSIGN(std::string ir,
+                           SourceToIr(content, nullptr, clang_argv));
 
   XLS_ASSERT_OK_AND_ASSIGN(xlscc_metadata::MetadataOutput meta,
                            translator_->GenerateMetadata());

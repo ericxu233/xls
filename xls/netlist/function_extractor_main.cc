@@ -18,16 +18,16 @@
 #include <string>
 
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "google/protobuf/text_format.h"
 #include "xls/common/exit_status.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/netlist/cell_library.h"
 #include "xls/netlist/function_extractor.h"
+#include "xls/netlist/lib_parser.h"
 #include "xls/netlist/netlist.pb.h"
 
 ABSL_FLAG(std::string, cell_library, "", "Cell library to preprocess.");
@@ -63,10 +63,10 @@ int main(int argc, char* argv[]) {
   xls::InitXls(argv[0], argc, argv);
 
   std::string cell_library_path = absl::GetFlag(FLAGS_cell_library);
-  XLS_QCHECK(!cell_library_path.empty()) << "--cell_library must be specified.";
+  QCHECK(!cell_library_path.empty()) << "--cell_library must be specified.";
 
   std::string output_path = absl::GetFlag(FLAGS_output_path);
-  XLS_QCHECK(!output_path.empty()) << "--output_path must be specified.";
+  QCHECK(!output_path.empty()) << "--output_path must be specified.";
 
   return xls::ExitStatus(xls::netlist::function::RealMain(
       cell_library_path, output_path, absl::GetFlag(FLAGS_output_textproto)));

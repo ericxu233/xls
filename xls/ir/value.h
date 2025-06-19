@@ -16,21 +16,24 @@
 #define XLS_IR_VALUE_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <ostream>
 #include <string>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
+#include "xls/data_structures/inline_bitmap.h"
+#include "xls/ir/bit_push_buffer.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/format_preference.h"
 #include "xls/ir/xls_type.pb.h"
+#include "xls/ir/xls_value.pb.h"
 
 namespace xls {
-
-class Type;
 
 enum class ValueKind {
   kInvalid,
@@ -66,7 +69,7 @@ class Value {
     return Value(ValueKind::kTuple, elements);
   }
   static Value TupleOwned(std::vector<Value>&& elements) {
-    return Value(ValueKind::kTuple, elements);
+    return Value(ValueKind::kTuple, std::move(elements));
   }
 
   // All members of "elements" must be of the same type, or an error status will
@@ -86,6 +89,8 @@ class Value {
 
   // As above, but as a precondition all elements must be known to be of the
   // same type.
+  //
+  // Prefer using ValueBuilder for construction.
   static Value ArrayOrDie(absl::Span<const Value> elements) {
     return Array(elements).value();
   }
@@ -93,9 +98,11 @@ class Value {
   // Construct an array using the given elements. Ownership of the vector is
   // transferred to the Value. DCHECK fails if not all elements are the same
   // type.
+  //
+  // Prefer using ValueBuilder for construction.
   static Value ArrayOwned(std::vector<Value>&& elements) {
     for (int64_t i = 1; i < elements.size(); ++i) {
-      XLS_DCHECK(elements[0].SameTypeAs(elements[i]));
+      DCHECK(elements[0].SameTypeAs(elements[i]));
     }
     return Value(ValueKind::kArray, std::move(elements));
   }
@@ -104,7 +111,8 @@ class Value {
     return Value(ValueKind::kToken, std::vector<Value>({}));
   }
   static Value Bool(bool enabled) {
-    return Value(UBits(/*value=*/enabled, /*bit_count=*/1));
+    return Value(
+        UBits(/*value=*/static_cast<uint64_t>(enabled), /*bit_count=*/1));
   }
 
   Value() : kind_(ValueKind::kInvalid), payload_(nullptr) {}
@@ -112,15 +120,29 @@ class Value {
   explicit Value(Bits bits)
       : kind_(ValueKind::kBits), payload_(std::move(bits)) {}
 
+  // Convert a ValueProto back to a value.
+  //
+  // If any bits element has a bit-count of more than max_bit_size the
+  // conversion will fail. Default to rejecting 1GiB or larger bits values.
+  // This limit is not for any correctness reason (if you want to have gigabytes
+  // of binary data that's fine) but just to change weird OOM crashes when fed
+  // with fuzzed/corrupted data into more debuggable Status errors. Set this to
+  // std::number_limits<int64_t>::max() to disable the check.
+  static absl::StatusOr<Value> FromProto(const ValueProto& proto,
+                                         int64_t max_bit_size = int64_t{1}
+                                                                << 33);
+
   // Serializes the contents of this value as bits in the buffer.
   void FlattenTo(BitPushBuffer* buffer) const;
+  absl::Status PopulateFrom(BitmapView bitmap);
 
   ValueKind kind() const { return kind_; }
   bool IsTuple() const { return kind_ == ValueKind::kTuple; }
   bool IsArray() const { return kind_ == ValueKind::kArray; }
   bool IsBits() const { return std::holds_alternative<Bits>(payload_); }
   bool IsToken() const { return kind_ == ValueKind::kToken; }
-  const Bits& bits() const { return std::get<Bits>(payload_); }
+  const Bits& bits() const& { return std::get<Bits>(payload_); }
+  Bits&& bits() && { return std::get<Bits>(std::move(payload_)); }
   absl::StatusOr<Bits> GetBitsWithStatus() const;
 
   absl::StatusOr<std::vector<Value>> GetElements() const;
@@ -157,11 +179,24 @@ class Value {
   // Returns the type of the Value as a type proto.
   absl::StatusOr<TypeProto> TypeAsProto() const;
 
+  // Returns this Value as a ValueProto.
+  absl::StatusOr<ValueProto> AsProto() const;
+
   // Returns true if 'other' has the same type as this Value.
   bool SameTypeAs(const Value& other) const;
 
   bool operator==(const Value& other) const;
   bool operator!=(const Value& other) const { return !(*this == other); }
+
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink, const Value& v) {
+    absl::Format(&sink, "%s", v.ToString(FormatPreference::kDefault));
+  }
+
+  template <typename H>
+  friend H AbslHashValue(H h, const Value& v) {
+    return H::combine(std::move(h), v.kind_, v.payload_);
+  }
 
  private:
   Value(ValueKind kind, absl::Span<const Value> elements)

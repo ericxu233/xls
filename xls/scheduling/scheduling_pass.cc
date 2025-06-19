@@ -14,38 +14,60 @@
 
 #include "xls/scheduling/scheduling_pass.h"
 
+#include <variant>
+#include <vector>
+
+#include "absl/algorithm/container.h"
+#include "absl/status/statusor.h"
+#include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/ir/function_base.h"
+#include "xls/ir/package.h"
+#include "xls/scheduling/pipeline_schedule.h"
+
 namespace xls {
-
-absl::StatusOr<bool> SchedulingOptimizationFunctionBasePass::RunOnFunctionBase(
-    SchedulingUnit<FunctionBase*>* s, const SchedulingPassOptions& options,
-    SchedulingPassResults* results) const {
-  FunctionBase* f = s->ir;
-  XLS_VLOG(2) << absl::StreamFormat("Running %s on function_base %s [pass #%d]",
-                                    long_name(), f->name(),
-                                    results->invocations.size());
-  XLS_VLOG(3) << "Before:";
-  XLS_VLOG_LINES(3, f->DumpIr());
-
-  XLS_ASSIGN_OR_RETURN(bool changed,
-                       RunOnFunctionBaseInternal(s, options, results));
-
-  XLS_VLOG(3) << absl::StreamFormat("After [changed = %d]:", changed);
-  XLS_VLOG_LINES(3, f->DumpIr());
-  return changed;
+/* static */ SchedulingContext SchedulingContext::CreateForSingleFunction(
+    FunctionBase* f) {
+  return SchedulingContext(f);
+}
+/* static */ SchedulingContext SchedulingContext::CreateForWholePackage(
+    Package* p) {
+  return SchedulingContext(p);
 }
 
-absl::StatusOr<bool> SchedulingOptimizationFunctionBasePass::RunInternal(
-    SchedulingUnit<>* s, const SchedulingPassOptions& options,
-    SchedulingPassResults* results) const {
-  bool changed = false;
-  for (FunctionBase* f : s->ir->GetFunctionBases()) {
-    SchedulingUnit<FunctionBase*> unit{f, s->schedule};
-    XLS_ASSIGN_OR_RETURN(bool function_changed,
-                         RunOnFunctionBaseInternal(&unit, options, results));
-    s->schedule = unit.schedule;
-    changed = changed || function_changed;
+absl::StatusOr<std::vector<FunctionBase*>>
+SchedulingContext::GetSchedulableFunctions() const {
+  // Package* means 'all FunctionBases in the package'
+  if (std::holds_alternative<Package*>(schedulable_unit_)) {
+    XLS_RET_CHECK_EQ(ir_, std::get<Package*>(schedulable_unit_));
+    // FFI functions are not schedulable.
+    std::vector<FunctionBase*> schedulable_functions = ir_->GetFunctionBases();
+    std::erase_if(schedulable_functions, [](FunctionBase* f) {
+      return f->ForeignFunctionData().has_value();
+    });
+    return schedulable_functions;
   }
-  return changed;
+  // Otherwise, return the specified FunctionBase (if it still exists in the
+  // package).
+  FunctionBase* f = std::get<FunctionBase*>(schedulable_unit_);
+  // Check that schedulable_unit_ is still in the package.
+  bool found = false;
+  for (FunctionBase* current_fb : ir_->GetFunctionBases()) {
+    if (current_fb == f) {
+      found = true;
+      break;
+    }
+  }
+  XLS_RET_CHECK(found) << "FunctionBase to schedule not found in the "
+                          "package; did a pass remove it?";
+  return std::vector<FunctionBase*>{f};
+}
+
+bool SchedulingContext::IsScheduled() const {
+  std::vector<FunctionBase*> schedulable_functions;
+  return absl::c_all_of(schedulable_functions, [this](FunctionBase* f) {
+    return schedules_.contains(f);
+  });
 }
 
 }  // namespace xls

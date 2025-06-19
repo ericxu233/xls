@@ -14,24 +14,28 @@
 
 #include "xls/dslx/errors.h"
 
+#include <memory>
+
 #include "gtest/gtest.h"
+#include "absl/status/status.h"
 #include "xls/dslx/frontend/pos.h"
-#include "xls/dslx/type_system/concrete_type.h"
+#include "xls/dslx/type_system/type.h"
 
 namespace xls::dslx {
 namespace {
 
 TEST(ErrorsTest, TypeInferenceErrorMessage) {
-  const std::string kFilename = "test.x";
-  const Pos start(kFilename, 0, 0);
-  const Pos limit(kFilename, 1, 1);
+  FileTable file_table;
+  const Pos start(Fileno(0), 0, 0);
+  const Pos limit(Fileno(0), 1, 1);
   Span span(start, limit);
-  std::unique_ptr<ConcreteType> type = BitsType::MakeU32();
-  absl::Status status =
-      TypeInferenceErrorStatus(span, type.get(), "this is the message!");
-  EXPECT_EQ(status.ToString(),
-            "INVALID_ARGUMENT: TypeInferenceError: test.x:1:1-2:2 uN[32] this "
-            "is the message!");
+  std::unique_ptr<Type> type = BitsType::MakeU32();
+  absl::Status status = TypeInferenceErrorStatus(
+      span, type.get(), "this is the message!", file_table);
+  EXPECT_EQ(
+      status.ToString(),
+      "INVALID_ARGUMENT: TypeInferenceError: <no-file>:1:1-2:2 uN[32] this "
+      "is the message!");
 }
 
 }  // namespace

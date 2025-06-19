@@ -14,8 +14,12 @@
 #ifndef XLS_PASSES_TABLE_SWITCH_PASS_H_
 #define XLS_PASSES_TABLE_SWITCH_PASS_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
+#include "xls/ir/function_base.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
@@ -34,14 +38,14 @@ namespace xls {
 //  - The Select ops have to be binary (i.e., selecting between only two cases).
 class TableSwitchPass : public OptimizationFunctionBasePass {
  public:
+  static constexpr std::string_view kName = "table_switch";
   TableSwitchPass()
-      : OptimizationFunctionBasePass("table_switch",
-                                     "Table switch conversion") {}
+      : OptimizationFunctionBasePass(kName, "Table switch conversion") {}
 
  protected:
   absl::StatusOr<bool> RunOnFunctionBaseInternal(
       FunctionBase* f, const OptimizationPassOptions& options,
-      PassResults* results) const override;
+      PassResults* results, OptimizationContext& context) const override;
 };
 
 }  // namespace xls

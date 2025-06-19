@@ -27,16 +27,24 @@
 #include <variant>
 #include <vector>
 
+#include "absl/base/attributes.h"
+#include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
+#include "xls/common/status/status_macros.h"
 #include "xls/common/strong_int.h"
 #include "xls/dslx/frontend/ast.h"
 #include "xls/dslx/frontend/bindings.h"
+#include "xls/dslx/frontend/module.h"
 #include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/frontend/scanner.h"
+#include "xls/dslx/frontend/token.h"
 #include "xls/dslx/frontend/token_parser.h"
+#include "xls/ir/channel.h"
 
 namespace xls::dslx {
 
@@ -70,17 +78,61 @@ XLS_DEFINE_STRONG_INT_TYPE(ExprRestrictions, uint32_t);
 
 constexpr ExprRestrictions kNoRestrictions = ExprRestrictions(0);
 
+// forward declaration
+class Parser;
+
+// RAII guard used to ensure the expression nesting depth does not get
+// unreasonably deep (which can cause stack overflows and "erroneously" flag
+// fuzzing issues in that dimension).
+class ABSL_MUST_USE_RESULT ExpressionDepthGuard final {
+ public:
+  explicit ExpressionDepthGuard(Parser* parser) : parser_(parser) {}
+  ~ExpressionDepthGuard();
+
+  // move-only type, and we use the parser pointer to track which instance is
+  // performing the side effect in the destructor if the original is moved
+  ExpressionDepthGuard(ExpressionDepthGuard&& other) : parser_(other.parser_) {
+    other.parser_ = nullptr;
+  }
+  ExpressionDepthGuard& operator=(ExpressionDepthGuard&& other) {
+    parser_ = other.parser_;
+    other.parser_ = nullptr;
+    return *this;
+  }
+
+  ExpressionDepthGuard(const ExpressionDepthGuard&) = delete;
+  ExpressionDepthGuard& operator=(const ExpressionDepthGuard&) = delete;
+
+ private:
+  Parser* parser_;
+};
+
+using TypeRefOrAnnotation = std::variant<TypeRef*, TypeAnnotation*>;
+
 class Parser : public TokenParser {
  public:
-  Parser(std::string module_name, Scanner* scanner)
+  Parser(std::string module_name, Scanner* scanner, bool parse_fn_stubs = false)
       : TokenParser(scanner),
-        module_(new Module(std::move(module_name), scanner->filename())) {}
+        module_(new Module(std::move(module_name), scanner->filename(),
+                           scanner->file_table())),
+        parse_fn_stubs_(parse_fn_stubs) {}
+
+  const FileTable& file_table() const { return scanner().file_table(); }
+  FileTable& file_table() { return scanner().file_table(); }
 
   absl::StatusOr<Function*> ParseFunction(
-      bool is_public, Bindings& bindings,
+      const Pos& start_pos, bool is_public, Bindings& bindings,
       absl::flat_hash_map<std::string, Function*>* name_to_fn = nullptr);
 
-  absl::StatusOr<Proc*> ParseProc(bool is_public, Bindings& bindings);
+  absl::StatusOr<Function*> ParseImplFunction(const Pos& start_pos,
+                                              bool is_public,
+                                              Bindings& bindings,
+                                              TypeAnnotation* struct_ref);
+
+  absl::StatusOr<Lambda*> ParseLambda(Bindings& bindings);
+
+  absl::StatusOr<ModuleMember> ParseProc(const Pos& start_pos, bool is_public,
+                                         Bindings& bindings);
 
   absl::StatusOr<std::unique_ptr<Module>> ParseModule(
       Bindings* bindings = nullptr);
@@ -95,16 +147,29 @@ class Parser : public TokenParser {
   //
   // The optional trailing semicolon presence is noted on the Block AST node
   // returned.
-  absl::StatusOr<Block*> ParseBlockExpression(Bindings& bindings);
+  //
+  // Takes an optional `prologue` of statements to prepend to the block.
+  absl::StatusOr<StatementBlock*> ParseBlockExpression(Bindings& bindings);
 
-  absl::StatusOr<TypeAlias*> ParseTypeAlias(bool is_public, Bindings& bindings);
+  absl::StatusOr<TypeAlias*> ParseTypeAlias(const Pos& start_pos,
+                                            bool is_public, Bindings& bindings);
 
-  absl::StatusOr<ConstAssert*> ParseConstAssert(Bindings& bindings);
+  // Args:
+  //  bindings: bindings to be used in parsing the assert expression.
+  //  identifier: [optional] token that contains the `const_assert!` identifier
+  //    -- if this is not given it is assumed that it should be popped from the
+  //    token steam.
+  absl::StatusOr<ConstAssert*> ParseConstAssert(
+      Bindings& bindings, const Token* ABSL_NULLABLE identifier = nullptr);
 
   Module& module() { return *module_; }
 
+  absl::Status ParseErrorStatus(const Span& span,
+                                std::string_view message) const;
+
  private:
   friend class ParserTest;
+  friend class ExpressionDepthGuard;
 
   // Simple helper class to wrap the operations necessary to evaluate [parser]
   // productions as transactions - with "Commit" or "Rollback" operations.
@@ -116,14 +181,12 @@ class Parser : public TokenParser {
           parent_bindings_(bindings),
           child_bindings_(bindings) {}
 
-    ~Transaction() {
-      XLS_CHECK(completed_) << "Uncompleted state transaction!";
-    }
+    ~Transaction() { CHECK(completed_) << "Uncompleted state transaction!"; }
 
     // Call on successful production: saves the changes from this
     // transaction to the parent bindings.
     void Commit() {
-      XLS_CHECK(!completed_) << "Doubly-completed transaction!";
+      CHECK(!completed_) << "Doubly-completed transaction!";
       if (parent_bindings_ != nullptr) {
         parent_bindings_->ConsumeChild(&child_bindings_);
       }
@@ -142,13 +205,14 @@ class Parser : public TokenParser {
 
     // Call on failed production: un-does changes to bindings and scanner state.
     void Rollback() {
-      XLS_CHECK(!completed_) << "Doubly-completed transaction!";
+      CHECK(!completed_) << "Doubly-completed transaction!";
       parser_->RestoreScannerCheckpoint(checkpoint_);
       child_bindings_ = Bindings(parent_bindings_);
       completed_ = true;
     }
 
     Bindings* bindings() { return &child_bindings_; }
+    bool completed() const { return completed_; }
 
    private:
     Parser* parser_;
@@ -225,19 +289,29 @@ class Parser : public TokenParser {
                                            const Token& start_tok);
 
   // Parses an AST construct that refers to a type; e.g. a name or a colon-ref.
-  absl::StatusOr<TypeRef*> ParseTypeRef(Bindings& bindings, const Token& tok);
+  absl::StatusOr<TypeRefOrAnnotation> ParseTypeRef(Bindings& bindings,
+                                                   const Token& tok);
 
+  // allow_generic_type indicates `T: type` is allowed.
   absl::StatusOr<TypeAnnotation*> ParseTypeAnnotation(
-      Bindings& bindings, std::optional<Token> first = std::nullopt);
+      Bindings& bindings, std::optional<Token> first = std::nullopt,
+      bool allow_generic_type = false);
+
+  // Parses the parametrics and dims after a `TypeRef` that the caller has
+  // already parsed, producing a `TypeAnnotation` for the whole thing.
+  absl::StatusOr<TypeAnnotation*> ParseTypeRefParametricsAndDims(
+      Bindings& bindings, const Span& span, TypeRefOrAnnotation type_ref);
 
   absl::StatusOr<NameRef*> ParseNameRef(Bindings& bindings,
                                         const Token* tok = nullptr);
 
   // Precondition: token cursor should be over a double colon '::' token.
   absl::StatusOr<ColonRef*> ParseColonRef(Bindings& bindings,
-                                          ColonRef::Subject subject);
+                                          ColonRef::Subject subject,
+                                          const Span& subject_span);
 
-  absl::StatusOr<Expr*> ParseCastOrEnumRefOrStructInstance(Bindings& bindings);
+  absl::StatusOr<Expr*> ParseCastOrEnumRefOrStructInstanceOrToken(
+      Bindings& bindings);
 
   absl::StatusOr<Expr*> ParseStructInstance(Bindings& bindings,
                                             TypeAnnotation* type = nullptr);
@@ -245,9 +319,17 @@ class Parser : public TokenParser {
   absl::StatusOr<std::variant<NameRef*, ColonRef*>> ParseNameOrColonRef(
       Bindings& bindings, std::string_view context = "");
 
+  // As above, but does not add the parsed identifier to any set of bindings.
+  absl::StatusOr<NameDef*> ParseNameDefNoBind();
+
+  // Parses a name definition and adds it to the given set of bindings.
+  //
+  // Wrapper around `ParseNameDefNoBind` above.
   absl::StatusOr<NameDef*> ParseNameDef(Bindings& bindings);
 
-  absl::StatusOr<std::variant<NameDef*, WildcardPattern*>>
+  absl::StatusOr<Token> PopSelfOrIdentifier(std::string_view context);
+
+  absl::StatusOr<std::variant<NameDef*, WildcardPattern*, RestOfTuple*>>
   ParseNameDefOrWildcard(Bindings& bindings);
 
   // Parses tree of name defs and returns it.
@@ -267,8 +349,8 @@ class Parser : public TokenParser {
   absl::StatusOr<TypeAnnotation*> MakeBuiltinTypeAnnotation(
       const Span& span, const Token& tok, absl::Span<Expr* const> dims);
   absl::StatusOr<TypeAnnotation*> MakeTypeRefTypeAnnotation(
-      const Span& span, TypeRef* type_ref, absl::Span<Expr* const> dims,
-      std::vector<ExprOrType> parametrics);
+      const Span& span, TypeRefOrAnnotation type_ref,
+      absl::Span<Expr* const> dims, std::vector<ExprOrType> parametrics);
 
   // Returns a parsed number (literal number) expression.
   absl::StatusOr<Number*> ParseNumber(Bindings& bindings);
@@ -293,6 +375,11 @@ class Parser : public TokenParser {
 
   absl::StatusOr<Array*> ParseArray(Bindings& bindings);
 
+  // If the next token is a colon, then parses a cast to `type`; otherwise just
+  // returns `type`.
+  absl::StatusOr<ExprOrType> MaybeParseCast(Bindings& bindings,
+                                            TypeAnnotation* type);
+
   absl::StatusOr<Expr*> ParseCast(Bindings& bindings,
                                   TypeAnnotation* type = nullptr);
 
@@ -307,6 +394,11 @@ class Parser : public TokenParser {
   // left-hand side like '[' or '(' in ParseTerm() above.
   absl::StatusOr<Expr*> ParseTermLhs(Bindings& bindings,
                                      ExprRestrictions restrictions);
+
+  // Attempts to parse a parenthetical and falls back to parsing as cast on
+  // failure.
+  absl::StatusOr<Expr*> ParseParentheticalOrCastLhs(Bindings& outer_bindings,
+                                                    const Pos& start_pos);
 
   absl::StatusOr<Expr*> ParseTermLhsParenthesized(Bindings& bindings,
                                                   const Pos& start_pos);
@@ -412,16 +504,19 @@ class Parser : public TokenParser {
   absl::StatusOr<Conditional*> ParseConditionalNode(
       Bindings& bindings, ExprRestrictions restrictions);
 
-  absl::StatusOr<Param*> ParseParam(Bindings& bindings);
+  absl::StatusOr<Param*> ParseParam(Bindings& bindings,
+                                    TypeAnnotation* struct_ref = nullptr);
 
   // Parses a member declaration in the body of a `proc` definition.
-  absl::StatusOr<ProcMember*> ParseProcMember(Bindings& bindings);
+  absl::StatusOr<ProcMember*> ParseProcMember(Bindings& bindings,
+                                              const Token& identifier_tok);
 
   // Parses a sequence of parameters, starting with cursor over '(', returns
   // after ')' is consumed.
   //
   // Permits trailing commas.
-  absl::StatusOr<std::vector<Param*>> ParseParams(Bindings& bindings);
+  absl::StatusOr<std::vector<Param*>> ParseParams(
+      Bindings& bindings, TypeAnnotation* struct_ref = nullptr);
 
   absl::StatusOr<NameDefTree*> ParseTuplePattern(const Pos& start_pos,
                                                  Bindings& bindings);
@@ -433,15 +528,17 @@ class Parser : public TokenParser {
   //            | ColonRef
   //            | NameDef
   //            | NameRef
-  //            | ConstRef
   //            | Number
-  absl::StatusOr<NameDefTree*> ParsePattern(Bindings& bindings);
+  absl::StatusOr<NameDefTree*> ParsePattern(Bindings& bindings,
+                                            bool within_tuple_pattern);
 
   // Parses a match expression.
   absl::StatusOr<Match*> ParseMatch(Bindings& bindings);
 
   // Parses a channel declaration.
-  absl::StatusOr<ChannelDecl*> ParseChannelDecl(Bindings& bindings);
+  absl::StatusOr<ChannelDecl*> ParseChannelDecl(
+      Bindings& bindings,
+      const std::optional<ChannelConfig>& channel_config = std::nullopt);
 
   // Parses a for loop construct; e.g.
   //
@@ -466,9 +563,14 @@ class Parser : public TokenParser {
   //    A = 0,
   //    B = 1,
   //  }
-  absl::StatusOr<EnumDef*> ParseEnumDef(bool is_public, Bindings& bindings);
+  absl::StatusOr<EnumDef*> ParseEnumDef(const Pos& start_pos, bool is_public,
+                                        Bindings& bindings);
 
-  absl::StatusOr<StructDef*> ParseStruct(bool is_public, Bindings& bindings);
+  absl::StatusOr<StructDef*> ParseStruct(const Pos& start_pos, bool is_public,
+                                         Bindings& bindings);
+
+  absl::StatusOr<Impl*> ParseImpl(const Pos& start_pos, bool is_public,
+                                  Bindings& bindings);
 
   // Parses parametric bindings that lead a function.
   //
@@ -499,32 +601,59 @@ class Parser : public TokenParser {
   absl::StatusOr<ExprOrType> ParseParametricArg(Bindings& bindings);
 
   // Parses a function out of the token stream.
-  absl::StatusOr<Function*> ParseFunctionInternal(bool is_public,
-                                                  Bindings& outer_bindings);
+  absl::StatusOr<Function*> ParseFunctionInternal(
+      const Pos& start_pos, bool is_public, Bindings& outer_bindings,
+      TypeAnnotation* struct_ref = nullptr);
 
-  // Parses an import statement into an Import AST node.
+  // Parses an import statement into an `Import` AST node.
   absl::StatusOr<Import*> ParseImport(Bindings& bindings);
+
+  // Parses a single entry in a `use` tree -- this can be a leaf or an interior
+  // entry.
+  absl::StatusOr<UseTreeEntry*> ParseUseTreeEntry(Bindings& bindings);
+
+  // Parses a use statement into a `Use` AST node.
+  absl::StatusOr<Use*> ParseUse(Bindings& bindings);
 
   // Returns TestFunction AST node by parsing new-style unit test construct.
   absl::StatusOr<TestFunction*> ParseTestFunction(Bindings& bindings,
-                                                  const Span& directive_span);
+                                                  const Span& attribute_span);
 
   absl::StatusOr<TestProc*> ParseTestProc(Bindings& bindings);
 
   // Parses a constant definition (e.g. at the top level of a module). Token
   // cursor should be over the `const` keyword.
-  absl::StatusOr<ConstantDef*> ParseConstantDef(bool is_public,
+  absl::StatusOr<ConstantDef*> ParseConstantDef(const Pos& start_pos,
+                                                bool is_public,
                                                 Bindings& bindings);
 
   absl::StatusOr<QuickCheck*> ParseQuickCheck(
       absl::flat_hash_map<std::string, Function*>* name_to_fn,
-      Bindings& bindings, const Span& directive_span);
+      Bindings& bindings, const Pos& hash_pos);
+
+  // Parses the test count configuration for a quickcheck attribute.
+  absl::StatusOr<QuickCheckTestCases> ParseQuickCheckConfig();
+
+  // Parses a module-level attribute -- cursor should be over the open bracket.
+  //
+  // Side-effect: module_ is tagged with the parsed attribute on success.
+  absl::Status ParseModuleAttribute();
 
   // Parses DSLX attributes, analogous to Rust's attributes.
+  //
+  // This accepts the following:
+  // #[test] Expects a 'fn', returns TestFunction*
+  // #[extern_verilog(...)] Expects a fn, returns Function*
+  // #[test_proc] Expects a proc, returns TestProc*
+  // #[quickcheck(...)] Expects a fn, returns QuickCheck*
+  // #[sv_type(...)] Expects a TypeDefinition, returns TypeDefinition
   absl::StatusOr<std::variant<TestFunction*, Function*, TestProc*, QuickCheck*,
-                              std::nullptr_t>>
+                              TypeDefinition, std::nullptr_t>>
   ParseAttribute(absl::flat_hash_map<std::string, Function*>* name_to_fn,
                  Bindings& bindings, const Pos& hash_pos);
+
+  absl::StatusOr<ChannelConfig> ParseExprAttribute(Bindings& bindings,
+                                                   const Pos& hash_pos);
 
   // Parses a "spawn" statement, which creates & initializes a proc.
   absl::StatusOr<Spawn*> ParseSpawn(Bindings& bindings);
@@ -536,11 +665,20 @@ class Parser : public TokenParser {
       std::vector<Expr*> args,
       std::vector<ExprOrType> parametrics = std::vector<ExprOrType>{});
 
-  // Traverses a Proc declaration to collect all the member data elements
-  // present therein - in other words, it collects everything but the "config"
-  // and "next" elements.
-  absl::StatusOr<std::vector<ProcMember*>> CollectProcMembers(
-      Bindings& bindings);
+  // Helper function that builds a `FormatMacro` corresponding to a DSLX
+  // invocation with verbosity, like vtrace_fmt!(...). The verbosity should be
+  // the first element of `args`.
+  absl::StatusOr<Expr*> BuildFormatMacroWithVerbosityArgument(
+      const Span& span, std::string_view name, std::vector<Expr*> args,
+      const std::vector<ExprOrType>& parametrics);
+
+  // Helper function that builds a `FormatMacro` corresponding to a DSLX
+  // invocation like trace_fmt!(...) or vtrace_fmt!(...), after the caller has
+  // extracted and removed any verbosity argument from `args`.
+  absl::StatusOr<Expr*> BuildFormatMacro(
+      const Span& span, std::string_view name, std::vector<Expr*> args,
+      const std::vector<ExprOrType>& parametrics,
+      std::optional<Expr*> verbosity = std::nullopt);
 
   // Parses a proc config function.
   //
@@ -558,14 +696,29 @@ class Parser : public TokenParser {
 
   absl::StatusOr<Function*> ParseProcInit(
       Bindings& bindings, std::vector<ParametricBinding*> parametric_bindings,
-      std::string_view proc_name);
+      std::string_view proc_name, bool is_public);
+
+  // Parses a proc-like entity (i.e. either a Proc or a Block). This will yield
+  // a node of type `T` unless the entity parsed is actually an impl-style
+  // `ProcDef`.
+  template <typename T>
+  absl::StatusOr<ModuleMember> ParseProcLike(const Pos& start_pos,
+                                             bool is_public,
+                                             Bindings& outer_bindings,
+                                             Keyword keyword);
+
+  // Bumps the internally-tracked expression depth so we can provide a useful
+  // error if we over-recurse on expression depth past the point a user would
+  // reasonably be expected to do. This (e.g.) helps avoid stack overflows
+  // during fuzzing.
+  absl::StatusOr<ExpressionDepthGuard> BumpExpressionDepth();
 
   std::unique_ptr<Module> module_;
 
   // `Let` nodes are created _after_ those that use their namedefs (due to the
   // chaining of the `body` member variable. We need to know, though, if a
   // reference to such an NDT (or element thereof) is to a constant or not, so
-  // we can emit either a ConstRef or NameRef. This set holds those NDTs known
+  // we can emit a NameRef. This set holds those NDTs known
   // to be constant for that purpose.
   absl::flat_hash_set<NameDefTree*> const_ndts_;
 
@@ -574,9 +727,14 @@ class Parser : public TokenParser {
   // deeply nested.
   static constexpr int64_t kApproximateExpressionDepthLimit = 64;
   int64_t approximate_expression_depth_ = 0;
+
+  // When true, we expect no function bodies, and a semicolon after
+  // the return type of a function.
+  bool parse_fn_stubs_;
 };
 
-const Span& GetSpan(const std::variant<NameDef*, WildcardPattern*>& v);
+const Span& GetSpan(
+    const std::variant<NameDef*, WildcardPattern*, RestOfTuple*>& v);
 
 }  // namespace xls::dslx
 

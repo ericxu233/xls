@@ -20,10 +20,10 @@
 
 #include <filesystem>  // NOLINT
 #include <memory>
-#include <string>
 
 #include "absl/types/span.h"
 #include "xls/dslx/import_data.h"
+#include "xls/dslx/virtualizable_file_system.h"
 #include "xls/dslx/warning_kind.h"
 
 namespace xls::dslx {
@@ -33,11 +33,13 @@ namespace xls::dslx {
 ImportData CreateImportData(
     const std::filesystem::path& stdlib_path,
     absl::Span<const std::filesystem::path> additional_search_paths,
-    WarningKindSet warnings);
+    WarningKindSet warnings, std::unique_ptr<VirtualizableFilesystem> vfs);
 
 // Creates an ImportData with reasonable defaults (standard path to the stdlib
 // and no additional search paths).
-ImportData CreateImportDataForTest();
+ImportData CreateImportDataForTest(
+    std::unique_ptr<VirtualizableFilesystem> vfs = nullptr,
+    WarningKindSet warnings = kAllWarningsSet);
 
 std::unique_ptr<ImportData> CreateImportDataPtrForTest();
 

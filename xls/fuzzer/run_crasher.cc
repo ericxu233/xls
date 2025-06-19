@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "absl/flags/flag.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -27,7 +28,6 @@
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/temp_directory.h"
 #include "xls/common/init_xls.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/fuzzer/run_fuzz.h"
 #include "xls/fuzzer/sample.h"
@@ -38,6 +38,8 @@ ABSL_FLAG(std::optional<std::string>, simulator, std::nullopt,
           "Verilog simulator to use. If not specified, the value specified in "
           "the crasher file. If the simulator is not specified in either "
           "location, the default simulator is used.");
+ABSL_FLAG(bool, unopt_interpreter, true,
+          "Should the interpreter be run on unopt-ir");
 
 namespace xls {
 namespace {
@@ -53,12 +55,16 @@ absl::Status RealMain(const std::filesystem::path& crasher_path,
   if (simulator.has_value()) {
     SampleOptions options = crasher.options();
     options.set_simulator(*simulator);
-    crasher = Sample(crasher.input_text(), options, crasher.args_batch(),
-                     crasher.ir_channel_names());
+    crasher = Sample(crasher.input_text(), options, crasher.testvector());
   }
 
-  XLS_LOG(INFO) << "Running crasher in directory " << run_dir;
-  return RunSample(crasher, run_dir);
+  LOG(INFO) << "Running crasher in directory " << run_dir;
+  if (!absl::GetFlag(FLAGS_unopt_interpreter)) {
+    SampleOptions options = crasher.options();
+    options.set_disable_unopt_interpreter(true);
+    crasher = Sample(crasher.input_text(), options, crasher.testvector());
+  }
+  return RunSample(crasher, run_dir).status();
 }
 
 }  // namespace
@@ -71,7 +77,7 @@ int main(int argc, char** argv) {
   std::vector<std::string_view> positional_arguments =
       xls::InitXls(usage, argc, argv);
   if (positional_arguments.size() != 1) {
-    XLS_LOG(QFATAL) << usage;
+    LOG(QFATAL) << usage;
     return EXIT_FAILURE;
   }
 

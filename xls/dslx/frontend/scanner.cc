@@ -21,8 +21,11 @@
 #include <string_view>
 #include <utility>
 
+#include "absl/base/no_destructor.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
@@ -30,20 +33,23 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/dslx/frontend/comment_data.h"
 #include "xls/dslx/frontend/pos.h"
+#include "xls/dslx/frontend/scanner_keywords.inc"
 #include "xls/dslx/frontend/token.h"
 
 namespace xls::dslx {
 
-absl::Status ScanErrorStatus(const Span& span, std::string_view message) {
+absl::Status ScanErrorStatus(const Span& span, std::string_view message,
+                             const FileTable& file_table) {
   return absl::InvalidArgumentError(
-      absl::StrFormat("ScanError: %s %s", span.ToString(), message));
+      absl::StrFormat("ScanError: %s %s", span.ToString(file_table), message));
 }
 
 char Scanner::PopChar() {
-  XLS_CHECK(!AtEof()) << "Cannot pop character when at EOF.";
+  CHECK(!AtEof()) << "Cannot pop character when at EOF.";
   char c = PeekChar();
   index_ += 1;
   if (c == '\n') {
@@ -69,20 +75,33 @@ bool Scanner::TryDropChar(char target) {
   return false;
 }
 
-Token Scanner::PopComment(const Pos& start_pos) {
+Token Scanner::PopComment(const Pos& start_pos, bool allow_multiline) {
   std::string chars;
+  Pos end_pos = GetPos();
   while (!AtCharEof()) {
     char c = PopChar();
     chars.append(1, c);
+    end_pos = GetPos();
     if (c == '\n') {
+      // If we've collected a comment, conditionally look for a continuation of
+      // it on the next line at the same colno.
+      if (allow_multiline && !AtCharEof() && PeekChar() != '\n' &&
+          chars.size() > 1) {
+        DropLeadingWhitespace();
+        if (!AtCharEof() && PeekChar() == '/' && PeekChar2OrNull() == '/' &&
+            GetPos().colno() == start_pos.colno()) {
+          DropChar(2);
+          continue;
+        }
+      }
       break;
     }
   }
-  return Token(TokenKind::kComment, Span(start_pos, GetPos()), chars);
+  return Token(TokenKind::kComment, Span(start_pos, end_pos), chars);
 }
 
 absl::StatusOr<Token> Scanner::PopWhitespace(const Pos& start_pos) {
-  XLS_CHECK(AtWhitespace());
+  CHECK(AtWhitespace());
   std::string chars;
   while (!AtCharEof() && AtWhitespace()) {
     chars.append(1, PopChar());
@@ -102,7 +121,7 @@ static uint8_t HexCharToU8(char hex_char) {
   if ('A' <= hex_char && hex_char <= 'F') {
     return hex_char - 'A' + 10;
   }
-  XLS_LOG(FATAL) << "Non-hex character received: " << hex_char;
+  LOG(FATAL) << "Non-hex character received: " << hex_char;
 }
 
 // Returns the next character literal.
@@ -268,11 +287,12 @@ absl::StatusOr<std::string> Scanner::ScanUntilDoubleQuote() {
 }
 
 /* static */ std::optional<Keyword> Scanner::GetKeyword(std::string_view s) {
-  static const auto* mapping = new absl::flat_hash_map<std::string, Keyword>{
+  static const absl::NoDestructor<absl::flat_hash_map<std::string, Keyword>>
+      mapping({
 #define MAKE_ITEM(__enum, unused, __str, ...) {__str, Keyword::__enum},
-      XLS_DSLX_KEYWORDS(MAKE_ITEM)
+          XLS_DSLX_KEYWORDS(MAKE_ITEM)
 #undef MAKE_ITEM
-  };
+      });
   auto it = mapping->find(s);
   if (it == mapping->end()) {
     return std::nullopt;
@@ -295,13 +315,13 @@ absl::StatusOr<Token> Scanner::ScanIdentifierOrKeyword(char startc,
   return Token(TokenKind::kIdentifier, span, std::move(s));
 }
 
-std::optional<CommentData> Scanner::TryPopComment() {
+std::optional<CommentData> Scanner::TryPopComment(bool allow_multiline) {
   const Pos start_pos = GetPos();
   if (!AtEof() && PeekChar() == '/' && PeekChar2OrNull() == '/') {
     DropChar(2);
-    Token token = PopComment(start_pos);
-    XLS_CHECK(token.GetValue().has_value());
-    return CommentData{token.span(), token.GetValue().value()};
+    Token token = PopComment(start_pos, allow_multiline);
+    CHECK(token.GetValue().has_value());
+    return CommentData{.span = token.span(), .text = token.GetValue().value()};
   }
   return std::nullopt;
 }
@@ -317,10 +337,21 @@ absl::StatusOr<std::optional<Token>> Scanner::TryPopWhitespaceOrComment() {
   }
   if (PeekChar() == '/' && PeekChar2OrNull() == '/') {
     DropChar(2);
-    Token token = PopComment(start_pos);
+    Token token = PopComment(start_pos, /* allow_multiline= */ false);
     return token;
   }
   return std::nullopt;
+}
+
+absl::StatusOr<Token> Scanner::ScanString(const Pos& start_pos) {
+  DropChar();
+  XLS_ASSIGN_OR_RETURN(std::string value, ScanUntilDoubleQuote());
+  if (!TryDropChar('"')) {
+    return ScanErrorStatus(
+        Span(start_pos, GetPos()),
+        "Expected close quote character to terminate open quote character.");
+  }
+  return Token(TokenKind::kString, Span(start_pos, GetPos()), value);
 }
 
 absl::StatusOr<Token> Scanner::ScanNumber(char startc, const Pos& start_pos) {
@@ -358,7 +389,7 @@ absl::StatusOr<Token> Scanner::ScanNumber(char startc, const Pos& start_pos) {
           Span(GetPos(), GetPos()),
           "Invalid radix for number, expect 0b or 0x because of leading 0.");
     }
-    XLS_CHECK(!s.empty())
+    CHECK(!s.empty())
         << "Must have seen numerical digits to attempt to scan a number.";
   }
   if (negative) {
@@ -390,30 +421,19 @@ void Scanner::DropLeadingWhitespace() {
   }
 }
 
-void Scanner::DropCommentsAndLeadingWhitespace() {
-  while (!AtCharEof()) {
-    if (AtWhitespace()) {
-      DropChar();
-    } else if (PeekChar() == '/' && PeekChar2OrNull() == '/') {
-      DropChar(2);  // Get rid of leading "//"
-      while (!AtCharEof()) {
-        if (PopChar() == '\n') {
-          break;
-        }
-      }
-    } else {
-      break;
-    }
-  }
-}
-
 absl::StatusOr<Token> Scanner::ScanChar(const Pos& start_pos) {
   const char open_quote = PopChar();
-  XLS_CHECK_EQ(open_quote, '\'');
+  CHECK_EQ(open_quote, '\'');
   if (AtCharEof()) {
     return ScanErrorStatus(
         Span(GetPos(), GetPos()),
         "Expected character after single quote, saw end of file.");
+  }
+  if (PeekChar() == '\n') {
+    return ScanErrorStatus(
+        Span(start_pos, GetPos()),
+        "Newline found in character literal. Newlines are not allowed in "
+        "character literals.");
   }
   XLS_ASSIGN_OR_RETURN(char c, ScanCharLiteral());
   if (AtCharEof() || !TryDropChar('\'')) {
@@ -428,16 +448,18 @@ absl::StatusOr<Token> Scanner::ScanChar(const Pos& start_pos) {
 
 absl::StatusOr<Token> Scanner::Pop() {
   if (include_whitespace_and_comments_) {
-    XLS_ASSIGN_OR_RETURN(std::optional<Token> tok,
-                         TryPopWhitespaceOrComment());
+    XLS_ASSIGN_OR_RETURN(std::optional<Token> tok, TryPopWhitespaceOrComment());
     if (tok) {
       return *tok;
     }
   } else {
     while (true) {
+      // Allow inline comments to be multi-line.
+      bool allow_multiline =
+          !AtCharEof() && !(GetPos().colno() == 0 || PeekChar() == '\n');
       DropLeadingWhitespace();
 
-      if (std::optional<CommentData> comment = TryPopComment()) {
+      if (std::optional<CommentData> comment = TryPopComment(allow_multiline)) {
         comments_.push_back(std::move(comment).value());
       } else {
         // Dropped whitespace and not seeing a comment, good to go scan a token.
@@ -459,6 +481,10 @@ absl::StatusOr<Token> Scanner::Pop() {
   const char startc = PeekChar();
   std::optional<Token> result;
   switch (startc) {
+    case '"': {
+      XLS_ASSIGN_OR_RETURN(result, ScanString(start_pos));
+      break;
+    }
     case '\'': {
       XLS_ASSIGN_OR_RETURN(result, ScanChar(start_pos));
       break;
@@ -520,6 +546,8 @@ absl::StatusOr<Token> Scanner::Pop() {
       if (TryDropChar('.')) {
         if (TryDropChar('.')) {
           result = Token(TokenKind::kEllipsis, mk_span());
+        } else if (TryDropChar('=')) {
+          result = Token(TokenKind::kDoubleDotEquals, mk_span());
         } else {
           result = Token(TokenKind::kDoubleDot, mk_span());
         }
@@ -551,7 +579,7 @@ absl::StatusOr<Token> Scanner::Pop() {
         result = Token(TokenKind::kAmpersand, mk_span());
       }
       break;
-    // clang-format off
+      // clang-format off
     case '(': DropChar(); result = Token(TokenKind::kOParen, mk_span()); break;  // NOLINT
     case ')': DropChar(); result = Token(TokenKind::kCParen, mk_span()); break;  // NOLINT
     case '[': DropChar(); result = Token(TokenKind::kOBrack, mk_span()); break;  // NOLINT
@@ -564,7 +592,6 @@ absl::StatusOr<Token> Scanner::Pop() {
     case '%': DropChar(); result = Token(TokenKind::kPercent, mk_span()); break;  // NOLINT
     case '^': DropChar(); result = Token(TokenKind::kHat, mk_span()); break;  // NOLINT
     case '/': DropChar(); result = Token(TokenKind::kSlash, mk_span()); break;  // NOLINT
-    case '"': DropChar(); result = Token(TokenKind::kDoubleQuote, mk_span()); break;  // NOLINT
     // clang-format on
     default:
       if (std::isalpha(startc) != 0 || startc == '_') {
@@ -588,7 +615,7 @@ absl::StatusOr<Token> Scanner::Pop() {
       }
   }
 
-  XLS_CHECK(result.has_value());
+  CHECK(result.has_value());
   return std::move(result).value();
 }
 

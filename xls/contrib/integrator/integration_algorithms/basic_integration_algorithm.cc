@@ -14,11 +14,20 @@
 
 #include "xls/contrib/integrator/integration_algorithms/basic_integration_algorithm.h"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <utility>
 
-#include "xls/ir/node_iterator.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/contrib/integrator/integration_algorithms/integration_algorithm.h"
+#include "xls/contrib/integrator/ir_integrator.h"
+#include "xls/ir/function.h"
+#include "xls/ir/node.h"
+#include "xls/ir/op.h"
 
 namespace xls {
 

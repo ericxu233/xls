@@ -15,6 +15,7 @@
 #ifndef XLS_COMMON_COMPARISON_UTILS_H_
 #define XLS_COMMON_COMPARISON_UTILS_H_
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -22,8 +23,8 @@
 
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/to_string_helpers.h"
-#include "xls/common/type_traits_helpers.h"
+#include "xls/common/to_string_utils.h"
+#include "xls/common/type_traits_utils.h"
 
 // Utilities for comparing C++ primitive types, std::pair and containers with a
 // const_iterator and size() members. The comparisons return a human readable
@@ -145,8 +146,7 @@ template <typename T, template <class...> class Container,
           typename std::enable_if<has_const_iterator_v<Container<T>> &&
                                       has_member_size_v<Container<T>>,
                                   T>::type* = nullptr>
-std::string Compare(std::string_view element_name,
-                    const Container<T>& expected,
+std::string Compare(std::string_view element_name, const Container<T>& expected,
                     const Container<T>& computed) {
   if (computed.size() != expected.size()) {
     return absl::StrFormat(

@@ -22,16 +22,17 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
 #include "xls/common/casts.h"
 #include "xls/common/status/matchers.h"
 #include "xls/ir/bits.h"
 #include "xls/ir/channel.h"
-#include "xls/ir/channel.pb.h"
 #include "xls/ir/channel_ops.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_matcher.h"
 #include "xls/ir/ir_test_base.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/type.h"
 #include "xls/ir/value.h"
 #include "xls/ir/xls_type.pb.h"
@@ -39,10 +40,10 @@
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
-using testing::ElementsAre;
-using testing::HasSubstr;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
+using ::testing::ElementsAre;
+using ::testing::HasSubstr;
 
 class PackageTest : public IrTestBase {};
 
@@ -324,12 +325,11 @@ TEST_F(PackageTest, CreateStreamingChannel) {
 
   // Create a channel with a specific ID.
   XLS_ASSERT_OK_AND_ASSIGN(
-      Channel * ch42,
-      p.CreateStreamingChannel(
-          "ch42", ChannelOps::kReceiveOnly, p.GetBitsType(44),
-          /*initial_values=*/{}, /*fifo_config=*/std::nullopt,
-          FlowControl::kReadyValid, ChannelStrictness::kProvenMutuallyExclusive,
-          ChannelMetadataProto(), 42));
+      Channel * ch42, p.CreateStreamingChannel(
+                          "ch42", ChannelOps::kReceiveOnly, p.GetBitsType(44),
+                          /*initial_values=*/{}, /*fifo_config=*/std::nullopt,
+                          FlowControl::kReadyValid,
+                          ChannelStrictness::kProvenMutuallyExclusive, 42));
   EXPECT_EQ(ch42->id(), 42);
   EXPECT_THAT(p.GetChannel(42), IsOkAndHolds(ch42));
 
@@ -344,10 +344,9 @@ TEST_F(PackageTest, CreateStreamingChannel) {
                    "ch1_dup", ChannelOps::kReceiveOnly, p.GetBitsType(44),
                    /*initial_values=*/{}, /*fifo_config=*/std::nullopt,
                    FlowControl::kReadyValid,
-                   ChannelStrictness::kProvenMutuallyExclusive,
-                   ChannelMetadataProto(), 1)
+                   ChannelStrictness::kProvenMutuallyExclusive, 1)
                   .status(),
-              StatusIs(absl::StatusCode::kInternal,
+              StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("Channel already exists with id 1")));
 
   // Fetching a non-existent channel ID is an error.
@@ -422,12 +421,13 @@ TEST_F(PackageTest, CloneSingleValueChannelSetParams) {
       StatusIs(absl::StatusCode::kInvalidArgument,
                HasSubstr("Cannot clone single value channel with "
                          "streaming channel parameter overrides")));
-  EXPECT_THAT(p.CloneChannel(ch0, "ch2",
-                             Package::CloneChannelOverrides().OverrideFifoDepth(
-                                 std::nullopt)),
-              StatusIs(absl::StatusCode::kInvalidArgument,
-                       HasSubstr("Cannot clone single value channel with "
-                                 "streaming channel parameter overrides")));
+  EXPECT_THAT(
+      p.CloneChannel(ch0, "ch2",
+                     Package::CloneChannelOverrides().OverrideChannelConfig(
+                         ChannelConfig())),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("Cannot clone single value channel with "
+                         "streaming channel parameter overrides")));
   EXPECT_THAT(
       p.CloneChannel(ch0, "ch3",
                      Package::CloneChannelOverrides().OverrideFlowControl(
@@ -435,17 +435,6 @@ TEST_F(PackageTest, CloneSingleValueChannelSetParams) {
       StatusIs(absl::StatusCode::kInvalidArgument,
                HasSubstr("Cannot clone single value channel with "
                          "streaming channel parameter overrides")));
-
-  ChannelMetadataProto new_metadata;
-  new_metadata.mutable_block_ports()->set_block_name("new_block_name");
-  XLS_ASSERT_OK_AND_ASSIGN(
-      Channel * ch4,
-      p.CloneChannel(
-          ch0, "ch4",
-          Package::CloneChannelOverrides().OverrideMetadata(new_metadata)));
-  EXPECT_EQ(ch4->metadata().block_ports().block_name(), "new_block_name");
-  EXPECT_NE(ch0->metadata().block_ports().block_name(),
-            ch4->metadata().block_ports().block_name());
 }
 
 TEST_F(PackageTest, CloneSingleValueChannelSamePackageButDifferentOps) {
@@ -475,7 +464,7 @@ TEST_F(PackageTest, CloneSingleValueChannelToDifferentPackage) {
 
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * ch0, p0.CreateSingleValueChannel("ch0", ChannelOps::kSendOnly,
-                                                p0.GetBitsType(32)));
+                                                 p0.GetBitsType(32)));
   XLS_ASSERT_OK_AND_ASSIGN(Channel * ch0_clone, p1.CloneChannel(ch0, "ch0"));
 
   EXPECT_EQ(p0.channels().size(), 1);
@@ -493,9 +482,15 @@ TEST_F(PackageTest, CloneStreamingChannelSamePackage) {
                                        Value(UBits(2, 32))};
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * ch0,
-      p.CreateStreamingChannel("ch0", ChannelOps::kSendOnly, p.GetBitsType(32),
-                               /*initial_values=*/initial_values,
-                               /*fifo_config=*/FifoConfig{.depth = 3}));
+      p.CreateStreamingChannel(
+          "ch0", ChannelOps::kSendOnly, p.GetBitsType(32),
+          /*initial_values=*/initial_values,
+          /*channel_config=*/
+          ChannelConfig(FifoConfig(/*depth=*/3, /*bypass=*/true,
+                                   /*register_push_outputs=*/true,
+                                   /*register_pop_outputs=*/false),
+                        /*input_flop_kind=*/std::nullopt,
+                        /*output_flop_kind=*/std::nullopt)));
   XLS_ASSERT_OK_AND_ASSIGN(Channel * ch1, p.CloneChannel(ch0, "ch1"));
 
   EXPECT_EQ(p.channels().size(), 2);
@@ -515,17 +510,19 @@ TEST_F(PackageTest, CloneStreamingChannelSamePackage) {
 TEST_F(PackageTest, CloneStreamingChannelSetParams) {
   Package p(TestName());
 
-  ChannelMetadataProto original_metadata;
-  original_metadata.mutable_block_ports()->set_block_name("original_name");
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * ch0,
       p.CreateStreamingChannel(
           "ch0", ChannelOps::kSendOnly, p.GetBitsType(32),
           /*initial_values*/ std::vector<Value>{Value(UBits(0, 32))},
-          /*fifo_config=*/FifoConfig{.depth = 3},
+          /*channel_config=*/
+          ChannelConfig(FifoConfig(/*depth=*/3, /*bypass=*/true,
+                                   /*register_push_outputs=*/true,
+                                   /*register_pop_outputs=*/false),
+                        /*input_flop_kind=*/std::nullopt,
+                        /*output_flop_kind=*/std::nullopt),
           /*flow_control=*/FlowControl::kNone,
-          /*strictness=*/ChannelStrictness::kProvenMutuallyExclusive,
-          /*metadata=*/original_metadata));
+          /*strictness=*/ChannelStrictness::kProvenMutuallyExclusive));
   std::vector<Value> initial_values_override;
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * ch1_base,
@@ -541,7 +538,6 @@ TEST_F(PackageTest, CloneStreamingChannelSetParams) {
   EXPECT_EQ(ch1->GetFifoDepth(), 3);
   EXPECT_EQ(ch1->GetFlowControl(), FlowControl::kNone);
   EXPECT_EQ(ch1->GetStrictness(), ChannelStrictness::kProvenMutuallyExclusive);
-  EXPECT_EQ(ch1->metadata().block_ports().block_name(), "original_name");
 
   EXPECT_EQ(ch1->initial_values(), initial_values_override);
 
@@ -551,9 +547,9 @@ TEST_F(PackageTest, CloneStreamingChannelSetParams) {
   EXPECT_TRUE(fifo_depth_override.has_value());
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * ch2_base,
-      p.CloneChannel(
-          ch0, "ch2",
-          Package::CloneChannelOverrides().OverrideFifoDepth(std::nullopt)));
+      p.CloneChannel(ch0, "ch2",
+                     Package::CloneChannelOverrides().OverrideChannelConfig(
+                         ChannelConfig())));
   StreamingChannel* ch2 = down_cast<StreamingChannel*>(ch2_base);
   ASSERT_NE(ch2, nullptr);
 
@@ -563,7 +559,6 @@ TEST_F(PackageTest, CloneStreamingChannelSetParams) {
   EXPECT_EQ(ch2->initial_values(), std::vector<Value>{Value(UBits(0, 32))});
   EXPECT_EQ(ch2->GetFlowControl(), FlowControl::kNone);
   EXPECT_EQ(ch2->GetStrictness(), ChannelStrictness::kProvenMutuallyExclusive);
-  EXPECT_EQ(ch2->metadata().block_ports().block_name(), "original_name");
 
   EXPECT_EQ(ch2->GetFifoDepth(), std::nullopt);
 
@@ -581,15 +576,12 @@ TEST_F(PackageTest, CloneStreamingChannelSetParams) {
   EXPECT_EQ(ch3->initial_values(), std::vector<Value>{Value(UBits(0, 32))});
   EXPECT_EQ(ch3->GetFifoDepth(), 3);
   EXPECT_EQ(ch3->GetStrictness(), ChannelStrictness::kProvenMutuallyExclusive);
-  EXPECT_EQ(ch3->metadata().block_ports().block_name(), "original_name");
 
   EXPECT_EQ(ch3->GetFlowControl(), FlowControl::kReadyValid);
 
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * ch4_base,
-      p.CloneChannel(ch0, "ch4",
-                     Package::CloneChannelOverrides().OverrideMetadata(
-                         ChannelMetadataProto())));
+      p.CloneChannel(ch0, "ch4", Package::CloneChannelOverrides()));
   StreamingChannel* ch4 = down_cast<StreamingChannel*>(ch4_base);
   ASSERT_NE(ch4, nullptr);
 
@@ -600,8 +592,6 @@ TEST_F(PackageTest, CloneStreamingChannelSetParams) {
   EXPECT_EQ(ch4->GetFifoDepth(), 3);
   EXPECT_EQ(ch4->GetFlowControl(), FlowControl::kNone);
   EXPECT_EQ(ch4->GetStrictness(), ChannelStrictness::kProvenMutuallyExclusive);
-  EXPECT_EQ(ch0->metadata().block_ports().block_name(), "original_name");
-  EXPECT_EQ(ch4->metadata().block_ports().block_name(), "");
 
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * ch5_base,
@@ -617,7 +607,6 @@ TEST_F(PackageTest, CloneStreamingChannelSetParams) {
   EXPECT_EQ(ch5->initial_values(), std::vector<Value>{Value(UBits(0, 32))});
   EXPECT_EQ(ch5->GetFifoDepth(), 3);
   EXPECT_EQ(ch5->GetFlowControl(), FlowControl::kNone);
-  EXPECT_EQ(ch5->metadata().block_ports().block_name(), "original_name");
   EXPECT_EQ(ch5->GetStrictness(), ChannelStrictness::kArbitraryStaticOrder);
 }
 
@@ -628,9 +617,15 @@ TEST_F(PackageTest, CloneStreamingChannelSamePackageButDifferentOps) {
                                        Value(UBits(2, 32))};
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * ch0,
-      p.CreateStreamingChannel("ch0", ChannelOps::kSendOnly, p.GetBitsType(32),
-                               /*initial_values=*/initial_values,
-                               /*fifo_config=*/FifoConfig{.depth = 3}));
+      p.CreateStreamingChannel(
+          "ch0", ChannelOps::kSendOnly, p.GetBitsType(32),
+          /*initial_values=*/initial_values,
+          /*channel_config=*/
+          ChannelConfig(FifoConfig(/*depth=*/3, /*bypass=*/true,
+                                   /*register_push_outputs=*/true,
+                                   /*register_pop_outputs=*/false),
+                        /*input_flop_kind=*/std::nullopt,
+                        /*output_flop_kind=*/std::nullopt)));
   XLS_ASSERT_OK_AND_ASSIGN(
       Channel * ch1,
       p.CloneChannel(ch0, "ch1",
@@ -658,11 +653,17 @@ TEST_F(PackageTest, CloneStreamingChannelDifferentPackage) {
 
   std::vector<Value> initial_values = {Value(UBits(1, 32)),
                                        Value(UBits(2, 32))};
-  XLS_ASSERT_OK_AND_ASSIGN(Channel * ch0,
-                           p0.CreateStreamingChannel(
-                               "ch0", ChannelOps::kSendOnly, p0.GetBitsType(32),
-                               /*initial_values=*/initial_values,
-                               /*fifo_config=*/FifoConfig{.depth = 3}));
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Channel * ch0,
+      p0.CreateStreamingChannel(
+          "ch0", ChannelOps::kSendOnly, p0.GetBitsType(32),
+          /*initial_values=*/initial_values,
+          /*channel_config=*/
+          ChannelConfig(FifoConfig(/*depth=*/3, /*bypass=*/true,
+                                   /*register_push_outputs=*/true,
+                                   /*register_pop_outputs=*/false),
+                        /*input_flop_kind=*/std::nullopt,
+                        /*output_flop_kind*/ std::nullopt)));
   XLS_ASSERT_OK_AND_ASSIGN(Channel * ch0_clone,
                            p1.CloneChannel(ch0, "ch0_clone"));
 
@@ -688,17 +689,17 @@ fn my_function(x: bits[32], y: bits[32]) -> bits[32] {
   ret add.1: bits[32] = add(x, y)
 }
 
-proc my_proc(tkn: token, st: bits[32], init={42}) {
+proc my_proc(st: bits[32], init={42}) {
   literal.3: bits[32] = literal(value=1, id=3)
   add.4: bits[32] = add(literal.3, st, id=4)
-  next (tkn, add.4)
+  next_value.5: () = next_value(param=st, value=add.4, id=5)
 }
 
 block my_block(a: bits[32], b: bits[32], out: bits[32]) {
-  a: bits[32] = input_port(name=a, id=5)
-  b: bits[32] = input_port(name=b, id=6)
-  add.7: bits[32] = add(a, b, id=7)
-  out: () = output_port(add.7, name=out, id=8)
+  a: bits[32] = input_port(name=a, id=6)
+  b: bits[32] = input_port(name=b, id=7)
+  add.8: bits[32] = add(a, b, id=8)
+  out: () = output_port(add.8, name=out, id=9)
 }
 
 )";
@@ -773,34 +774,34 @@ fn my_function(x: bits[32], y: bits[32]) -> bits[32] {
   ret add.1: bits[32] = add(x, y)
 }
 
-proc my_proc(tkn: token, st: bits[32], init={42}) {
+proc my_proc(st: bits[32], init={42}) {
   literal.3: bits[32] = literal(value=1, id=3)
   add.4: bits[32] = add(literal.3, st, id=4)
-  next (tkn, add.4)
+  next_value.5: () = next_value(param=st, value=add.4, id=5)
 }
 
 block my_block(a: bits[32], b: bits[32], out: bits[32]) {
-  a: bits[32] = input_port(name=a, id=5)
-  b: bits[32] = input_port(name=b, id=6)
-  add.7: bits[32] = add(a, b, id=7)
-  out: () = output_port(add.7, name=out, id=8)
+  a: bits[32] = input_port(name=a, id=6)
+  b: bits[32] = input_port(name=b, id=7)
+  add.8: bits[32] = add(a, b, id=8)
+  out: () = output_port(add.8, name=out, id=9)
 }
 
 fn my_function2(x: bits[32], y: bits[32]) -> bits[32] {
-  ret add.9: bits[32] = add(x, y)
+  ret add.10: bits[32] = add(x, y)
 }
 
-proc my_proc2(tkn: token, st: bits[32], init={42}) {
-  literal.10: bits[32] = literal(value=1, id=10)
-  add.11: bits[32] = add(literal.10, st, id=11)
-  next (tkn, add.11)
+proc my_proc2(st: bits[32], init={42}) {
+  literal.11: bits[32] = literal(value=1, id=11)
+  add.12: bits[32] = add(literal.11, st, id=12)
+  next_value.13: () = next_value(param=st, value=add.12, id=13)
 }
 
 block my_block2(a: bits[32], b: bits[32], out: bits[32]) {
-  a: bits[32] = input_port(name=a, id=12)
-  b: bits[32] = input_port(name=b, id=13)
-  add.14: bits[32] = add(a, b, id=14)
-  out: () = output_port(add.14, name=out, id=15)
+  a: bits[32] = input_port(name=a, id=14)
+  b: bits[32] = input_port(name=b, id=15)
+  add.16: bits[32] = add(a, b, id=16)
+  out: () = output_port(add.16, name=out, id=17)
 }
 
 )";
@@ -819,17 +820,17 @@ top fn my_function(x: bits[32], y: bits[32]) -> bits[32] {
   ret add.1: bits[32] = add(x, y)
 }
 
-proc my_proc(tkn: token, st: bits[32], init={42}) {
+proc my_proc(st: bits[32], init={42}) {
   literal.3: bits[32] = literal(value=1, id=3)
   add.4: bits[32] = add(literal.3, st, id=4)
-  next (tkn, add.4)
+  next_value.5: () = next_value(param=st, value=add.4, id=5)
 }
 
 block my_block(a: bits[32], b: bits[32], out: bits[32]) {
-  a: bits[32] = input_port(name=a, id=5)
-  b: bits[32] = input_port(name=b, id=6)
-  add.7: bits[32] = add(a, b, id=7)
-  out: () = output_port(add.7, name=out, id=8)
+  a: bits[32] = input_port(name=a, id=6)
+  b: bits[32] = input_port(name=b, id=7)
+  add.8: bits[32] = add(a, b, id=8)
+  out: () = output_port(add.8, name=out, id=9)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg, ParsePackage(text));
@@ -850,17 +851,17 @@ fn my_function(x: bits[32], y: bits[32]) -> bits[32] {
   ret add.1: bits[32] = add(x, y)
 }
 
-top proc my_proc(tkn: token, st: bits[32], init={42}) {
+top proc my_proc(st: bits[32], init={42}) {
   literal.3: bits[32] = literal(value=1, id=3)
   add.4: bits[32] = add(literal.3, st, id=4)
-  next (tkn, add.4)
+  next_value.5: () = next_value(param=st, value=add.4, id=5)
 }
 
 block my_block(a: bits[32], b: bits[32], out: bits[32]) {
-  a: bits[32] = input_port(name=a, id=5)
-  b: bits[32] = input_port(name=b, id=6)
-  add.7: bits[32] = add(a, b, id=7)
-  out: () = output_port(add.7, name=out, id=8)
+  a: bits[32] = input_port(name=a, id=6)
+  b: bits[32] = input_port(name=b, id=7)
+  add.8: bits[32] = add(a, b, id=8)
+  out: () = output_port(add.8, name=out, id=9)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg, ParsePackage(text));
@@ -881,17 +882,17 @@ fn my_function(x: bits[32], y: bits[32]) -> bits[32] {
   ret add.1: bits[32] = add(x, y)
 }
 
-proc my_proc(tkn: token, st: bits[32], init={42}) {
+proc my_proc(st: bits[32], init={42}) {
   literal.3: bits[32] = literal(value=1, id=3)
   add.4: bits[32] = add(literal.3, st, id=4)
-  next (tkn, add.4)
+  next_value.5: () = next_value(param=st, value=add.4, id=5)
 }
 
 top block my_block(a: bits[32], b: bits[32], out: bits[32]) {
-  a: bits[32] = input_port(name=a, id=5)
-  b: bits[32] = input_port(name=b, id=6)
-  add.7: bits[32] = add(a, b, id=7)
-  out: () = output_port(add.7, name=out, id=8)
+  a: bits[32] = input_port(name=a, id=6)
+  b: bits[32] = input_port(name=b, id=7)
+  add.8: bits[32] = add(a, b, id=8)
+  out: () = output_port(add.8, name=out, id=9)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg, ParsePackage(text));
@@ -912,17 +913,17 @@ fn my_function(x: bits[32], y: bits[32]) -> bits[32] {
   ret add.1: bits[32] = add(x, y)
 }
 
-proc my_proc(tkn: token, st: bits[32], init={42}) {
+proc my_proc(st: bits[32], init={42}) {
   literal.3: bits[32] = literal(value=1, id=3)
   add.4: bits[32] = add(literal.3, st, id=4)
-  next (tkn, add.4)
+  next_value.5: () = next_value(param=st, value=add.4, id=5)
 }
 
 block my_block(a: bits[32], b: bits[32], out: bits[32]) {
-  a: bits[32] = input_port(name=a, id=5)
-  b: bits[32] = input_port(name=b, id=6)
-  add.7: bits[32] = add(a, b, id=7)
-  out: () = output_port(add.7, name=out, id=8)
+  a: bits[32] = input_port(name=a, id=6)
+  b: bits[32] = input_port(name=b, id=7)
+  add.8: bits[32] = add(a, b, id=8)
+  out: () = output_port(add.8, name=out, id=9)
 }
 )";
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg, ParsePackage(text));
@@ -955,7 +956,7 @@ fn my_function(x: bits[32], y: bits[32]) -> bits[32] {
 
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg1, ParsePackage(text1));
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg2, ParsePackage(text2));
-  XLS_ASSERT_OK(pkg1->AddPackage(pkg2.get()).status());
+  XLS_ASSERT_OK(pkg1->ImportFromPackage(pkg2.get()).status());
   EXPECT_EQ(pkg1->functions().size(), 2);
   XLS_EXPECT_OK(pkg1->GetFunction("my_function"));
   XLS_EXPECT_OK(pkg1->GetFunction("my_function_1"));
@@ -987,7 +988,7 @@ fn my_function(x: bits[32], y: bits[32]) -> bits[32] {
 
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg1, ParsePackage(text1));
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg2, ParsePackage(text2));
-  XLS_ASSERT_OK(pkg1->AddPackage(pkg2.get()).status());
+  XLS_ASSERT_OK(pkg1->ImportFromPackage(pkg2.get()).status());
 
   EXPECT_EQ(pkg1->functions().size(), 4);
   XLS_EXPECT_OK(pkg1->GetFunction("my_function"));
@@ -1001,41 +1002,39 @@ TEST_F(PackageTest, LinkChannelsAndProcs) {
 package my_package
 
 chan test_channel(
-  bits[32], id=0, kind=streaming, ops=send_receive,
-  flow_control=ready_valid, metadata="""""")
+  bits[32], id=0, kind=streaming, ops=send_receive, flow_control=ready_valid)
 
-top proc main(__token: token, __state: (), init={()}) {
-  receive.1: (token, bits[32]) = receive(__token, channel_id=0)
+top proc main(__state: (), init={()}) {
+  __token: token = literal(value=token, id=1000)
+  receive.1: (token, bits[32]) = receive(__token, channel=test_channel)
   tuple_index.2: token = tuple_index(receive.1, index=0)
   tuple_index.3: bits[32] = tuple_index(receive.1, index=1)
-  send.4: token = send(__token, tuple_index.3, channel_id=0)
-  after_all.5: token = after_all(send.4, tuple_index.2)
-  tuple.6: () = tuple()
-  next (after_all.5, tuple.6)
+  send.4: token = send(__token, tuple_index.3, channel=test_channel)
+  tuple.5: () = tuple()
+  next (tuple.5)
 }
   )";
   constexpr std::string_view text2 = R"(
 package my_package2
 
 chan another_test_channel(
-  bits[32], id=0, kind=streaming, ops=send_receive,
-  flow_control=ready_valid, metadata="""""")
+  bits[32], id=0, kind=streaming, ops=send_receive, flow_control=ready_valid)
 
 
-top proc another_main(__token: token, __state: (), init={()}) {
-  receive.1: (token, bits[32]) = receive(__token, channel_id=0)
+top proc another_main(__state: (), init={()}) {
+  __token: token = literal(value=token, id=1000)
+  receive.1: (token, bits[32]) = receive(__token, channel=another_test_channel)
   tuple_index.2: token = tuple_index(receive.1, index=0)
   tuple_index.3: bits[32] = tuple_index(receive.1, index=1)
-  send.4: token = send(__token, tuple_index.3, channel_id=0)
-  after_all.5: token = after_all(send.4, tuple_index.2)
-  tuple.6: () = tuple()
-  next (after_all.5, tuple.6)
+  send.4: token = send(__token, tuple_index.3, channel=another_test_channel)
+  tuple.5: () = tuple()
+  next (tuple.5)
 }
   )";
 
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg1, ParsePackage(text1));
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg2, ParsePackage(text2));
-  XLS_ASSERT_OK(pkg1->AddPackage(pkg2.get()).status());
+  XLS_ASSERT_OK(pkg1->ImportFromPackage(pkg2.get()).status());
   EXPECT_EQ(pkg1->channels().size(), 2);
   EXPECT_EQ(pkg1->procs().size(), 2);
   XLS_EXPECT_OK(pkg1->GetProc("main"));
@@ -1049,50 +1048,48 @@ TEST_F(PackageTest, LinkChannelsAndProcsWithInvokes) {
 package my_package
 
 chan test_channel(
-  bits[32], id=0, kind=streaming, ops=send_receive,
-  flow_control=ready_valid, metadata="""""")
+  bits[32], id=0, kind=streaming, ops=send_receive, flow_control=ready_valid)
 
 fn f(x: bits[32], y: bits[32]) -> bits[32] {
   ret add.15: bits[32] = add(x, y)
 }
 
-top proc main(__token: token, __state: (), init={()}) {
-  receive.1: (token, bits[32]) = receive(__token, channel_id=0)
+top proc main(__state: (), init={()}) {
+  __token: token = literal(value=token, id=1000)
+  receive.1: (token, bits[32]) = receive(__token, channel=test_channel)
   tuple_index.2: token = tuple_index(receive.1, index=0)
   tuple_index.3: bits[32] = tuple_index(receive.1, index=1)
   invoke.4: bits[32] = invoke(tuple_index.3, tuple_index.3, to_apply=f)
-  send.5: token = send(__token, invoke.4, channel_id=0)
-  after_all.6: token = after_all(send.5, tuple_index.2)
-  tuple.7: () = tuple()
-  next (after_all.6, tuple.7)
+  send.5: token = send(__token, invoke.4, channel=test_channel)
+  tuple.6: () = tuple()
+  next (tuple.6)
 }
   )";
   constexpr std::string_view text2 = R"(
 package my_package2
 
 chan another_test_channel(
-  bits[32], id=0, kind=streaming, ops=send_receive,
-  flow_control=ready_valid, metadata="""""")
+  bits[32], id=0, kind=streaming, ops=send_receive, flow_control=ready_valid)
 
 fn f(x: bits[32], y: bits[32]) -> bits[32] {
   ret sub.15: bits[32] = sub(x, y)
 }
 
-top proc another_main(__token: token, __state: (), init={()}) {
-  receive.1: (token, bits[32]) = receive(__token, channel_id=0)
+top proc another_main(__state: (), init={()}) {
+  __token: token = literal(value=token, id=1000)
+  receive.1: (token, bits[32]) = receive(__token, channel=another_test_channel)
   tuple_index.2: token = tuple_index(receive.1, index=0)
   tuple_index.3: bits[32] = tuple_index(receive.1, index=1)
   invoke.4: bits[32] = invoke(tuple_index.3, tuple_index.3, to_apply=f)
-  send.5: token = send(__token, invoke.4, channel_id=0)
-  after_all.6: token = after_all(send.5, tuple_index.2)
-  tuple.7: () = tuple()
-  next (after_all.6, tuple.7)
+  send.5: token = send(__token, invoke.4, channel=another_test_channel)
+  tuple.6: () = tuple()
+  next (tuple.6)
 }
   )";
 
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg1, ParsePackage(text1));
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg2, ParsePackage(text2));
-  XLS_ASSERT_OK(pkg1->AddPackage(pkg2.get()).status());
+  XLS_ASSERT_OK(pkg1->ImportFromPackage(pkg2.get()).status());
 
   EXPECT_EQ(pkg1->channels().size(), 2);
   EXPECT_EQ(pkg1->procs().size(), 2);
@@ -1129,7 +1126,7 @@ block my_block(a: bits[32], b: bits[32], out: bits[32]) {
 
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg1, ParsePackage(text1));
   XLS_ASSERT_OK_AND_ASSIGN(auto pkg2, ParsePackage(text2));
-  XLS_ASSERT_OK(pkg1->AddPackage(pkg2.get()).status());
+  XLS_ASSERT_OK(pkg1->ImportFromPackage(pkg2.get()).status());
 
   EXPECT_EQ(pkg1->blocks().size(), 2);
   XLS_EXPECT_OK(pkg1->GetBlock("my_block"));
@@ -1150,5 +1147,36 @@ top fn main(a: bits[32]) -> bits[32][0] {
               StatusIs(absl::StatusCode::kUnimplemented,
                        HasSubstr("Empty array Values are not supported.")));
 }
+
+TEST_F(PackageTest, TransformMetrics) {
+  auto p = CreatePackage();
+  FunctionBuilder fb(TestName(), p.get());
+  auto literal0 = fb.Literal(UBits(123, 32));
+  auto literal1 = fb.Literal(UBits(444, 32));
+  auto add = fb.Add(literal0, literal1);
+  auto sub = fb.Subtract(literal0, literal1);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.BuildWithReturnValue(add));
+
+  EXPECT_EQ(p->transform_metrics().nodes_added, 4);
+  EXPECT_EQ(p->transform_metrics().nodes_removed, 0);
+  EXPECT_EQ(p->transform_metrics().nodes_replaced, 0);
+  EXPECT_EQ(p->transform_metrics().operands_replaced, 0);
+
+  XLS_ASSERT_OK(
+      literal0.node()->ReplaceUsesWithNew<Literal>(Value(UBits(42, 32))));
+
+  EXPECT_EQ(p->transform_metrics().nodes_added, 5);
+  EXPECT_EQ(p->transform_metrics().nodes_removed, 0);
+  EXPECT_EQ(p->transform_metrics().nodes_replaced, 1);
+  EXPECT_EQ(p->transform_metrics().operands_replaced, 2);
+
+  XLS_ASSERT_OK(f->RemoveNode(sub.node()));
+
+  EXPECT_EQ(p->transform_metrics().nodes_added, 5);
+  EXPECT_EQ(p->transform_metrics().nodes_removed, 1);
+  EXPECT_EQ(p->transform_metrics().nodes_replaced, 1);
+  EXPECT_EQ(p->transform_metrics().operands_replaced, 2);
+}
+
 }  // namespace
 }  // namespace xls

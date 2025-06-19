@@ -14,22 +14,18 @@
 
 #include "xls/netlist/netlist_parser.h"
 
+#include <cctype>
 #include <string>
-#include <tuple>
 
-#include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
-#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/common/string_to_int.h"
-#include "xls/ir/bits.h"
-#include "xls/netlist/netlist.h"
 
 namespace xls {
 namespace netlist {
@@ -85,17 +81,17 @@ std::string Token::ToString() const {
 }
 
 char Scanner::PeekCharOrDie() const {
-  XLS_CHECK(!AtEofInternal());
+  CHECK(!AtEofInternal());
   return text_[index_];
 }
 
 char Scanner::PeekChar2OrDie() const {
-  XLS_CHECK_GT(text_.size(), index_ + 1);
+  CHECK_GT(text_.size(), index_ + 1);
   return text_[index_ + 1];
 }
 
 char Scanner::PopCharOrDie() {
-  XLS_CHECK(!AtEofInternal());
+  CHECK(!AtEofInternal());
   char c = text_[index_++];
   if (c == '\n') {
     lineno_++;
@@ -183,7 +179,7 @@ absl::StatusOr<Token> Scanner::Peek() {
 absl::StatusOr<Token> Scanner::Pop() {
   XLS_ASSIGN_OR_RETURN(Token result, Peek());
   lookahead_.reset();
-  XLS_VLOG(3) << "Popping token: " << result.ToString();
+  VLOG(3) << "Popping token: " << result.ToString();
   return result;
 }
 

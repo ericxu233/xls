@@ -14,63 +14,193 @@
 
 #include "xls/jit/function_jit.h"
 
-#include <cstdio>
+#include <array>
+#include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <ios>
+#include <iostream>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
+#include <string_view>
+#include <tuple>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "xls/common/fuzzing/fuzztest.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/random/bit_gen_ref.h"
 #include "absl/random/random.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/substitute.h"
+#include "absl/types/span.h"
+#include "llvm/include/llvm/IR/DataLayout.h"
+#include "xls/common/bits_util.h"
+#include "xls/common/math_util.h"
 #include "xls/common/status/matchers.h"
+#include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/interpreter/ir_evaluator_test_base.h"
+#include "xls/interpreter/observer.h"
 #include "xls/interpreter/random_value.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/bits_ops.h"
+#include "xls/ir/events.h"
 #include "xls/ir/function_builder.h"
+#include "xls/ir/fuzz_type_domain.h"
+#include "xls/ir/ir_parser.h"
+#include "xls/ir/package.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
 #include "xls/ir/value_view.h"
+#include "xls/ir/xls_type.pb.h"
+#include "xls/jit/function_base_jit.h"
+#include "xls/jit/jit_buffer.h"
+#include "xls/jit/jit_runtime.h"
+#include "xls/jit/llvm_compiler.h"
+#include "xls/jit/observer.h"
+#include "xls/jit/orc_jit.h"
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
+using ::absl_testing::IsOk;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
+using ::testing::ElementsAre;
+using ::testing::ElementsAreArray;
+using ::testing::HasSubstr;
+using ::testing::TestParamInfo;
+using ::testing::Values;
 
 // TODO(https://github.com/google/xls/issues/506): 2021-10-12 Replace the empty
 // events returned by the JIT evaluator with a entry point that includes the
 // collected events (once they are supported by the JIT).
+auto MakeJitWithOptLevel(bool with_observers, int64_t opt_level) {
+  return IrEvaluatorTestParam(
+      [=](Function* function, absl::Span<const Value> args,
+          std::optional<EvaluationObserver*> obs)
+          -> absl::StatusOr<InterpreterResult<Value>> {
+        XLS_ASSIGN_OR_RETURN(
+            auto jit, FunctionJit::Create(
+                          function, /*opt_level=*/opt_level,
+                          /*include_observer_callbacks=*/obs.has_value()));
+        std::optional<RuntimeEvaluationObserverAdapter> run_obs;
+        if (obs) {
+          run_obs.emplace(
+              *obs,
+              [](uint64_t idx) -> Node* {
+                return reinterpret_cast<Node*>(static_cast<intptr_t>(idx));
+              },
+              jit->runtime());
+          XLS_EXPECT_OK(jit->SetRuntimeObserver(&*run_obs));
+        }
+        return jit->Run(args);
+      },
+      [=](Function* function,
+          const absl::flat_hash_map<std::string, Value>& kwargs,
+          std::optional<EvaluationObserver*> obs)
+          -> absl::StatusOr<InterpreterResult<Value>> {
+        XLS_ASSIGN_OR_RETURN(
+            auto jit, FunctionJit::Create(
+                          function, /*opt_level=*/opt_level,
+                          /*include_observer_callbacks=*/obs.has_value()));
+        std::optional<RuntimeEvaluationObserverAdapter> run_obs;
+        if (obs) {
+          run_obs.emplace(
+              *obs,
+              [](uint64_t idx) -> Node* {
+                return reinterpret_cast<Node*>(static_cast<intptr_t>(idx));
+              },
+              jit->runtime());
+          XLS_EXPECT_OK(jit->SetRuntimeObserver(&*run_obs));
+        }
+        return jit->Run(kwargs);
+      },
+      with_observers,
+      absl::StrFormat("JitOpt%d%s", opt_level,
+                      with_observers ? "WithObservers" : "NoObservers"));
+}
 INSTANTIATE_TEST_SUITE_P(
     FunctionJitTest, IrEvaluatorTestBase,
-    testing::Values(IrEvaluatorTestParam(
-        [](Function* function, absl::Span<const Value> args)
-            -> absl::StatusOr<InterpreterResult<Value>> {
-          XLS_ASSIGN_OR_RETURN(auto jit, FunctionJit::Create(function));
-          return jit->Run(args);
-        },
-        [](Function* function,
-           const absl::flat_hash_map<std::string, Value>& kwargs)
-            -> absl::StatusOr<InterpreterResult<Value>> {
-          XLS_ASSIGN_OR_RETURN(auto jit, FunctionJit::Create(function));
-          return jit->Run(kwargs);
-        })));
+    Values(MakeJitWithOptLevel(/*with_observers=*/true,
+                               LlvmCompiler::kDefaultOptLevel),
+           MakeJitWithOptLevel(/*with_observers=*/false,
+                               LlvmCompiler::kDefaultOptLevel),
+           MakeJitWithOptLevel(/*with_observers=*/false, 0)),
+    testing::PrintToStringParamName());
 
 absl::StatusOr<Value> RunJitNoEvents(FunctionJit* jit,
                                      absl::Span<const Value> args) {
   XLS_ASSIGN_OR_RETURN(InterpreterResult<Value> result, jit->Run(args));
 
   if (!result.events.trace_msgs.empty()) {
+    std::vector<std::string_view> trace_msgs;
+    trace_msgs.reserve(result.events.trace_msgs.size());
+    for (const TraceMessage& trace : result.events.trace_msgs) {
+      trace_msgs.push_back(trace.message);
+    }
     return absl::FailedPreconditionError(absl::StrFormat(
         "Unexpected traces generated during RunJitNoEvents:\n%s",
-        absl::StrJoin(result.events.trace_msgs, "\n")));
+        absl::StrJoin(trace_msgs, "\n")));
   }
 
   return InterpreterResultToStatusOrValue(result);
+}
+
+TEST(FunctionJitTest, MsanCatchesUninitializedInputs) {
+#ifndef ABSL_HAVE_MEMORY_SANITIZER
+  GTEST_SKIP() << "Msan is not linked";
+#endif
+  Package p("MsanUninit");
+  FunctionBuilder b("fun", &p);
+  auto p1 = b.Param("cond", p.GetBitsType(8));
+  b.Add(p1, p1);
+  XLS_ASSERT_OK_AND_ASSIGN(Function * function, b.Build());
+  XLS_ASSERT_OK_AND_ASSIGN(auto jit,
+                           FunctionJit::Create(function, /*opt_level=*/1));
+  GTEST_SKIP()
+      << "MSAN is not currently configured to check accesses within "
+         "jit-functions due to bug: https://github.com/google/xls/issues/1418";
+  EXPECT_DEATH(
+      [&]() {
+        uint8_t input = 44;
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+        // Force 'input' to be uninitialized.
+        __msan_poison(&input, 1);
+        if (VLOG_IS_ON(2)) {
+          __msan_print_shadow(&input, 1);
+        }
+#endif
+        BitsView<8> bv(&input);
+        // Deliberately initialized.
+        uint8_t res = 2;
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+        if (VLOG_IS_ON(2)) {
+          __msan_print_shadow(&res, 1);
+        }
+#endif
+        MutableBitsView<8> mbv(&res);
+        jit->RunWithUnpackedViews(bv, mbv).IgnoreError();
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+        if (VLOG_IS_ON(2)) {
+          __msan_print_shadow(&input, 1);
+          __msan_print_shadow(&res, 1);
+        }
+#endif
+        std::cerr << "output is " << static_cast<uint32_t>(mbv.GetValue());
+      }(),
+      ".*MemorySanitizer.*");
 }
 
 TEST(FunctionJitTest, TraceFmtNoArgsTest) {
@@ -87,7 +217,7 @@ TEST(FunctionJitTest, TraceFmtNoArgsTest) {
   std::vector<Value> args = {Value::Token(), Value(UBits(1, 1))};
   XLS_ASSERT_OK_AND_ASSIGN(InterpreterResult<Value> result, jit->Run(args));
   ASSERT_EQ(result.events.trace_msgs.size(), 1);
-  EXPECT_EQ(result.events.trace_msgs.at(0), "hi I traced");
+  EXPECT_EQ(result.events.trace_msgs.at(0).message, "hi I traced");
 }
 
 TEST(FunctionJitTest, TraceFmtOneArgTest) {
@@ -104,14 +234,14 @@ TEST(FunctionJitTest, TraceFmtOneArgTest) {
   std::vector<Value> args = {Value::Token(), Value(UBits(1, 1))};
   XLS_ASSERT_OK_AND_ASSIGN(InterpreterResult<Value> result, jit->Run(args));
   ASSERT_EQ(result.events.trace_msgs.size(), 1);
-  EXPECT_EQ(result.events.trace_msgs.at(0), "hi I traced: 1");
+  EXPECT_EQ(result.events.trace_msgs.at(0).message, "hi I traced: 1");
 }
 
 TEST(FunctionJitTest, TraceFmtSignedTest) {
   Package package("my_package");
   std::string ir_text = R"(
   fn trace_no_args(tkn: token, x: bits[8]) -> token {
-    pred: bits[1] = literal(value=1, id=0)
+    pred: bits[1] = literal(value=1)
     trace.1: token = trace(tkn, pred, format="signed: {:d}", data_operands=[x], id=1)
     trace.2: token = trace(trace.1, pred, format="unsigned: {:u}", data_operands=[x], id=2)
     ret trace.3: token = trace(trace.2, pred, format="default: {}", data_operands=[x], id=3)
@@ -124,9 +254,9 @@ TEST(FunctionJitTest, TraceFmtSignedTest) {
   std::vector<Value> args = {Value::Token(), Value(UBits(0xff, 8))};
   XLS_ASSERT_OK_AND_ASSIGN(InterpreterResult<Value> result, jit->Run(args));
   ASSERT_EQ(result.events.trace_msgs.size(), 3);
-  EXPECT_EQ(result.events.trace_msgs.at(0), "signed: -1");
-  EXPECT_EQ(result.events.trace_msgs.at(1), "unsigned: 255");
-  EXPECT_EQ(result.events.trace_msgs.at(2), "default: 255");
+  EXPECT_EQ(result.events.trace_msgs.at(0).message, "signed: -1");
+  EXPECT_EQ(result.events.trace_msgs.at(1).message, "unsigned: 255");
+  EXPECT_EQ(result.events.trace_msgs.at(2).message, "default: 255");
 }
 
 TEST(FunctionJitTest, TraceFmtTwoArgTest) {
@@ -144,7 +274,7 @@ TEST(FunctionJitTest, TraceFmtTwoArgTest) {
   std::vector<Value> args = {Value::Token(), Value(UBits(1, 1))};
   XLS_ASSERT_OK_AND_ASSIGN(InterpreterResult<Value> result, jit->Run(args));
   ASSERT_EQ(result.events.trace_msgs.size(), 1);
-  EXPECT_EQ(result.events.trace_msgs.at(0), "hi I traced: 1 also: 2a");
+  EXPECT_EQ(result.events.trace_msgs.at(0).message, "hi I traced: 1 also: 2a");
 }
 
 TEST(FunctionJitTest, TraceFmtBigArgTest) {
@@ -164,13 +294,13 @@ TEST(FunctionJitTest, TraceFmtBigArgTest) {
   std::vector<Value> args = {Value::Token(), Value(UBits(1, 1))};
   XLS_ASSERT_OK_AND_ASSIGN(InterpreterResult<Value> result, jit->Run(args));
   ASSERT_EQ(result.events.trace_msgs.size(), 1);
-  EXPECT_EQ(result.events.trace_msgs.at(0),
+  EXPECT_EQ(result.events.trace_msgs.at(0).message,
             "hi I traced: "
             "800000000000000000000000000000000000000000000000000000000000000000"
             "00000000000000000000000000000000000000000000000000000000000000");
 }
 
-// This test verifies that a compiled JIT function can be re-used.
+// This test verifies that a compiled JIT function can be reused.
 TEST(FunctionJitTest, ReuseTest) {
   Package package("my_package");
   std::string ir_text = R"(
@@ -249,23 +379,28 @@ TEST(FunctionJitTest, PackedAndUnpackedSmokeWide) {
 
   XLS_ASSERT_OK_AND_ASSIGN(auto jit, FunctionJit::Create(function));
 
-  uint8_t input_data[] = {0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa};
+  // 80-bit data is represented as an i128 with 16 byte alignment.
+  // TODO(allight): 2023-11-30: The fact this is needed is unfortunate.
+  alignas(16)
+      uint8_t input_data[] = {0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa};
   {
     uint8_t output_data[10];
     PackedBitsView<80> input(input_data, 0);
     PackedBitsView<80> output(output_data, 0);
     XLS_ASSERT_OK(jit->RunWithPackedViews(input, output));
-    EXPECT_THAT(output_data, testing::ElementsAre(0x2, 0x2, 0x3, 0x4, 0x5, 0x6,
-                                                  0x7, 0x8, 0x9, 0xa));
+    EXPECT_THAT(output_data,
+                ElementsAre(0x2, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa));
   }
 
   {
-    uint8_t output_data[10];
+    // 80-bit data is represented as an i128 with 16 byte alignment.
+    // TODO(allight): 2023-11-30: The fact this is needed is unfortunate.
+    alignas(16) uint8_t output_data[10];
     BitsView<80> input(input_data);
     MutableBitsView<80> output(output_data);
     XLS_ASSERT_OK(jit->RunWithUnpackedViews(input, output));
-    EXPECT_THAT(output_data, testing::ElementsAre(0x2, 0x2, 0x3, 0x4, 0x5, 0x6,
-                                                  0x7, 0x8, 0x9, 0xa));
+    EXPECT_THAT(output_data,
+                ElementsAre(0x2, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa));
   }
 }
 
@@ -404,6 +539,29 @@ Bits VectorToPackedBits(const std::vector<Bits>& input) {
   return rope.Build();
 }
 
+void FlattenValue(const Value& value, BitsRope& rope) {
+  if (value.IsBits()) {
+    rope.push_back(value.bits());
+  } else if (value.IsArray()) {
+    for (const Value& element : value.elements()) {
+      FlattenValue(element, rope);
+    }
+  } else if (value.IsTuple()) {
+    // Tuple elements are declared MSelement to LSelement, so we need to pack
+    // them in "reverse" order, so the LSelement is at the LSb.
+    for (int64_t i = value.elements().size() - 1; i >= 0; i--) {
+      FlattenValue(value.elements()[i], rope);
+    }
+  }
+}
+
+std::vector<uint8_t> FlattenValue(const Value& value) {
+  BitsRope rope(value.GetFlatBitCount());
+  FlattenValue(value, rope);
+  std::vector<uint8_t> bytes = rope.Build().ToBytes();
+  return bytes;
+}
+
 // Utility struct to hold different representations of the same data together.
 template <typename ViewT>
 struct TestData {
@@ -412,29 +570,6 @@ struct TestData {
   Value value;
   std::vector<uint8_t> bytes;
   ViewT view;
-
-  static std::vector<uint8_t> FlattenValue(const Value& value) {
-    BitsRope rope(value.GetFlatBitCount());
-    FlattenValue(value, rope);
-    std::vector<uint8_t> bytes = rope.Build().ToBytes();
-    return bytes;
-  }
-
-  static void FlattenValue(const Value& value, BitsRope& rope) {
-    if (value.IsBits()) {
-      rope.push_back(value.bits());
-    } else if (value.IsArray()) {
-      for (const Value& element : value.elements()) {
-        FlattenValue(element, rope);
-      }
-    } else if (value.IsTuple()) {
-      // Tuple elements are declared MSelement to LSelement, so we need to pack
-      // them in "reverse" order, so the LSelement is at the LSb.
-      for (int i = value.elements().size() - 1; i >= 0; i--) {
-        FlattenValue(value.elements()[i], rope);
-      }
-    }
-  }
 };
 
 // Tests PackedArrayView input/output from the JIT. Takes in an array, an index,
@@ -480,9 +615,9 @@ absl::Status TestSimpleArray(absl::BitGenRef bitgen) {
 
   for (int i = 0; i < CeilOfRatio(kBitWidth * kNumElements, kCharBit); i++) {
     XLS_RET_CHECK(output_data.bytes[i] == expected_data.bytes[i])
-        << std::hex << ": byte " << i << ": "
-        << "0x" << static_cast<int>(output_data.bytes[i]) << " vs. "
-        << "0x" << static_cast<int>(expected_data.bytes[i]);
+        << std::hex << ": byte " << i << ": " << "0x"
+        << static_cast<int>(output_data.bytes[i]) << " vs. " << "0x"
+        << static_cast<int>(expected_data.bytes[i]);
   }
   return absl::OkStatus();
 }
@@ -541,9 +676,9 @@ absl::Status TestTuples(absl::BitGenRef bitgen) {
 
   for (int i = 0; i < CeilOfRatio(TupleT::kBitCount, kCharBit); i++) {
     XLS_RET_CHECK(output_data.bytes[i] == expected_data.bytes[i])
-        << std::hex << ": byte " << i << ": "
-        << "0x" << static_cast<int>(output_data.bytes[i]) << " vs. "
-        << "0x" << static_cast<int>(expected_data.bytes[i]);
+        << std::hex << ": byte " << i << ": " << "0x"
+        << static_cast<int>(output_data.bytes[i]) << " vs. " << "0x"
+        << static_cast<int>(expected_data.bytes[i]);
   }
 
   return absl::OkStatus();
@@ -674,7 +809,7 @@ TEST(FunctionJitTest, Assert) {
   std::vector<Value> fail_args = {Value::Token(), Value(UBits(0, 1))};
   EXPECT_THAT(RunJitNoEvents(jit.get(), fail_args),
               StatusIs(absl::StatusCode::kAborted,
-                       testing::HasSubstr("the assertion error message")));
+                       HasSubstr("the assertion error message")));
 }
 
 TEST(FunctionJitTest, FunAssert) {
@@ -694,7 +829,7 @@ TEST(FunctionJitTest, FunAssert) {
 
   XLS_ASSERT_OK_AND_ASSIGN(Function * fun, fun_builder.Build());
 
-  FunctionBuilder top_builder("top", &p);
+  FunctionBuilder top_builder("top_f", &p);
   auto y = top_builder.Param("y", p.GetBitsType(5));
 
   std::vector<BValue> args = {y};
@@ -709,9 +844,9 @@ TEST(FunctionJitTest, FunAssert) {
               IsOkAndHolds(Value(UBits(7, 5))));
 
   std::vector<Value> fail_args = {Value(UBits(8, 5))};
-  EXPECT_THAT(RunJitNoEvents(jit.get(), fail_args),
-              StatusIs(absl::StatusCode::kAborted,
-                       testing::HasSubstr("x is more than 7")));
+  EXPECT_THAT(
+      RunJitNoEvents(jit.get(), fail_args),
+      StatusIs(absl::StatusCode::kAborted, HasSubstr("x is more than 7")));
 }
 
 TEST(FunctionJitTest, TwoAssert) {
@@ -738,14 +873,14 @@ TEST(FunctionJitTest, TwoAssert) {
 
   EXPECT_THAT(RunJitNoEvents(jit.get(), fail1_args),
               StatusIs(absl::StatusCode::kAborted,
-                       testing::HasSubstr("first assertion error message")));
+                       HasSubstr("first assertion error message")));
 
   std::vector<Value> fail2_args = {Value::Token(), Value(UBits(1, 1)),
                                    Value(UBits(0, 1))};
 
   EXPECT_THAT(RunJitNoEvents(jit.get(), fail2_args),
               StatusIs(absl::StatusCode::kAborted,
-                       testing::HasSubstr("second assertion error message")));
+                       HasSubstr("second assertion error message")));
 
   std::vector<Value> failboth_args = {Value::Token(), Value(UBits(0, 1)),
                                       Value(UBits(0, 1))};
@@ -754,7 +889,7 @@ TEST(FunctionJitTest, TwoAssert) {
   // so test that it is reported properly.
   EXPECT_THAT(RunJitNoEvents(jit.get(), failboth_args),
               StatusIs(absl::StatusCode::kAborted,
-                       testing::HasSubstr("first assertion error message")));
+                       HasSubstr("first assertion error message")));
 }
 
 TEST(FunctionJitTest, TokenCompareError) {
@@ -764,11 +899,9 @@ TEST(FunctionJitTest, TokenCompareError) {
 
   b.Eq(p0, p0);
 
-  XLS_ASSERT_OK_AND_ASSIGN(Function * f, b.Build());
-
-  EXPECT_THAT(FunctionJit::Create(f),
+  EXPECT_THAT(b.Build(),
               StatusIs(absl::StatusCode::kInvalidArgument,
-                       testing::HasSubstr("Tokens are incomparable")));
+                       HasSubstr("cannot be Token type for this operation")));
 }
 
 // Make sure the token comparison error is still reported when the token is
@@ -788,7 +921,50 @@ TEST(FunctionJitTest, CompoundTokenCompareError) {
 
   EXPECT_THAT(FunctionJit::Create(f),
               StatusIs(absl::StatusCode::kInvalidArgument,
-                       testing::HasSubstr("Tokens are incomparable")));
+                       HasSubstr("Tokens are incomparable")));
+}
+
+TEST(FunctionJitTest, BigFunctionInputsOutputs) {
+  Package package("my_package");
+
+  FunctionBuilder fb("test", &package);
+  fb.Add(fb.Param("x", package.GetBitsType(256)),
+         fb.Param("y", package.GetBitsType(256)));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * function, fb.Build());
+  XLS_ASSERT_OK_AND_ASSIGN(auto jit, FunctionJit::Create(function));
+  Bits ret_bits =
+      bits_ops::Concat({UBits(0, 256 - 65), UBits(1, 1), UBits(0, 64)});
+
+  // Test using values
+  {
+    Value x(bits_ops::ZeroExtend(UBits(-1, 64), 256));
+    Value y(bits_ops::ZeroExtend(UBits(1, 64), 256));
+    Value ret = Value(ret_bits);
+
+    EXPECT_THAT(RunJitNoEvents(jit.get(), {x, y}), IsOkAndHolds(ret));
+  }
+
+  // Test using views.
+  {
+    // TODO(allight): 2023-12-08: The fact that we need alignas is unfortunate.
+    alignas(16) std::array<uint8_t, 256 / 8> x_view{
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    alignas(16) std::array<uint8_t, 256 / 8> y_view{
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    alignas(16) std::array<uint8_t, 256 / 8> ret_view{};
+
+    InterpreterEvents events;
+    EXPECT_THAT(jit->RunWithViews({x_view.data(), y_view.data()},
+                                  absl::MakeSpan(ret_view), &events),
+                IsOk());
+    EXPECT_EQ(Bits::FromBytes(ret_view, 256), ret_bits);
+  }
 }
 
 TEST(FunctionJitTest, TupleViewSmokeTest2) {
@@ -828,7 +1004,7 @@ fn f(x: bits[1], y: bits[21]) -> (bits[1], bits[21]) {
     xls::TupleView<xls::BitsView<1>, xls::BitsView<21>> result_view(result);
     EXPECT_EQ(result_view.Get<0>().GetValue(), 0x1);
     EXPECT_EQ(result_view.Get<1>().GetValue(), 0xabcd);
-    EXPECT_THAT(result, testing::ElementsAreArray(
+    EXPECT_THAT(result, ElementsAreArray(
                             {0x1, 0x00, 0x00, 0x00, 0xcd, 0xab, 0x00, 0x00}));
   }
 }
@@ -874,9 +1050,331 @@ fn f(x: bits[1], y: bits[8]) -> (bits[1], bits[8], bits[16]) {
     EXPECT_EQ(result_view.Get<0>().GetValue(), 0x1);
     EXPECT_EQ(result_view.Get<1>().GetValue(), 0x34);
     EXPECT_EQ(result_view.Get<2>().GetValue(), 0xabcd);
-    EXPECT_THAT(result, testing::ElementsAreArray({0x1, 0x34, 0xcd, 0xab}));
+    EXPECT_THAT(result, ElementsAreArray({0x1, 0x34, 0xcd, 0xab}));
   }
 }
+
+TEST(FunctionJitTest, MisalignedPointerCopied) {
+  Package package("my_package");
+
+  FunctionBuilder fb("test", &package);
+  fb.Add(fb.Param("x", package.GetBitsType(256)),
+         fb.Param("y", package.GetBitsType(256)));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * function, fb.Build());
+  XLS_ASSERT_OK_AND_ASSIGN(auto jit, FunctionJit::Create(function));
+  Bits ret_bits =
+      bits_ops::Concat({UBits(0, 256 - 65), UBits(1, 1), UBits(0, 64)});
+
+  alignas(16) std::array<uint8_t, 1 + (256 / 8)> x_view{
+      0xAB, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  };
+  alignas(16) std::array<uint8_t, 1 + (256 / 8)> y_view{
+      0xAB, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  };
+  alignas(16) std::array<uint8_t, 1 + (256 / 8)> ret_view{};
+  {
+    InterpreterEvents events;
+    EXPECT_THAT(jit->RunWithViews</*kForceZeroCopy=*/false>(
+                    {x_view.data() + 1, y_view.data() + 1},
+                    absl::MakeSpan(ret_view).subspan(1), &events),
+                IsOk());
+    EXPECT_EQ(Bits::FromBytes(absl::MakeSpan(ret_view).subspan(1), 256),
+              ret_bits);
+  }
+}
+
+TEST(FunctionJitDeathTest, MisalignedPointerCaught) {
+#ifndef NDEBUG
+  Package package("my_package");
+
+  FunctionBuilder fb("test", &package);
+  fb.Add(fb.Param("x", package.GetBitsType(256)),
+         fb.Param("y", package.GetBitsType(256)));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * function, fb.Build());
+  XLS_ASSERT_OK_AND_ASSIGN(auto jit, FunctionJit::Create(function));
+
+  alignas(16) std::array<uint8_t, 1 + (256 / 8)> x_view{
+      0xAB, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  };
+  alignas(16) std::array<uint8_t, 1 + (256 / 8)> y_view{
+      0xAB, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  };
+  alignas(16) std::array<uint8_t, 1 + (256 / 8)> ret_view{};
+  ASSERT_DEATH(
+      {
+        InterpreterEvents events;
+        auto unused = jit->RunWithViews</*kForceZeroCopy=*/true>(
+            {x_view.data() + 1, y_view.data() + 1},
+            absl::MakeSpan(ret_view).subspan(1), &events);
+      },
+      ".*does not have alignment of [0-9]+.*");
+#else
+  GTEST_SKIP() << "Checking only performed in dbg mode.";
+#endif
+}
+
+// Check that expected_data matched output_data.
+// Log values of expected_data, output_data, and whatever entries are in
+// extra_data.
+void CheckOutput(absl::Span<uint8_t const> expected_data,
+                 absl::Span<uint8_t const> output_data,
+                 std::initializer_list<
+                     std::tuple<std::string_view, absl::Span<uint8_t const>>>
+                     extra_data) {
+  CHECK_EQ(expected_data.size(), output_data.size());
+  if (VLOG_IS_ON(3)) {
+    auto print_byte_vec = [](absl::Span<uint8_t const> bytes,
+                             std::string_view name) {
+      std::vector<std::string> strs;
+      for (uint8_t byte : bytes) {
+        strs.push_back(absl::StrFormat("%d", byte));
+      }
+      VLOG(3) << absl::StreamFormat("%s: %s", name, absl::StrJoin(strs, ", "));
+    };
+    for (const auto& [name, data] : extra_data) {
+      print_byte_vec(data, name);
+    }
+    print_byte_vec(output_data, "output_data");
+    print_byte_vec(expected_data, "expected_data");
+  }
+
+  for (int i = 0; i < output_data.size(); ++i) {
+    EXPECT_EQ(output_data[i], expected_data[i])
+        << std::hex << ": byte " << i << ": " << "0x"
+        << static_cast<int>(output_data[i]) << " vs. " << "0x"
+        << static_cast<int>(expected_data[i]);
+  }
+}
+
+// Tests the packed jit interface with bits inputs/outputs.
+// The dut performs min(x, y).
+//
+// type_proto must be a bits type.
+void TestPackedBitsWithType(const TypeProto& type_proto) {
+  Package package("my_package");
+  XLS_ASSERT_OK_AND_ASSIGN(Type * converted_type_proto,
+                           package.GetTypeFromProto(type_proto));
+  XLS_ASSERT_OK_AND_ASSIGN(BitsType * tpe, converted_type_proto->AsBits());
+
+  // f(x, y) = min(x, y)
+  FunctionBuilder b("f", &package);
+  BValue x = b.Param("x", tpe);
+  BValue y = b.Param("y", tpe);
+  BValue x_lt_y = b.ULt(x, y);
+  b.Select(x_lt_y, {y, x});
+  XLS_ASSERT_OK_AND_ASSIGN(Function * function, b.Build());
+  constexpr int64_t opt_level = 3;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto orc_jit,
+      OrcJit::Create(opt_level, /*include_observer_callbacks=*/false,
+                     /*jit_observer=*/nullptr));
+  XLS_ASSERT_OK_AND_ASSIGN(llvm::DataLayout data_layout,
+                           orc_jit->CreateDataLayout());
+  XLS_ASSERT_OK_AND_ASSIGN(JittedFunctionBase jit,
+                           JittedFunctionBase::Build(function, *orc_jit));
+
+  std::minstd_rand bitgen;
+  Value lhs_value = RandomValue(tpe, bitgen);
+  Value rhs_value = RandomValue(tpe, bitgen);
+  std::vector<uint8_t> lhs = FlattenValue(lhs_value);
+  std::vector<uint8_t> rhs = FlattenValue(rhs_value);
+  std::vector<uint8_t> output(lhs.size());
+
+  bool lhs_lt_rhs = bits_ops::ULessThan(lhs_value.bits(), rhs_value.bits());
+  absl::Span<uint8_t const> expected = lhs_lt_rhs ? lhs : rhs;
+
+  std::array<uint8_t*, 2> inputs = {lhs.data(), rhs.data()};
+  std::array<uint8_t*, 1> outputs = {output.data()};
+
+  InterpreterEvents events;
+  JitRuntime runtime(data_layout);
+  JitTempBuffer temp_buffer = jit.CreateTempBuffer();
+  std::optional<int64_t> ret = jit.RunPackedJittedFunction(
+      inputs.data(), outputs.data(), &temp_buffer, &events,
+      /*instance_context=*/nullptr, /*jit_runtime=*/&runtime,
+      /*continuation_point=*/0);
+  ASSERT_TRUE(ret.has_value());
+  CheckOutput(/*expected_data=*/expected, /*output_data=*/output,
+              /*extra_data=*/{{"lhs", lhs}, {"rhs", rhs}});
+}
+
+// Tests the packed jit interface.
+// The DUT takes in two tuples x and y of the same type and produces an output
+// tuple (x0, y1, x2, ...).
+//
+// type_proto must be a tuple type.
+void TestPackedTupleWithType(const TypeProto& type_proto) {
+  Package package("my_package");
+  XLS_ASSERT_OK_AND_ASSIGN(Type * converted_type_proto,
+                           package.GetTypeFromProto(type_proto));
+  XLS_ASSERT_OK_AND_ASSIGN(TupleType * tuple_type,
+                           converted_type_proto->AsTuple());
+
+  // Build DUT
+  FunctionBuilder b("f", &package);
+  BValue x = b.Param("x", tuple_type);
+  BValue y = b.Param("y", tuple_type);
+  std::vector<BValue> output_elements;
+  output_elements.reserve(tuple_type->size());
+  for (int64_t i = 0; i < tuple_type->size(); ++i) {
+    if (i % 2 == 0) {
+      // pull from x
+      output_elements.push_back(b.TupleIndex(x, i));
+    } else {
+      // pull from y
+      output_elements.push_back(b.TupleIndex(y, i));
+    }
+  }
+  b.Tuple(output_elements);
+
+  XLS_ASSERT_OK_AND_ASSIGN(Function * function, b.Build());
+  constexpr int64_t opt_level = 3;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto orc_jit,
+      OrcJit::Create(opt_level, /*include_observer_callbacks=*/false,
+                     /*jit_observer=*/nullptr));
+  XLS_ASSERT_OK_AND_ASSIGN(llvm::DataLayout data_layout,
+                           orc_jit->CreateDataLayout());
+  XLS_ASSERT_OK_AND_ASSIGN(JittedFunctionBase jit,
+                           JittedFunctionBase::Build(function, *orc_jit));
+
+  std::minstd_rand bitgen;
+  Value lhs_value = RandomValue(tuple_type, bitgen);
+  Value rhs_value = RandomValue(tuple_type, bitgen);
+  std::vector<uint8_t> lhs = FlattenValue(lhs_value);
+  std::vector<uint8_t> rhs = FlattenValue(rhs_value);
+  std::vector<uint8_t> output(lhs.size());
+  std::vector<Value> expected_elements;
+  expected_elements.reserve(lhs.size());
+  // Build expected tuple value.
+  for (int64_t i = 0; i < lhs_value.size(); ++i) {
+    if (i % 2 == 0) {
+      // pull from x
+      expected_elements.push_back(lhs_value.element(i));
+    } else {
+      // pull from y
+      expected_elements.push_back(rhs_value.element(i));
+    }
+  }
+  std::vector<uint8_t> expected = FlattenValue(Value::Tuple(expected_elements));
+  CHECK_EQ(expected.size(), output.size());
+
+  // Run jit and check output.
+  std::array<uint8_t*, 2> inputs = {lhs.data(), rhs.data()};
+  std::array<uint8_t*, 1> outputs = {output.data()};
+
+  InterpreterEvents events;
+  JitRuntime runtime(data_layout);
+  JitTempBuffer temp_buffer = jit.CreateTempBuffer();
+  std::optional<int64_t> ret = jit.RunPackedJittedFunction(
+      inputs.data(), outputs.data(), &temp_buffer, &events,
+      /*instance_context=*/nullptr, /*jit_runtime=*/&runtime,
+      /*continuation_point=*/0);
+  ASSERT_TRUE(ret.has_value());
+  CheckOutput(/*expected_data=*/expected, /*output_data=*/output,
+              /*extra_data=*/{{"lhs", lhs}, {"rhs", rhs}});
+}
+
+// Tests the packed jit interface.
+// The DUT takes in an array, an index, and a replacement value, and does an
+// array_update(). We then verify that the output array looks as expected.
+//
+// type_proto must be an array type.
+void TestPackedArrayWithType(const TypeProto& type_proto) {
+  std::minstd_rand bitgen;
+  Package package("my_package");
+  XLS_ASSERT_OK_AND_ASSIGN(Type * converted_type_proto,
+                           package.GetTypeFromProto(type_proto));
+  XLS_ASSERT_OK_AND_ASSIGN(ArrayType * array_type,
+                           converted_type_proto->AsArray());
+  Type* element_type = array_type->element_type();
+  int64_t num_elements = array_type->size();
+  int64_t kIndexBitWidth = CeilOfLog2(num_elements);
+
+  FunctionBuilder b("f", &package);
+  BValue array =
+      b.Param("array", package.GetArrayType(num_elements, element_type));
+  BValue idx = b.Param("idx", package.GetBitsType(kIndexBitWidth));
+  BValue new_value = b.Param("new_value", element_type);
+  b.ArrayUpdate(array, new_value, {idx});
+  XLS_ASSERT_OK_AND_ASSIGN(Function * function, b.Build());
+  constexpr int64_t opt_level = 3;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      auto orc_jit,
+      OrcJit::Create(opt_level, /*include_observer_callbacks=*/false,
+                     /*jit_observer=*/nullptr));
+  XLS_ASSERT_OK_AND_ASSIGN(llvm::DataLayout data_layout,
+                           orc_jit->CreateDataLayout());
+  XLS_ASSERT_OK_AND_ASSIGN(JittedFunctionBase jit,
+                           JittedFunctionBase::Build(function, *orc_jit));
+
+  std::vector<Bits> bits_vector;
+  for (int i = 0; i < num_elements; i++) {
+    Value value = RandomValue(
+        package.GetBitsType(element_type->GetFlatBitCount()), bitgen);
+    bits_vector.push_back(value.bits());
+  }
+  std::vector<uint8_t> array_data =
+      FlattenValue(Value(VectorToPackedBits(bits_vector)));
+  std::vector<uint8_t> index_data;
+  std::vector<uint8_t> output_data(array_data.size());
+
+  Value replacement =
+      RandomValue(package.GetBitsType(element_type->GetFlatBitCount()), bitgen);
+  std::vector<uint8_t> replacement_data = FlattenValue(replacement);
+
+  std::array<uint8_t*, 3> inputs = {array_data.data(),
+                                    nullptr,  // fill in index_data later
+                                    replacement_data.data()};
+  std::array<uint8_t*, 1> outputs = {output_data.data()};
+  for (int64_t index = 0; index < num_elements; ++index) {
+    index_data = FlattenValue(Value(UBits(index, kIndexBitWidth)));
+    inputs[1] = index_data.data();
+    Bits old_bits_value = bits_vector[index];
+    bits_vector[index] = replacement.bits();
+    std::vector<uint8_t> expected_data =
+        FlattenValue(Value(VectorToPackedBits(bits_vector)));
+    InterpreterEvents events;
+    JitRuntime runtime(data_layout);
+    JitTempBuffer temp_buffer = jit.CreateTempBuffer();
+    std::optional<int64_t> ret = jit.RunPackedJittedFunction(
+        inputs.data(), outputs.data(), &temp_buffer, &events,
+        /*instance_context=*/nullptr, /*jit_runtime=*/&runtime,
+        /*continuation_point=*/0);
+    ASSERT_TRUE(ret.has_value());
+    bits_vector[index] = old_bits_value;
+
+    CheckOutput(/*expected_data=*/expected_data, /*output_data=*/output_data,
+                /*extra_data=*/{{"array_data", array_data}});
+  }
+}
+
+FUZZ_TEST(FunctionJitTest, TestPackedBitsWithType)
+    .WithDomains(BitsTypeDomain(/*max_bit_count=*/5000));
+
+FUZZ_TEST(FunctionJitTest, TestPackedTupleWithType)
+    .WithDomains(TypeDomainWithSizeInRange(
+        /*min_size=*/1,
+        /*max_size=*/65536,
+        TupleTypeDomain(TypeDomain(/*max_bit_count=*/132,
+                                   /*max_elements=*/68),
+                        /*max_elements=*/1030)));
+
+FUZZ_TEST(FunctionJitTest, TestPackedArrayWithType)
+    .WithDomains(TypeDomainWithSizeInRange(
+        /*min_size=*/1,
+        /*max_size=*/65536,
+        ArrayTypeDomain(TypeDomain(/*max_bit_count=*/132,
+                                   /*max_elements=*/68),
+                        /*max_elements=*/1030)));
 
 }  // namespace
 }  // namespace xls

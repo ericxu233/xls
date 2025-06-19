@@ -23,15 +23,17 @@
 
 #include "gtest/gtest.h"
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/file/temp_directory.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/dslx/frontend/pos.h"
 #include "xls/fuzzer/ast_generator.h"
 #include "xls/fuzzer/sample.h"
+#include "xls/fuzzer/sample_runner.h"
 
 ABSL_FLAG(bool, wide, false, "Run with wide bits types.");
 ABSL_FLAG(bool, generate_proc, false, "Generate a proc sample.");
@@ -89,7 +91,7 @@ class RunFuzzTest : public ::testing::Test {
     if (test_info == nullptr) {
       return;
     }
-    XLS_CHECK(test_info->name() != nullptr);
+    CHECK(test_info->name() != nullptr);
 
     std::filesystem::path test_outputs_path =
         undeclared_outputs_dir / test_info->name();
@@ -99,7 +101,7 @@ class RunFuzzTest : public ::testing::Test {
     if (test_info->value_param() != nullptr) {
       test_outputs_path /= test_info->value_param();
     }
-    XLS_CHECK(std::filesystem::create_directories(test_outputs_path));
+    CHECK(std::filesystem::create_directories(test_outputs_path));
     std::filesystem::copy(temp_dir.path(), test_outputs_path,
                           std::filesystem::copy_options::recursive);
   }
@@ -113,7 +115,7 @@ class RunFuzzTest : public ::testing::Test {
     };
   }
 
-  SampleOptions GetSampleOptions() {
+  static SampleOptions GetSampleOptions() {
     SampleOptions options;
     options.set_input_is_dslx(true);
     options.set_ir_converter_args({"--top=main"});
@@ -127,13 +129,16 @@ class RunFuzzTest : public ::testing::Test {
     return options;
   }
 
-  absl::StatusOr<Sample> RunFuzz(int64_t seed) {
+  absl::StatusOr<std::pair<Sample, CompletedSampleKind>> RunFuzz(
+      int64_t seed, SampleOptions sample_options = GetSampleOptions()) {
     std::mt19937_64 rng(seed);
-    return GenerateSampleAndRun(rng, GetAstGeneratorOptions(),
-                                GetSampleOptions(), /*run_dir=*/GetTempPath(),
+
+    return GenerateSampleAndRun(file_table_, rng, GetAstGeneratorOptions(),
+                                sample_options, /*run_dir=*/GetTempPath(),
                                 crasher_dir_);
   }
 
+  dslx::FileTable file_table_;
   std::optional<std::filesystem::path> crasher_dir_;
   std::optional<TempDirectory> temp_dir_;
 };
@@ -151,12 +156,14 @@ TEST_F(RunFuzzTest, DifferentSeedsProduceDifferentSamples) {
 TEST_F(RunFuzzTest, SequentialSamplesAreDifferent) {
   std::mt19937_64 rng{42};
   XLS_ASSERT_OK_AND_ASSIGN(
-      Sample sample1,
-      GenerateSampleAndRun(rng, GetAstGeneratorOptions(), GetSampleOptions(),
+      auto sample1,
+      GenerateSampleAndRun(file_table_, rng, GetAstGeneratorOptions(),
+                           GetSampleOptions(),
                            /*run_dir=*/GetTempPath(), crasher_dir_));
   XLS_ASSERT_OK_AND_ASSIGN(
-      Sample sample2,
-      GenerateSampleAndRun(rng, GetAstGeneratorOptions(), GetSampleOptions(),
+      auto sample2,
+      GenerateSampleAndRun(file_table_, rng, GetAstGeneratorOptions(),
+                           GetSampleOptions(),
                            /*run_dir=*/GetTempPath(), crasher_dir_));
   EXPECT_NE(sample1, sample2);
 }
@@ -165,10 +172,13 @@ class RunFuzzSeededTest : public RunFuzzTest,
                           public ::testing::WithParamInterface<int64_t> {};
 
 TEST_P(RunFuzzSeededTest, TestSeed) {
+  SampleOptions sample_options = GetSampleOptions();
+  sample_options.set_codegen(true);
+
   const int64_t base_seed = GetParam();
   for (int i = 0; i < kSampleCount; ++i) {
     const int64_t sample_seed = kSampleCount * base_seed + i;
-    XLS_EXPECT_OK(RunFuzz(sample_seed)) << absl::StreamFormat(
+    XLS_EXPECT_OK(RunFuzz(sample_seed, sample_options)) << absl::StreamFormat(
         "For seed %d, sample #%d of %d failed (sample seed = %d).", base_seed,
         i, kSampleCount, sample_seed);
   }

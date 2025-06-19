@@ -111,7 +111,8 @@ Returns whether or not the given `APFloat` represents an infinite quantity.
 pub fn is_pos_inf<EXP_SZ:u32, FRACTION_SZ:u32>(x: APFloat<EXP_SZ, FRACTION_SZ>) -> bool
 ```
 
-Returns whether or not the given `APFloat` represents a positive infinite quantity.
+Returns whether or not the given `APFloat` represents a positive infinite
+quantity.
 
 ### `apfloat::is_neg_inf`
 
@@ -119,7 +120,8 @@ Returns whether or not the given `APFloat` represents a positive infinite quanti
 pub fn is_neg_inf<EXP_SZ:u32, FRACTION_SZ:u32>(x: APFloat<EXP_SZ, FRACTION_SZ>) -> bool
 ```
 
-Returns whether or not the given `APFloat` represents a negative infinite quantity.
+Returns whether or not the given `APFloat` represents a negative infinite
+quantity.
 
 ### `apfloat::zero`
 
@@ -137,14 +139,32 @@ pub fn one<EXP_SZ:u32, FRACTION_SZ:u32>(sign: bits[1]) -> APFloat<EXP_SZ, FRACTI
 
 Returns one or minus one depending upon the given sign parameter.
 
+### `apfloat::max_normal`
+
+```dslx-snippet
+pub fn max_normal<EXP_SZ:u32, FRACTION_SZ:u32>(sign: bits[1]) -> APFloat<EXP_SZ, FRACTION_SZ>
+```
+
+Returns the largest normal value or its negative depending upon the given sign
+parameter.
+
+### `apfloat::abs`
+
+```dslx-snippet
+pub fn abs<EXP_SZ:u32, FRACTION_SZ:u32>(x: APFloat<EXP_SZ, FRACTION_SZ>) -> APFloat<EXP_SZ, FRACTION_SZ>
+```
+
+Returns the absolute value of `x` unless it is a `NaN`, in which case it will
+return a quiet `NaN`.
+
 ### `apfloat::negate`
 
 ```dslx-snippet
 pub fn negate<EXP_SZ:u32, FRACTION_SZ:u32>(x: APFloat<EXP_SZ, FRACTION_SZ>) -> APFloat<EXP_SZ, FRACTION_SZ>
 ```
 
-Returns the negative of `x` unless it is a `NaN`, in which case it will change it
-from a quiet to signaling `NaN` or from signaling to a quiet `NaN`.
+Returns the negative of `x` unless it is a `NaN`, in which case it will change
+it from a quiet to signaling `NaN` or from signaling to a quiet `NaN`.
 
 ### `apfloat::max_normal_exp`
 
@@ -167,27 +187,42 @@ exponent field. For single precision floats this value is -126.
 ### `apfloat::unbiased_exponent`
 
 ```dslx-snippet
-pub fn unbiased_exponent<EXP_SZ:u32, FRACTION_SZ:u32>(f: APFloat<EXP_SZ, FRACTION_SZ>) -> sN[EXP_SZ]
+pub fn unbiased_exponent<EXP_SZ: u32, FRACTION_SZ: u32>(f: APFloat<EXP_SZ, FRACTION_SZ>) -> sN[EXP_SZ]
 ```
 
-Returns the unbiased exponent. For normal numbers it is `bexp - 2^EXP_SZ +
-1``and for subnormals it is,`2 - 2^EXP_SZ``. For infinity and `NaN``, there are
-no guarantees, as the unbiased exponent has no meaning in that case.
+Returns the unbiased exponent of `f`. For normal numbers it is `bexp -
+2^(EXP_SZ - 1) + 1`. For zero and subnormals, it is `1 - 2^(EXP_SZ-1)`. For
+infinity and `NaN`, it is `-2^(EXP_SZ - 1)`.
 
-For example, for single precision normal numbers the unbiased exponent is
-`bexp - 127``and for subnormal numbers it is`-126`.
+For example, for single precision IEEE numbers, the unbiased exponent is `bexp -
+127`, for zero and subnormal numbers it is `-127`, and for infinity and `NaN` it
+is `-128`.
 
 ### `apfloat::bias`
 
 ```dslx-snippet
-pub fn bias<EXP_SZ: u32, FRACTION_SZ: u32>(unbiased_exponent: sN[EXP_SZ]) -> bits[EXP_SZ]
+pub fn bias<EXP_SZ: u32>(unbiased_exponent: sN[EXP_SZ]) -> bits[EXP_SZ]
 ```
 
-Returns the biased exponent which is equal to `unbiased_exponent + 2^EXP_SZ - 1`
+Returns the biased exponent which is equal to `unbiased_exponent + 2^(EXP_SZ -
+1)`
 
-Since the function only takes as input the unbiased exponent, it cannot
-distinguish between normal and subnormal numbers, as a result it assumes that
-the input is the exponent for a normal number.
+Notice: Since the function only takes as input the unbiased exponent, it cannot
+distinguish between zero and subnormal numbers, or `NaN` and infinity,
+respectively.
+
+### `apfloat::exponent_bias`
+
+<!-- disableFinding(SNIPPET_INVALID_LANGUAGE) -->
+
+```dslx-snippet
+pub fn exponent_bias<EXP_SZ: u32, FRACTION_SZ: u32>(
+                     f: APFloat<EXP_SZ, FRACTION_SZ>)
+    -> sN[EXP_SZ]
+```
+
+Returns `2^(EXP_SZ-1)-1`, which is the exponent bias used for encoding the given
+APFloat type. For example, this would return `127` for `float32`.
 
 ### `apfloat::flatten`
 
@@ -223,11 +258,11 @@ pub fn ldexp<EXP_SZ:u32, FRACTION_SZ:u32>(
 
 `ldexp` (load exponent) computes `fraction * 2^exp`. Note that:
 
- - Input denormals are treated as/flushed to 0. (denormals-are-zero / DAZ).
-   Similarly, denormal results are flushed to 0.
- - No exception flags are raised/reported.
- - We emit a single, canonical representation for NaN (qnan) but accept all
-   `NaN` representations as input.
+-   Input denormals are treated as/flushed to 0. (denormals-are-zero / DAZ).
+    Similarly, denormal results are flushed to 0.
+-   No exception flags are raised/reported.
+-   We emit a single, canonical representation for NaN (qnan) but accept all
+    `NaN` representations as input.
 
 ### `apfloat::cast_from_fixed_using_rne`
 
@@ -250,6 +285,44 @@ pub fn cast_from_fixed_using_rz<EXP_SZ:u32, FRACTION_SZ:u32, NUM_SRC_BITS:u32>(
 
 Casts the fixed point number to a floating point number using RZ (Round to Zero)
 as the [rounding mode](https://en.wikipedia.org/wiki/Rounding).
+
+### `apfloat::upcast_with_denorms`
+
+```dslx-snippet
+pub fn upcast_with_denorms<TO_EXP_SZ: u32, TO_FRACTION_SZ: u32, FROM_EXP_SZ: u32, FROM_FRACTION_SZ: u32>
+    (f: APFloat<FROM_EXP_SZ, FROM_FRACTION_SZ>) -> APFloat<TO_EXP_SZ, TO_FRACTION_SZ> {
+```
+
+Upcast the given apfloat to an apfloat with fraction and exponent size at least
+as large as the input's. Subnormal inputs are supported; they are converted to
+normal numbers of the same value when the exponent size is larger, or preserved
+otherwise. To treat subnormals as zero, use `upcast_daz` (which is a convenience
+wrapper that calls `subnormals_to_zero` before calling this function).
+
+### `apfloat::upcast_daz`
+
+```dslx-snippet
+pub fn upcast_daz<TO_EXP_SZ: u32, TO_FRACTION_SZ: u32, FROM_EXP_SZ: u32, FROM_FRACTION_SZ: u32>
+    (f: APFloat<FROM_EXP_SZ, FROM_FRACTION_SZ>) -> APFloat<TO_EXP_SZ, TO_FRACTION_SZ> {
+```
+
+Upcast the given apfloat to an apfloat with fraction and exponent size at least
+as large as the input's. Subnormal inputs are treated as zero.
+
+### `apfloat::downcast_rne`
+
+```dslx-snippet
+pub fn downcast_rne<TO_FRACTION_SZ: u32, TO_EXP_SZ,
+                    FROM_FRACTION_SZ: u32, FROM_EXP_SZ: u32>(
+                    f: APFloat<FROM_EXP_SZ, FROM_FRACTION_SZ>)
+    -> APFloat<TO_EXP_SZ, TO_FRACTION_SZ> {
+```
+
+Round the apfloat to an apfloat with smaller fraction or smaller exponent (or
+both). Ties round to even (LSB = 0) and denormal inputs and outputs get flushed
+to zero. Values with exponents above the target exponent range will overflow to
+infinity. Values with exponents below the target exponent range will underflow
+to zero.
 
 ### `apfloat::normalize`
 
@@ -342,16 +415,6 @@ pub fn lt_2<EXP_SZ: u32, FRACTION_SZ: u32>(
 Returns `true` if `x < y`. Denormals are Zero (DAZ). Always returns `false` if
 `x` or `y` is `NaN`.
 
-### `apfloat::round_towards_zero`
-
-```dslx-snippet
-pub fn round_towards_zero<EXP_SZ:u32, FRACTION_SZ:u32>(
-                          x: APFloat<EXP_SZ, FRACTION_SZ>)
-    -> APFloat<EXP_SZ, FRACTION_SZ>
-```
-
-Returns an `APFloat` with all its bits past the decimal point set to `0`.
-
 ### `apfloat::to_int`
 
 ```dslx-snippet
@@ -361,6 +424,38 @@ pub fn to_int<EXP_SZ: u32, FRACTION_SZ: u32, RESULT_SZ:u32>(
 
 Returns the signed integer part of the input float, truncating any fractional
 bits if necessary.
+
+Exceptional cases:
+
+X operand                          | `sN[RESULT_SZ]` value
+---------------------------------- | ---------------------
+`NaN`                              | `sN[RESULT_SZ]::ZERO`
+`+Inf`                             | `sN[RESULT_SZ]::MAX`
+`-Inf`                             | `sN[RESULT_SZ]::MIN`
++0.0, -0.0 or any subnormal number | `sN[RESULT_SZ]::ZERO`
+`> sN[RESULT_SZ]::MAX`             | `sN[RESULT_SZ]::MAX`
+`< sN[RESULT_SZ]::MIN`             | `sN[RESULT_SZ]::MIN`
+
+### `apfloat::to_uint`
+
+```dslx-snippet
+pub fn to_uint<RESULT_SZ:u32, EXP_SZ: u32, FRACTION_SZ: u32>(
+               x: APFloat<EXP_SZ, FRACTION_SZ>) -> uN[RESULT_SZ]
+```
+
+Casts the input float to the nearest unsigned integer. Any fractional bits are
+truncated and negative floats are clamped to 0.
+
+Exceptional cases:
+
+X operand                          | `uN[RESULT_SZ]` value
+---------------------------------- | ---------------------
+`NaN`                              | `uN[RESULT_SZ]::ZERO`
+`+Inf`                             | `uN[RESULT_SZ]::MAX`
+`-Inf`                             | `uN[RESULT_SZ]::ZERO`
++0.0, -0.0 or any subnormal number | `uN[RESULT_SZ]::ZERO`
+`> uN[RESULT_SZ]::MAX`             | `uN[RESULT_SZ]::MAX`
+`< uN[RESULT_SZ]::ZERO`            | `uN[RESULT_SZ]::ZERO`
 
 ### `apfloat::add/sub`
 
@@ -390,49 +485,61 @@ Floating-point addition, like any FP operation, is much more complicated than
 integer addition, and has many more steps. Being the first operation described,
 we'll take extra care to explain floating-point addition:
 
-1.  **Expand fractions:** Floating-point operations are computed with bits
-    beyond that in their normal representations for increased precision. For
-    IEEE 754 numbers, there are three extra, called the guard, rounding and
-    sticky bits. The first two behave normally, but the last, the "sticky" bit,
-    is special. During shift operations (below), if a "1" value is ever shifted
-    into the sticky bit, it "sticks" - the bit will remain "1" through any
-    further shift operations. In this step, the fractions are expanded by these
-    three bits.
-1.  **Align fractions:** To ensure that fractions are added with appropriate
-    magnitudes, they must be aligned according to their exponents. To do so, the
-    smaller significant needs to be shifted to the right (each right shift is
-    equivalent to increasing the exponent by one).
-    -   The extra precision bits are populated in this shift.
-    -   As part of this step, the leading 1 bit... and a sign bit Note: The
-        sticky bit is calculated and applied in this step.
-1.  **Sign-adjustment:** if the fractions differ in sign, then the fraction with
-    the smaller initial exponent needs to be (two's complement) negated.
-1.  **Add the fractions and capture the carry bit.** Note that, if the signs of
-    the fractions differs, then this could result in higher bits being cleared.
-1.  **Normalize the fractions:** Shift the result so that the leading '1' is
-    present in the proper space. This means shifting right one place if the
-    result set the carry bit, and to the left some number of places if high bits
-    were cleared.
-    -   The sticky bit must be preserved in any of these shifts!
-1.  **Rounding:** Here, the extra precision bits are examined to determine if
-    the result fraction's last bit should be rounded up. IEEE 754 supports five
-    rounding modes:
-    -   Round towards 0: just chop off the extra precision bits.
-    -   Round towards +infinity: round up if any extra precision bits are set.
-    -   Round towards -infinity: round down if any extra precision bits are set.
-    -   Round to nearest, ties away from zero: Rounds to the nearest value. In
-        cases where the extra precision bits are halfway between values, i.e.,
-        0b100, then the result is rounded up for positive numbers and down for
-        negative ones.
-    -   Round to nearest, ties to even: Rounds to the nearest value. In cases
-        where the extra precision bits are halfway between values, then the
-        result is rounded in whichever direction causes the LSB of the result
-        significant to be 0.
-        -   This is the most commonly-used rounding mode.
-        -   This is [currently] the only supported mode by the DSLX
-            implementation.
-1.  **Special case handling:** The results are examined for special cases such
-    as NaNs, infinities, or (optionally) subnormals.
+<!-- mdformat off(nested lists are rendered differently in mkdocs) -->
+
+1. **Expand fractions:** Floating-point operations are computed with bits
+   beyond that in their normal representations for increased precision. For
+   IEEE 754 numbers, there are three extra, called the guard, rounding and
+   sticky bits. The first two behave normally, but the last, the "sticky" bit,
+   is special. During shift operations (below), if a "1" value is ever shifted
+   into the sticky bit, it "sticks" - the bit will remain "1" through any
+   further shift operations. In this step, the fractions are expanded by these
+   three bits.
+1. **Align fractions:** To ensure that fractions are added with appropriate
+   magnitudes, they must be aligned according to their exponents. To do so, the
+   smaller significant needs to be shifted to the right (each right shift is
+   equivalent to increasing the exponent by one).
+
+   * The extra precision bits are populated in this shift.
+   * As part of this step, the leading 1 bit... and a sign bit Note: The
+     sticky bit is calculated and applied in this step.
+
+1. **Sign-adjustment:** if the fractions differ in sign, then the fraction with
+   the smaller initial exponent needs to be (two's complement) negated.
+
+1. **Add the fractions and capture the carry bit.** Note that, if the signs of
+   the fractions differs, then this could result in higher bits being cleared.
+
+1. **Normalize the fractions:** Shift the result so that the leading '1' is
+   present in the proper space. This means shifting right one place if the
+   result set the carry bit, and to the left some number of places if high bits
+   were cleared.
+
+   * The sticky bit must be preserved in any of these shifts!
+
+1. **Rounding:** Here, the extra precision bits are examined to determine if
+   the result fraction's last bit should be rounded up. IEEE 754 supports five
+   rounding modes:
+
+   * Round towards 0: just chop off the extra precision bits.
+   * Round towards +infinity: round up if any extra precision bits are set.
+   * Round towards -infinity: round down if any extra precision bits are set.
+   * Round to nearest, ties away from zero: Rounds to the nearest value. In
+     cases where the extra precision bits are halfway between values, i.e.,
+     0b100, then the result is rounded up for positive numbers and down for
+     negative ones.
+   * Round to nearest, ties to even: Rounds to the nearest value. In cases
+     where the extra precision bits are halfway between values, then the
+     result is rounded in whichever direction causes the LSB of the result
+     significant to be 0.
+
+     * This is the most commonly-used rounding mode.
+     * This is [currently] the only supported mode by the DSLX implementation.
+
+1. **Special case handling:** The results are examined for special cases such
+   as NaNs, infinities, or (optionally) subnormals.
+
+<!-- mdformat on -->
 
 ##### Result sign determination
 
@@ -461,14 +568,107 @@ straightforward (types are as for a C `float` implementation):
   let normal_chunk = shifted_fraction[0:3];
   let half_way_chunk = shifted_fraction[2:4];
   let do_round_up =
-      u1:1 if (normal_chunk > u3:0x4) | (half_way_chunk == u2:0x3)
-      else u1:0;
+      if (normal_chunk > u3:0x4) | (half_way_chunk == u2:0x3) { u1:1 }
+      else { u1:0 };
 
   // We again need an extra bit for carry.
-  let rounded_fraction = (shifted_fraction as u28) + u28:0x8 if do_round_up
-      else (shifted_fraction as u28);
+  let rounded_fraction = if do_round_up { (shifted_fraction as u28) + u28:0x8 }
+                         else { shifted_fraction as u28 };
   let rounding_carry = rounded_fraction[-1:];
 ```
+
+### `apfloat::has_fractional_part`
+
+Returns whether or not the given APFloat has a fractional part.
+
+```dslx-snippet
+pub fn has_fractional_part<EXP_SZ: u32, FRACTION_SZ: u32>(f: APFloat<EXP_SZ, FRACTION_SZ>) -> bool
+```
+
+### `apfloat::has_negative_exponent`
+
+Returns whether or not the given APFloat has an negative exponent.
+
+```dslx-snippet
+pub fn has_negative_exponent<EXP_SZ: u32, FRACTION_SZ: u32>
+    (f: APFloat<EXP_SZ, FRACTION_SZ>) -> bool
+```
+
+### `apfloat::ceil_with_denorms`
+
+```dslx-snippet
+pub fn ceil_with_denorms<EXP_SZ: u32, FRACTION_SZ: u32>
+    (f: APFloat<EXP_SZ, FRACTION_SZ>) -> APFloat<EXP_SZ, FRACTION_SZ>
+```
+
+Returns the nearest integral `APFloat` of the same precision as `f` whose value
+is greater than or equal to `f` (round toward positive). Subnormal inputs are
+supported and rounded as per IEEE-754 to be no less than the infinitely precise
+result. To treat subnormals as zero, use `ceil_daz` (which is a
+convenience wrapper that calls `subnormals_to_zero` before calling this
+function).
+
+### `apfloat::ceil_daz`
+
+```dslx-snippet
+pub fn ceil_daz<EXP_SZ: u32, FRACTION_SZ: u32>
+    (f: APFloat<EXP_SZ, FRACTION_SZ>) -> APFloat<EXP_SZ, FRACTION_SZ>
+```
+
+Returns the nearest integral `APFloat` of the same precision as `f` whose value
+is greater than or equal to `f` (round toward positive). Subnormal inputs are
+treated as zero.
+
+### `apfloat::floor_with_denorms`
+
+```dslx-snippet
+pub fn floor_with_denorms<EXP_SZ: u32, FRACTION_SZ: u32>
+    (f: APFloat<EXP_SZ, FRACTION_SZ>) -> APFloat<EXP_SZ, FRACTION_SZ>
+```
+
+Returns the nearest integral `APFloat` of the same precision as `f` whose value
+is lesser than or equal to `f` (round toward negative). Subnormal inputs are
+supported and rounded as per IEEE-754 to be no greater than the infinitely
+precise result. To treat subnormals as zero, use `floor_daz` (which is a
+convenience wrapper that calls `subnormals_to_zero` before calling this
+function).
+
+### `apfloat::floor_daz`
+
+```dslx-snippet
+pub fn floor_daz<EXP_SZ: u32, FRACTION_SZ: u32>
+    (f: APFloat<EXP_SZ, FRACTION_SZ>) -> APFloat<EXP_SZ, FRACTION_SZ>
+```
+
+Returns the nearest integral `APFloat` of the same precision as `f` whose value
+is lesser than or equal to `f` (round toward negative). Subnormal inputs are
+treated as zero.
+
+### `apfloat::trunc`
+
+```dslx-snippet
+pub fn trunc<EXP_SZ:u32, FRACTION_SZ:u32>(
+                          x: APFloat<EXP_SZ, FRACTION_SZ>)
+    -> APFloat<EXP_SZ, FRACTION_SZ>
+```
+
+Returns an `APFloat` of the same precision as `f` with all the fractional bits
+set to `0`.
+
+### `apfloat::round`
+
+```dslx-snippet
+pub fn round<EXP_SZ:u32, FRACTION_SZ:u32>(
+                          x: APFloat<EXP_SZ, FRACTION_SZ>)
+    -> APFloat<EXP_SZ, FRACTION_SZ>
+```
+
+Returns an `APFloat` of the same precision as `f` rounded to the nearest
+integer.
+
+!!! NOTE
+    This uses the "tie-to-even" rounding style: in case of a tie (`f` half-way
+    between two integers), round to the nearest "even" integer.
 
 ### `apfloat::mul`
 
@@ -538,10 +738,12 @@ Besides `float64` specializations of the functions in `apfloat.x`, the following
 functions are defined just for `float64`.
 
 ### `float64::to_int64`
+
 ```dslx-snippet
 pub fn to_int64(x: F64) -> s64;
 ```
-Convert the the `F64` struct into a 64 bit integer.
+
+Convert the `F64` struct into a 64 bit integer.
 
 ## float32
 
@@ -559,21 +761,27 @@ pub const F32_ONE_FLAT = u32:0x3f800000;
 Besides `float32` specializations of the functions in `apfloat.x`, the following
 functions are defined just for `float32`.
 
-### `float32::to_int32`, `float32::from_int32`
+### `float32::to_int32`, `float32::to_uint32`, `float32::from_int32`
+
 ```dslx-snippet
 pub fn to_int32(x: F32) -> s32
+pub fn to_uint32(x: F32) -> u32
 pub fn from_int32(x: s32) -> F32
 ```
-Convert the `F32` struct to and from a 32bit integer.
 
-# `float32::fixed_fraction`
+Convert the `F32` struct to a 32 bit signed/unsigned integer, or from a 32 bit
+signed integer to an `F32`.
+
+### `float32::fixed_fraction`
+
 ```dslx-snippet
 pub fn fixed_fraction(input_float: F32) -> u23
 ```
 
 TBD
 
-# `float32::fast_rsqrt_config_refinements`/`float32::fast_rsqrt`
+### `float32::fast_rsqrt_config_refinements`/`float32::fast_rsqrt`
+
 ```dslx-snippet
 pub fn fast_rsqrt_config_refinements<NUM_REFINEMENTS: u32 = {u32:1}>(x: F32) -> F32
 pub fn fast_rsqrt(x: F32) -> F32
@@ -586,11 +794,11 @@ division module, although this hasn't been benchmarked yet. Latency is expected
 to be lower as well. The tradeoff is that this offers slighlty less precision
 (error is < 0.2% in worst case). Note that:
 
- - Input denormals are treated as/flushed to 0. (denormals-are-zero / DAZ).
- - Only round-to-nearest mode is supported.
- - No exception flags are raised/reported.
- - We emit a single, canonical representation for NaN (qnan) but accept
-   all NaN respresentations as input.
+-   Input denormals are treated as/flushed to 0. (denormals-are-zero / DAZ).
+-   Only round-to-nearest mode is supported.
+-   No exception flags are raised/reported.
+-   We emit a single, canonical representation for NaN (qnan) but accept all NaN
+    respresentations as input.
 
 `fast_rsqrt_config_refinements` allows the user to specify the number of
 Computes an approximation of 1.0 / sqrt(x). `NUM_REFINEMENTS` can be increased
@@ -609,24 +817,45 @@ pub type BF16 = apfloat::APFloat<8, 7>;
 pub type FloatTag = apfloat::APFloatTag;
 pub type TaggedBF16 = (FloatTag, BF16);
 ```
-Besides `bfloat16` specializations of the functions in `apfloat.x`, the following
-functions are defined just for `bfloat16`.
 
-### `bfloat16:to_int16`
+Besides `bfloat16` specializations of the functions in `apfloat.x`, the
+following functions are defined just for `bfloat16`.
+
+### `bfloat16:to_int16`, `bfloat16:to_uint16`
+
 ```dslx-snippet
 pub fn to_int16(x: BF16) -> s16
+pub fn to_uint16(x: BF16) -> u16
 ```
-Convert the the `BF16` struct into a 16 bit integer.
+
+Convert the `BF16` struct to a 16 bit signed/unsigned integer.
+
+### `bfloat16::from_int8`
+
+```dslx-snippet
+pub fn from_int8(x: s8) -> BF16
+```
+
+Converts the given signed integer to bfloat16. For s8, all values can be
+captured exactly, so no need to round or handle overflow.
+
+### `bfloat16::from_float32`
+
+```dslx-snippet
+pub fn from_float32(x: F32) -> BF16
+```
+
+Converts the given float32 to bfloat16. Ties round to even (LSB = 0) and
+denormal inputs get flushed to zero.
 
 ### `bfloat16:increment_fraction`
+
 ```dslx-snippet
 pub fn increment_fraction(input: BF16) -> BF16
 ```
 
 Increments the fraction of the input BF16 by one and returns the normalized
 result. Input must be a normal *non-zero* number.
-
-
 
 ## Testing
 
@@ -641,11 +870,12 @@ When comparing to a reference, a natural question is the stability of the
 reference, i.e., is the reference answer the same across all versions or
 environments? Will the answer given by glibc/libm on AArch64 be the same as one
 given by a hardware FMA unit on a GPU? Fortunately, all "correct"
-implementations will give the same results for the same inputs.\* In addition,
-POSIX has the same result-precision language. It's worth noting that -ffast-math
-doesn't currently affect FMA emission/fusion/fission/etc.
+implementations will give the same results for the same inputs. [^2] In
+addition, POSIX has the same result-precision language. It's worth noting that
+-ffast-math doesn't currently affect FMA emission/fusion/fission/etc.
 
-\* - There are operations for which this is not true. Transcendental ops may
+[^2]: There are operations for which this is not true. Transcendental ops may
+
 differ between implementations due to the
 [*table maker's dilemma*](https://en.wikipedia.org/wiki/Rounding).
 

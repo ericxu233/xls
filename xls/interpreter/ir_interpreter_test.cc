@@ -12,42 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "xls/interpreter/ir_interpreter.h"
+
+#include <optional>
 #include <string>
-#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
+#include "absl/types/span.h"
 #include "xls/common/status/matchers.h"
 #include "xls/interpreter/function_interpreter.h"
 #include "xls/interpreter/ir_evaluator_test_base.h"
+#include "xls/interpreter/observer.h"
 #include "xls/ir/bits.h"
-#include "xls/ir/bits_ops.h"
+#include "xls/ir/events.h"
 #include "xls/ir/function_builder.h"
 #include "xls/ir/ir_parser.h"
 #include "xls/ir/ir_test_base.h"
 #include "xls/ir/package.h"
+#include "xls/ir/value.h"
 #include "xls/ir/verifier.h"
 
 namespace xls {
 namespace {
 
-using status_testing::IsOkAndHolds;
-using status_testing::StatusIs;
-using testing::ElementsAre;
-using testing::ElementsAreArray;
-using testing::HasSubstr;
-using testing::UnorderedElementsAre;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
+using ::testing::ElementsAre;
+using ::testing::ElementsAreArray;
+using ::testing::FieldsAre;
+using ::testing::HasSubstr;
+using ::testing::UnorderedElementsAre;
 
 INSTANTIATE_TEST_SUITE_P(
     IrInterpreterTest, IrEvaluatorTestBase,
     testing::Values(IrEvaluatorTestParam(
-        [](Function* function, absl::Span<const Value> args) {
-          return InterpretFunction(function, args);
+        [](Function* function, absl::Span<const Value> args,
+           std::optional<EvaluationObserver*> obs) {
+          return InterpretFunction(function, args, obs);
         },
         [](Function* function,
-           const absl::flat_hash_map<std::string, Value>& kwargs) {
-          return InterpretFunctionKwargs(function, kwargs);
-        })));
+           const absl::flat_hash_map<std::string, Value>& kwargs,
+           std::optional<EvaluationObserver*> obs) {
+          return InterpretFunctionKwargs(function, kwargs, obs);
+        },
+        true, "IrInterpreter")),
+    testing::PrintToStringParamName());
 
 // Fixture for IrInterpreter-only tests (i.e., those that aren't common to all
 // IR evaluators).
@@ -140,8 +153,9 @@ fn accum_dynamic(trips: bits[8]) -> bits[32] {
                            InterpretFunction(accum_fixed, {}));
 
   Value accum_5_value = Value(UBits(10, 32));
-  std::vector<std::string> accum_5_traces = {
-      "accum is 0", "accum is 0", "accum is 1", "accum is 3", "accum is 6"};
+  auto accum_5_traces = {FieldsAre("accum is 0", 0), FieldsAre("accum is 0", 0),
+                         FieldsAre("accum is 1", 0), FieldsAre("accum is 3", 0),
+                         FieldsAre("accum is 6", 0)};
   EXPECT_EQ(accum_fixed_result.value, accum_5_value);
   EXPECT_THAT(accum_fixed_result.events.trace_msgs,
               ElementsAreArray(accum_5_traces));
@@ -165,7 +179,8 @@ fn accum_dynamic(trips: bits[8]) -> bits[32] {
       InterpreterResult<Value> accum_dynamic_1,
       InterpretFunction(accum_dynamic, {Value(UBits(1, 8))}));
   EXPECT_EQ(accum_dynamic_1.value, Value(UBits(0, 32)));
-  EXPECT_THAT(accum_dynamic_1.events.trace_msgs, ElementsAre("accum is 0"));
+  EXPECT_THAT(accum_dynamic_1.events.trace_msgs,
+              ElementsAre(FieldsAre("accum is 0", 0)));
 
   XLS_ASSERT_OK_AND_ASSIGN(
       InterpreterResult<Value> accum_dynamic_7,
@@ -173,8 +188,10 @@ fn accum_dynamic(trips: bits[8]) -> bits[32] {
   EXPECT_EQ(accum_dynamic_7.value, Value(UBits(21, 32)));
   EXPECT_THAT(
       accum_dynamic_7.events.trace_msgs,
-      ElementsAre("accum is 0", "accum is 0", "accum is 1", "accum is 3",
-                  "accum is 6", "accum is 10", "accum is 15"));
+      ElementsAre(FieldsAre("accum is 0", 0), FieldsAre("accum is 0", 0),
+                  FieldsAre("accum is 1", 0), FieldsAre("accum is 3", 0),
+                  FieldsAre("accum is 6", 0), FieldsAre("accum is 10", 0),
+                  FieldsAre("accum is 15", 0)));
 }
 
 // Test collecting traces across a map.
@@ -209,8 +226,10 @@ fn map_trace() -> bits[32][5]{
   XLS_ASSERT_OK_AND_ASSIGN(Value map_trace_expected,
                            Value::UBitsArray({121, 144, 169, 196, 225}, 32));
   EXPECT_EQ(map_trace_result.value, map_trace_expected);
-  EXPECT_THAT(map_trace_result.events.trace_msgs,
-              UnorderedElementsAre("f is odd", "d is odd", "b is odd"));
+  EXPECT_THAT(
+      map_trace_result.events.trace_msgs,
+      UnorderedElementsAre(FieldsAre("f is odd", 0), FieldsAre("d is odd", 0),
+                           FieldsAre("b is odd", 0)));
 }
 
 }  // namespace

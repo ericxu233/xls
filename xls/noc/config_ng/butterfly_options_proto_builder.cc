@@ -14,13 +14,18 @@
 
 #include "xls/noc/config_ng/butterfly_options_proto_builder.h"
 
-#include "xls/common/logging/logging.h"
+#include <cstdint>
+
+#include "absl/log/die_if_null.h"
+#include "xls/noc/config_ng/bidirectional_butterfly_options_proto_builder.h"
+#include "xls/noc/config_ng/topology_options_network_config_builder.pb.h"
+#include "xls/noc/config_ng/unidirectional_butterfly_options_proto_builder.h"
 
 namespace xls::noc {
 
 ButterflyOptionsProtoBuilder::ButterflyOptionsProtoBuilder(
     ButterflyOptionsProto* proto_ptr)
-    : proto_ptr_(XLS_DIE_IF_NULL(proto_ptr)) {}
+    : proto_ptr_(ABSL_DIE_IF_NULL(proto_ptr)) {}
 
 ButterflyOptionsProtoBuilder::ButterflyOptionsProtoBuilder(
     ButterflyOptionsProto* proto_ptr,

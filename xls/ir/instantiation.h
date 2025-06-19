@@ -15,11 +15,15 @@
 #ifndef XLS_IR_INSTANTIATION_H_
 #define XLS_IR_INSTANTIATION_H_
 
+#include <cstdint>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <string_view>
 
 #include "absl/status/statusor.h"
+#include "xls/ir/channel.h"
+#include "xls/ir/package.h"
 #include "xls/ir/type.h"
 
 namespace xls {
@@ -27,7 +31,7 @@ namespace xls {
 class Block;
 class Function;
 
-enum class InstantiationKind {
+enum class InstantiationKind : uint8_t {
   // Instantiation of an IR block in the same package.
   kBlock,
 
@@ -43,11 +47,19 @@ absl::StatusOr<InstantiationKind> StringToInstantiationKind(
     std::string_view str);
 std::ostream& operator<<(std::ostream& os, InstantiationKind kind);
 
+template <typename Sink>
+void AbslStringify(Sink& sink, const InstantiationKind kind) {
+  absl::Format(&sink, "%s", InstantiationKindToString(kind));
+}
+
 struct InstantiationPort {
   std::string name;
   Type* type;
 };
 
+class BlockInstantiation;
+class ExternInstantiation;
+class FifoInstantiation;
 // Base class for an instantiation which is a block-scoped construct that
 // represents a module instantiation at the Verilog level. The instantiated
 // object can be another block, a FIFO (not yet supported), or a externally
@@ -58,16 +70,22 @@ class Instantiation {
       : name_(name), kind_(kind) {}
   virtual ~Instantiation() = default;
 
-  const std::string& name() const { return name_; }
+  std::string_view name() const { return name_; }
 
   InstantiationKind kind() const { return kind_; }
 
   virtual std::string ToString() const = 0;
 
+  virtual absl::StatusOr<InstantiationType> type() const = 0;
+
   virtual absl::StatusOr<InstantiationPort> GetInputPort(
       std::string_view name) = 0;
   virtual absl::StatusOr<InstantiationPort> GetOutputPort(
       std::string_view name) = 0;
+
+  virtual absl::StatusOr<BlockInstantiation*> AsBlockInstantiation();
+  virtual absl::StatusOr<ExternInstantiation*> AsExternInstantiation();
+  virtual absl::StatusOr<FifoInstantiation*> AsFifoInstantiation();
 
  protected:
   std::string name_;
@@ -84,11 +102,16 @@ class BlockInstantiation : public Instantiation {
   Block* instantiated_block() const { return instantiated_block_; }
 
   std::string ToString() const override;
+  absl::StatusOr<InstantiationType> type() const override;
 
   absl::StatusOr<InstantiationPort> GetInputPort(
       std::string_view name) override;
   absl::StatusOr<InstantiationPort> GetOutputPort(
       std::string_view name) override;
+
+  absl::StatusOr<BlockInstantiation*> AsBlockInstantiation() override {
+    return this;
+  }
 
  private:
   Block* instantiated_block_;
@@ -105,9 +128,50 @@ class ExternInstantiation : public Instantiation {
   absl::StatusOr<InstantiationPort> GetOutputPort(std::string_view name) final;
 
   std::string ToString() const final;
+  absl::StatusOr<InstantiationType> type() const override;
+
+  absl::StatusOr<ExternInstantiation*> AsExternInstantiation() override {
+    return this;
+  }
 
  private:
   Function* function_;
+};
+
+class FifoInstantiation : public Instantiation {
+ public:
+  FifoInstantiation(std::string_view inst_name, FifoConfig fifo_config,
+                    Type* data_type,
+                    std::optional<std::string_view> channel_name,
+                    Package* package);
+
+  static constexpr std::string_view kResetPortName = "rst";
+  static constexpr std::string_view kPushValidPortName = "push_valid";
+  static constexpr std::string_view kPushDataPortName = "push_data";
+  static constexpr std::string_view kPushReadyPortName = "push_ready";
+  static constexpr std::string_view kPopValidPortName = "pop_valid";
+  static constexpr std::string_view kPopDataPortName = "pop_data";
+  static constexpr std::string_view kPopReadyPortName = "pop_ready";
+
+  absl::StatusOr<InstantiationPort> GetInputPort(std::string_view name) final;
+  absl::StatusOr<InstantiationPort> GetOutputPort(std::string_view name) final;
+  absl::StatusOr<InstantiationType> type() const override;
+
+  const FifoConfig& fifo_config() const { return fifo_config_; }
+  Type* data_type() const { return data_type_; }
+  std::optional<std::string_view> channel_name() const { return channel_name_; }
+
+  std::string ToString() const final;
+
+  absl::StatusOr<FifoInstantiation*> AsFifoInstantiation() override {
+    return this;
+  }
+
+ private:
+  FifoConfig fifo_config_;
+  Type* data_type_;
+  std::optional<std::string> channel_name_;
+  Package* package_;
 };
 
 }  // namespace xls

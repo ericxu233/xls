@@ -16,17 +16,18 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "xls/common/status/matchers.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/bits.h"
 #include "xls/ir/function.h"
 #include "xls/ir/function_builder.h"
-#include "xls/ir/ir_matcher.h"
-#include "xls/ir/ir_scanner.h"
 #include "xls/ir/ir_test_base.h"
 #include "xls/ir/package.h"
 #include "xls/passes/dce_pass.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
 
 namespace xls {
 
@@ -38,13 +39,14 @@ class AssertCleanupPassTest : public IrTestBase {
 
   absl::StatusOr<bool> Run(Function* f) {
     PassResults results;
+    OptimizationContext context;
     XLS_ASSIGN_OR_RETURN(bool changed,
                          UselessAssertRemovalPass().RunOnFunctionBase(
-                             f, OptimizationPassOptions(), &results));
+                             f, OptimizationPassOptions(), &results, context));
     // Run dce to clean things up.
     XLS_RETURN_IF_ERROR(
         DeadCodeEliminationPass()
-            .RunOnFunctionBase(f, OptimizationPassOptions(), &results)
+            .RunOnFunctionBase(f, OptimizationPassOptions(), &results, context)
             .status());
     // Return whether useless assert removal changed anything.
     return changed;
@@ -62,7 +64,7 @@ TEST_F(AssertCleanupPassTest, RemoveSingleAssertNoTokenThreading) {
   fb.Concat({x, l2});
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
   EXPECT_EQ(f->node_count(), 6);
-  EXPECT_THAT(Run(f), status_testing::IsOkAndHolds(true));
+  EXPECT_THAT(Run(f), absl_testing::IsOkAndHolds(true));
   // We expect there to be three nodes left.
   // The assert with literal 1 condition should be removed, along with the dead
   // literal 1 and after all.
@@ -80,7 +82,7 @@ TEST_F(AssertCleanupPassTest, DontRemoveSingleAssertLiteral0) {
   fb.Concat({x, l2});
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
   EXPECT_EQ(f->node_count(), 6);
-  EXPECT_THAT(Run(f), status_testing::IsOkAndHolds(false));
+  EXPECT_THAT(Run(f), absl_testing::IsOkAndHolds(false));
   // We expect there to be six nodes left.
   // Assert with literal 0 kept, nothing changed.
   EXPECT_EQ(f->node_count(), 6);
@@ -98,7 +100,7 @@ TEST_F(AssertCleanupPassTest, DontRemoveSingleAssertNotLiteral) {
   fb.Concat({x, l2});
   XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.Build());
   EXPECT_EQ(f->node_count(), 7);
-  EXPECT_THAT(Run(f), status_testing::IsOkAndHolds(false));
+  EXPECT_THAT(Run(f), absl_testing::IsOkAndHolds(false));
   // We expect there to be seven nodes left.
   // Assert with non-literal condition kept, nothing changed.
   EXPECT_EQ(f->node_count(), 7);
@@ -122,7 +124,7 @@ TEST_F(AssertCleanupPassTest, RemoveSingleAssertTokenThreading) {
   // Should be seven nodes to start.
   // Input operand x and six nodes defined in function.
   EXPECT_EQ(f->node_count(), 7);
-  EXPECT_THAT(Run(f), status_testing::IsOkAndHolds(true));
+  EXPECT_THAT(Run(f), absl_testing::IsOkAndHolds(true));
   // We expect there to be five nodes left.
   // Assert and the literal 1 condition removed, token rewired.
   EXPECT_EQ(f->node_count(), 5);
@@ -147,7 +149,7 @@ TEST_F(AssertCleanupPassTest, RemoveCascadedAssertTokenThreading_2Levels) {
   // Should be 9 nodes to start.
   // Input operand x, 8 nodes defined in function.
   EXPECT_EQ(f->node_count(), 9);
-  EXPECT_THAT(Run(f), status_testing::IsOkAndHolds(true));
+  EXPECT_THAT(Run(f), absl_testing::IsOkAndHolds(true));
   // We expect there to be five nodes left.
   // Asserts and literal 1 conditions removed, token rewired.
   EXPECT_EQ(f->node_count(), 5);
@@ -169,7 +171,7 @@ TEST_F(AssertCleanupPassTest, RemoveCascadedAssertTokenThreading_20Levels) {
 
   // Should be 45 nodes to start.
   EXPECT_EQ(f->node_count(), 45);
-  EXPECT_THAT(Run(f), status_testing::IsOkAndHolds(true));
+  EXPECT_THAT(Run(f), absl_testing::IsOkAndHolds(true));
   // We expect there to be five nodes left, same as above.
   // Asserts and literal 1 conditions removed, token rewired.
   EXPECT_EQ(f->node_count(), 5);

@@ -13,7 +13,12 @@
 # limitations under the License.
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -22,12 +27,6 @@ cc_library(
     srcs = ["experiment.cc"],
     hdrs = ["experiment.h"],
     deps = [
-        "@com_google_absl//absl/container:btree",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings:str_format",
-        "@com_google_absl//absl/types:variant",
-        "//xls/common/logging",
         "//xls/common/status:ret_check",
         "//xls/common/status:status_macros",
         "//xls/noc/config:network_config_cc_proto",
@@ -38,10 +37,20 @@ cc_library(
         "//xls/noc/simulation:network_graph_builder",
         "//xls/noc/simulation:noc_traffic_injector",
         "//xls/noc/simulation:parameters",
+        "//xls/noc/simulation:random_number_interface",
         "//xls/noc/simulation:sim_objects",
         "//xls/noc/simulation:simulator_to_link_monitor_shim",
         "//xls/noc/simulation:simulator_to_traffic_injector_shim",
         "//xls/noc/simulation:traffic_description",
+        "@com_google_absl//absl/container:btree",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:span",
+        "@com_google_absl//absl/types:variant",
     ],
 )
 
@@ -50,10 +59,11 @@ cc_library(
     hdrs = ["experiment_factory.h"],
     deps = [
         ":experiment",
+        "//xls/common:casts",
         "@com_google_absl//absl/container:btree",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
-        "//xls/common:casts",
     ],
 )
 
@@ -63,15 +73,18 @@ cc_test(
     deps = [
         ":experiment",
         ":experiment_factory",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/strings:str_format",
-        "//xls/common:xls_gunit",
         "//xls/common:xls_gunit_main",
-        "//xls/common/logging",
         "//xls/common/status:matchers",
         "//xls/noc/config:network_config_cc_proto",
         "//xls/noc/config:network_config_proto_builder",
         "//xls/noc/simulation:common",
+        "//xls/noc/simulation:flit",
+        "//xls/noc/simulation:traffic_description",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@googletest//:gtest",
     ],
 )
 
@@ -81,10 +94,10 @@ cc_library(
     hdrs = ["sample_experiments.h"],
     deps = [
         ":experiment_factory",
-        "@com_google_absl//absl/status",
-        "//xls/noc/config:network_config_cc_proto",
+        "//xls/common/status:ret_check",
         "//xls/noc/drivers/samples:aggregate_tree_experiment",
         "//xls/noc/drivers/samples:simple_vc_experiment",
+        "@com_google_absl//absl/status",
     ],
 )
 
@@ -92,12 +105,16 @@ cc_test(
     name = "sample_experiments_test",
     srcs = ["sample_experiments_test.cc"],
     deps = [
+        ":experiment",
         ":experiment_factory",
         ":sample_experiments",
-        "@com_google_absl//absl/strings:str_format",
-        "//xls/common:xls_gunit",
         "//xls/common:xls_gunit_main",
-        "//xls/common/logging",
         "//xls/common/status:matchers",
+        "//xls/noc/simulation:common",
+        "//xls/noc/simulation:flit",
+        "@com_google_absl//absl/container:btree",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings:str_format",
+        "@googletest//:gtest",
     ],
 )

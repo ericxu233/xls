@@ -12,17 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef XLS_AREA_MODEL_AREA_ESTIMATOR_H_
-#define XLS_AREA_MODEL_AREA_ESTIMATOR_H_
+#ifndef XLS_CONTRIB_INTEGRATOR_AREA_MODEL_AREA_ESTIMATOR_H_
+#define XLS_CONTRIB_INTEGRATOR_AREA_MODEL_AREA_ESTIMATOR_H_
 
+#include <cstdint>
 #include <memory>
 #include <string_view>
 
 #include "absl/status/statusor.h"
-#include "xls/delay_model/delay_estimator.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
 #include "xls/ir/node.h"
 
-namespace xls {
+namespace xls::integrator {
 
 // Abstraction describing an area model for XLS operations.
 class AreaEstimator {
@@ -47,6 +48,6 @@ class AreaEstimator {
 absl::StatusOr<std::unique_ptr<AreaEstimator>> GetAreaEstimatorByName(
     std::string_view name);
 
-}  // namespace xls
+}  // namespace xls::integrator
 
-#endif  // XLS_AREA_MODEL_AREA_ESTIMATOR_H_
+#endif  // XLS_CONTRIB_INTEGRATOR_AREA_MODEL_AREA_ESTIMATOR_H_

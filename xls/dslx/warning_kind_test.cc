@@ -16,7 +16,11 @@
 
 #include <string_view>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "xls/common/status/matchers.h"
 
 namespace xls::dslx {
@@ -46,6 +50,68 @@ TEST(WarningKindTest, InitializerListHasAllKinds) {
               WarningKind{static_cast<WarningKindInt>(1 << i)});
   }
   EXPECT_EQ(kWarningKindCount, kAllWarningKinds.size());
+}
+
+TEST(WarningKindTest, DefaultSetAnyMissing) {
+  ASSERT_TRUE(WarningIsEnabled(kAllWarningsSet, WarningKind::kShouldUseAssert));
+
+  // Currently "should use assert" warning is disabled for propagation delay.
+  ASSERT_FALSE(
+      WarningIsEnabled(kDefaultWarningsSet, WarningKind::kShouldUseAssert));
+}
+
+TEST(WarningKindTest, Complement) {
+  EXPECT_EQ(Complement(kAllWarningsSet), kNoWarningsSet);
+  EXPECT_EQ(Complement(kNoWarningsSet), kAllWarningsSet);
+}
+
+TEST(WarningKindTest, SetIntersection) {
+  EXPECT_EQ(kAllWarningsSet & kAllWarningsSet, kAllWarningsSet);
+  EXPECT_EQ(kAllWarningsSet & kNoWarningsSet, kNoWarningsSet);
+  EXPECT_EQ(kNoWarningsSet & kAllWarningsSet, kNoWarningsSet);
+  EXPECT_EQ(kNoWarningsSet & kNoWarningsSet, kNoWarningsSet);
+  EXPECT_EQ(DisableWarning(kAllWarningsSet, WarningKind::kShouldUseAssert) &
+                EnableWarning(kNoWarningsSet, WarningKind::kShouldUseAssert),
+            kNoWarningsSet);
+}
+
+TEST(WarningKindTest, SetUnion) {
+  EXPECT_EQ(kAllWarningsSet | kAllWarningsSet, kAllWarningsSet);
+  EXPECT_EQ(kAllWarningsSet | kNoWarningsSet, kAllWarningsSet);
+  EXPECT_EQ(kNoWarningsSet | kAllWarningsSet, kAllWarningsSet);
+  EXPECT_EQ(kNoWarningsSet | kNoWarningsSet, kNoWarningsSet);
+  EXPECT_EQ(DisableWarning(kAllWarningsSet, WarningKind::kShouldUseAssert) |
+                EnableWarning(kNoWarningsSet, WarningKind::kShouldUseAssert),
+            kAllWarningsSet);
+}
+
+TEST(WarningKindTest, WarningKindSetFromString) {
+  XLS_ASSERT_OK_AND_ASSIGN(WarningKindSet set,
+                           WarningKindSetFromString("should_use_assert"));
+  ASSERT_TRUE(WarningIsEnabled(set, WarningKind::kShouldUseAssert));
+}
+
+TEST(WarningKindTest, GetWarningsSetFromFlagsEmpty) {
+  XLS_ASSERT_OK_AND_ASSIGN(WarningKindSet set, GetWarningsSetFromFlags("", ""));
+  EXPECT_EQ(set, kDefaultWarningsSet);
+}
+
+TEST(WarningKindTest, GetWarningsSetFromFlagsEmptyEnable) {
+  XLS_ASSERT_OK_AND_ASSIGN(WarningKindSet set,
+                           GetWarningsSetFromFlags("", "constant_naming"));
+  EXPECT_EQ(set,
+            DisableWarning(kDefaultWarningsSet, WarningKind::kConstantNaming));
+}
+
+TEST(WarningKindTest, GetWarningsSetFromFlagsContradiction) {
+  absl::StatusOr<WarningKindSet> set =
+      GetWarningsSetFromFlags("constant_naming", "constant_naming");
+  EXPECT_THAT(set.status(),
+              absl_testing::StatusIs(
+                  absl::StatusCode::kInvalidArgument,
+                  testing::HasSubstr(
+                      "Cannot both enable and disable the same warning(s); "
+                      "enabled: constant_naming disabled: constant_naming")));
 }
 
 }  // namespace

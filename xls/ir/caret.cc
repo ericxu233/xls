@@ -15,6 +15,7 @@
 #include "xls/ir/caret.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -23,10 +24,13 @@
 
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
+#include "xls/ir/fileno.h"
+#include "xls/ir/source_location.h"
 
 namespace xls {
 

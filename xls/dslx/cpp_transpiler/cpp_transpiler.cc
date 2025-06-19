@@ -14,6 +14,7 @@
 
 #include "xls/dslx/cpp_transpiler/cpp_transpiler.h"
 
+#include <filesystem>  // NOLINT
 #include <memory>
 #include <string>
 #include <string_view>
@@ -45,6 +46,7 @@ absl::StatusOr<CppSource> TranspileToCpp(Module* module,
 #include <cstdint>
 #include <ostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "absl/status/statusor.h"
@@ -59,6 +61,7 @@ $2$1$3
       R"(// AUTOMATICALLY GENERATED FILE FROM `xls/dslx/cpp_transpiler`. DO NOT EDIT!
 #include <array>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "%s"
@@ -70,7 +73,7 @@ $2$1$3
 #include "xls/public/status_macros.h"
 #include "xls/public/value.h"
 
-static bool FitsInNBitsSigned(int64_t value, int64_t n) {
+[[maybe_unused]] static bool FitsInNBitsSigned(int64_t value, int64_t n) {
   // All bits from [n - 1, 64) must be all zero or all ones.
   if (n >= 64) {
     return true;
@@ -82,14 +85,14 @@ static bool FitsInNBitsSigned(int64_t value, int64_t n) {
        (mask & value_as_unsigned) == mask;
 }
 
-static bool FitsInNBitsUnsigned(uint64_t value, int64_t n) {
+[[maybe_unused]] static bool FitsInNBitsUnsigned(uint64_t value, int64_t n) {
   if (n >= 64) {
     return true;
   }
   return value < (uint64_t{1} << n);
 }
 
-static std::string __indent(int64_t amount) {
+[[maybe_unused]] static std::string __indent(int64_t amount) {
   return std::string(amount * 2, ' ');
 }
 
@@ -99,6 +102,9 @@ static std::string __indent(int64_t amount) {
                        import_data->GetRootTypeInfo(module));
   std::vector<std::string> header;
   std::vector<std::string> source;
+
+  // TODO(b/351861097): 2024-07-08 Convert dependent types in other imports so
+  // that types defined in imported files can be used.
   for (const TypeDefinition& def : module->GetTypeDefinitions()) {
     XLS_ASSIGN_OR_RETURN(std::unique_ptr<CppTypeGenerator> generator,
                          CppTypeGenerator::Create(def, type_info, import_data));

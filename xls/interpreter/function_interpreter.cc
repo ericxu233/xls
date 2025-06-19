@@ -14,22 +14,36 @@
 
 #include "xls/interpreter/function_interpreter.h"
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
-#include "xls/ir/bits.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/interpreter/ir_interpreter.h"
+#include "xls/interpreter/observer.h"
+#include "xls/ir/events.h"
 #include "xls/ir/keyword_args.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/type.h"
+#include "xls/ir/value.h"
 
 namespace xls {
 namespace {
 
 // An interpreter for XLS functions.
-class FunctionInterpreter : public IrInterpreter {
+class FunctionInterpreter final : public IrInterpreter {
  public:
-  explicit FunctionInterpreter(absl::Span<const Value> args)
-      : args_(args.begin(), args.end()) {}
+  FunctionInterpreter(absl::Span<const Value> args,
+                      std::optional<EvaluationObserver*> observer)
+      : IrInterpreter(observer), args_(args.begin(), args.end()) {}
 
   absl::Status HandleParam(Param* param) override {
     XLS_ASSIGN_OR_RETURN(int64_t index,
@@ -50,11 +64,13 @@ class FunctionInterpreter : public IrInterpreter {
 }  // namespace
 
 absl::StatusOr<InterpreterResult<Value>> InterpretFunction(
-    Function* function, absl::Span<const Value> args) {
-  XLS_VLOG(3) << "Interpreting function " << function->name();
+    Function* function, absl::Span<const Value> args,
+    std::optional<EvaluationObserver*> observer) {
+  VLOG(3) << "Interpreting function " << function->name();
   if (args.size() != function->params().size()) {
     return absl::InvalidArgumentError(absl::StrFormat(
-        "Function %s wants %d arguments, got %d.", function->name(),
+        "Function `%s` (type: `%s`) wants %d arguments, got %d.",
+        function->name(), function->GetType()->ToString(),
         function->params().size(), args.size()));
   }
   for (int64_t argno = 0; argno < args.size(); ++argno) {
@@ -68,22 +84,21 @@ absl::StatusOr<InterpreterResult<Value>> InterpretFunction(
           value.ToString(), argno, param_type->ToString()));
     }
   }
-  FunctionInterpreter visitor(args);
+  FunctionInterpreter visitor(args, observer);
   XLS_RETURN_IF_ERROR(function->Accept(&visitor));
   Value result = visitor.ResolveAsValue(function->return_value());
-  XLS_VLOG(2) << "Result = " << result;
+  VLOG(2) << "Result = " << result;
   InterpreterEvents events = visitor.GetInterpreterEvents();
   return InterpreterResult<Value>{std::move(result), std::move(events)};
 }
 
-/* static */
-absl::StatusOr<InterpreterResult<Value>> InterpretFunctionKwargs(
-    Function* function, const absl::flat_hash_map<std::string, Value>& args) {
-  XLS_VLOG(2) << "Interpreting function " << function->name()
-              << " with arguments:";
+/* static */ absl::StatusOr<InterpreterResult<Value>> InterpretFunctionKwargs(
+    Function* function, const absl::flat_hash_map<std::string, Value>& args,
+    std::optional<EvaluationObserver*> observer) {
+  VLOG(2) << "Interpreting function " << function->name() << " with arguments:";
   XLS_ASSIGN_OR_RETURN(std::vector<Value> positional_args,
                        KeywordArgsToPositional(*function, args));
-  return InterpretFunction(function, positional_args);
+  return InterpretFunction(function, positional_args, observer);
 }
 
 }  // namespace xls

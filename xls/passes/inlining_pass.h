@@ -15,20 +15,42 @@
 #ifndef XLS_PASSES_INLINING_PASS_H_
 #define XLS_PASSES_INLINING_PASS_H_
 
+#include <string_view>
+
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "xls/ir/function.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/package.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/pass_base.h"
+#include "xls/passes/pass_pipeline.pb.h"
 
 namespace xls {
 
 class InliningPass : public OptimizationPass {
  public:
-  InliningPass() : OptimizationPass("inlining", "Inlines invocations") {}
+  enum class InlineDepth {
+    kFull,
+    kLeafOnly,
+  };
+  static constexpr std::string_view kName = "inlining";
+  explicit InliningPass(InlineDepth depth = InlineDepth::kFull)
+      : OptimizationPass(kName, "Inlines invocations"), depth_(depth) {}
+
+  // Inline a single invoke instruction. Provided for test and utility
+  // (ir_minimizer) use.
+  // Because this is only for ir-minimizer use it allows the inlined function to
+  // have invokes in the function code.
+  static absl::Status InlineOneInvoke(Invoke* invoke);
+
+  absl::StatusOr<PassPipelineProto::Element> ToProto() const override;
 
  protected:
   absl::StatusOr<bool> RunInternal(Package* p,
                                    const OptimizationPassOptions& options,
-                                   PassResults* results) const override;
+                                   PassResults* results,
+                                   OptimizationContext& context) const override;
+  InlineDepth depth_;
 };
 
 }  // namespace xls

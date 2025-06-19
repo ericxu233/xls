@@ -19,16 +19,30 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include "absl/base/no_destructor.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
 #include "absl/types/span.h"
+#include "xls/codegen/block_conversion.h"
+#include "xls/codegen/block_generator.h"
+#include "xls/codegen/codegen_options.h"
+#include "xls/codegen/codegen_pass.h"
+#include "xls/common/casts.h"
+#include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/common/thread.h"
 #include "xls/fdo/extract_nodes.h"
+#include "xls/ir/block.h"
+#include "xls/ir/function.h"
 #include "xls/ir/node.h"
-#include "xls/synthesis/synthesis.pb.h"
+#include "xls/scheduling/pipeline_schedule.h"
+#include "xls/scheduling/scheduling_options.h"
 
 namespace xls {
 namespace synthesis {
@@ -63,32 +77,138 @@ Synthesizer::SynthesizeNodesConcurrentlyAndGetDelays(
   return delay_list;
 }
 
-absl::StatusOr<int64_t> YosysSynthesizer::SynthesizeVerilogAndGetDelay(
-    std::string_view verilog_text, std::string_view top_module_name) const {
-  synthesis::CompileRequest request;
-  request.set_module_text(verilog_text);
-  request.set_top_module_name(top_module_name);
-  request.set_target_frequency_hz(kFrequencyHz);
-
-  synthesis::CompileResponse response;
-  XLS_RETURN_IF_ERROR(service_.RunSynthesis(&request, &response));
-  return response.slack_ps() == 0 ? 0 : kClockPeriodPs - response.slack_ps();
-}
-
-absl::StatusOr<int64_t> YosysSynthesizer::SynthesizeNodesAndGetDelay(
+absl::StatusOr<int64_t> Synthesizer::SynthesizeNodesAndGetDelay(
     const absl::flat_hash_set<Node *> &nodes) const {
   std::string top_name = "tmp_module";
-  XLS_ASSIGN_OR_RETURN(
-      std::optional<std::string> verilog_text,
-      ExtractNodesAndGetVerilog(nodes, top_name, /*flop_inputs_outputs=*/true));
-  if (!verilog_text.has_value()) {
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<Package> tmp_package,
+                       ExtractNodes(nodes, top_name));
+  XLS_ASSIGN_OR_RETURN(Function * f, tmp_package->GetFunction(top_name));
+  XLS_ASSIGN_OR_RETURN(std::string verilog_text,
+                       FunctionBaseToVerilog(f, /*flop_inputs_outputs=*/true));
+  if (verilog_text.empty()) {
     return 0;
   }
-  XLS_ASSIGN_OR_RETURN(int64_t nodes_delay,
-                       SynthesizeVerilogAndGetDelay(
-                           verilog_text.value(), top_name));
-  return nodes_delay;
+  return SynthesizeVerilogAndGetDelay(verilog_text, top_name);
+}
+
+absl::StatusOr<int64_t> Synthesizer::SynthesizeFunctionBaseAndGetDelay(
+    FunctionBase *f) const {
+  XLS_ASSIGN_OR_RETURN(std::string verilog_text,
+                       FunctionBaseToVerilog(f, /*flop_inputs_outputs=*/true));
+  if (verilog_text.empty()) {
+    return 0;
+  }
+  return SynthesizeVerilogAndGetDelay(verilog_text, f->name());
+}
+
+absl::StatusOr<std::string> Synthesizer::FunctionBaseToVerilog(
+    FunctionBase *f, bool flop_inputs_outputs) const {
+  if (f->node_count() == 0) {
+    return "";
+  }
+  // With the temporary function, we convert it to a combinational block. If
+  // flop_inputs_outputs is set, we insert registers to the inputs and outputs.
+  Block *tmp_block;
+  if (!flop_inputs_outputs) {
+    if (!f->IsFunction()) {
+      return absl::InvalidArgumentError(
+          "Proc inputs and outputs must be flopped.");
+    }
+    verilog::CodegenOptions options;
+    options.entry(f->name());
+    XLS_ASSIGN_OR_RETURN(verilog::CodegenContext context,
+                         verilog::FunctionToCombinationalBlock(
+                             down_cast<Function *>(f), options));
+    XLS_RET_CHECK(context.HasTopBlock());
+    tmp_block = context.top_block();
+  } else {
+    ScheduleCycleMap cycle_map;
+    for (Node *node : f->nodes()) {
+      cycle_map.emplace(node, 0);
+    }
+    // Generate block with flopped inputs and outputs. We always use verilog
+    // instead of system verilog. We always split the tuple outputs into
+    // individuals.
+    verilog::CodegenOptions options;
+    options.entry(f->name())
+        .clock_name("clk")
+        .use_system_verilog(false)
+        .flop_inputs(true)
+        .flop_outputs(true);
+    if (f->IsProc()) {
+      options.reset("rst", false, false, false);
+    }
+    PipelineSchedule schedule(f, cycle_map, 1);
+    XLS_ASSIGN_OR_RETURN(
+        verilog::CodegenContext context,
+        verilog::FunctionBaseToPipelinedBlock(schedule, options, f));
+    XLS_RET_CHECK(context.HasTopBlock());
+    tmp_block = context.top_block();
+  }
+
+  verilog::CodegenOptions options;
+  return GenerateVerilog(tmp_block, options.use_system_verilog(false));
+}
+
+absl::StatusOr<SynthesizerFactory *> SynthesizerManager::GetSynthesizerFactory(
+    std::string_view name) {
+  if (!synthesizers_.contains(name)) {
+    if (synthesizer_names_.empty()) {
+      return absl::NotFoundError(
+          absl::StrFormat("No synthesizer found named \"%s\". No "
+                          "synthesizer are registered. Was InitXls called?",
+                          name));
+    }
+    return absl::NotFoundError(absl::StrFormat(
+        "No synthesizer found named \"%s\". Available synthesizers: %s", name,
+        absl::StrJoin(synthesizer_names_, ", ")));
+  }
+
+  return synthesizers_.at(name).get();
+}
+
+absl::StatusOr<std::unique_ptr<Synthesizer>>
+SynthesizerManager::MakeSynthesizer(std::string_view name,
+                                    const SynthesizerParameters &parameters) {
+  XLS_ASSIGN_OR_RETURN(SynthesizerFactory * factory,
+                       GetSynthesizerFactory(name));
+  return factory->CreateSynthesizer(parameters);
+};
+
+absl::StatusOr<std::unique_ptr<Synthesizer>>
+SynthesizerManager::MakeSynthesizer(
+    std::string_view name, const SchedulingOptions &scheduling_options) {
+  XLS_ASSIGN_OR_RETURN(SynthesizerFactory * factory,
+                       GetSynthesizerFactory(name));
+  return factory->CreateSynthesizer(scheduling_options);
+};
+
+absl::Status SynthesizerManager::RegisterSynthesizer(
+    std::unique_ptr<SynthesizerFactory> synthesizer_factory) {
+  std::string name = synthesizer_factory->name();
+  if (synthesizers_.contains(name)) {
+    return absl::InternalError(
+        absl::StrFormat("SynthesizerFactory named %s already exists", name));
+  }
+  synthesizers_[name] = std::move(synthesizer_factory);
+  synthesizer_names_.push_back(name);
+  return absl::OkStatus();
+}
+
+SynthesizerManager &GetSynthesizerManagerSingleton() {
+  static absl::NoDestructor<SynthesizerManager> manager;
+  return *manager;
 }
 
 }  // namespace synthesis
+
+absl::StatusOr<synthesis::Synthesizer *> SetUpSynthesizer(
+    const SchedulingOptions &flags) {
+  XLS_ASSIGN_OR_RETURN(
+      std::unique_ptr<synthesis::Synthesizer> synthesizer,
+      synthesis::GetSynthesizerManagerSingleton().MakeSynthesizer(
+          flags.fdo_synthesizer_name(), flags));
+  return synthesizer.release();
+}
+
 }  // namespace xls

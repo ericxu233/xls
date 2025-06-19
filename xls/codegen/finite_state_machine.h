@@ -16,6 +16,7 @@
 #define XLS_CODEGEN_FINITE_STATE_MACHINE_H_
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <list>
 #include <memory>
@@ -24,12 +25,13 @@
 #include <string_view>
 #include <vector>
 
-#include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "xls/codegen/vast.h"
+#include "xls/codegen/vast/vast.h"
 #include "xls/common/casts.h"
-#include "xls/common/logging/logging.h"
+#include "xls/ir/bits.h"
+#include "xls/ir/source_location.h"
 
 namespace xls {
 namespace verilog {
@@ -111,7 +113,7 @@ class FsmBlockBase {
   // Adds the assignment of 'logic_ref' to 'value' to the block.
   void AddAssignment(LogicRef* logic_ref, Expression* value) {
     for (const auto& assignment : assignments_) {
-      XLS_CHECK_NE(logic_ref, assignment.lhs)
+      CHECK_NE(logic_ref, assignment.lhs)
           << logic_ref->GetName() << " already assigned.";
     }
     assignments_.push_back(Assignment{logic_ref, value});
@@ -178,7 +180,7 @@ class FsmBlock : public FsmBlockBase {
 
   // Sets the next state to transition to.
   T& NextState(FsmState* next_state) {
-    XLS_CHECK(next_state_ == nullptr);
+    CHECK(next_state_ == nullptr);
     next_state_ = next_state;
     return down_cast<T&>(*this);
   }
@@ -239,8 +241,7 @@ class FsmBlock : public FsmBlockBase {
 // An unconditional block of logic within an FSM state.
 class UnconditionalFsmBlock : public FsmBlock<UnconditionalFsmBlock> {
  public:
-  explicit UnconditionalFsmBlock(std::string_view debug_name,
-                                 VerilogFile* file)
+  explicit UnconditionalFsmBlock(std::string_view debug_name, VerilogFile* file)
       : FsmBlock<UnconditionalFsmBlock>(debug_name, file) {}
 };
 
@@ -337,8 +338,7 @@ class FsmState : public UnconditionalFsmBlock {
 class FsmBuilder {
  public:
   FsmBuilder(std::string_view name, Module* module, LogicRef* clk,
-             bool use_system_verilog,
-             std::optional<Reset> reset = std::nullopt)
+             bool use_system_verilog, std::optional<Reset> reset = std::nullopt)
       : name_(name),
         module_(module),
         file_(module->file()),

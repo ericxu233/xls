@@ -19,14 +19,16 @@
 #include <limits>
 #include <vector>
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
-#include "xls/common/logging/logging.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/ir/function_base.h"
-#include "xls/ir/node_iterator.h"
-#include "xls/ir/node_util.h"
+#include "xls/ir/nodes.h"
 #include "xls/ir/op.h"
+#include "xls/ir/source_location.h"
+#include "xls/ir/type.h"
 #include "xls/passes/optimization_pass.h"
+#include "xls/passes/optimization_pass_registry.h"
 #include "xls/passes/pass_base.h"
 
 namespace xls {
@@ -298,7 +300,7 @@ int64_t NumberOfTokensInType(Type* type) {
 
 absl::StatusOr<bool> TokenSimplificationPass::RunOnFunctionBaseInternal(
     FunctionBase* f, const OptimizationPassOptions& options,
-    PassResults* results) const {
+    PassResults* results, OptimizationContext& context) const {
   for (Node* node : f->nodes()) {
     if (NumberOfTokensInType(node->GetType()) > 1) {
       return false;
@@ -307,7 +309,7 @@ absl::StatusOr<bool> TokenSimplificationPass::RunOnFunctionBaseInternal(
 
   bool changed = false;
 
-  for (Node* node : TopoSort(f)) {
+  for (Node* node : context.TopoSort(f)) {
     if (!node->Is<MinDelay>()) {
       continue;
     }
@@ -316,7 +318,7 @@ absl::StatusOr<bool> TokenSimplificationPass::RunOnFunctionBaseInternal(
     changed = changed || subpass_changed;
   }
 
-  for (Node* node : TopoSort(f)) {
+  for (Node* node : context.TopoSort(f)) {
     if (!node->Is<MinDelay>()) {
       continue;
     }
@@ -325,7 +327,7 @@ absl::StatusOr<bool> TokenSimplificationPass::RunOnFunctionBaseInternal(
     changed = changed || subpass_changed;
   }
 
-  for (Node* node : TopoSort(f)) {
+  for (Node* node : context.TopoSort(f)) {
     if (!node->Is<AfterAll>()) {
       continue;
     }
@@ -334,7 +336,7 @@ absl::StatusOr<bool> TokenSimplificationPass::RunOnFunctionBaseInternal(
     changed = changed || subpass_changed;
   }
 
-  for (Node* node : ReverseTopoSort(f)) {
+  for (Node* node : context.ReverseTopoSort(f)) {
     if (!node->Is<AfterAll>()) {
       continue;
     }
@@ -343,7 +345,7 @@ absl::StatusOr<bool> TokenSimplificationPass::RunOnFunctionBaseInternal(
     changed = changed || subpass_changed;
   }
 
-  for (Node* node : TopoSort(f)) {
+  for (Node* node : context.TopoSort(f)) {
     if (!node->Is<AfterAll>()) {
       continue;
     }
@@ -352,7 +354,7 @@ absl::StatusOr<bool> TokenSimplificationPass::RunOnFunctionBaseInternal(
     changed = changed || subpass_changed;
   }
 
-  for (Node* node : TopoSort(f)) {
+  for (Node* node : context.TopoSort(f)) {
     if (!node->Is<AfterAll>()) {
       continue;
     }
@@ -361,7 +363,7 @@ absl::StatusOr<bool> TokenSimplificationPass::RunOnFunctionBaseInternal(
     changed = changed || subpass_changed;
   }
 
-  for (Node* node : TopoSort(f)) {
+  for (Node* node : context.TopoSort(f)) {
     if (!node->Is<AfterAll>()) {
       continue;
     }
@@ -371,7 +373,7 @@ absl::StatusOr<bool> TokenSimplificationPass::RunOnFunctionBaseInternal(
   }
 
   if (changed) {
-    for (Node* node : TopoSort(f)) {
+    for (Node* node : context.TopoSort(f)) {
       if (!node->Is<MinDelay>()) {
         continue;
       }
@@ -381,5 +383,7 @@ absl::StatusOr<bool> TokenSimplificationPass::RunOnFunctionBaseInternal(
 
   return changed;
 }
+
+REGISTER_OPT_PASS(TokenSimplificationPass);
 
 }  // namespace xls

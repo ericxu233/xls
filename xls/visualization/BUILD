@@ -13,7 +13,12 @@
 # limitations under the License.
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -22,26 +27,28 @@ cc_binary(
     srcs = ["sched_printer_main.cc"],
     visibility = ["//xls:xls_users"],
     deps = [
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/container:flat_hash_set",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:str_format",
         "//xls/common:init_xls",
         "//xls/common/file:filesystem",
-        "//xls/common/logging",
         "//xls/common/status:status_macros",
-        "//xls/delay_model:analyze_critical_path",
-        "//xls/delay_model:delay_estimator",
+        "//xls/estimators/delay_model:analyze_critical_path",
+        "//xls/estimators/delay_model:delay_estimator",
         "//xls/ir",
         "//xls/ir:ir_parser",
         "//xls/ir:op",
+        "//xls/ir:verifier",
         "//xls/scheduling:pipeline_schedule",
         "//xls/scheduling:run_pipeline_schedule",
         "//xls/scheduling:scheduling_options",
         "//xls/tools:scheduling_options_flags",
         "//xls/tools:scheduling_options_flags_cc_proto",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
     ],
 )

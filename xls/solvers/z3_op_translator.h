@@ -20,9 +20,10 @@
 #include <string_view>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/types/span.h"
-#include "../z3/src/api/z3.h"  // IWYU pragma: keep
-#include "../z3/src/api/z3_api.h"
+#include "z3/src/api/z3.h"  // IWYU pragma: keep
+#include "z3/src/api/z3_api.h"
 
 namespace xls::solvers::z3 {
 
@@ -46,6 +47,9 @@ class Z3OpTranslator {
   Z3_ast ReduceOr(Z3_ast arg) { return Z3_mk_bvredor(z3_ctx_, arg); }
   Z3_ast EqZero(Z3_ast arg) { return Not(Z3_mk_bvredor(z3_ctx_, arg)); }
   Z3_ast Eq(Z3_ast lhs, Z3_ast rhs) { return EqZero(Xor(lhs, rhs)); }
+  Z3_ast If(Z3_ast cond, Z3_ast consequent, Z3_ast alternate) {
+    return Cond(NeZeroBool(cond), consequent, alternate);
+  }
 
   // Returns a boolean-kinded result that says whether lhs == rhs.
   Z3_ast EqBool(Z3_ast lhs, Z3_ast rhs) { return Z3_mk_eq(z3_ctx_, lhs, rhs); }
@@ -59,8 +63,13 @@ class Z3OpTranslator {
   Z3_ast True() { return Z3_mk_true(z3_ctx_); }
   Z3_ast False() { return Z3_mk_false(z3_ctx_); }
 
-  Z3_ast ZextBy1b(Z3_ast arg) { return Z3_mk_zero_ext(z3_ctx_, 1, arg); }
-  Z3_ast SextBy1b(Z3_ast arg) { return Z3_mk_sign_ext(z3_ctx_, 1, arg); }
+  Z3_ast ZeroExtBy1b(Z3_ast arg) { return Z3_mk_zero_ext(z3_ctx_, 1, arg); }
+  Z3_ast SignExtBy1b(Z3_ast arg) { return Z3_mk_sign_ext(z3_ctx_, 1, arg); }
+
+  // Left shift by 'r'. Handles coercing types internally.
+  Z3_ast Shll(Z3_ast l, Z3_ast r);
+
+  Z3_ast ZeroExt(Z3_ast bits, int64_t new_bit_count);
 
   // Extracts bit "bitno" from the given argument, returns a single-bit
   // bitvector result.
@@ -142,6 +151,7 @@ class Z3OpTranslator {
   // significant bit of the result, and arg[args.size()-1]'s least significant
   // bit is the least significant bit of the result.
   Z3_ast ConcatN(absl::Span<const Z3_ast> args) {
+    CHECK(!args.empty());
     Z3_ast accum = args[0];
     for (int64_t i = 1; i < args.size(); ++i) {
       accum = Z3_mk_concat(z3_ctx_, accum, args[i]);
@@ -152,13 +162,29 @@ class Z3OpTranslator {
   // Returns whether lhs < rhs -- this is determined by zero-extending the
   // values and testing whether lhs - rhs < 0
   Z3_ast ULt(Z3_ast lhs, Z3_ast rhs) {
-    return Msb(Sub(ZextBy1b(lhs), ZextBy1b(rhs)));
+    return Msb(Sub(ZeroExtBy1b(lhs), ZeroExtBy1b(rhs)));
   }
   Z3_ast ULe(Z3_ast lhs, Z3_ast rhs) { return Or(ULt(lhs, rhs), Eq(lhs, rhs)); }
+  Z3_ast UGt(Z3_ast lhs, Z3_ast rhs) { return Not(ULe(lhs, rhs)); }
   Z3_ast UGe(Z3_ast lhs, Z3_ast rhs) { return Not(ULt(lhs, rhs)); }
 
+  Z3_ast ULtBool(Z3_ast lhs, Z3_ast rhs) {
+    return Z3_mk_bvult(z3_ctx_, lhs, rhs);
+  }
+  Z3_ast ULeBool(Z3_ast lhs, Z3_ast rhs) {
+    return Z3_mk_bvule(z3_ctx_, lhs, rhs);
+  }
+  Z3_ast UGtBool(Z3_ast lhs, Z3_ast rhs) {
+    return Z3_mk_bvugt(z3_ctx_, lhs, rhs);
+  }
+  Z3_ast UGeBool(Z3_ast lhs, Z3_ast rhs) {
+    return Z3_mk_bvuge(z3_ctx_, lhs, rhs);
+  }
+
+  // Returns whether lhs < rhs -- this is determined by sign-extending the
+  // values and testing whether lhs - rhs < 0
   Z3_ast SLt(Z3_ast lhs, Z3_ast rhs) {
-    return Msb(Sub(SextBy1b(lhs), SextBy1b(rhs)));
+    return Msb(Sub(SignExtBy1b(lhs), SignExtBy1b(rhs)));
   }
 
   Z3_ast Min(Z3_ast lhs, Z3_ast rhs) {
